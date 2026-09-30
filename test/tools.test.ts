@@ -1,80 +1,113 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { before, describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import { bashTool, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
-import { checkInput, truncate } from "../src/tools/index.ts";
+import { checkInput, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
+import { FileVersions } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
 
+let ctx: ToolContext;
 let cwd: string;
-before(async () => {
+beforeEach(async () => {
   cwd = await mkdtemp(join(tmpdir(), "jig-test-"));
+  ctx = { cwd, versions: new FileVersions() };
 });
+
+const read = (path: string, more: object = {}) => readTool.run({ path, ...more }, ctx);
+const write = (path: string, content: string) => writeTool.run({ path, content }, ctx);
+const edit = (old_string: string, new_string: string, path = "code.js") =>
+  editTool.run({ path, old_string, new_string }, ctx);
+
+/** Creates a file behind the tools' back, then lets the model "read" it. */
+async function givenFile(path: string, content: string | Buffer): Promise<void> {
+  await writeFile(join(cwd, path), content);
+  await read(path);
+}
 
 describe("read_file", () => {
   it("numbers lines like cat -n", async () => {
     await writeFile(join(cwd, "a.txt"), "one\ntwo\n");
-    assert.equal(await readTool.run({ path: "a.txt" }, { cwd }), "     1\tone\n     2\ttwo\n");
+    assert.equal(await read("a.txt"), "     1\tone\n     2\ttwo\n");
   });
 
   it("reads a page with offset and limit, and says how to continue", async () => {
     await writeFile(join(cwd, "long.txt"), Array.from({ length: 10 }, (_, i) => `line ${i + 1}`).join("\n"));
-    const out = await readTool.run({ path: "long.txt", offset: 3, limit: 2 }, { cwd });
+    const out = await read("long.txt", { offset: 3, limit: 2 });
     assert.match(out, /^ {5}3\tline 3\n {5}4\tline 4\n/);
     assert.match(out, /Showed lines 3-4 of 10\. Use offset=5 to continue/);
   });
 
+  it("hides Windows line endings", async () => {
+    await writeFile(join(cwd, "win.txt"), "one\r\ntwo\r\n");
+    assert.equal(await read("win.txt"), "     1\tone\n     2\ttwo\n");
+  });
+
   it("explains missing files, directories and binary files", async () => {
-    await assert.rejects(readTool.run({ path: "nope.txt" }, { cwd }), /File not found: nope\.txt/);
-    await mkdir(join(cwd, "dir"), { recursive: true });
-    await assert.rejects(readTool.run({ path: "dir" }, { cwd }), /is a directory/);
+    await assert.rejects(read("nope.txt"), /File not found: nope\.txt/);
+    await mkdir(join(cwd, "dir"));
+    await assert.rejects(read("dir"), /is a directory/);
     await writeFile(join(cwd, "blob.bin"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
-    await assert.rejects(readTool.run({ path: "blob.bin" }, { cwd }), /binary/);
+    await assert.rejects(read("blob.bin"), /binary/);
   });
 
   it("refuses paths outside the working directory", async () => {
-    await assert.rejects(readTool.run({ path: "../secret.txt" }, { cwd }), /outside the working directory/);
-    await assert.rejects(readTool.run({ path: "/etc/hosts" }, { cwd }), /outside the working directory/);
+    await assert.rejects(read("../secret.txt"), /outside the working directory/);
+    await assert.rejects(read("/etc/hosts"), /outside the working directory/);
   });
 });
 
 describe("write_file", () => {
-  it("creates parent directories and says whether it created or overwrote", async () => {
-    const created = await writeTool.run({ path: "new/dir/f.txt", content: "hi\n" }, { cwd });
-    assert.equal(created, "Created new/dir/f.txt (1 line).");
-    const overwrote = await writeTool.run({ path: "new/dir/f.txt", content: "a\nb\n" }, { cwd });
-    assert.equal(overwrote, "Overwrote new/dir/f.txt (2 lines).");
+  it("creates parent directories, and overwrites only files it has read", async () => {
+    assert.equal(await write("new/dir/f.txt", "hi\n"), "Created new/dir/f.txt (1 line).");
+    assert.equal(await write("new/dir/f.txt", "a\nb\n"), "Overwrote new/dir/f.txt (2 lines).");
     assert.equal(await readFile(join(cwd, "new/dir/f.txt"), "utf8"), "a\nb\n");
+
+    await writeFile(join(cwd, "theirs.txt"), "the user's work\n");
+    await assert.rejects(write("theirs.txt", "gone\n"), /haven't read theirs\.txt/);
+  });
+
+  it("keeps an existing file's CRLF line endings", async () => {
+    await givenFile("win.txt", "old\r\n");
+    assert.match(await write("win.txt", "a\nb\n"), /kept its CRLF line endings/);
+    assert.equal(await readFile(join(cwd, "win.txt"), "utf8"), "a\r\nb\r\n");
   });
 });
 
 describe("edit_file", () => {
-  const edit = (old_string: string, new_string: string) =>
-    editTool.run({ path: "code.js", old_string, new_string }, { cwd });
-
   it("replaces an exact, unique match", async () => {
-    await writeFile(join(cwd, "code.js"), "const a = 1;\nconst b = 2;\n");
+    await givenFile("code.js", "const a = 1;\nconst b = 2;\n");
     assert.match(await edit("const b = 2;", "const b = 3;"), /at line 2/);
     assert.equal(await readFile(join(cwd, "code.js"), "utf8"), "const a = 1;\nconst b = 3;\n");
+    await edit("const a = 1;", "const a = 0;"); // its own write doesn't count as a change by someone else
+  });
+
+  it("refuses to edit a file it hasn't read, or one that changed since", async () => {
+    await writeFile(join(cwd, "code.js"), "x = 1\n");
+    await assert.rejects(edit("x = 1", "x = 2"), /haven't read code\.js yet/);
+    await read("code.js");
+    await writeFile(join(cwd, "code.js"), "x = 10\n"); // someone else edits it
+    await utimes(join(cwd, "code.js"), new Date(), new Date(Date.now() + 5000));
+    await assert.rejects(edit("x = 10", "x = 2"), /has changed since you last read it/);
   });
 
   it("rejects a missing or ambiguous match and leaves the file alone", async () => {
-    await writeFile(join(cwd, "code.js"), "x();\nx();\n");
+    await givenFile("code.js", "x();\nx();\n");
     await assert.rejects(edit("y();", "z();"), /not found/);
     await assert.rejects(edit("x();", "z();"), /occurs 2 times/);
     assert.equal(await readFile(join(cwd, "code.js"), "utf8"), "x();\nx();\n");
   });
 
   it("counts overlapping matches as ambiguous", async () => {
-    await writeFile(join(cwd, "code.js"), "aaa");
+    await givenFile("code.js", "aaa");
     await assert.rejects(edit("aa", "b"), /occurs 2 times/);
   });
 
   it("inserts new_string literally, even with $& or $1 in it", async () => {
-    await writeFile(join(cwd, "code.js"), "price = 0;\n");
+    await givenFile("code.js", "price = 0;\n");
     await edit("price = 0;", 'price = "$&$1";');
     assert.equal(await readFile(join(cwd, "code.js"), "utf8"), 'price = "$&$1";\n');
   });
@@ -83,11 +116,24 @@ describe("edit_file", () => {
     await assert.rejects(edit("", "x"), /old_string is empty/);
     await assert.rejects(edit("x", "x"), /identical/);
   });
+
+  it("edits files with Windows line endings and keeps them", async () => {
+    await givenFile("win.py", "def f():\r\n    return 1\r\n");
+    await edit("def f():\n    return 1", "def f():\n    return 2", "win.py");
+    assert.equal(await readFile(join(cwd, "win.py"), "utf8"), "def f():\r\n    return 2\r\n");
+  });
+
+  it("points at the nearest match when old_string is not found", async () => {
+    await givenFile("code.py", "def f():\n    if x:\n        return 1\n    return 2\n");
+    await assert.rejects(edit("if x:\n    return 1", "if x:\n    return 3", "code.py"), /Lines 2-3 match it except for whitespace/);
+    await assert.rejects(edit("     2\t    if x:", "y", "code.py"), /line numbers, which read_file only adds/);
+    await assert.rejects(edit("def f():\n    return 9", "z", "code.py"), /first line matches line 1/);
+  });
 });
 
 describe("bash", () => {
   it("returns stdout, stderr and the exit code", async () => {
-    const out = await bashTool.run({ command: "echo hello; echo oops >&2; exit 3" }, { cwd });
+    const out = await bashTool.run({ command: "echo hello; echo oops >&2; exit 3" }, ctx);
     assert.match(out, /hello/);
     assert.match(out, /oops/);
     assert.match(out, /Exit code: 3$/);

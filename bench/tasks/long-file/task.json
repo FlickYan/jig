@@ -1,0 +1,9 @@
+{
+  "instruction": "normalize_phone in utils/helpers.py drops the leading '+' from international numbers: '+44 20 7946 0958' should become '+442079460958'. Please fix it.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug fix",
+    "long file"
+  ]
+}

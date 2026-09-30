@@ -1,0 +1,8 @@
+{
+  "instruction": "Implement the LRUCache class in lru.py so that it does everything its docstring describes.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "implement from a spec"
+  ]
+}

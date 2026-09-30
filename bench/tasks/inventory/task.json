@@ -1,0 +1,9 @@
+{
+  "instruction": "Customers who try to order exactly the number of items we have left get an error like `Insufficient stock for SKU-123: requested 3, available 3`. Ordering fewer works fine. Find the cause and fix it.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug fix",
+    "search a larger codebase"
+  ]
+}

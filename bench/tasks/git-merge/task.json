@@ -1,0 +1,9 @@
+{
+  "instruction": "Merge the `feature` branch into `main` and resolve the conflict. Keep both changes: the new greeting from `feature` and the logging that was added on `main`. Commit the merge as a normal merge commit (no rebase or squash).",
+  "check": "python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "git",
+    "terminal task",
+    "merge conflict"
+  ]
+}

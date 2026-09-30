@@ -4,8 +4,10 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { runAgent, type AgentOptions, type RunResult } from "./agent.ts";
 import { createModel, EFFORTS, type Effort } from "./model.ts";
+import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { systemPrompt } from "./prompt.ts";
-import { TOOLS, type Tool } from "./tools/index.ts";
+import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
+import { FileVersions } from "./tools/util.ts";
 import * as ui from "./ui.ts";
 
 const HELP = `Usage: jig [options] [task]
@@ -15,13 +17,21 @@ Runs one task, or starts an interactive session if no task is given.
 Options:
   -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
   -e, --effort <level>  ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
-  -y, --yes             run every tool call without asking first
+      --mode <mode>     when to ask before a tool call (default: edits)
+${MODES.map((mode) => `                          ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
+  -y, --yes             same as --mode auto
+      --hide-thinking   don't print the model's thinking (/thinking toggles it in a session)
   -C, --cwd <dir>       project directory (default: the current directory)
       --max-steps <n>   most model calls per task (default: 50)
   -h, --help            show this help
 
-In a session, /reset starts a new conversation and /exit quits.
+Reading files, and read-only commands (ls, cat, grep, git status, ...) inside the project, never ask.
 Ctrl+C stops the current task (press it again to force quit).`;
+
+const COMMANDS = `  /mode [ask|edits|auto]  show or change when jig asks before a tool call
+  /thinking               show or hide the model's thinking
+  /reset                  start a new conversation
+  /exit                   quit (Ctrl+D works too)`;
 
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
@@ -29,7 +39,9 @@ async function main(): Promise<void> {
     options: {
       model: { type: "string", short: "m", default: "deepseek-flash" },
       effort: { type: "string", short: "e" },
+      mode: { type: "string", default: "edits" },
       yes: { type: "boolean", short: "y", default: false },
+      "hide-thinking": { type: "boolean", default: false },
       cwd: { type: "string", short: "C", default: "." },
       "max-steps": { type: "string", default: "50" },
       help: { type: "boolean", short: "h", default: false },
@@ -41,25 +53,32 @@ async function main(): Promise<void> {
   }
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
+  const mode = (values.yes ? "auto" : values.mode) as Mode;
+  if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
   if (!Number.isInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer");
+  ui.setThinkingVisible(!values["hide-thinking"]);
 
   const cwd = resolve(values.cwd);
+  const permissions = new Permissions(mode, cwd);
   const messages: Anthropic.Beta.BetaMessageParam[] = []; // the conversation, kept across tasks in a session
-  let alwaysAllow = values.yes;
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
 
-  async function approve(tool: Tool): Promise<boolean> {
-    if (alwaysAllow) return true;
+  async function approve(tool: Tool, input: ToolInput): Promise<boolean> {
+    if (permissions.allows(tool, input)) return true;
     if (!process.stdin.isTTY) {
       ui.notice("No terminal to ask for permission, so the call was declined. Use --yes to allow tool calls.");
       return false;
     }
-    const answer = await ui.ask(`  Allow ${tool.definition.name}? [y]es / [n]o / [a]lways: `);
+    const always = permissions.alwaysLabel(tool, input);
+    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
     if (answer === null) task?.abort(); // Ctrl+C at the prompt stops the whole task
     const choice = answer?.trim().toLowerCase() ?? "";
-    if (choice.startsWith("a")) alwaysAllow = true;
-    return choice.startsWith("y") || choice.startsWith("a");
+    if (always && choice.startsWith("a")) {
+      permissions.allowAlways(tool, input);
+      return true;
+    }
+    return choice.startsWith("y");
   }
 
   const agent: AgentOptions = {
@@ -67,6 +86,7 @@ async function main(): Promise<void> {
     tools: TOOLS,
     cwd,
     maxSteps,
+    versions: new FileVersions(),
     approve,
     ui: ui.terminalUI,
   };
@@ -92,22 +112,46 @@ async function main(): Promise<void> {
     }
   }
 
+  /** Runs a slash command. Returns false to quit. */
+  function command(line: string): boolean {
+    const [name, arg] = line.split(/\s+/);
+    if (name === "/exit") return false;
+    if (name === "/help") {
+      ui.println(COMMANDS);
+    } else if (name === "/reset") {
+      messages.length = 0;
+      agent.versions = new FileVersions();
+      ui.notice("Started a new conversation.");
+    } else if (name === "/thinking") {
+      ui.setThinkingVisible(!ui.thinkingVisible());
+      ui.notice(`Thinking is now ${ui.thinkingVisible() ? "shown" : "hidden"}.`);
+    } else if (name === "/mode" && arg && !MODES.includes(arg as Mode)) {
+      ui.notice(`Unknown mode "${arg}". Choose one of: ${MODES.join(", ")}.`);
+    } else if (name === "/mode") {
+      if (arg) permissions.mode = arg as Mode;
+      ui.notice(`Mode: ${permissions.mode} (${MODE_HELP[permissions.mode]}).`);
+    } else {
+      ui.notice(`Unknown command ${name}. Type /help to see the commands.`);
+    }
+    return true;
+  }
+
   if (positionals.length > 0) {
     if (!(await runTask(positionals.join(" ")))) process.exitCode = 1;
     return;
   }
 
-  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${values.model} · effort ${effort ?? "default"} · ${cwd}`)}`);
-  ui.println(ui.dim("Type a task and press Enter. /reset starts a new conversation, /exit quits."));
+  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${values.model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
     ui.println();
     const line = await ui.ask(ui.bold("> "));
-    if (line === null || line.trim() === "/exit") break;
-    if (line.trim() === "/reset") {
-      messages.length = 0;
-      ui.notice("Started a new conversation.");
-    } else if (line.trim()) {
-      await runTask(line);
+    if (line === null) break;
+    const input = line.trim();
+    if (input.startsWith("/")) {
+      if (!command(input)) break;
+    } else if (input) {
+      await runTask(input);
     }
   }
 }
@@ -123,6 +167,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
   if (note) ui.notice(note);
+  // The benchmark runner (bench/run.ts) reads this line, so keep its format.
   const { input, cacheWrite, cacheRead, output } = result.usage;
   const tokensIn = input + cacheWrite + cacheRead;
   ui.println(

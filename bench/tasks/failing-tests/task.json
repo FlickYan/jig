@@ -1,0 +1,9 @@
+{
+  "instruction": "Some tests in tests/ are failing. Fix the code so that the whole test suite passes. Don't change the tests.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug fix",
+    "failing tests"
+  ]
+}

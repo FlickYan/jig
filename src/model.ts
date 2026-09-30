@@ -126,7 +126,7 @@ async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, si
       } else if (event.type === "content_block_delta") {
         const delta = event.delta;
         if (delta.type === "text_delta") ui.text(delta.text);
-        else if (delta.type === "thinking_delta") ui.progress(delta.thinking); // reasoning is empty; notes are not
+        else if (delta.type === "thinking_delta") ui.thinking(delta.thinking);
         else if (delta.type === "input_json_delta") {
           rawInputs.set(event.index, (rawInputs.get(event.index) ?? "") + delta.partial_json);
         }

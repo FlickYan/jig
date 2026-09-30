@@ -24,7 +24,7 @@ export const bashTool: Tool = {
       additionalProperties: false,
     },
   },
-  readOnly: false,
+  kind: "run",
   describe: ({ command }) => String(command),
 
   run(input, { cwd, signal }) {

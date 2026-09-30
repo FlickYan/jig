@@ -8,6 +8,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions } from "../src/agent.ts";
 import type { ModelTurn } from "../src/model.ts";
 import { TOOLS } from "../src/tools/index.ts";
+import { FileVersions } from "../src/tools/util.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -36,6 +37,7 @@ function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
     tools: TOOLS,
     cwd,
     maxSteps: 10,
+    versions: new FileVersions(),
     approve: async () => true,
     ui: { toolCall() {}, toolResult() {} },
     ...overrides,
@@ -94,15 +96,6 @@ describe("runAgent", () => {
     const [result] = resultsIn(messages[2]);
     assert.equal(result.is_error, true);
     assert.match(String(result.content), /declined/);
-  });
-
-  it("never asks before read-only tools", async () => {
-    let asked = 0;
-    const { options, messages } = setup([reply([toolUse("t1", "read_file", { path: "missing.txt" })]), reply([text("ok")])], {
-      approve: async () => (asked++, true),
-    });
-    await runAgent(messages, options);
-    assert.equal(asked, 0);
   });
 
   it("sends invalid input back to the model instead of running the tool", async () => {

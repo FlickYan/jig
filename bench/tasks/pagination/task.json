@@ -1,0 +1,5 @@
+{
+  "instruction": "Users of our search API say the first results never show up, and the last page is sometimes missing. The pagination code is in pager.py. Please fix it.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": ["python", "bug fix", "two bugs"]
+}

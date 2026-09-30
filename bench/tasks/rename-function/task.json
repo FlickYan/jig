@@ -1,0 +1,9 @@
+{
+  "instruction": "Rename `calc_total` to `calculate_total` everywhere in this project, including the README. Old callers outside this repo still use `calc_total`, so keep it working as a deprecated alias: calling it should emit a DeprecationWarning and return the same result.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "refactor",
+    "several files"
+  ]
+}

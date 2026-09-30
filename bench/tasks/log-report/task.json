@@ -1,0 +1,9 @@
+{
+  "instruction": "logs/access.log is our API's access log, one request per line: timestamp, client IP, method, path, status code and latency, like `2026-09-14T13:05:22Z 203.0.113.7 GET /api/orders 200 123ms`. A few lines are malformed (cut off, or with non-numeric fields); skip them. Write report.json in the project root with:\n- `top_ips`: the 3 client IPs with the most requests, most first, as a list of {\"ip\": ..., \"requests\": n}; break ties by IP string, ascending\n- `errors_by_hour`: the number of 5xx responses in each hour, as an object with keys like \"2026-09-14T13\", in ascending order, only for hours with at least one 5xx\n- `slowest_path`: the path with the highest average latency, as {\"path\": ..., \"avg_ms\": x} with x rounded to 1 decimal",
+  "check": "python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "data",
+    "terminal task",
+    "file too large to read whole"
+  ]
+}

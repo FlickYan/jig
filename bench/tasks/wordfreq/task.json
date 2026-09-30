@@ -1,0 +1,9 @@
+{
+  "instruction": "Add a `--top N` option to wordfreq.py. After the usual summary line it should print the N most frequent words, one per line, as `<count> <word>`, with the counts right-aligned to the width of the largest count shown. Words with the same count go in alphabetical order. If N is larger than the number of distinct words, print them all. N must be at least 1: for 0 or a negative number, exit with argparse's usage error (status 2). Without --top, the output must stay exactly as it is now.",
+  "check": "python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "exact output format"
+  ]
+}

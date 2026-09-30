@@ -1,0 +1,5 @@
+{
+  "name": "service-config",
+  "private": true,
+  "type": "module"
+}

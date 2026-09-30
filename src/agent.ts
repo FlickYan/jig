@@ -1,6 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { CallModel } from "./model.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
+import type { FileVersions } from "./tools/util.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 type Message = Anthropic.Beta.BetaMessage;
@@ -19,7 +20,9 @@ export interface AgentOptions {
   cwd: string;
   /** Hard stop: the most model calls one task may take. */
   maxSteps: number;
-  /** Guardrail, asked before every tool call that is not read-only. */
+  /** What the model has read in this conversation (see FileVersions). */
+  versions: FileVersions;
+  /** Guardrail, asked before every tool call: resolves false to decline it. */
   approve(tool: Tool, input: ToolInput): Promise<boolean>;
   ui: AgentUI;
 }
@@ -118,11 +121,11 @@ async function handleToolCall(
 
   const input = call.input as ToolInput;
   opts.ui.toolCall(call.name, tool.describe(input));
-  if (!tool.readOnly && !(await opts.approve(tool, input))) {
+  if (!(await opts.approve(tool, input))) {
     return fail("The user declined this tool call. Ask them how they want to proceed.");
   }
   try {
-    const output = truncate(await tool.run(input, { cwd: opts.cwd, signal }));
+    const output = truncate(await tool.run(input, { cwd: opts.cwd, versions: opts.versions, signal }));
     opts.ui.toolResult(output, false);
     return { type: "tool_result", tool_use_id: call.id, content: output };
   } catch (err) {

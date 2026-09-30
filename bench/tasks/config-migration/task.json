@@ -1,0 +1,9 @@
+{
+  "instruction": "Add support for the version 2 config format described in docs/config-v2.md: implement and export `migrate`, and make `loadConfig` in src/config.js behave the way the document says.",
+  "check": "node --test bench_tests/",
+  "tags": [
+    "javascript",
+    "feature",
+    "follow a spec"
+  ]
+}

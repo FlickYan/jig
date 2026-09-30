@@ -1,3 +1,4 @@
+import type { Stats } from "node:fs";
 import { stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -8,18 +9,57 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
  */
 export function resolveInRoot(root: string, path: string): string {
   const abs = resolve(root, path);
-  const rel = relative(root, abs);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+  if (!isInside(root, abs)) {
     throw new Error(`${path} is outside the working directory (${root}). File tools only work inside it.`);
   }
   return abs;
 }
 
+export function isInside(root: string, abs: string): boolean {
+  const rel = relative(root, abs);
+  return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+}
+
 /** Fails with a message the model can act on if `abs` is missing or is a directory. */
-export async function assertFile(abs: string, path: string): Promise<void> {
+export async function assertFile(abs: string, path: string): Promise<Stats> {
   const info = await stat(abs).catch(() => null);
   if (!info) throw new Error(`File not found: ${path}`);
-  if (info.isDirectory()) throw new Error(`${path} is a directory. Use bash (e.g. ls) to see what is in it.`);
+  if (info.isDirectory()) throw new Error(`${path} is a directory. Use glob or bash (e.g. ls) to see what is in it.`);
+  return info;
+}
+
+/**
+ * The version (modification time and size) of each file as the model last saw it. edit_file and
+ * write_file use it to refuse changing a file the model hasn't read, or one that changed since it did:
+ * a formatter, a command or the user may have edited it, and a blind write would undo their change.
+ */
+export class FileVersions {
+  private readonly seen = new Map<string, string>();
+
+  /** Call after the model reads or writes a file. Pass the stats taken before reading it, if any. */
+  async record(abs: string, info?: Stats): Promise<void> {
+    this.seen.set(abs, versionOf(info ?? (await stat(abs))));
+  }
+
+  async assertCurrent(abs: string, path: string): Promise<void> {
+    const seen = this.seen.get(abs);
+    if (!seen) throw new Error(`You haven't read ${path} yet. Read it with read_file before changing it.`);
+    if (versionOf(await stat(abs)) !== seen) {
+      throw new Error(
+        `${path} has changed since you last read it (a command, a formatter or the user may have edited it). ` +
+          "Read it again before changing it.",
+      );
+    }
+  }
+}
+
+function versionOf(info: Stats): string {
+  return `${info.mtimeMs}:${info.size}`;
+}
+
+/** Converts line endings to Windows style (\r\n). */
+export function toCRLF(text: string): string {
+  return text.replace(/\r?\n/g, "\r\n");
 }
 
 export function countLines(text: string): number {
@@ -31,4 +71,12 @@ export function countLines(text: string): number {
 export function lineCount(text: string): string {
   const n = countLines(text);
   return `${n} line${n === 1 ? "" : "s"}`;
+}
+
+/** Lines of a file in read_file's format: line numbers, a tab, the text. */
+export function numbered(lines: string[], first: number, count: number): string {
+  return lines
+    .slice(first, first + count)
+    .map((line, i) => `${String(first + i + 1).padStart(6)}\t${line}`)
+    .join("\n");
 }

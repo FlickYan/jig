@@ -13,7 +13,9 @@
   "scripts": {
     "start": "node src/cli.ts",
     "test": "node --test test/*.test.ts",
-    "typecheck": "tsc"
+    "typecheck": "tsc",
+    "bench": "node bench/run.ts",
+    "bench:report": "node bench/report.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.129.0"

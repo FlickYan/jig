@@ -58,22 +58,46 @@ export function error(text: string): void {
   println(red(text));
 }
 
-// Streaming model output. Text is the reply itself; progress notes are the short updates the model
-// writes between tool calls, shown dimmed.
+// Streaming model output. Text is the reply itself. Thinking is shown dimmed: for Claude that is short
+// progress notes between tool calls, for DeepSeek its whole reasoning, which can be long, so it can be hidden.
+
+let showThinking = true;
+let thinkingStarted = 0; // when the hidden thinking block began, for the status line
+let thinkingShownAt = 0;
+
+export function setThinkingVisible(visible: boolean): void {
+  showThinking = visible;
+}
+
+export function thinkingVisible(): boolean {
+  return showThinking;
+}
 
 export function text(delta: string): void {
   startBlockOutput(delta);
   write(delta);
 }
 
-export function progress(delta: string): void {
-  startBlockOutput(delta);
-  write(dim(delta));
+export function thinking(delta: string): void {
+  if (!delta) return;
+  if (showThinking) {
+    startBlockOutput(delta);
+    write(dim(delta));
+    return;
+  }
+  // Hidden: keep a ticking status line instead, so a long think doesn't look like a hang.
+  const now = Date.now();
+  thinkingStarted ||= now;
+  if (now - thinkingShownAt >= 1000) {
+    status(`thinking… ${Math.round((now - thinkingStarted) / 1000)}s`);
+    thinkingShownAt = now;
+  }
 }
 
 export function endBlock(): void {
   if (blockHasOutput) freshLine();
   blockHasOutput = false;
+  thinkingStarted = 0;
 }
 
 function startBlockOutput(delta: string): void {

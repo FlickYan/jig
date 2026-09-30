@@ -1,0 +1,9 @@
+{
+  "instruction": "mapLimit in src/mapLimit.js returns results in the wrong order when calls finish at different times, and it seems to run more calls at once than the limit allows. Please fix it so it does what its documentation says.",
+  "check": "node --test bench_tests/",
+  "tags": [
+    "javascript",
+    "bug fix",
+    "async"
+  ]
+}

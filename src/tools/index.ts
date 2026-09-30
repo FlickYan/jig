@@ -1,12 +1,17 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { bashTool } from "./bash.ts";
 import { editTool } from "./edit.ts";
+import { globTool } from "./glob.ts";
+import { grepTool } from "./grep.ts";
 import { readTool } from "./read.ts";
+import type { FileVersions } from "./util.ts";
 import { writeTool } from "./write.ts";
 
 export interface ToolContext {
   /** Project root. Relative paths resolve against it, and the file tools refuse to leave it. */
   cwd: string;
+  /** What the model has read, so edits to files it hasn't seen, or that changed since, can be refused. */
+  versions: FileVersions;
   /** Aborted when the user presses Ctrl+C. */
   signal?: AbortSignal;
 }
@@ -16,15 +21,15 @@ export type ToolInput = Record<string, unknown>;
 export interface Tool {
   /** Name, description and input schema, sent to the model as-is. */
   definition: Anthropic.Beta.BetaTool;
-  /** Read-only tools run without asking the user first. */
-  readOnly: boolean;
+  /** What the tool can do, which decides whether it needs approval: look, change files, or run commands. */
+  kind: "read" | "edit" | "run";
   /** What the terminal shows for a call: the first line goes next to the tool name, the rest below it. */
   describe(input: ToolInput): string;
   /** Returns the text the model sees. To report a failure, throw an Error: its message goes to the model. */
   run(input: ToolInput, ctx: ToolContext): Promise<string>;
 }
 
-export const TOOLS: Tool[] = [readTool, writeTool, editTool, bashTool];
+export const TOOLS: Tool[] = [readTool, grepTool, globTool, writeTool, editTool, bashTool];
 
 /** Tool output longer than this (~10k tokens) is cut from the middle before the model sees it. */
 export const MAX_OUTPUT_CHARS = 40_000;
@@ -37,8 +42,8 @@ export function truncate(text: string, max = MAX_OUTPUT_CHARS): string {
 }
 
 /**
- * Checks a tool call's input against the tool's schema. Our schemas are flat objects of strings and
- * integers, so this covers them completely. Returns what is wrong, or null if the input is valid.
+ * Checks a tool call's input against the tool's schema. Our schemas are flat objects of strings,
+ * integers and booleans, so this covers them completely. Returns what is wrong, or null if it is valid.
  */
 export function checkInput(tool: Tool, input: unknown): string | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return "input must be a JSON object";
