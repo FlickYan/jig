@@ -1,0 +1,25 @@
+{
+  "name": "jig",
+  "version": "0.1.0",
+  "description": "A minimal terminal coding agent: a streaming tool-use loop over the Claude API",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "jig": "src/cli.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/cli.ts",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.129.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "typescript": "^7.0.2"
+  }
+}
