@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { createSandbox } from "../src/sandbox.ts";
-import { loadSettings } from "../src/settings.ts";
+import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { runCommand } from "../src/tools/bash.ts";
 
@@ -76,17 +76,60 @@ describe("snapshots", () => {
 });
 
 describe("settings", () => {
-  it("combines the user's and the project's rules", async () => {
+  async function writeSettings(user: object, project: object) {
     await mkdir(join(dir, ".jig-home"), { recursive: true });
-    await writeFile(join(dir, ".jig-home", "settings.json"), JSON.stringify({ deny: ["git push"] }));
-    await mkdir(join(dir, ".jig"));
-    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ deny: ["rm"], allow: ["npm test"], network: true }));
-    assert.deepEqual(loadSettings(dir), { allow: ["npm test"], deny: ["git push", "rm"], network: true });
+    await writeFile(join(dir, ".jig-home", "settings.json"), JSON.stringify(user));
+    await mkdir(join(dir, ".jig"), { recursive: true });
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify(project));
+  }
+
+  it("combines the user's and a trusted project's settings", async () => {
+    await writeSettings({ deny: ["git push"] }, { deny: ["rm"], allow: ["npm test"], network: true });
+    const { user, project } = readSettings(dir);
+    assert.deepEqual(mergeSettings(user, project!.settings, true), {
+      allow: ["npm test"],
+      deny: ["git push", "rm"],
+      sandbox: undefined,
+      network: true,
+      hooks: [],
+      mcpServers: {},
+    });
+  });
+
+  it("uses only the deny rules of a project that isn't trusted", async () => {
+    await writeSettings({ allow: ["make"] }, {
+      deny: ["rm"],
+      allow: ["npm test"],
+      sandbox: false,
+      hooks: { PreToolUse: [{ matcher: "bash", command: "./check.sh" }] },
+      mcpServers: { db: { command: "node", args: ["server.js"] } },
+    });
+    const { user, project } = readSettings(dir);
+    assert.deepEqual(needsTrust(project!.settings), [
+      "run a PreToolUse hook: ./check.sh",
+      'start the MCP server "db": node server.js',
+      "run these commands without asking: npm test",
+      "run commands outside the sandbox",
+    ]);
+    assert.deepEqual(mergeSettings(user, project!.settings, false), { allow: ["make"], deny: ["rm"], hooks: [], mcpServers: {} });
+  });
+
+  it("remembers trust in one version of the project's settings, not in later edits", async () => {
+    await writeSettings({}, { allow: ["npm test"] });
+    const before = readSettings(dir).project!;
+    assert.equal(isTrusted(dir, before), false);
+    trust(dir, before);
+    assert.equal(isTrusted(dir, readSettings(dir).project!), true);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ allow: ["npm test", "curl"] }));
+    assert.equal(isTrusted(dir, readSettings(dir).project!), false);
   });
 
   it("explains a bad settings file", async () => {
-    await mkdir(join(dir, ".jig"));
-    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ deny: "git push" }));
-    assert.throws(() => loadSettings(dir), /"deny" must be a list of commands/);
+    await writeSettings({}, { deny: "git push" });
+    assert.throws(() => readSettings(dir), /"deny" must be a list of commands/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { BeforeEverything: [] } }));
+    assert.throws(() => readSettings(dir), /unknown hook event "BeforeEverything"/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ mcpServers: { db: { args: [] } } }));
+    assert.throws(() => readSettings(dir), /MCP server "db" needs a "command"/);
   });
 });

@@ -1,0 +1,9 @@
+{
+  "instruction": "Add `shipping_cost(weight_kg, subtotal)` in a new module shop/shipping.py. It returns the shipping cost as a Decimal: free if the subtotal is 75.00 or more, otherwise a 4.99 base fee plus 0.85 for every started kilogram (2.1 kg counts as 3 kg). Parcels over 30 kg can't be shipped: raise ValueError for those.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "feedback from a hook"
+  ]
+}

@@ -107,17 +107,27 @@ function startBlockOutput(delta: string): void {
   }
 }
 
+// Calls that only read run at the same time, so a result doesn't always come right after its call's
+// line. Such a result gets a line saying whose it is.
+const callLabels = new Map<string, string>();
+let lastCall: string | undefined; // the call the last tool line was about
+
 export const terminalUI: AgentUI = {
-  toolCall(name, description) {
+  toolCall(name, description, id) {
     const [summary = "", ...details] = description.split("\n");
     println(`${cyan("●")} ${bold(name)} ${clip(summary)}`);
+    callLabels.set(id, `${name} ${clip(summary)}`);
+    lastCall = id;
     for (const line of details.slice(0, MAX_DETAIL_LINES)) {
       println(`  ${line.startsWith("- ") ? red(clip(line)) : line.startsWith("+ ") ? green(clip(line)) : clip(line)}`);
     }
     if (details.length > MAX_DETAIL_LINES) println(dim(`  … ${moreLines(details.length - MAX_DETAIL_LINES)}`));
   },
 
-  toolResult(output, isError) {
+  toolResult(output, isError, id) {
+    if (id !== lastCall) println(dim(`  ⎿ ${callLabels.get(id) ?? ""}`));
+    callLabels.delete(id);
+    lastCall = id;
     const lines = output.split("\n").filter((line) => line.trim() !== "");
     const shown = lines.slice(0, PREVIEW_LINES);
     shown.forEach((line, i) => println(isError ? red(`  ${i === 0 ? "✗ " : "  "}${clip(line)}`) : dim(`  ${clip(line)}`)));
@@ -126,6 +136,24 @@ export const terminalUI: AgentUI = {
 
   notice: (text) => println(yellow(text)),
 };
+
+/**
+ * A subagent's tool calls, indented under its own call and labelled with its task, since several can
+ * run at once. Results are left out (the subagent's answer sums them up), apart from failures.
+ */
+export function subagentUI(label: string): AgentUI {
+  const prefix = dim(`  │ ${label.length > 40 ? `${label.slice(0, 40)}…` : label} ·`);
+  return {
+    toolCall(name, description) {
+      println(`${prefix} ${name} ${dim(clip(description.split("\n")[0]))}`);
+      lastCall = undefined; // the subagent's own result, when it comes, needs saying whose it is
+    },
+    toolResult(output, isError) {
+      if (isError) println(`${prefix} ${red(clip(output.split("\n")[0]))}`);
+    },
+    notice: (text) => println(`${prefix} ${yellow(text)}`),
+  };
+}
 
 function clip(line: string): string {
   return line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}…` : line;

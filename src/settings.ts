@@ -1,6 +1,24 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { jigHome } from "./paths.ts";
+
+export const HOOK_EVENTS = ["PreToolUse", "PostToolUse"] as const;
+export type HookEvent = (typeof HOOK_EVENTS)[number];
+
+export interface Hook {
+  event: HookEvent;
+  /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default: all). */
+  matcher?: string;
+  /** Shell command; gets the tool call as JSON on stdin. */
+  command: string;
+}
+
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
 
 export interface Settings {
   /** Commands that run without asking, matched by their first words: "npm test" allows `npm test -- -u`. */
@@ -11,37 +29,116 @@ export interface Settings {
   sandbox?: boolean;
   /** Let sandboxed commands use the network (default: off). */
   network?: boolean;
+  hooks: Hook[];
+  mcpServers: Record<string, McpServerConfig>;
+}
+
+export interface ProjectSettings {
+  path: string;
+  /** Hash of the file, so trust in one version doesn't carry over to edits. */
+  hash: string;
+  settings: Settings;
+}
+
+const empty = (): Settings => ({ allow: [], deny: [], hooks: [], mcpServers: {} });
+
+/** The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one. */
+export function readSettings(root: string): { user: Settings; project?: ProjectSettings } {
+  const userFile = join(jigHome(), "settings.json");
+  const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile) : empty();
+  const projectFile = join(root, ".jig", "settings.json");
+  if (!existsSync(projectFile)) return { user };
+  const text = readFileSync(projectFile, "utf8");
+  return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings: parse(text, projectFile) } };
 }
 
 /**
- * Settings from ~/.jig/settings.json and then the project's .jig/settings.json. The allow and deny lists
- * of both are combined; for the other settings, the project's file wins.
+ * The parts of a project's settings that could run code or weaken jig's safety, described for the
+ * user. A repository you just cloned could otherwise start programs (hooks, MCP servers) or switch the
+ * sandbox off the moment jig runs in it, so these need the user's trust. Deny rules only restrict, so
+ * they always apply.
  */
-export function loadSettings(root: string): Settings {
-  const settings: Settings = { allow: [], deny: [] };
-  for (const file of [join(jigHome(), "settings.json"), join(root, ".jig", "settings.json")]) {
-    if (!existsSync(file)) continue;
-    let data: Record<string, unknown>;
-    try {
-      data = JSON.parse(readFileSync(file, "utf8"));
-    } catch (err) {
-      throw new Error(`${file} is not valid JSON: ${(err as Error).message}`);
-    }
-    settings.allow.push(...strings(data, "allow", file));
-    settings.deny.push(...strings(data, "deny", file));
-    for (const key of ["sandbox", "network"] as const) {
-      if (data[key] === undefined) continue;
-      if (typeof data[key] !== "boolean") throw new Error(`${file}: "${key}" must be true or false`);
-      settings[key] = data[key];
-    }
+export function needsTrust(settings: Settings): string[] {
+  const asks: string[] = [];
+  for (const hook of settings.hooks) asks.push(`run a ${hook.event} hook: ${hook.command}`);
+  for (const [name, server] of Object.entries(settings.mcpServers)) {
+    asks.push(`start the MCP server "${name}": ${[server.command, ...(server.args ?? [])].join(" ")}`);
   }
-  return settings;
+  if (settings.allow.length) asks.push(`run these commands without asking: ${settings.allow.join(", ")}`);
+  if (settings.sandbox === false) asks.push("run commands outside the sandbox");
+  if (settings.network) asks.push("give sandboxed commands network access");
+  return asks;
 }
 
-function strings(data: Record<string, unknown>, key: string, file: string): string[] {
-  const value = data[key] ?? [];
-  if (!Array.isArray(value) || value.some((item) => typeof item !== "string" || !item.trim())) {
-    throw new Error(`${file}: "${key}" must be a list of commands, like ["git push"]`);
+/** The settings in effect: the user's, plus the project's (only its deny rules, unless it is trusted). */
+export function mergeSettings(user: Settings, project: Settings | undefined, trusted: boolean): Settings {
+  if (!project) return user;
+  if (!trusted) return { ...user, deny: [...user.deny, ...project.deny] };
+  return {
+    allow: [...user.allow, ...project.allow],
+    deny: [...user.deny, ...project.deny],
+    sandbox: project.sandbox ?? user.sandbox,
+    network: project.network ?? user.network,
+    hooks: [...user.hooks, ...project.hooks],
+    mcpServers: { ...user.mcpServers, ...project.mcpServers },
+  };
+}
+
+const trustFile = () => join(jigHome(), "trusted-projects.json");
+
+/** Whether the user trusted this exact version of the project's settings. */
+export function isTrusted(root: string, project: ProjectSettings): boolean {
+  if (!existsSync(trustFile())) return false;
+  return JSON.parse(readFileSync(trustFile(), "utf8"))[root] === project.hash;
+}
+
+export function trust(root: string, project: ProjectSettings): void {
+  const trusted = existsSync(trustFile()) ? JSON.parse(readFileSync(trustFile(), "utf8")) : {};
+  trusted[root] = project.hash;
+  mkdirSync(dirname(trustFile()), { recursive: true });
+  writeFileSync(trustFile(), `${JSON.stringify(trusted, null, 2)}\n`);
+}
+
+function parse(text: string, file: string): Settings {
+  let data: Record<string, unknown>;
+  try {
+    data = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`${file} is not valid JSON: ${(err as Error).message}`);
   }
-  return value.map((rule: string) => rule.trim());
+  const fail = (message: string): never => {
+    throw new Error(`${file}: ${message}`);
+  };
+  const settings = empty();
+  for (const key of ["allow", "deny"] as const) {
+    const rules = data[key] ?? [];
+    if (!Array.isArray(rules) || rules.some((rule) => typeof rule !== "string" || !rule.trim())) {
+      fail(`"${key}" must be a list of commands, like ["git push"]`);
+    }
+    settings[key] = (rules as string[]).map((rule) => rule.trim());
+  }
+  for (const key of ["sandbox", "network"] as const) {
+    if (data[key] === undefined) continue;
+    if (typeof data[key] !== "boolean") fail(`"${key}" must be true or false`);
+    settings[key] = data[key] as boolean;
+  }
+  const hooks = (data.hooks ?? {}) as Record<string, unknown>;
+  for (const [event, list] of Object.entries(hooks)) {
+    if (!HOOK_EVENTS.includes(event as HookEvent)) fail(`unknown hook event "${event}" (use ${HOOK_EVENTS.join(" or ")})`);
+    if (!Array.isArray(list)) fail(`"hooks.${event}" must be a list of {"matcher", "command"}`);
+    for (const hook of list as Record<string, unknown>[]) {
+      if (typeof hook?.command !== "string") fail(`every hook in "hooks.${event}" needs a "command"`);
+      if (hook.matcher !== undefined && typeof hook.matcher !== "string") fail(`a hook's "matcher" must be a string`);
+      settings.hooks.push({ event: event as HookEvent, matcher: hook.matcher as string | undefined, command: hook.command as string });
+    }
+  }
+  const servers = (data.mcpServers ?? {}) as Record<string, Record<string, unknown>>;
+  for (const [name, server] of Object.entries(servers)) {
+    if (typeof server?.command !== "string") fail(`MCP server "${name}" needs a "command"`);
+    if (server.args !== undefined && !(Array.isArray(server.args) && server.args.every((arg) => typeof arg === "string"))) {
+      fail(`MCP server "${name}": "args" must be a list of strings`);
+    }
+    settings.mcpServers[name] = { command: server.command as string, args: server.args as string[] | undefined, env: server.env as Record<string, string> | undefined };
+  }
+  return settings;
 }

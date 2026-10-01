@@ -1,19 +1,23 @@
 #!/usr/bin/env node
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { formatTokens, runAgent, type AgentOptions, type RunResult } from "./agent.ts";
+import { formatTokens, runAgent, type AgentOptions, type RunResult, type ToolHooks } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
+import { runHooks } from "./hooks.ts";
+import { connectMcpServers } from "./mcp.ts";
 import { contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { loadInstructions, systemPrompt } from "./prompt.ts";
+import { loadInstructions, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { createSandbox } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
-import { loadSettings } from "./settings.ts";
+import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
+import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { Snapshots } from "./snapshots.ts";
 import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
+import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
 
 const HELP = `Usage: jig [options] [task]
@@ -38,13 +42,22 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
   -h, --help              show this help
 
 jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/.jig/sessions, and
-snapshots the project's files before each task so /undo can put them back. Allow and deny rules for
-commands go in ~/.jig/settings.json or .jig/settings.json.
+snapshots the project's files before each task so /undo can put them back.
+
+Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
+commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
+loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
+Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
+project and in your home directory.
 Ctrl+C stops the current task (press it again to force quit).`;
+
+const SUBAGENT_MAX_STEPS = 30;
 
 const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks before a tool call
   /undo                        put the files back the way they were before the last task
   /thinking                    show or hide the model's thinking
+  /skills                      list the skills; /<skill> [task] runs one
+  /mcp                         list the MCP servers and their tools
   /context                     show how much context the conversation takes up
   /compact                     summarize the conversation to free up context
   /reset                       start a new conversation (and reload AGENTS.md)
@@ -89,16 +102,49 @@ async function main(): Promise<void> {
   ui.setThinkingVisible(!values["hide-thinking"]);
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
-  const settings = loadSettings(cwd);
+  const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
   const sandbox = (values.sandbox ?? settings.sandbox ?? true) ? createSandbox(cwd, { network }) : undefined;
   if (values.sandbox && !sandbox) throw new Error("The sandbox is only available on macOS so far.");
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained: !!sandbox && !network });
+  const contained = !!sandbox && !network;
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained });
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
+  // Well before the context window fills: long contexts cost more per step and models use them less well.
+  const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
+
+  // Extensions: skills, the MCP servers' tools, hooks, and subagents.
+  const { skills, warnings } = discoverSkills(cwd);
+  for (const warning of warnings) ui.notice(warning);
+  const mcp = await connectMcpServers(settings.mcpServers, cwd);
+  cleanup.push(mcp.close);
+  for (const error of mcp.errors) ui.notice(error);
+  const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
+  const extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
-  const newModel = () => createModel({ model, effort, system: systemPrompt(cwd, instructions, sandbox?.limits), tools: TOOLS });
+  // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
+  const research = new Permissions("plan", cwd, { deny: settings.deny, contained });
+  const researchTools = [...TOOLS, ...extensions].filter((tool) => tool.kind === "read" || tool.kind === "run");
+  const newSubagentModel = () =>
+    createModel({ model, effort, quiet: true, system: subagentPrompt(cwd, instructions, sandbox?.limits), tools: researchTools });
+  const subagents: SubagentSetup = {
+    callModel: newSubagentModel(),
+    tools: researchTools,
+    cwd,
+    maxSteps: SUBAGENT_MAX_STEPS,
+    compactAt: compactLimit,
+    async authorize(tool, input) {
+      const decision = research.decide(tool, input);
+      return decision === "allow" ? null : decision === "ask" ? "Not run: a subagent can't ask the user." : decision.refuse;
+    },
+    sandbox,
+    hooks,
+    ui: ui.subagentUI,
+  };
+  const tools = [...TOOLS, subagentTool(subagents), ...extensions];
+  const newModel = () =>
+    createModel({ model, effort, system: systemPrompt(cwd, instructions, sandbox?.limits, skillCatalog(skills)), tools });
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
   let conversation = resumeFrom
@@ -131,13 +177,13 @@ async function main(): Promise<void> {
 
   const agent: AgentOptions = {
     callModel: newModel(),
-    tools: TOOLS,
+    tools,
     cwd,
     maxSteps,
-    // Well before the context window fills: long contexts cost more per step and models use them less well.
-    compactAt: compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8)),
+    compactAt: compactLimit,
     authorize,
     sandbox,
+    hooks,
     ui: ui.terminalUI,
   };
 
@@ -161,7 +207,7 @@ async function main(): Promise<void> {
     }
   }
 
-  function runTask(text: string): Promise<boolean> {
+  function runTask(text: string, label = text): Promise<boolean> {
     if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
       modelKnowsPlanMode = permissions.mode === "plan";
       notes.push(
@@ -170,12 +216,19 @@ async function main(): Promise<void> {
           : "Plan mode is off: you can make changes again.",
       );
     }
-    takeSnapshot(text);
+    takeSnapshot(label);
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
     const started = Date.now();
     return asTask(async (signal) => report(await runAgent(conversation, agent, signal), Date.now() - started, maxSteps));
+  }
+
+  /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
+  function runSkill(skill: Skill, task: string): Promise<boolean> {
+    const content = loadSkill(skill);
+    conversation.pin(`skill:${skill.name}`, content);
+    return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
 
   function takeSnapshot(label: string): void {
@@ -210,6 +263,7 @@ async function main(): Promise<void> {
     } else if (name === "/reset") {
       instructions = loadInstructions(cwd);
       agent.callModel = newModel();
+      subagents.callModel = newSubagentModel();
       conversation = new Conversation(SessionFile.create(cwd, model));
       modelKnowsPlanMode = false;
       notes.length = 0;
@@ -222,6 +276,15 @@ async function main(): Promise<void> {
     } else if (name === "/mode") {
       if (arg) permissions.mode = arg as Mode;
       ui.notice(`Mode: ${permissions.mode} (${MODE_HELP[permissions.mode]}).`);
+    } else if (name === "/skills") {
+      if (!skills.length) ui.notice("No skills found. A skill is a folder with a SKILL.md, in .jig/skills, .agents/skills or .claude/skills.");
+      for (const skill of skills) ui.println(`  /${skill.name}  ${ui.dim(skill.description)}`);
+    } else if (name === "/mcp") {
+      if (!Object.keys(settings.mcpServers).length) ui.notice('No MCP servers. Add them under "mcpServers" in jig\'s settings.');
+      for (const line of [...mcp.status, ...mcp.errors]) ui.println(`  ${line}`);
+      for (const tool of mcp.tools) ui.println(ui.dim(`    ${tool.definition.name}${tool.kind === "read" ? " (read-only)" : ""}`));
+    } else if (skills.some((skill) => name === `/${skill.name}`)) {
+      await runSkill(skills.find((skill) => name === `/${skill.name}`)!, line.slice(name.length).trim());
     } else if (name === "/context") {
       const limit = agent.compactAt ? `it is compacted at ${formatTokens(agent.compactAt)}` : "automatic compaction is off";
       ui.notice(`The conversation takes up about ${formatTokens(conversation.tokens)} tokens; ${limit}.`);
@@ -246,6 +309,12 @@ async function main(): Promise<void> {
   ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
   ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (no sandbox)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
+  const extras = [
+    skills.length && plural(skills.length, "skill") + " (/skills)",
+    mcp.tools.length && plural(mcp.tools.length, "MCP tool") + " (/mcp)",
+    settings.hooks.length && plural(settings.hooks.length, "hook"),
+  ].filter(Boolean);
+  if (extras.length) ui.println(ui.dim(`With ${extras.join(", ")}.`));
   if (resumeFrom) ui.println(ui.dim(`Continuing ${basename(resumeFrom)} (${conversation.messages.length} messages).`));
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
@@ -259,6 +328,48 @@ async function main(): Promise<void> {
       await runTask(input);
     }
   }
+}
+
+/**
+ * The settings in effect: the user's, plus the project's. A repository could run programs through its
+ * settings (hooks, MCP servers) or loosen the sandbox, so those parts of a project's settings only apply
+ * once the user trusts them, which is asked again whenever the file changes. Deny rules always apply.
+ */
+async function loadSettings(cwd: string): Promise<Settings> {
+  const { user, project } = readSettings(cwd);
+  if (!project) return user;
+  const asks = needsTrust(project.settings);
+  const file = relative(cwd, project.path);
+  let trusted = asks.length === 0 || isTrusted(cwd, project) || process.env.JIG_TRUST_PROJECT === "1";
+  if (!trusted && process.stdin.isTTY) {
+    ui.notice(`This project's ${file} asks jig to:`);
+    for (const ask of asks) ui.println(`  - ${ask}`);
+    const answer = await ui.ask("Do you trust this project and allow these? [y/N] ");
+    trusted = answer?.trim().toLowerCase().startsWith("y") ?? false;
+    if (trusted) trust(cwd, project);
+  }
+  if (!trusted) {
+    const how = process.stdin.isTTY ? "" : " Run jig in a terminal to review it, or set JIG_TRUST_PROJECT=1.";
+    ui.notice(`Not using ${file} (apart from its deny rules) until you trust it.${how}`);
+  }
+  return mergeSettings(user, project.settings, trusted);
+}
+
+/** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
+function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
+  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2]) => {
+    const outcome = await runHooks(hooks, event, call, cwd);
+    for (const warning of outcome.warnings) ui.notice(warning);
+    return outcome;
+  };
+  return {
+    before: async (tool, input) => (await run("PreToolUse", { tool, input })).block ?? null,
+    after: async (tool, input, output) => (await run("PostToolUse", { tool, input, output })).feedback ?? null,
+  };
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
 function describeInstructions(instructions: { path: string }[]): string {
@@ -313,7 +424,12 @@ function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-main().catch((err: unknown) => {
-  ui.error(describeError(err));
-  process.exitCode = 1;
-});
+/** What to shut down before exiting, like the MCP servers. */
+const cleanup: Array<() => Promise<void>> = [];
+
+main()
+  .catch((err: unknown) => {
+    ui.error(describeError(err));
+    process.exitCode = 1;
+  })
+  .finally(() => Promise.allSettled(cleanup.map((close) => close())));

@@ -1,0 +1,9 @@
+{
+  "instruction": "Looking up a user's orders is slow. Add a migration with an index on orders.user_id.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "sql",
+    "follow a skill"
+  ]
+}

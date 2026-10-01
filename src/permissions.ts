@@ -49,6 +49,8 @@ export class Permissions {
   private readonly contained: boolean;
   /** Programs the user chose to always allow for this session, like "python3". */
   private readonly programs = new Set<string>();
+  /** External tools (MCP) the user chose to always allow for this session. */
+  private readonly externalTools = new Set<string>();
 
   constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false }: PolicyOptions = {}) {
     this.mode = mode;
@@ -59,10 +61,13 @@ export class Permissions {
   }
 
   decide(tool: Tool, input: ToolInput): Decision {
+    const name = tool.definition.name;
+    if (this.denyRules.includes(name)) return { refuse: `Refused: the ${name} tool is denied in jig's settings.` };
     const command = tool.kind === "run" ? String(input.command) : "";
     const rule = command && this.denyRules.find((r) => matchesDenyRule(command, r));
     if (rule) return { refuse: `Refused: the command matches the deny rule "${rule}" in jig's settings. Don't try to get around it.` };
     if (tool.kind === "read") return "allow";
+    if (tool.kind === "external") return this.decideExternal(tool.definition.name);
     const commands = command ? parseCommand(command) : null;
     if (this.mode === "plan") {
       if (commands?.every((argv) => this.readsOnly(argv))) return "allow";
@@ -74,15 +79,28 @@ export class Permissions {
     return this.mode === "edits" && this.contained ? "allow" : "ask";
   }
 
+  /**
+   * Tools from MCP servers. They act outside the sandbox (on GitHub, in a browser, in a database), so
+   * they ask unless the settings allow them by name, and plan mode refuses them unless they are marked
+   * read-only (then their kind is "read"). Deny rules name them too, like "mcp__github__merge_pull_request".
+   */
+  private decideExternal(name: string): Decision {
+    if (this.mode === "plan") return { refuse: "Refused: plan mode is on, so nothing may be changed. Describe what you would do instead." };
+    if (this.mode === "auto" || this.externalTools.has(name) || this.allowRules.some((rule) => rule.join(" ") === name)) return "allow";
+    return "ask";
+  }
+
   /** What answering "always" would allow from now on, or null if this call can't be generalized. */
   alwaysLabel(tool: Tool, input: ToolInput): string | null {
     if (tool.kind === "edit") return "file changes";
+    if (tool.kind === "external") return `the ${tool.definition.name} tool`;
     const programs = this.newPrograms(input);
     return programs.length ? `${programs.map((p) => `\`${p}\``).join(", ")} commands in this project` : null;
   }
 
   /** Remembers an "always" answer for the rest of the session. */
   allowAlways(tool: Tool, input: ToolInput): void {
+    if (tool.kind === "external") this.externalTools.add(tool.definition.name);
     if (tool.kind === "edit" && this.mode === "ask") this.mode = "edits";
     for (const program of this.newPrograms(input)) this.programs.add(program);
   }

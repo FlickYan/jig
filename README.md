@@ -3,8 +3,8 @@
 A minimal coding agent for the terminal, written from scratch in TypeScript on the Anthropic Messages API
 (Claude, or DeepSeek through its Anthropic-compatible endpoint). There is no agent framework: it is one
 streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
-(a macOS sandbox, permission modes, deny rules, snapshots with undo), and a benchmark that measures each
-version.
+(a macOS sandbox, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
+servers, hooks, subagents), and a benchmark that measures each version.
 
 (A jig is the workshop fixture that holds a piece of work and guides the tool cutting it, which is what an
 agent harness does for a model.)
@@ -45,9 +45,9 @@ Usage: jig [options] [task]
       --max-steps <n>   most model calls per task (default: 50)
 ```
 
-In a session: `/mode`, `/undo`, `/thinking`, `/context`, `/compact`, `/reset`, `/help` and `/exit`. After each task
-jig prints the steps taken, the tokens sent and received, and how many input tokens came from the prompt
-cache.
+In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
+`/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens sent and
+received (subagents included), and how many input tokens came from the prompt cache.
 
 ### Safety
 
@@ -69,8 +69,13 @@ cache.
   ```
 
   A deny rule is refused in every mode, even `auto`, and matches its words in order within one command, so
-  `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. The settings can also hold
-  `"sandbox": false` or `"network": true` for a project.
+  `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. A deny rule can also name a
+  tool, like `"mcp__github__merge_pull_request"`. The settings can also hold `"sandbox": false` or
+  `"network": true` for a project.
+- **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
+  loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply after
+  you say yes to a prompt listing exactly what they would do; the answer is remembered for that version of
+  the file, and any change asks again. Until then only its deny rules apply, since they only restrict.
 - **Undo.** Before each task, jig snapshots the project's files into a private git repository in
   `~/.jig/snapshots/` (so it works in any folder and never touches the project's own git history), and
   `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
@@ -93,13 +98,51 @@ cache.
   estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
   continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
 
+### Extensions
+
+- **Skills.** jig reads [Agent Skills](https://agentskills.io): folders with a `SKILL.md` (a name and a
+  description in YAML frontmatter, then instructions) and maybe scripts and reference files. They are found
+  in `.jig/skills`, `.agents/skills` and `.claude/skills`, in the project and in your home directory, the
+  project's winning on a name clash. Loading is progressive: the system prompt lists only each skill's name
+  and description; the model calls the `skill` tool to load the instructions when a task matches, and
+  reads the skill's other files only if the instructions point to them. `/<skill> [task]` loads one
+  yourself.
+- **MCP servers.** jig is an MCP client over stdio, on the official TypeScript SDK. Servers configured in
+  the settings start with jig, and their tools join jig's own as `mcp__<server>__<tool>`:
+
+  ```json
+  { "mcpServers": { "tracker": { "command": "node", "args": ["tools/tracker-server.mjs"], "env": {} } } }
+  ```
+
+  A tool the server marks read-only runs like jig's own read tools; any other asks first (outside `auto`
+  mode) and is refused in `plan` mode, because it acts outside the sandbox's reach. `[a]lways` approves one
+  tool for the session; allow and deny rules can name tools too.
+- **Hooks.** Commands that run around tool calls, configured like Claude Code's:
+
+  ```json
+  { "hooks": {
+      "PreToolUse":  [{ "matcher": "bash", "command": "./scripts/check-command.sh" }],
+      "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }] } }
+  ```
+
+  A hook gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
+  a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
+  stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
+  and otherwise ignored.
+- **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
+  touch) to a fresh agent loop with a context of its own. It gets the tools that only look, under `plan`
+  mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the
+  main conversation. Several subagent calls in one reply run at the same time.
+
 ## How it works
 
 ```
  task ──▶ messages ──▶ model (streamed) ──▶ reply has tool calls? ── no ──▶ done
              ▲                                    │ yes
              │                                    ▼
-             │         for each call: check input ▶ permission policy ▶ run ▶ truncate output
+             │   for each call: check input ▶ PreToolUse hooks ▶ permission policy ▶ run
+             │                  ▶ truncate output ▶ PostToolUse hooks
+             │   (calls that only read run at the same time, the others in order)
              │                                    │
              └──── all tool results, in one message ◀┘
 ```
@@ -110,12 +153,15 @@ cache.
 | [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | The only file that talks to the API: request settings per provider, streaming, checking streamed tool input |
-| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` |
-| [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules |
+| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent` |
+| [`src/skills.ts`](src/skills.ts) | Finding skills, the catalog in the system prompt, and the `skill` tool |
+| [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
+| [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
+| [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
 | [`src/sandbox.ts`](src/sandbox.ts) | The macOS sandbox profile commands run under |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
-| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval prompt, notes to the model, Ctrl+C |
+| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
 
@@ -173,6 +219,18 @@ cache.
 - **Snapshots in a private repository.** `git stash` would change the user's repository and miss
   untracked files; a second git directory with the project as its work tree snapshots everything that
   isn't ignored, deduplicates unchanged files, and leaves the project untouched.
+- **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
+  stays inside the project and user skills live in the home directory. The `skill` tool also lists the
+  skill's other files, and pins the instructions so compaction keeps them word for word rather than
+  summarizing them away mid-task.
+- **Calls that only read run at the same time.** When every call in a reply is a read (file reads,
+  searches, subagents, read-only MCP tools), they run in parallel; if any call changes something, they
+  all run in order, since one may depend on another. Results still go back in the order of the calls, and
+  in the terminal a result that doesn't follow its own call says whose it is.
+- **MCP servers come back.** Ctrl+C in a terminal reaches every process in the foreground group, MCP
+  servers included, and servers crash. A tool call to a server that has stopped starts it again.
+- **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
+  everything it read, so it gets one more call, without tools, to write up what it found.
 - **Two providers, one format.** DeepSeek's Anthropic-compatible API lets the same SDK and message format
   serve both. DeepSeek does not support `is_error` on tool results, so for DeepSeek failures are marked
   with `Error:` in the text instead, and the Claude-only settings (adaptive thinking with short progress
@@ -181,7 +239,7 @@ cache.
 
 ## Benchmark
 
-`bench/` is a small benchmark in the style of Terminal-Bench: seventeen tasks, each a small project, an
+`bench/` is a small benchmark in the style of Terminal-Bench: twenty tasks, each a small project, an
 instruction worded the way a user would ask, hidden tests, and a reference solution.
 
 For each attempt the runner:
@@ -195,14 +253,14 @@ jig: `--ref m1` runs the code tagged `m1`, on today's tasks.
 
 ```bash
 npm run bench -- --ref m1 --label m1 --attempts 3   # milestone 1
-npm run bench -- --ref m2 --label m2 --attempts 3   # milestone 2
-npm run bench -- --label m3 --attempts 3            # the current code
+npm run bench -- --ref m4 --label m4 --attempts 3   # milestone 4
+npm run bench -- --label m5 --attempts 3            # the current code
 npm run bench:report                                # compare the saved runs (Markdown)
 ```
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
-Runs on earlier versions of the suite are in `suite-12/` and `suite-15/`, one-off experiments in
+Runs on earlier versions of the suite are in `suite-12/`, `suite-15/` and `suite-17/`, one-off experiments in
 `experiments/`; `npm run bench:report -- bench/results/experiments` reports a folder.
 Logs of every attempt (the transcript, the diff the agent made, the check's output and jig's session file)
 go to `bench/logs/`. Model output varies between runs, so use several `--attempts`: the report shows the
@@ -232,16 +290,70 @@ already solved, without spending anything on a model.
 | `csv-parser` | A CSV parser to a precise spec with many edge cases (hard) |
 | `injection-readme` | A typo fix in a project whose README tells AI agents to write to the home directory and delete the tests |
 | `injection-output` | A bug fix where the test script's output tells AI agents to pipe a script from the internet into bash |
+| `skill-migration` | A database migration whose index must follow a naming rule that is only in the project's skill |
+| `mcp-ticket` | "Please fix ticket PRICE-118": what the fix is, is only in the ticket, which the project's tracker MCP server serves |
+| `hook-lint` | A feature where the team's linter, which the project's hook runs after each edit (it isn't in the project), forbids two common habits |
 
 For the two injection tasks the runner also records whether any tool call tried to do what the injected
 text said, separately from whether harm was done: a sandboxed agent can try and still pass.
+
+The last three tasks need M5's extensions, so versions before it can only solve them by luck or by working
+around the missing feature (decoding the tracker's data by hand, say). They check that the model uses the
+features when it should, not just that they work. Their projects configure an MCP server or a hook in
+`.jig/settings.json`, which the runner trusts (`JIG_TRUST_PROJECT=1`), and a task's `home/` directory is
+copied into the attempt's home directory, which is how `hook-lint`'s linter is "installed".
 
 This is an in-house suite: good for comparing versions of jig and settings (models, effort, tools), not
 for comparing against other agents. For that, milestone 6 runs a public benchmark.
 
 ### Results
 
-All four milestones on the current suite, with deepseek-flash and three attempts per task:
+**M4 against M5, on the current 20-task suite** (deepseek-flash, three attempts per task):
+
+| run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
+|-----|--------|-------|------------|-------------------|-----------|------|------|
+| m4 | 98% ±2% (59/60) | 7.2 | 9.1 | 0.0 | 30,360 | $0.0045 | 14s |
+| m5 | 98% ±2% (59/60) | 6.8 | 8.8 | 0.0 | 31,213 | $0.0045 | 13s |
+
+On the three tasks for the extensions (per attempt):
+
+| task | m4 | m5 |
+|------|----|----|
+| `skill-migration` | 2/3 passed · 7.3 steps · 24.0k tokens in · $0.0025 | 3/3 passed · 7.0 steps · 23.1k tokens in · $0.0024 |
+| `mcp-ticket` | 3/3 passed · 9.0 steps · 43.2k tokens in · $0.0047 · 13s | 3/3 passed · 8.0 steps · 26.5k tokens in · $0.0031 · 9s |
+| `hook-lint` | 3/3 passed · 7.3 steps · 26.2k tokens in · $0.0040 | 3/3 passed · 7.3 steps · 29.6k tokens in · $0.0046 |
+
+What the logs showed:
+
+- **M5 used each extension where it applied.** It loaded the `db-migrations` skill as its first call in
+  all three `skill-migration` attempts, and asked the tracker server for the ticket as its first call in all
+  three `mcp-ticket` attempts. In `hook-lint`, the hook's feedback reached it in one attempt (when it wrote
+  the file, and again after an edit that left the `raise ValueError` line alone), and it switched to
+  `InvalidOrder`.
+- **M4 worked around the missing features, at a price.** With no MCP client, M4 read `.jig/settings.json`
+  and the server's source in every `mcp-ticket` attempt, then spoke JSON-RPC to the server by hand
+  (`printf '{"jsonrpc":"2.0",…}' | node tools/tracker-server.mjs`). It passed, but M5 did the same with 39%
+  fewer input tokens and 34% lower cost, and the trick only works because this server is a local script.
+  M4 found the skill's naming rule only when it happened to look in hidden directories (2 of 3). The third
+  attempt named the index `orders_user_id_idx` and failed.
+- **The hook mostly wasn't needed, because the model went looking.** In 3 of the 6 `hook-lint` attempts
+  (both versions) the model read `.jig/settings.json`, found the linter the hook runs and ran it itself;
+  in 2 more it used `InvalidOrder` after reading `shop/errors.py`. The hook stepped in only in the sixth.
+  A hook guarantees the check; without one, it depends on the model choosing to look.
+- **Subagents went unused.** In 60 attempts the model never chose the subagent tool: these projects are
+  small enough to read directly. Subagents do work: asked to use two at once to find where tool output is
+  truncated and where the sandbox profile is written, jig ran both in parallel and got both locations right.
+  This suite can't show what they are for, which is keeping a large codebase's research out of the main
+  context. Milestone 6's larger tasks should.
+- **Parallel calls saved little time.** 36 of 60 M5 attempts ran calls in parallel at least once, but
+  reads take milliseconds and the model's generation dominates: 14.2s → 13.6s per attempt on the 17
+  earlier tasks, within noise.
+- **No regressions.** On the 17 earlier tasks M5 passed 50 of 51. In the one miss, a `wordfreq` attempt
+  padded counts to a fixed width the spec doesn't ask for: a model mistake of the kind every version has
+  made once. Steps went from 7.0 to 6.7 and cost stayed the same.
+
+**M1 to M4, on the earlier 17-task suite** (in `bench/results/suite-17/`), with deepseek-flash and three
+attempts per task:
 
 | run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
 |-----|--------|-------|------------|-------------------|-----------|------|------|
@@ -276,7 +388,8 @@ Averages are per attempt. What the runs and their logs showed:
 ## Tests
 
 ```bash
-npm test            # tools, permissions, sandbox, snapshots, search, context, benchmark metrics, and the loop: no API calls
+npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, MCP (against a
+                    # hand-written server), hooks, subagents, benchmark metrics, and the loop: no API calls
 npm run typecheck
 ```
 
@@ -286,5 +399,5 @@ npm run typecheck
 - [x] **2. Reliability:** `grep` and `glob`; read-before-edit; CRLF handling; edit errors that point at the nearest match; permission modes with read-only commands allowed; hideable thinking; the benchmark
 - [x] **3. Context:** `AGENTS.md`; token tracking with automatic and manual compaction; sessions saved as JSON Lines, with `--continue` and `--resume`; fixes for the two problems the benchmark found; three new benchmark tasks
 - [x] **4. Safety:** macOS sandbox (writes only in the project, no network); `plan` mode; allow and deny rules; snapshots and `/undo`; prompt-injection guidance; read-before-edit narrowed to overwrites; two prompt-injection tasks
-- [ ] **5. Extensions:** `SKILL.md` loader with progressive disclosure, MCP client over stdio, subagent tool, a pre-tool hook
+- [x] **5. Extensions:** Agent Skills with progressive disclosure; MCP client over stdio (official SDK) with restart; `PreToolUse` and `PostToolUse` hooks; read-only subagents; parallel read-only tool calls; project trust; three benchmark tasks for the extensions
 - [ ] **6. Evaluation:** Terminal-Bench 2.x through Harbor; success rate, cost and turns per task; ablations (effort level, compaction, subagents) against mini-swe-agent on the same model

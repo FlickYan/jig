@@ -11,8 +11,9 @@ type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 /** What the loop reports as it goes. The CLI prints it; tests record it. */
 export interface AgentUI {
-  toolCall(name: string, description: string): void;
-  toolResult(output: string, isError: boolean): void;
+  /** `id` tells calls apart: calls that only read run at the same time, so results can come in any order. */
+  toolCall(name: string, description: string, id: string): void;
+  toolResult(output: string, isError: boolean, id: string): void;
   notice(text: string): void;
 }
 
@@ -28,7 +29,16 @@ export interface AgentOptions {
   authorize(tool: Tool, input: ToolInput): Promise<string | null>;
   /** Where commands run, if not directly on the machine. */
   sandbox?: Sandbox;
+  /** The user's hooks around tool calls (see hooks.ts). */
+  hooks?: ToolHooks;
   ui: AgentUI;
+}
+
+export interface ToolHooks {
+  /** Before a call runs: resolves to why it is blocked, or null. */
+  before(tool: string, input: ToolInput): Promise<string | null>;
+  /** After a call ran: resolves to feedback for the model about the result, or null. */
+  after(tool: string, input: ToolInput, output: string): Promise<string | null>;
 }
 
 export interface Usage {
@@ -85,10 +95,13 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
 
     // Every tool call gets a result, even ones that never run, or the next request is invalid.
     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete
+    const handle = (call: ToolUse) => handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, conversation, opts, usage, signal);
+    // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
+    // run at the same time. Anything else runs in order, since one call may depend on another's effect.
+    const readOnly = calls.every((call) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read");
     const results: ToolResult[] = [];
-    for (const call of calls) {
-      results.push(await handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, conversation, opts, signal));
-    }
+    if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
+    else for (const call of calls) results.push(await handle(call));
     conversation.push({ role: "user", content: results }); // all results for one reply go in one message
 
     if (signal?.aborted) return result("interrupted", step);
@@ -115,52 +128,59 @@ async function handleToolCall(
   state: { cutOff: boolean; malformed?: string },
   conversation: Conversation,
   opts: AgentOptions,
+  usage: Usage,
   signal?: AbortSignal,
 ): Promise<ToolResult> {
   const fail = (content: string): ToolResult => {
-    opts.ui.toolResult(content, true);
+    opts.ui.toolResult(content, true, call.id);
     return { type: "tool_result", tool_use_id: call.id, content, is_error: true };
   };
 
   const tool = opts.tools.find((t) => t.definition.name === call.name);
   if (!tool) {
-    opts.ui.toolCall(call.name, "");
+    opts.ui.toolCall(call.name, "", call.id);
     return fail(`Unknown tool "${call.name}". Available: ${opts.tools.map((t) => t.definition.name).join(", ")}.`);
   }
   if (signal?.aborted) {
-    opts.ui.toolCall(call.name, "");
+    opts.ui.toolCall(call.name, "", call.id);
     return fail("Not run: the user interrupted.");
   }
   if (state.cutOff) {
-    opts.ui.toolCall(call.name, "");
+    opts.ui.toolCall(call.name, "", call.id);
     return fail("Not run: your reply hit the output limit before this call was complete. Try again in smaller steps.");
   }
   // The model's input was streamed without server-side validation, so check it before anything runs.
   const problem = state.malformed !== undefined ? "input is not valid JSON" : checkInput(tool, call.input);
   if (problem) {
-    opts.ui.toolCall(call.name, "(invalid input)");
+    opts.ui.toolCall(call.name, "(invalid input)", call.id);
     return fail(JSON.stringify({ INVALID_JSON: state.malformed ?? JSON.stringify(call.input), error: problem }));
   }
 
   const input = call.input as ToolInput;
-  opts.ui.toolCall(call.name, tool.describe(input));
+  opts.ui.toolCall(call.name, tool.describe(input), call.id);
+  // Hooks first, as in Claude Code: no point asking the user about a call a hook would block anyway.
+  const blocked = await opts.hooks?.before(call.name, input);
+  if (blocked) return fail(`Blocked by a hook: ${blocked}`);
   const refusal = await opts.authorize(tool, input);
   if (refusal) return fail(refusal);
+  let output: string;
   try {
-    const context = { cwd: opts.cwd, versions: conversation.versions, signal, sandbox: opts.sandbox };
-    const output = truncate(await tool.run(input, context));
-    opts.ui.toolResult(output, false);
-    return { type: "tool_result", tool_use_id: call.id, content: output };
+    const pin = (key: string, text: string) => conversation.pin(key, text);
+    output = truncate(await tool.run(input, { cwd: opts.cwd, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage }));
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
   }
+  const feedback = await opts.hooks?.after(call.name, input, output);
+  if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+  opts.ui.toolResult(output, false, call.id);
+  return { type: "tool_result", tool_use_id: call.id, content: output };
 }
 
 function replyText(reply: Message): string {
   return reply.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
-function addUsage(total: Usage, usage: Anthropic.Beta.BetaUsage): void {
+export function addUsage(total: Usage, usage: Anthropic.Beta.BetaUsage): void {
   total.input += usage.input_tokens;
   total.cacheWrite += usage.cache_creation_input_tokens ?? 0;
   total.cacheRead += usage.cache_read_input_tokens ?? 0;

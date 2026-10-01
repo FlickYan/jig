@@ -13,6 +13,8 @@ export class Conversation {
   versions = new FileVersions();
   /** Size in tokens: measured at the last model call, plus an estimate for anything added since. */
   tokens = 0;
+  /** Text that must survive compaction, like the instructions of skills in use, by key. */
+  readonly pinned = new Map<string, string>();
   private readonly session?: SessionFile;
 
   constructor(session?: SessionFile, messages: MessageParam[] = []) {
@@ -23,6 +25,10 @@ export class Conversation {
 
   get sessionPath(): string | undefined {
     return this.session?.path;
+  }
+
+  pin(key: string, text: string): void {
+    this.pinned.set(key, text);
   }
 
   push(message: MessageParam): void {

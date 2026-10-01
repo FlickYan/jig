@@ -30,6 +30,11 @@ describe("parseTranscript", () => {
     });
   });
 
+  it("puts a failure on the right call when results come out of order", () => {
+    const parallel = "● read_file a.py\n● grep TODO\n  ⎿ grep TODO\n  a.py:3: TODO\n  ⎿ read_file a.py\n  ✗ File not found: a.py\n";
+    assert.deepEqual(parseTranscript(parallel).toolErrorsByTool, { read_file: 1 });
+  });
+
   it("copes with colors and with a run that never finished", () => {
     assert.equal(parseTranscript(`\x1b[36m●\x1b[39m \x1b[1mbash\x1b[22m ls\n`).toolCalls.bash, 1);
     assert.equal(parseTranscript("API error 401: invalid key").steps, null);

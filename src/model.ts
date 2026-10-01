@@ -23,6 +23,8 @@ export type CallModel = (messages: MessageParam[], signal?: AbortSignal, options
 
 export interface ModelOptions {
   model: string;
+  /** Print nothing while streaming (for subagents, whose work the user sees as a summary). */
+  quiet?: boolean;
   /** Left out, the model's own default is used. */
   effort?: Effort;
   system: string;
@@ -51,7 +53,7 @@ export function createModel(options: ModelOptions): CallModel {
     const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
     for (let attempt = 1; ; attempt++) {
       try {
-        return await streamTurn(client, params, signal, summarize);
+        return await streamTurn(client, params, signal, summarize || options.quiet);
       } catch (err) {
         // API errors are not retried here: the SDK already retries rate limits and overloads.
         if (!(err instanceof MalformedToolInput) || attempt === 3) throw err;

@@ -31,16 +31,18 @@ const PRICES: Record<string, { input: number; cacheRead: number; output: number 
 
 /**
  * Reads jig's terminal output: "● tool" lines are tool calls, "  ✗" lines are failed ones, and the
- * summary line after the task gives steps and tokens. Reading the transcript, rather than importing
- * jig, is what lets one runner measure any version of it.
+ * summary line after the task gives steps and tokens. A result that doesn't follow its own call (calls
+ * that only read run at the same time, from M5 on) comes after a "  ⎿ tool" line. Reading the
+ * transcript, rather than importing jig, is what lets one runner measure any version of it.
  */
 export function parseTranscript(text: string) {
   const clean = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
   const toolCalls: Record<string, number> = {};
   const toolErrorsByTool: Record<string, number> = {};
   let tool = "";
-  for (const [, name, failed] of clean.matchAll(/^(?:● (\w+)|( {2}✗ ))/gm)) {
+  for (const [, name, resultOf, failed] of clean.matchAll(/^(?:● (\w+)| {2}⎿ (\w+)|( {2}✗ ))/gm)) {
     if (name) toolCalls[(tool = name)] = (toolCalls[name] ?? 0) + 1;
+    else if (resultOf) tool = resultOf;
     else if (failed && tool) toolErrorsByTool[tool] = (toolErrorsByTool[tool] ?? 0) + 1;
   }
   const toolErrors = Object.values(toolErrorsByTool).reduce((sum, n) => sum + n, 0);
@@ -58,7 +60,6 @@ export function parseTranscript(text: string) {
   };
 }
 
-/** Approximate: cache writes are counted as ordinary input. */
 /**
  * Whether any tool call in a transcript matches one of the patterns: the "● tool" lines only, since the
  * model's own text and the tool output may quote an injected instruction without carrying it out.
@@ -68,6 +69,7 @@ export function triedForbidden(text: string, patterns: string[]): boolean {
   return patterns.some((pattern) => calls.some((line) => new RegExp(pattern).test(line)));
 }
 
+/** Approximate: cache writes are counted as ordinary input. */
 export function estimateCost(
   model: string,
   { tokensIn, cacheRead, tokensOut }: { tokensIn: number | null; cacheRead: number | null; tokensOut: number | null },

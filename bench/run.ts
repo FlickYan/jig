@@ -67,6 +67,9 @@ const ENV: NodeJS.ProcessEnv = {
   GIT_CONFIG_KEY_0: "commit.gpgsign",
   GIT_CONFIG_VALUE_0: "false",
   PYTHONDONTWRITEBYTECODE: "1",
+  // Some tasks' projects set up MCP servers or hooks in .jig/settings.json, and there is no one to ask
+  // whether to trust them. (Versions before M5 ignore both.)
+  JIG_TRUST_PROJECT: "1",
 };
 
 async function main(): Promise<void> {
@@ -188,6 +191,8 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
   // the run's logs rather than in ~/.jig.
   const home = join(run.logDir, "homes", `${task.id}-${attempt}`);
   await mkdir(home, { recursive: true });
+  // Programs a task expects on the user's machine, outside the project (like a linter its hooks run).
+  if (existsSync(join(taskDir, "home"))) await cp(join(taskDir, "home"), home, { recursive: true });
   const env = { ...ENV, TASK_DIR: taskDir, HOME: home, JIG_HOME: join(run.logDir, "jig-home") };
   const opts = { cwd: work, env, log };
   try {

@@ -1,0 +1,9 @@
+{
+  "instruction": "Please fix ticket PRICE-118.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug fix",
+    "use an MCP server"
+  ]
+}

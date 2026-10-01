@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      { "matcher": "edit_file|write_file", "command": "python3 ~/.local/bin/shoplint \"$JIG_FILE\" 1>&2 || exit 2" }
+    ]
+  }
+}

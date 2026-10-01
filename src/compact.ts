@@ -36,7 +36,10 @@ export async function compact(conversation: Conversation, callModel: CallModel, 
   const { message } = await callModel([...history, { role: "user", content: SUMMARY_REQUEST }], options.signal, { summarize: true });
   const summary = message.content.map((block) => (block.type === "text" ? block.text : "")).join("").trim();
   if (!summary) throw new Error("Compaction failed: the model wrote no summary.");
+  // Pinned text (the instructions of skills in use) is kept word for word, not summarized.
+  const pinned = [...conversation.pinned.values()];
+  const kept = pinned.length ? `\n\nStill in effect from before the summary:\n\n${pinned.join("\n\n")}` : "";
   const next = options.continueTask ? "\n\nContinue the task from where it stopped." : "";
-  conversation.replace([{ role: "user", content: `${PREAMBLE}\n\n${summary}${next}` }, ...keep]);
+  conversation.replace([{ role: "user", content: `${PREAMBLE}\n\n${summary}${kept}${next}` }, ...keep]);
   return { before, after: conversation.tokens, usage: message.usage };
 }
