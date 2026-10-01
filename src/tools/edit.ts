@@ -36,7 +36,9 @@ export const editTool: Tool = {
     if (oldText === newText) throw new Error("old_string and new_string are identical; there is nothing to change.");
     const file = resolveInRoot(cwd, path);
     await assertFile(file, path);
-    await versions.assertCurrent(file, path);
+    // No read-before-edit check here, unlike write_file: an exact, unique match of old_string already
+    // shows the model knows the text it replaces, and can't overwrite anything it hasn't seen. In the
+    // benchmark the check refused 22 edits across five runs, and every refusal was a false alarm.
     const text = await readFile(file, "utf8");
 
     // The model writes \n line endings. In a file that uses \r\n, match in either style, and always write

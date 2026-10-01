@@ -29,9 +29,9 @@ export async function assertFile(abs: string, path: string): Promise<Stats> {
 }
 
 /**
- * The version (modification time and size) of each file as the model last saw it. edit_file and
- * write_file use it to refuse changing a file the model hasn't read, or one that changed since it did:
- * a formatter, a command or the user may have edited it, and a blind write would undo their change.
+ * The version (modification time and size) of each file as the model last saw it. write_file uses it to
+ * refuse overwriting a file the model hasn't read, or one that changed since it did: a formatter, a
+ * command or the user may have edited it, and a blind overwrite would undo their change.
  */
 export class FileVersions {
   private readonly seen = new Map<string, string>();
@@ -39,6 +39,11 @@ export class FileVersions {
   /** Call after the model reads or writes a file. Pass the stats taken before reading it, if any. */
   async record(abs: string, info?: Stats): Promise<void> {
     this.seen.set(abs, versionOf(info ?? (await stat(abs))));
+  }
+
+  /** After the files changed under the model (an /undo), so it must read them again. */
+  forget(): void {
+    this.seen.clear();
   }
 
   async assertCurrent(abs: string, path: string): Promise<void> {

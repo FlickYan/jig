@@ -1,0 +1,220 @@
+{
+  "id": "2026-10-01T19-19-41_m1-stale10",
+  "label": "m1-stale10",
+  "version": "m1 (cdb6069)",
+  "model": "deepseek-flash",
+  "suite": "fb722fb7",
+  "date": "2026-10-01T11:21:34.092Z",
+  "settings": {
+    "attempts": 10,
+    "maxSteps": 40,
+    "timeout": 900,
+    "jigArgs": []
+  },
+  "summary": {
+    "passRate": 1,
+    "passRateSpread": 0,
+    "passed": 10,
+    "attempts": 10,
+    "timeouts": 0,
+    "injected": 0,
+    "followedInjection": 0,
+    "steps": 10.5,
+    "toolCalls": 15.4,
+    "toolErrors": 0,
+    "toolErrorsByTool": {},
+    "tokensIn": 72520,
+    "tokensOut": 8260,
+    "cost": 0.011679,
+    "seconds": 39.28
+  },
+  "attempts": [
+    {
+      "task": "stale-cache",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 25.8,
+      "steps": 10,
+      "tokensIn": 49300,
+      "cacheRead": 44900,
+      "tokensOut": 5400,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 10,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00807
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 30.5,
+      "steps": 10,
+      "tokensIn": 54700,
+      "cacheRead": 49900,
+      "tokensOut": 6500,
+      "toolCalls": {
+        "bash": 9,
+        "edit_file": 5
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00954
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 24.5,
+      "steps": 10,
+      "tokensIn": 47400,
+      "cacheRead": 43000,
+      "tokensOut": 4800,
+      "toolCalls": {
+        "bash": 5,
+        "edit_file": 4
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00734
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 4,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 37.4,
+      "steps": 10,
+      "tokensIn": 66800,
+      "cacheRead": 62600,
+      "tokensOut": 8200,
+      "toolCalls": {
+        "bash": 6,
+        "read_file": 8,
+        "edit_file": 3
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01148
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 5,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 75,
+      "steps": 13,
+      "tokensIn": 149400,
+      "cacheRead": 144100,
+      "tokensOut": 16100,
+      "toolCalls": {
+        "bash": 10,
+        "read_file": 7,
+        "write_file": 3
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02177
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 6,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 87.3,
+      "steps": 13,
+      "tokensIn": 170800,
+      "cacheRead": 165200,
+      "tokensOut": 18700,
+      "toolCalls": {
+        "bash": 7,
+        "read_file": 8,
+        "write_file": 4
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02511
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 7,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 30.2,
+      "steps": 7,
+      "tokensIn": 32100,
+      "cacheRead": 28800,
+      "tokensOut": 6300,
+      "toolCalls": {
+        "bash": 4,
+        "read_file": 8,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00872
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 8,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 22.8,
+      "steps": 12,
+      "tokensIn": 53200,
+      "cacheRead": 48500,
+      "tokensOut": 4500,
+      "toolCalls": {
+        "bash": 8,
+        "edit_file": 3
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0071
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 9,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 26.3,
+      "steps": 9,
+      "tokensIn": 45500,
+      "cacheRead": 41200,
+      "tokensOut": 5600,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 9,
+        "edit_file": 3
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00826
+    },
+    {
+      "task": "stale-cache",
+      "attempt": 10,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 33,
+      "steps": 11,
+      "tokensIn": 56000,
+      "cacheRead": 51700,
+      "tokensOut": 6500,
+      "toolCalls": {
+        "bash": 7,
+        "read_file": 7,
+        "write_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0094
+    }
+  ]
+}

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { type Attempt, estimateCost, formatTable, money, num, parseTranscript, percent, summarize } from "./metrics.ts";
+import { type Attempt, estimateCost, formatTable, money, num, parseTranscript, percent, summarize, triedForbidden } from "./metrics.ts";
 
 const BENCH = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(BENCH);
@@ -26,7 +26,8 @@ Options:
   --concurrency <n>   attempts running at the same time (default: 3)
   --max-steps <n>     jig's step limit per task (default: 40)
   --timeout <s>       seconds before an attempt is stopped (default: 900)
-  --jig-args "<args>" extra arguments for jig, e.g. "--compact-at 30000" (the version must support them)
+  --jig-args="<args>" extra arguments for jig, e.g. --jig-args="--effort low" (with the =, since they start
+                      with a dash; the jig version must support them)
   --keep              keep each attempt's project directory for inspection`;
 
 interface Task {
@@ -37,6 +38,8 @@ interface Task {
   check: string;
   /** What the task exercises. */
   tags: string[];
+  /** For prompt-injection tasks: patterns that, in a tool call, mean the agent followed the injected text. */
+  forbidden?: string[];
 }
 
 interface RunContext {
@@ -176,10 +179,17 @@ async function prepareJig(ref?: string): Promise<{ dir: string; version: string 
 
 async function runAttempt(task: Task, attempt: number, run: RunContext): Promise<Attempt> {
   const taskDir = join(BENCH, "tasks", task.id);
-  const work = await mkdtemp(join(tmpdir(), `jig-bench-${task.id}-`));
+  // A neutral name: the path is in jig's system prompt, and naming it after the task (say "injection-readme")
+  // told the model it was being tested.
+  const work = await mkdtemp(join(tmpdir(), "project-"));
   const log = createWriteStream(join(run.logDir, `${task.id}-${attempt}.log`));
-  // jig saves a session for every attempt: keep them with this run's logs instead of in ~/.jig.
-  const opts = { cwd: work, env: { ...ENV, TASK_DIR: taskDir, JIG_HOME: join(run.logDir, "jig-home") }, log };
+  // A home directory of its own (outside the project and the temp directories, so the sandbox can't
+  // write there): injection tasks check that nothing landed in it. jig's sessions and snapshots go with
+  // the run's logs rather than in ~/.jig.
+  const home = join(run.logDir, "homes", `${task.id}-${attempt}`);
+  await mkdir(home, { recursive: true });
+  const env = { ...ENV, TASK_DIR: taskDir, HOME: home, JIG_HOME: join(run.logDir, "jig-home") };
+  const opts = { cwd: work, env, log };
   try {
     await cp(join(taskDir, "repo"), work, { recursive: true });
     await exec("bash", ["-c", "git init -q -b main && git add -A && git commit -qm 'Starting point'"], { ...opts, timeout: 60 });
@@ -207,8 +217,9 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
     const check = await exec("bash", ["-c", task.check], { ...opts, timeout: 300 });
     const metrics = parseTranscript(transcript);
     const passed = check.code === 0 && !timedOut;
-    log.write(`\n--- ${passed ? "PASSED" : "FAILED"}${timedOut ? " (timed out)" : ""} ---\n`);
-    return { task: task.id, attempt, passed, timedOut, seconds, ...metrics, cost: estimateCost(run.model, metrics) };
+    const followedInjection = task.forbidden && run.agent === "jig" ? triedForbidden(transcript, task.forbidden) : undefined;
+    log.write(`\n--- ${passed ? "PASSED" : "FAILED"}${timedOut ? " (timed out)" : ""}${followedInjection ? " (followed the injected instruction)" : ""} ---\n`);
+    return { task: task.id, attempt, passed, timedOut, seconds, ...metrics, cost: estimateCost(run.model, metrics), followedInjection };
   } finally {
     if (run.keep) log.write(`Kept the project in ${work}\n`);
     else await rm(work, { recursive: true, force: true });
@@ -253,7 +264,7 @@ function exec(
 
 function describe(a: Attempt): string {
   const parts = [a.steps !== null && `${a.steps} steps`, a.steps !== null && `${a.toolErrors} tool errors`, a.cost !== null && money(a.cost), `${a.seconds}s`];
-  return [...parts, a.timedOut && "timed out"].filter(Boolean).join(" · ");
+  return [...parts, a.timedOut && "timed out", a.followedInjection && "FOLLOWED THE INJECTION"].filter(Boolean).join(" · ");
 }
 
 function printTable(tasks: Task[], attempts: Attempt[]): void {

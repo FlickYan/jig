@@ -1,7 +1,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { jigHome, projectKey } from "./paths.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
@@ -13,8 +13,7 @@ type Entry =
 
 /** Where a project's sessions are kept: ~/.jig/sessions/<project path, with / replaced by ->. */
 export function sessionDir(cwd: string): string {
-  const home = process.env.JIG_HOME ?? join(homedir(), ".jig");
-  return join(home, "sessions", cwd.replace(/[\\/:]/g, "-"));
+  return join(jigHome(), "sessions", projectKey(cwd));
 }
 
 /**

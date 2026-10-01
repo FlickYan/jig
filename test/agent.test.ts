@@ -38,7 +38,7 @@ function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
     cwd,
     maxSteps: 10,
     compactAt: 0,
-    approve: async () => true,
+    authorize: async () => null,
     ui: { toolCall() {}, toolResult() {}, notice() {} },
     ...overrides,
   };
@@ -89,7 +89,7 @@ describe("runAgent", () => {
   it("does not run a call the user declines, and tells the model", async () => {
     const { options, conversation, messages } = setup(
       [reply([toolUse("t1", "write_file", { path: "no.txt", content: "x" })]), reply([text("ok")])],
-      { approve: async () => false },
+      { authorize: async () => "The user declined this tool call." },
     );
     await runAgent(conversation, options);
     assert.ok(!existsSync(join(cwd, "no.txt")));

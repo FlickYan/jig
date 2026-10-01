@@ -9,7 +9,10 @@ import { Conversation } from "./conversation.ts";
 import { contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, systemPrompt } from "./prompt.ts";
+import { createSandbox } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
+import { loadSettings } from "./settings.ts";
+import { Snapshots } from "./snapshots.ts";
 import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
 import * as ui from "./ui.ts";
 
@@ -23,6 +26,8 @@ Options:
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto
+      --no-sandbox        run commands directly on this machine instead of in the sandbox (macOS)
+      --allow-network     let sandboxed commands use the network
       --hide-thinking     don't print the model's thinking (/thinking toggles it in a session)
   -c, --continue          continue this project's most recent session
       --resume <file>     continue a saved session (--sessions lists them)
@@ -32,25 +37,30 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --max-steps <n>     most model calls per task (default: 50)
   -h, --help              show this help
 
-jig follows the project's AGENTS.md (or CLAUDE.md), and saves every session under ~/.jig/sessions.
-Reading files, and read-only commands (ls, cat, grep, git status, ...) inside the project, never ask.
+jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/.jig/sessions, and
+snapshots the project's files before each task so /undo can put them back. Allow and deny rules for
+commands go in ~/.jig/settings.json or .jig/settings.json.
 Ctrl+C stops the current task (press it again to force quit).`;
 
-const COMMANDS = `  /mode [ask|edits|auto]  show or change when jig asks before a tool call
-  /thinking               show or hide the model's thinking
-  /context                show how much context the conversation takes up
-  /compact                summarize the conversation to free up context
-  /reset                  start a new conversation (and reload AGENTS.md)
-  /exit                   quit (Ctrl+D works too)`;
+const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks before a tool call
+  /undo                        put the files back the way they were before the last task
+  /thinking                    show or hide the model's thinking
+  /context                     show how much context the conversation takes up
+  /compact                     summarize the conversation to free up context
+  /reset                       start a new conversation (and reload AGENTS.md)
+  /exit                        quit (Ctrl+D works too)`;
 
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
+    allowNegative: true,
     options: {
       model: { type: "string", short: "m", default: "deepseek-flash" },
       effort: { type: "string", short: "e" },
       mode: { type: "string", default: "edits" },
       yes: { type: "boolean", short: "y", default: false },
+      sandbox: { type: "boolean" },
+      "allow-network": { type: "boolean" },
       "hide-thinking": { type: "boolean", default: false },
       continue: { type: "boolean", short: "c", default: false },
       resume: { type: "string" },
@@ -78,32 +88,45 @@ async function main(): Promise<void> {
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
 
-  const permissions = new Permissions(mode, cwd);
+  // Flags win over the settings files, which win over the defaults: sandbox on, network off.
+  const settings = loadSettings(cwd);
+  const network = values["allow-network"] ?? settings.network ?? false;
+  const sandbox = (values.sandbox ?? settings.sandbox ?? true) ? createSandbox(cwd, { network }) : undefined;
+  if (values.sandbox && !sandbox) throw new Error("The sandbox is only available on macOS so far.");
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained: !!sandbox && !network });
+  let snapshots: Snapshots | undefined = new Snapshots(cwd);
+
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
-  const newModel = () => createModel({ model, effort, system: systemPrompt(cwd, instructions), tools: TOOLS });
+  const newModel = () => createModel({ model, effort, system: systemPrompt(cwd, instructions, sandbox?.limits), tools: TOOLS });
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
   let conversation = resumeFrom
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
+  // Things the model should know before the next request, like an /undo. Plan mode is announced when it
+  // starts and ends: the system prompt can't change mid-conversation, so this rides on the user's message.
+  const notes: string[] = [];
+  let modelKnowsPlanMode = false;
 
-  async function approve(tool: Tool, input: ToolInput): Promise<boolean> {
-    if (permissions.allows(tool, input)) return true;
-    if (!process.stdin.isTTY) {
-      ui.notice("No terminal to ask for permission, so the call was declined. Use --yes to allow tool calls.");
-      return false;
-    }
+  async function authorize(tool: Tool, input: ToolInput): Promise<string | null> {
+    const decision = permissions.decide(tool, input);
+    if (decision === "allow") return null;
+    if (decision !== "ask") return decision.refuse;
+    if (!process.stdin.isTTY) return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
     const always = permissions.alwaysLabel(tool, input);
     const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
-    if (answer === null) task?.abort(); // Ctrl+C at the prompt stops the whole task
-    const choice = answer?.trim().toLowerCase() ?? "";
+    if (answer === null) {
+      task?.abort(); // Ctrl+C at the prompt stops the whole task
+      return "Not run: the user stopped the task.";
+    }
+    const choice = answer.trim().toLowerCase();
     if (always && choice.startsWith("a")) {
       permissions.allowAlways(tool, input);
-      return true;
+      return null;
     }
-    return choice.startsWith("y");
+    return choice.startsWith("y") ? null : "The user declined this tool call. Ask them how they want to proceed.";
   }
 
   const agent: AgentOptions = {
@@ -113,7 +136,8 @@ async function main(): Promise<void> {
     maxSteps,
     // Well before the context window fills: long contexts cost more per step and models use them less well.
     compactAt: compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8)),
-    approve,
+    authorize,
+    sandbox,
     ui: ui.terminalUI,
   };
 
@@ -138,9 +162,41 @@ async function main(): Promise<void> {
   }
 
   function runTask(text: string): Promise<boolean> {
-    conversation.push({ role: "user", content: text });
+    if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
+      modelKnowsPlanMode = permissions.mode === "plan";
+      notes.push(
+        modelKnowsPlanMode
+          ? "Plan mode is on: you can read, search and run read-only commands, but every change is refused. Investigate, then propose a plan."
+          : "Plan mode is off: you can make changes again.",
+      );
+    }
+    takeSnapshot(text);
+    const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
+    notes.length = 0;
+    conversation.push({ role: "user", content: message });
     const started = Date.now();
     return asTask(async (signal) => report(await runAgent(conversation, agent, signal), Date.now() - started, maxSteps));
+  }
+
+  function takeSnapshot(label: string): void {
+    try {
+      snapshots?.take(label.slice(0, 200));
+    } catch (err) {
+      ui.notice(`Couldn't snapshot the project, so /undo is off: ${(err as Error).message.split("\n")[0]}`);
+      snapshots = undefined;
+    }
+  }
+
+  function undo(): void {
+    const restored = snapshots?.undo();
+    if (!restored) return ui.notice(snapshots ? "Nothing to undo." : "/undo is off: the project couldn't be snapshotted.");
+    const { changed, removed } = restored;
+    if (!changed.length && !removed.length) return ui.notice("The last task didn't change any files.");
+    ui.notice(`Put back ${changed.length} file${changed.length === 1 ? "" : "s"} and removed ${removed.length} the task had created.`);
+    for (const path of changed) ui.println(ui.dim(`  restored ${path}`));
+    for (const path of removed) ui.println(ui.dim(`  removed  ${path}`));
+    conversation.versions.forget(); // the files are not what the model last saw
+    notes.push("The user undid your changes from their previous request: the project's files are back to how they were before it.");
   }
 
   /** Runs a slash command. Returns false to quit. */
@@ -149,10 +205,14 @@ async function main(): Promise<void> {
     if (name === "/exit") return false;
     if (name === "/help") {
       ui.println(COMMANDS);
+    } else if (name === "/undo") {
+      undo();
     } else if (name === "/reset") {
       instructions = loadInstructions(cwd);
       agent.callModel = newModel();
       conversation = new Conversation(SessionFile.create(cwd, model));
+      modelKnowsPlanMode = false;
+      notes.length = 0;
       ui.notice(`Started a new conversation${instructions.length ? ` (with ${describeInstructions(instructions)})` : ""}.`);
     } else if (name === "/thinking") {
       ui.setThinkingVisible(!ui.thinkingVisible());
@@ -184,6 +244,7 @@ async function main(): Promise<void> {
   }
 
   ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (no sandbox)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
   if (resumeFrom) ui.println(ui.dim(`Continuing ${basename(resumeFrom)} (${conversation.messages.length} messages).`));
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));

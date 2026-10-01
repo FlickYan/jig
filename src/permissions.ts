@@ -5,19 +5,35 @@ import { isInside } from "./tools/util.ts";
 
 /**
  * How much jig may do without asking:
+ *   plan   look only: file changes and commands that change things are refused, not asked about
  *   ask    every file change and every command asks first
- *   edits  file changes run without asking (the file tools only work inside the project); commands ask
+ *   edits  file changes run without asking (the file tools only work inside the project); commands ask,
+ *          unless the sandbox contains them
  *   auto   everything runs without asking
- * In every mode, looking never asks: the read tools, and commands that only read inside the project.
+ * In every mode, looking never asks (the read tools, and commands that only read inside the project),
+ * and the settings' deny rules are always refused.
  */
-export const MODES = ["ask", "edits", "auto"] as const;
+export const MODES = ["plan", "ask", "edits", "auto"] as const;
 export type Mode = (typeof MODES)[number];
 
 export const MODE_HELP: Record<Mode, string> = {
+  plan: "look around and plan; refuse every change",
   ask: "ask before every file change and command",
-  edits: "change files in the project freely, ask before commands",
+  edits: "change files in the project freely; ask before commands the sandbox doesn't contain",
   auto: "never ask",
 };
+
+/** Run the call, ask the user first, or refuse it (the reason goes to the model). */
+export type Decision = "allow" | "ask" | { refuse: string };
+
+export interface PolicyOptions {
+  /** Commands that run without asking, matched by their first words. */
+  allow?: string[];
+  /** Commands that are always refused. */
+  deny?: string[];
+  /** Commands run in a sandbox that keeps them inside the project and off the network. */
+  contained?: boolean;
+}
 
 // Programs that only print: they don't change files or start other programs, whatever their arguments.
 const READERS = new Set(["cat", "cut", "diff", "du", "echo", "grep", "head", "ls", "nl", "pwd", "stat", "tail", "tr", "wc", "which"]);
@@ -28,20 +44,34 @@ const FIND_ACTIONS = /^-(exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/;
 export class Permissions {
   mode: Mode;
   private readonly root: string;
+  private readonly allowRules: string[][];
+  private readonly denyRules: string[];
+  private readonly contained: boolean;
   /** Programs the user chose to always allow for this session, like "python3". */
   private readonly programs = new Set<string>();
 
-  constructor(mode: Mode, root: string) {
+  constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false }: PolicyOptions = {}) {
     this.mode = mode;
     this.root = root;
+    this.allowRules = allow.map((rule) => rule.split(/\s+/));
+    this.denyRules = deny;
+    this.contained = contained;
   }
 
-  /** Whether a tool call can run without asking the user first. */
-  allows(tool: Tool, input: ToolInput): boolean {
-    if (tool.kind === "read" || this.mode === "auto") return true;
-    if (tool.kind === "edit") return this.mode === "edits";
-    const commands = parseCommand(String(input.command));
-    return commands !== null && commands.every((argv) => this.readsOnly(argv) || this.isApproved(argv));
+  decide(tool: Tool, input: ToolInput): Decision {
+    const command = tool.kind === "run" ? String(input.command) : "";
+    const rule = command && this.denyRules.find((r) => matchesDenyRule(command, r));
+    if (rule) return { refuse: `Refused: the command matches the deny rule "${rule}" in jig's settings. Don't try to get around it.` };
+    if (tool.kind === "read") return "allow";
+    const commands = command ? parseCommand(command) : null;
+    if (this.mode === "plan") {
+      if (commands?.every((argv) => this.readsOnly(argv))) return "allow";
+      return { refuse: "Refused: plan mode is on, so nothing may be changed. Investigate, then describe the changes you would make." };
+    }
+    if (this.mode === "auto") return "allow";
+    if (tool.kind === "edit") return this.mode === "edits" ? "allow" : "ask";
+    if (commands?.every((argv) => this.readsOnly(argv) || this.isApproved(argv) || this.allowedByRule(argv))) return "allow";
+    return this.mode === "edits" && this.contained ? "allow" : "ask";
   }
 
   /** What answering "always" would allow from now on, or null if this call can't be generalized. */
@@ -68,6 +98,10 @@ export class Permissions {
     return this.programs.has(program) && this.stayInside(args);
   }
 
+  private allowedByRule(argv: string[]): boolean {
+    return this.stayInside(argv.slice(1)) && this.allowRules.some((rule) => rule.every((word, i) => argv[i] === word));
+  }
+
   private readsOnly([program, ...args]: string[]): boolean {
     if (!this.stayInside(args)) return false;
     if (READERS.has(program)) return true;
@@ -84,4 +118,23 @@ export class Permissions {
       return !value.split("/").includes("..") || isInside(this.root, resolve(this.root, value));
     });
   }
+}
+
+/**
+ * Whether a command contains a deny rule's words, in order, within one simple command, looking inside
+ * quotes and substitutions too. So "git push" also matches `git -C repo push`, `cd x && git push` and
+ * `bash -c "git push"`; the price is false alarms like `git log --grep push`. Deny rules can't catch
+ * every disguise (`g\it push`), so they are a guardrail; the sandbox is what actually contains commands.
+ */
+export function matchesDenyRule(command: string, rule: string): boolean {
+  const words = rule.split(/\s+/);
+  for (const part of command.split(/&&|\|\||[;|&\n()`]|\$\(/)) {
+    const tokens = part.split(/\s+/).map((token) => token.replace(/^["'$]+|["']+$/g, "")).filter(Boolean);
+    let next = 0; // how many of the rule's words have been seen, in order
+    for (const token of tokens) {
+      if (token === words[next]) next++;
+      if (next === words.length) return true;
+    }
+  }
+  return false;
 }

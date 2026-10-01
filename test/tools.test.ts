@@ -85,13 +85,17 @@ describe("edit_file", () => {
     await edit("const a = 1;", "const a = 0;"); // its own write doesn't count as a change by someone else
   });
 
-  it("refuses to edit a file it hasn't read, or one that changed since", async () => {
+  it("edits without a read first: the exact match is the check", async () => {
     await writeFile(join(cwd, "code.js"), "x = 1\n");
-    await assert.rejects(edit("x = 1", "x = 2"), /haven't read code\.js yet/);
+    assert.match(await edit("x = 1", "x = 2"), /Edited code\.js/);
+  });
+
+  it("won't overwrite a file whose current version the model hasn't read", async () => {
+    await writeFile(join(cwd, "code.js"), "x = 1\n");
     await read("code.js");
     await writeFile(join(cwd, "code.js"), "x = 10\n"); // someone else edits it
     await utimes(join(cwd, "code.js"), new Date(), new Date(Date.now() + 5000));
-    await assert.rejects(edit("x = 10", "x = 2"), /has changed since you last read it/);
+    await assert.rejects(write("code.js", "y = 0\n"), /has changed since you last read it/);
   });
 
   it("rejects a missing or ambiguous match and leaves the file alone", async () => {
@@ -129,7 +133,7 @@ describe("edit_file", () => {
   it("counts a file printed with cat as read", async () => {
     await writeFile(join(cwd, "code.js"), "x = 1\n");
     await bashTool.run({ command: "ls && cat -n code.js" }, ctx);
-    assert.match(await edit("x = 1", "x = 2"), /Edited code\.js/);
+    assert.match(await write("code.js", "x = 2\n"), /Overwrote code\.js/);
   });
 
   it("points at the nearest match when old_string is not found", async () => {

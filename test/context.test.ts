@@ -52,7 +52,7 @@ const options = (callModel: CallModel, compactAt: number): AgentOptions => ({
   cwd: dir,
   maxSteps: 10,
   compactAt,
-  approve: async () => true,
+  authorize: async () => null,
   ui: { toolCall() {}, toolResult() {}, notice() {} },
 });
 

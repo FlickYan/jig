@@ -4,16 +4,19 @@ import { editTool } from "./edit.ts";
 import { globTool } from "./glob.ts";
 import { grepTool } from "./grep.ts";
 import { readTool } from "./read.ts";
+import type { Sandbox } from "../sandbox.ts";
 import type { FileVersions } from "./util.ts";
 import { writeTool } from "./write.ts";
 
 export interface ToolContext {
   /** Project root. Relative paths resolve against it, and the file tools refuse to leave it. */
   cwd: string;
-  /** What the model has read, so edits to files it hasn't seen, or that changed since, can be refused. */
+  /** What the model has read, so write_file can refuse to overwrite a file it hasn't seen as it is now. */
   versions: FileVersions;
   /** Aborted when the user presses Ctrl+C. */
   signal?: AbortSignal;
+  /** Where commands run, if not directly on the machine. */
+  sandbox?: Sandbox;
 }
 
 export type ToolInput = Record<string, unknown>;

@@ -2,8 +2,9 @@
 
 A minimal coding agent for the terminal, written from scratch in TypeScript on the Anthropic Messages API
 (Claude, or DeepSeek through its Anthropic-compatible endpoint). There is no agent framework: it is one
-streaming tool-use loop, six tools, a permission policy, context management (AGENTS.md, saved sessions,
-compaction), and a benchmark that measures each version.
+streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
+(a macOS sandbox, permission modes, deny rules, snapshots with undo), and a benchmark that measures each
+version.
 
 (A jig is the workshop fixture that holds a piece of work and guides the tool cutting it, which is what an
 agent harness does for a model.)
@@ -29,10 +30,13 @@ Usage: jig [options] [task]
   -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
   -e, --effort <level>  low | medium | high | xhigh | max (default: the model's own; DeepSeek takes low | high | max)
       --mode <mode>     when to ask before a tool call (default: edits)
+                          plan   look around and plan; refuse every change
                           ask    ask before every file change and command
-                          edits  change files in the project freely, ask before commands
+                          edits  change files in the project freely; ask before commands the sandbox doesn't contain
                           auto   never ask
   -y, --yes             same as --mode auto
+      --no-sandbox      run commands directly on this machine instead of in the sandbox (macOS)
+      --allow-network   let sandboxed commands use the network
       --hide-thinking   don't print the model's thinking (/thinking toggles it in a session)
   -c, --continue        continue this project's most recent session
       --resume <file>   continue a saved session (--sessions lists them)
@@ -41,18 +45,40 @@ Usage: jig [options] [task]
       --max-steps <n>   most model calls per task (default: 50)
 ```
 
-In a session: `/mode`, `/thinking`, `/context`, `/compact`, `/reset`, `/help` and `/exit`. After each task
+In a session: `/mode`, `/undo`, `/thinking`, `/context`, `/compact`, `/reset`, `/help` and `/exit`. After each task
 jig prints the steps taken, the tokens sent and received, and how many input tokens came from the prompt
 cache.
 
-### When jig asks first
+### Safety
 
-Reading never asks: `read_file`, `grep`, `glob`, and commands that only read inside the project (`ls`,
-`cat`, `grep`, `git status`, `git diff`, `find` without `-exec`/`-delete`, and a few more). In the default
-`edits` mode, file changes run without asking too, since the file tools can't leave the project. Any other
-command asks `[y]es / [n]o / [a]lways allow python3 commands in this project`, where "always" covers that
-program for the rest of the session. Commands with redirections, substitutions or paths outside the
-project always ask. The policy is in [`src/permissions.ts`](src/permissions.ts).
+- **Sandbox.** On macOS, commands run under the operating system's sandbox (Seatbelt, as in Codex and
+  Claude Code): they can read anything but write only inside the project, its git directory and the temp
+  directories, and can't reach the network except localhost (`--allow-network` lifts that). Because a
+  sandboxed command can't harm anything outside the project or send data out, in the default `edits` mode
+  commands run without asking. `--no-sandbox` turns it off.
+- **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
+  told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
+  changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
+  `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
+  When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session.
+- **Rules.** `~/.jig/settings.json` and the project's `.jig/settings.json` can list commands to always
+  allow or always refuse:
+
+  ```json
+  { "allow": ["npm test", "make"], "deny": ["git push", "npm publish"] }
+  ```
+
+  A deny rule is refused in every mode, even `auto`, and matches its words in order within one command, so
+  `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. The settings can also hold
+  `"sandbox": false` or `"network": true` for a project.
+- **Undo.** Before each task, jig snapshots the project's files into a private git repository in
+  `~/.jig/snapshots/` (so it works in any folder and never touches the project's own git history), and
+  `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
+  command. `/undo` again goes one task further back. Projects with more than 200 MB of files that aren't
+  ignored aren't snapshotted.
+- **Prompt injection.** The system prompt tells the model that text in files and command output is data,
+  not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
+  are what protect you when that isn't enough.
 
 ### Context
 
@@ -85,9 +111,11 @@ project always ask. The policy is in [`src/permissions.ts`](src/permissions.ts).
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | The only file that talks to the API: request settings per provider, streaming, checking streamed tool input |
 | [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash` |
-| [`src/permissions.ts`](src/permissions.ts) | Which tool calls need the user's approval |
+| [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules |
+| [`src/sandbox.ts`](src/sandbox.ts) | The macOS sandbox profile commands run under |
+| [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
-| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval prompt, Ctrl+C |
+| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval prompt, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
 
@@ -104,11 +132,12 @@ project always ask. The policy is in [`src/permissions.ts`](src/permissions.ts).
   `old_string` doesn't match, jig looks for the nearest thing in the file: leftover line numbers from
   `read_file`, the same lines with different indentation (shown exactly as they are), or where its first
   line appears. The next attempt usually succeeds.
-- **Read before edit.** jig remembers each file's modification time and size as of the model's last read.
-  `edit_file` and `write_file` refuse to change a file the model hasn't read, or one that changed since
-  (a formatter, a command or the user edited it), so it never overwrites work it hasn't seen. Printing a
-  file with `cat`, `head` or `tail` counts as reading it: the benchmark showed the model often reads that
-  way, and refusing the edit afterwards only cost it a step.
+- **Read before overwrite.** jig remembers each file's modification time and size as of the model's last
+  read (`read_file`, or printing it with `cat`, `head` or `tail`). `write_file` refuses to replace a file the
+  model hasn't read, or one that changed since (a formatter, a command or the user edited it), so it never
+  overwrites work it hasn't seen. `edit_file` doesn't need the check: its exact, unique match already proves
+  the model knows the text it replaces. In M2 and M3 the check covered edits too, and in the benchmark it
+  refused 22 edits, all false alarms, so M4 narrowed it.
 - **Line endings are the file's business.** The model writes `\n`; in a file that uses `\r\n`, edits are
   matched and written with `\r\n` (including lines an edit adds), and `write_file` keeps an existing file's
   CRLF endings.
@@ -134,6 +163,16 @@ project always ask. The policy is in [`src/permissions.ts`](src/permissions.ts).
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
   runner's worker processes die too. Commands get no stdin, so an interactive prompt gets end-of-file
   instead of hanging the agent.
+- **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
+  slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
+  just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
+  Linux would use bubblewrap the same way; that isn't written yet.
+- **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
+  `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
+  what a command can do.
+- **Snapshots in a private repository.** `git stash` would change the user's repository and miss
+  untracked files; a second git directory with the project as its work tree snapshots everything that
+  isn't ignored, deduplicates unchanged files, and leaves the project untouched.
 - **Two providers, one format.** DeepSeek's Anthropic-compatible API lets the same SDK and message format
   serve both. DeepSeek does not support `is_error` on tool results, so for DeepSeek failures are marked
   with `Error:` in the text instead, and the Claude-only settings (adaptive thinking with short progress
@@ -142,7 +181,7 @@ project always ask. The policy is in [`src/permissions.ts`](src/permissions.ts).
 
 ## Benchmark
 
-`bench/` is a small benchmark in the style of Terminal-Bench: fifteen tasks, each a small project, an
+`bench/` is a small benchmark in the style of Terminal-Bench: seventeen tasks, each a small project, an
 instruction worded the way a user would ask, hidden tests, and a reference solution.
 
 For each attempt the runner:
@@ -163,10 +202,12 @@ npm run bench:report                                # compare the saved runs (Ma
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
+Runs on earlier versions of the suite are in `suite-12/` and `suite-15/`, one-off experiments in
+`experiments/`; `npm run bench:report -- bench/results/experiments` reports a folder.
 Logs of every attempt (the transcript, the diff the agent made, the check's output and jig's session file)
 go to `bench/logs/`. Model output varies between runs, so use several `--attempts`: the report shows the
 pass rate with its spread between rounds, and a difference smaller than that spread is noise.
-`--jig-args "--compact-at 30000"` passes options to jig, for ablations of one setting.
+`--jig-args="--effort low"` passes options to jig, for ablations of one setting.
 
 `npm run bench -- --agent oracle` applies every reference solution and must pass all tasks;
 `--agent noop` changes nothing and must fail them all. Together they show each task is solvable and not
@@ -189,36 +230,53 @@ already solved, without spending anything on a model.
 | `project-conventions` | A small feature that must follow the project's AGENTS.md, including rules the code doesn't show |
 | `stale-cache` | Stale profiles after an update: two update paths, and the cache must keep working (hard) |
 | `csv-parser` | A CSV parser to a precise spec with many edge cases (hard) |
+| `injection-readme` | A typo fix in a project whose README tells AI agents to write to the home directory and delete the tests |
+| `injection-output` | A bug fix where the test script's output tells AI agents to pipe a script from the internet into bash |
+
+For the two injection tasks the runner also records whether any tool call tried to do what the injected
+text said, separately from whether harm was done: a sandboxed agent can try and still pass.
 
 This is an in-house suite: good for comparing versions of jig and settings (models, effort, tools), not
 for comparing against other agents. For that, milestone 6 runs a public benchmark.
 
-### What the first runs showed
+### Results
 
-On the first twelve tasks, with deepseek-flash and three attempts each, M1 solved 36/36 and M2 35/36.
-Reading the logs turned that into four findings:
+All four milestones on the current suite, with deepseek-flash and three attempts per task:
 
-- **The suite was too easy.** M1 already solved everything, so the pass rate could not show an
-  improvement. The three newer tasks are harder, and the reliability features are measured by failed tool
-  calls, steps and tokens instead.
-- **The one M2 failure was a bug in the benchmark.** `map-limit`'s documentation said it "throws" a
-  RangeError, the model threw it immediately, and the hidden test only accepted a rejected promise. The
-  test now accepts both.
-- **M2's read-before-edit check misfired.** Six of M2's seven failed tool calls were edits refused right
-  after the model had printed the file with `cat`. Files printed with `cat`, `head` or `tail` now count as
-  read.
-- **`settings-crlf` didn't test line endings, and hid a bug.** Its fix was a one-line change, which never
-  contains a line ending, so M1 passed it too. Looking closer showed that an edit adding lines to a CRLF
-  file wrote them with `\n`, leaving the file mixed. Fixed in M3, and the task now needs such an edit.
+| run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
+|-----|--------|-------|------------|-------------------|-----------|------|------|
+| m1 | 100% (51/51) | 7.2 | 7.7 | 0.0 | 29,447 | $0.0046 | 15s |
+| m2 | 98% ±3% (50/51) | 7.4 | 9.2 | 0.2 | 35,649 | $0.0047 | 15s |
+| m3 | 98% ±3% (50/51) | 7.2 | 8.8 | 0.0 | 32,192 | $0.0046 | 14s |
+| m4 | 98% ±3% (50/51) | 7.0 | 8.6 | 0.0 | 29,955 | $0.0045 | 14s |
 
-M2's runs used 15% fewer tokens on average, but almost all of that came from one task (`log-report`,
-where the model happened to sample the log instead of printing it whole); on the other eleven M2 used
-slightly more. With three attempts that is not a real difference either way.
+Averages are per attempt. What the runs and their logs showed:
+
+- **The pass rate is at its ceiling.** deepseek-flash solves nearly every task with any version of jig,
+  even at `--effort low`, so the pass rate can't show the harness getting better. What the benchmark does
+  show is that nothing regressed, what each version costs, and, in the logs, why things fail.
+- **Single failures are noise.** `stale-cache` failed once for M3 and once for M4, and twice for M4 at low
+  effort. Ten more attempts each: M1 10/10, M4 10/10. A difference of one attempt in three means nothing.
+- **AGENTS.md mattered.** M2 failed `project-conventions` in 2 of 6 attempts (counting the run on the
+  15-task suite), each time without having opened AGENTS.md, so it missed the CHANGELOG rule. M1 happened
+  to read it every time; M3 and M4 load it themselves and passed 12 of 12.
+- **The read-before-edit check misfired.** M2's failed tool calls were edits refused right after the model
+  had printed the file with `cat`. M3 counted `cat` as a read but still missed forms like
+  `cat x 2>/dev/null`. Across five M2 and M3 runs the check refused 22 edits, none of them because a file
+  had changed, and in the logs we checked the model then read the file and made the same edit. M4 limits
+  the check to `write_file`: no refusals since, and failed tool calls went from 0.2 per attempt to 0.
+- **No version followed the prompt injections** (0 of 6 attempts each), so with this model they didn't test
+  the sandbox. That it blocks writes outside the project and the network is checked by `test/safety.test.ts`,
+  which runs real sandboxed commands. The sandbox and snapshots cost no measurable time.
+- **The benchmark had bugs too.** A hidden test accepted only one reading of "throws"; a task meant to
+  test line endings never needed a line ending; and naming each task's folder after the task told the
+  model "this is a benchmark for injection" (it said so in its reasoning). Each was found by reading the
+  logs of a failure or of a surprising pass, and fixed.
 
 ## Tests
 
 ```bash
-npm test            # tools, permissions, search, context, benchmark metrics, and the loop with a scripted fake model: no API calls
+npm test            # tools, permissions, sandbox, snapshots, search, context, benchmark metrics, and the loop: no API calls
 npm run typecheck
 ```
 
@@ -227,6 +285,6 @@ npm run typecheck
 - [x] **1. Core loop:** streaming, `read_file` / `write_file` / `edit_file` / `bash`, step limit, approval prompt
 - [x] **2. Reliability:** `grep` and `glob`; read-before-edit; CRLF handling; edit errors that point at the nearest match; permission modes with read-only commands allowed; hideable thinking; the benchmark
 - [x] **3. Context:** `AGENTS.md`; token tracking with automatic and manual compaction; sessions saved as JSON Lines, with `--continue` and `--resume`; fixes for the two problems the benchmark found; three new benchmark tasks
-- [ ] **4. Safety:** a read-only plan mode, deny rules for commands, run commands in Docker, git snapshot before edits plus `/undo`
+- [x] **4. Safety:** macOS sandbox (writes only in the project, no network); `plan` mode; allow and deny rules; snapshots and `/undo`; prompt-injection guidance; read-before-edit narrowed to overwrites; two prompt-injection tasks
 - [ ] **5. Extensions:** `SKILL.md` loader with progressive disclosure, MCP client over stdio, subagent tool, a pre-tool hook
 - [ ] **6. Evaluation:** Terminal-Bench 2.x through Harbor; success rate, cost and turns per task; ablations (effort level, compaction, subagents) against mini-swe-agent on the same model

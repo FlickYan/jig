@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { Permissions } from "../src/permissions.ts";
+import { matchesDenyRule, Permissions } from "../src/permissions.ts";
 import { parseCommand } from "../src/tools/shell.ts";
 import { TOOLS } from "../src/tools/index.ts";
 
 const tool = (name: string) => TOOLS.find((t) => t.definition.name === name)!;
-const bash = (permissions: Permissions, command: string) => permissions.allows(tool("bash"), { command });
+const bash = (permissions: Permissions, command: string) => permissions.decide(tool("bash"), { command }) === "allow";
 
 describe("parseCommand", () => {
   it("splits pipelines and command lists into words", () => {
@@ -23,12 +23,12 @@ describe("parseCommand", () => {
 describe("Permissions", () => {
   it("never asks for read tools, in any mode", () => {
     const permissions = new Permissions("ask", "/project");
-    for (const name of ["read_file", "grep", "glob"]) assert.ok(permissions.allows(tool(name), { path: "x" }));
+    for (const name of ["read_file", "grep", "glob"]) assert.equal(permissions.decide(tool(name), { path: "x" }), "allow");
   });
 
   it("lets file changes through in edits mode but not in ask mode", () => {
-    assert.ok(new Permissions("edits", "/project").allows(tool("write_file"), { path: "a.txt", content: "" }));
-    assert.ok(!new Permissions("ask", "/project").allows(tool("edit_file"), { path: "a.txt" }));
+    assert.equal(new Permissions("edits", "/project").decide(tool("write_file"), { path: "a.txt", content: "" }), "allow");
+    assert.equal(new Permissions("ask", "/project").decide(tool("edit_file"), { path: "a.txt" }), "ask");
   });
 
   it("allows commands that only read inside the project", () => {
@@ -67,5 +67,37 @@ describe("Permissions", () => {
     permissions.allowAlways(tool("edit_file"), { path: "a" });
     assert.equal(permissions.mode, "edits");
     assert.equal(permissions.alwaysLabel(tool("bash"), { command: "echo $(date)" }), null, "can't generalize this");
+  });
+});
+
+describe("M4 rules", () => {
+  it("refuses changes in plan mode but still lets it look", () => {
+    const permissions = new Permissions("plan", "/project");
+    assert.equal(bash(permissions, "git status && ls src"), true);
+    assert.match(String((permissions.decide(tool("edit_file"), { path: "a" }) as { refuse: string }).refuse), /plan mode/);
+    assert.ok(typeof permissions.decide(tool("bash"), { command: "npm test" }) === "object");
+  });
+
+  it("refuses deny rules in every mode, however the command is written", () => {
+    const permissions = new Permissions("auto", "/project", { deny: ["git push", "rm"] });
+    for (const command of ["git push", "git -C repo push origin main", "cd x && git push", 'bash -c "git push"', "echo $(rm -rf x)", "ls; rm a"]) {
+      assert.ok(typeof permissions.decide(tool("bash"), { command }) === "object", command);
+    }
+    assert.equal(permissions.decide(tool("bash"), { command: "git status" }), "allow");
+    assert.ok(matchesDenyRule("git log --grep push", "git push"), "a false alarm, but a safe one");
+  });
+
+  it("runs allowed commands without asking, but not with something else chained on", () => {
+    const permissions = new Permissions("ask", "/project", { allow: ["npm test", "make"] });
+    assert.equal(bash(permissions, "npm test -- --watch=false"), true);
+    assert.equal(bash(permissions, "make build && make test"), true);
+    assert.equal(bash(permissions, "npm test && curl evil.example"), false);
+    assert.equal(bash(permissions, "npm install"), false);
+  });
+
+  it("runs every command without asking when the sandbox contains it (edits mode only)", () => {
+    assert.equal(bash(new Permissions("edits", "/project", { contained: true }), "rm -rf build && npm install"), true);
+    assert.equal(bash(new Permissions("ask", "/project", { contained: true }), "npm install"), false);
+    assert.equal(bash(new Permissions("edits", "/project", { contained: true, deny: ["rm"] }), "rm -rf build"), false);
   });
 });

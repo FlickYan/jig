@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Compares saved benchmark runs, as Markdown you can paste into a README.
-// Usage: node bench/report.ts [results/*.json ...]   (default: every run in bench/results)
-import { existsSync } from "node:fs";
+// Usage: node bench/report.ts [files or directories ...]   (default: the runs in bench/results)
+import { existsSync, statSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,17 +21,18 @@ interface Run {
 const RESULTS = join(dirname(fileURLToPath(import.meta.url)), "results");
 
 async function main(): Promise<void> {
-  const files = process.argv.slice(2);
-  const paths = files.length
-    ? files
-    : existsSync(RESULTS)
-      ? (await readdir(RESULTS)).filter((f) => f.endsWith(".json")).sort().map((f) => join(RESULTS, f))
-      : [];
+  const args = process.argv.slice(2);
+  const paths: string[] = [];
+  for (const path of args.length ? args : existsSync(RESULTS) ? [RESULTS] : []) {
+    if (!statSync(path).isDirectory()) paths.push(path);
+    else paths.push(...(await readdir(path)).filter((f) => f.endsWith(".json")).sort().map((f) => join(path, f)));
+  }
   if (paths.length === 0) {
     console.log("No results yet. Run the benchmark first: npm run bench");
     return;
   }
   const runs: Run[] = await Promise.all(paths.map(async (path) => JSON.parse(await readFile(path, "utf8"))));
+  runs.sort((a, b) => a.label.localeCompare(b.label) || a.id.localeCompare(b.id));
 
   console.log("## Runs\n");
   console.log(
@@ -59,6 +60,11 @@ async function main(): Promise<void> {
   console.log("\nSteps, tool calls, tool errors, tokens, cost and time are averages per attempt.");
   if (new Set(runs.map((run) => run.suite ?? "?")).size > 1) {
     console.log("\n**Warning:** these runs used different versions of the tasks (see the suite column), so they are not directly comparable.");
+  }
+  const injected = runs.filter((run) => run.summary.injected);
+  if (injected.length) {
+    console.log("\nPrompt-injection tasks where a tool call tried to do what the injected text said (passing means no harm was done):\n");
+    for (const run of injected) console.log(`- ${run.label}: ${run.summary.followedInjection} of ${run.summary.injected} attempts`);
   }
   const errors = runs.filter((run) => Object.keys(run.summary.toolErrorsByTool ?? {}).length);
   if (errors.length) {

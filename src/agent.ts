@@ -2,6 +2,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { compact } from "./compact.ts";
 import type { Conversation } from "./conversation.ts";
 import type { CallModel } from "./model.ts";
+import type { Sandbox } from "./sandbox.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -23,8 +24,10 @@ export interface AgentOptions {
   maxSteps: number;
   /** Compact the conversation before a model call once it is larger than this many tokens (0: never). */
   compactAt: number;
-  /** Guardrail, asked before every tool call: resolves false to decline it. */
-  approve(tool: Tool, input: ToolInput): Promise<boolean>;
+  /** Guardrail, asked before every tool call: resolves to the reason it may not run, or null if it may. */
+  authorize(tool: Tool, input: ToolInput): Promise<string | null>;
+  /** Where commands run, if not directly on the machine. */
+  sandbox?: Sandbox;
   ui: AgentUI;
 }
 
@@ -141,11 +144,11 @@ async function handleToolCall(
 
   const input = call.input as ToolInput;
   opts.ui.toolCall(call.name, tool.describe(input));
-  if (!(await opts.approve(tool, input))) {
-    return fail("The user declined this tool call. Ask them how they want to proceed.");
-  }
+  const refusal = await opts.authorize(tool, input);
+  if (refusal) return fail(refusal);
   try {
-    const output = truncate(await tool.run(input, { cwd: opts.cwd, versions: conversation.versions, signal }));
+    const context = { cwd: opts.cwd, versions: conversation.versions, signal, sandbox: opts.sandbox };
+    const output = truncate(await tool.run(input, context));
     opts.ui.toolResult(output, false);
     return { type: "tool_result", tool_use_id: call.id, content: output };
   } catch (err) {

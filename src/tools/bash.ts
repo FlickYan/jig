@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import type { Sandbox } from "../sandbox.ts";
 import type { Tool } from "./index.ts";
 import { parseCommand } from "./shell.ts";
 import { type FileVersions, isInside } from "./util.ts";
@@ -32,10 +33,10 @@ export const bashTool: Tool = {
   kind: "run",
   describe: ({ command }) => String(command),
 
-  async run(input, { cwd, signal, versions }) {
+  async run(input, { cwd, signal, versions, sandbox }) {
     const { command, timeout = DEFAULT_TIMEOUT } = input as { command: string; timeout?: number };
     const seconds = Math.min(Math.max(timeout, 1), MAX_TIMEOUT);
-    const output = await runCommand(command, cwd, seconds, signal);
+    const output = await runCommand(command, cwd, seconds, signal, sandbox);
     await recordViewedFiles(command, cwd, versions);
     return output;
   },
@@ -60,11 +61,12 @@ async function recordViewedFiles(command: string, cwd: string, versions: FileVer
   }
 }
 
-export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal): Promise<string> {
+export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal, sandbox?: Sandbox): Promise<string> {
   return new Promise((resolve, reject) => {
+    const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
-    const child = spawn("bash", ["-c", command], { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let killedBecause = "";
     const kill = (reason: string) => {
