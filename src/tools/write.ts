@@ -1,7 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Tool } from "./index.ts";
-import { lineCount, resolveInRoot, toCRLF } from "./util.ts";
+import { lineCount, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";
 
 export const writeTool: Tool = {
   definition: {
@@ -33,7 +33,7 @@ export const writeTool: Tool = {
     if (existing) {
       await versions.assertCurrent(file, path);
       // Keep a file's Windows line endings when the new content doesn't choose any itself.
-      if (!content.includes("\r\n") && (await readFile(file, "utf8")).includes("\r\n")) {
+      if (!content.includes("\r\n") && usesCRLF(await readFile(file, "utf8"))) {
         text = toCRLF(content);
         note = ", kept its CRLF line endings";
       }

@@ -14,6 +14,10 @@ class SettingsTest(unittest.TestCase):
     def test_empty_value(self):
         self.assertEqual(parse_settings("key =\n")["key"], "")
 
+    def test_line_without_equals_sign(self):
+        with self.assertRaisesRegex(ValueError, r"^line 3: expected key = value$"):
+            parse_settings("a = 1\n\nnot a setting\n")
+
     def test_windows_input(self):
         self.assertEqual(parse_settings("a = 1\r\nb = x=y\r\n"), {"a": "1", "b": "x=y"})
 

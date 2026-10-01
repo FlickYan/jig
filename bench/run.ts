@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Runs an agent on the benchmark tasks and records how it did. See the Benchmark section of the README.
 import { execFileSync, spawn } from "node:child_process";
-import { createWriteStream, existsSync, type WriteStream } from "node:fs";
+import { createHash } from "node:crypto";
+import { createWriteStream, existsSync, readFileSync, type WriteStream } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -25,6 +26,7 @@ Options:
   --concurrency <n>   attempts running at the same time (default: 3)
   --max-steps <n>     jig's step limit per task (default: 40)
   --timeout <s>       seconds before an attempt is stopped (default: 900)
+  --jig-args "<args>" extra arguments for jig, e.g. "--compact-at 30000" (the version must support them)
   --keep              keep each attempt's project directory for inspection`;
 
 interface Task {
@@ -40,6 +42,7 @@ interface Task {
 interface RunContext {
   agent: string;
   jigDir?: string;
+  jigArgs: string[];
   model: string;
   logDir: string;
   keep: boolean;
@@ -75,6 +78,7 @@ async function main(): Promise<void> {
       concurrency: { type: "string", default: "3" },
       "max-steps": { type: "string", default: "40" },
       timeout: { type: "string", default: "900" },
+      "jig-args": { type: "string", default: "" },
       keep: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -86,13 +90,17 @@ async function main(): Promise<void> {
   const agent = values.agent;
   if (!["jig", "oracle", "noop"].includes(agent)) throw new Error("--agent must be jig, oracle or noop");
 
+  if (agent === "jig" && values.model.startsWith("deepseek") && !process.env.DEEPSEEK_API_KEY) {
+    throw new Error("DEEPSEEK_API_KEY is not set, so every attempt would fail. Export it and run again.");
+  }
   const tasks = await loadTasks(values.tasks?.split(","));
   const jig = agent === "jig" ? await prepareJig(values.ref) : undefined;
   const label = values.label ?? values.ref ?? (agent === "jig" ? "working-tree" : agent);
   const runId = `${new Date().toLocaleString("sv-SE").replace(" ", "T").replace(/:/g, "-")}_${label}`; // local time
   const logDir = join(BENCH, "logs", runId);
   await mkdir(logDir, { recursive: true });
-  const settings = { attempts: Number(values.attempts), maxSteps: Number(values["max-steps"]), timeout: Number(values.timeout) };
+  const jigArgs = values["jig-args"].split(/\s+/).filter(Boolean);
+  const settings = { attempts: Number(values.attempts), maxSteps: Number(values["max-steps"]), timeout: Number(values.timeout), jigArgs };
   const run: RunContext = { agent, jigDir: jig?.dir, model: values.model, logDir, keep: values.keep, ...settings };
 
   const who = jig ? `jig ${jig.version} with ${values.model}` : `the ${agent} agent`;
@@ -118,9 +126,15 @@ async function main(): Promise<void> {
     }
     return;
   }
+  if (attempts.every((a) => a.steps === null)) {
+    console.log("No attempt got as far as a reply from the model (see the logs), so the results were not saved.");
+    process.exitCode = 1;
+    return;
+  }
   const file = join(BENCH, "results", `${runId}.json`);
   await mkdir(dirname(file), { recursive: true });
-  const record = { id: runId, label, version: jig!.version, model: values.model, date: new Date().toISOString(), settings, summary, attempts };
+  const suite = suiteFingerprint(tasks);
+  const record = { id: runId, label, version: jig!.version, model: values.model, suite, date: new Date().toISOString(), settings, summary, attempts };
   await writeFile(file, `${JSON.stringify(record, null, 2)}\n`);
   console.log(`Saved ${file}\nCompare runs with: npm run bench:report`);
 }
@@ -131,6 +145,17 @@ async function loadTasks(only?: string[]): Promise<Task[]> {
   if (unknown.length) throw new Error(`Unknown tasks: ${unknown.join(", ")}. The tasks are: ${ids.join(", ")}`);
   const selected = ids.filter((id) => !only || only.includes(id));
   return Promise.all(selected.map(async (id) => ({ id, ...JSON.parse(await readFile(join(BENCH, "tasks", id, "task.json"), "utf8")) })));
+}
+
+/**
+ * A short hash of everything in the selected tasks. Runs are only comparable on the same suite: the report
+ * shows it, so a run made before a task changed isn't mistaken for a result on the current tasks.
+ */
+function suiteFingerprint(tasks: Task[]): string {
+  const hash = createHash("sha256");
+  const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "--", ...tasks.map((t) => join("bench/tasks", t.id))], { cwd: ROOT, encoding: "utf8" });
+  for (const file of files.split("\n").filter(Boolean).sort()) hash.update(file).update(readFileSync(join(ROOT, file)));
+  return hash.digest("hex").slice(0, 8);
 }
 
 /** The directory of the jig version to run: the working tree, or a git ref exported to a temp directory. */
@@ -153,7 +178,8 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
   const taskDir = join(BENCH, "tasks", task.id);
   const work = await mkdtemp(join(tmpdir(), `jig-bench-${task.id}-`));
   const log = createWriteStream(join(run.logDir, `${task.id}-${attempt}.log`));
-  const opts = { cwd: work, env: { ...ENV, TASK_DIR: taskDir }, log };
+  // jig saves a session for every attempt: keep them with this run's logs instead of in ~/.jig.
+  const opts = { cwd: work, env: { ...ENV, TASK_DIR: taskDir, JIG_HOME: join(run.logDir, "jig-home") }, log };
   try {
     await cp(join(taskDir, "repo"), work, { recursive: true });
     await exec("bash", ["-c", "git init -q -b main && git add -A && git commit -qm 'Starting point'"], { ...opts, timeout: 60 });
@@ -166,7 +192,7 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
     let timedOut = false;
     if (run.agent === "jig") {
       const cli = join(run.jigDir!, "src/cli.ts");
-      const args = [cli, "-C", work, "--yes", "--max-steps", String(run.maxSteps), "--model", run.model, task.instruction];
+      const args = [cli, "-C", work, "--yes", "--max-steps", String(run.maxSteps), "--model", run.model, ...run.jigArgs, task.instruction];
       ({ output: transcript, timedOut } = await exec("node", args, { ...opts, timeout: run.timeout }));
     } else if (run.agent === "oracle") {
       await exec("bash", [join(taskDir, "solve.sh")], { ...opts, timeout: 120 });

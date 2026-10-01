@@ -12,6 +12,7 @@ interface Run {
   label: string;
   version: string;
   model: string;
+  suite?: string;
   settings: { attempts: number };
   summary: Summary;
   attempts: Attempt[];
@@ -36,11 +37,12 @@ async function main(): Promise<void> {
   console.log(
     formatTable(
       [
-        ["run", "jig version", "model", "passed", "steps", "tool calls", "tool errors", "tokens in", "tokens out", "cost", "time"],
-        ...runs.map(({ label, version, model, summary: s }) => [
+        ["run", "jig version", "model", "suite", "passed", "steps", "tool calls", "tool errors", "tokens in", "tokens out", "cost", "time"],
+        ...runs.map(({ label, version, model, suite, summary: s }) => [
           label,
           version,
           model,
+          suite ?? "?",
           `${percent(s.passRate)}${s.passRateSpread ? ` ±${percent(s.passRateSpread)}` : ""} (${s.passed}/${s.attempts})`,
           num(s.steps),
           num(s.toolCalls),
@@ -54,7 +56,19 @@ async function main(): Promise<void> {
       true,
     ),
   );
-  console.log("\nSteps, tool calls, tool errors, tokens, cost and time are averages per attempt.\n");
+  console.log("\nSteps, tool calls, tool errors, tokens, cost and time are averages per attempt.");
+  if (new Set(runs.map((run) => run.suite ?? "?")).size > 1) {
+    console.log("\n**Warning:** these runs used different versions of the tasks (see the suite column), so they are not directly comparable.");
+  }
+  const errors = runs.filter((run) => Object.keys(run.summary.toolErrorsByTool ?? {}).length);
+  if (errors.length) {
+    console.log("\nFailed tool calls, in total:\n");
+    for (const run of errors) {
+      const parts = Object.entries(run.summary.toolErrorsByTool ?? {}).map(([tool, n]) => `${tool} ${n}`);
+      console.log(`- ${run.label}: ${parts.join(", ")}`);
+    }
+  }
+  console.log();
 
   console.log("## Tasks solved\n");
   const tasks = [...new Set(runs.flatMap((run) => run.attempts.map((a) => a.task)))].sort();

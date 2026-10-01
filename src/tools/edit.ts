@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
-import { assertFile, lineCount, numbered, resolveInRoot, toCRLF } from "./util.ts";
+import { assertFile, lineCount, numbered, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";
 
 export const editTool: Tool = {
   definition: {
@@ -39,9 +39,11 @@ export const editTool: Tool = {
     await versions.assertCurrent(file, path);
     const text = await readFile(file, "utf8");
 
-    // The model writes \n line endings. In a file that uses \r\n, match and replace in the file's style.
-    let [search, replacement] = [oldText, newText];
-    if (!text.includes(search) && text.includes("\r\n")) [search, replacement] = [toCRLF(oldText), toCRLF(newText)];
+    // The model writes \n line endings. In a file that uses \r\n, match in either style, and always write
+    // new lines the file's way (a one-line old_string matches as-is, but its replacement can add lines).
+    const crlf = usesCRLF(text);
+    const search = crlf && !text.includes(oldText) ? toCRLF(oldText) : oldText;
+    const replacement = crlf ? toCRLF(newText) : newText;
 
     const count = countOccurrences(text, search);
     if (count === 0) throw new Error(explainMissing(path, text, oldText));

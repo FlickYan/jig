@@ -1,9 +1,9 @@
 import type Anthropic from "@anthropic-ai/sdk";
+import { compact } from "./compact.ts";
+import type { Conversation } from "./conversation.ts";
 import type { CallModel } from "./model.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
-import type { FileVersions } from "./tools/util.ts";
 
-type MessageParam = Anthropic.Beta.BetaMessageParam;
 type Message = Anthropic.Beta.BetaMessage;
 type ToolUse = Anthropic.Beta.BetaToolUseBlock;
 type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
@@ -12,6 +12,7 @@ type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 export interface AgentUI {
   toolCall(name: string, description: string): void;
   toolResult(output: string, isError: boolean): void;
+  notice(text: string): void;
 }
 
 export interface AgentOptions {
@@ -20,8 +21,8 @@ export interface AgentOptions {
   cwd: string;
   /** Hard stop: the most model calls one task may take. */
   maxSteps: number;
-  /** What the model has read in this conversation (see FileVersions). */
-  versions: FileVersions;
+  /** Compact the conversation before a model call once it is larger than this many tokens (0: never). */
+  compactAt: number;
   /** Guardrail, asked before every tool call: resolves false to decline it. */
   approve(tool: Tool, input: ToolInput): Promise<boolean>;
   ui: AgentUI;
@@ -47,11 +48,11 @@ export interface RunResult {
  * The agent loop: call the model, run the tools it asks for, send back the results, and repeat until
  * it replies without asking for a tool.
  *
- * `messages` is the conversation so far, ending with the user's new message. The loop only ever appends
- * to it. Rewriting earlier messages would throw away the prompt cache and invalidate the model's
- * earlier thinking blocks.
+ * The conversation ends with the user's new message. The loop only ever appends to it, apart from
+ * compaction, which replaces it whole: rewriting earlier messages would throw away the prompt cache and
+ * invalidate the model's earlier thinking blocks.
  */
-export async function runAgent(messages: MessageParam[], opts: AgentOptions, signal?: AbortSignal): Promise<RunResult> {
+export async function runAgent(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal): Promise<RunResult> {
   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
   const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage });
 
@@ -59,7 +60,10 @@ export async function runAgent(messages: MessageParam[], opts: AgentOptions, sig
     let reply: Message;
     let malformed: Map<string, string>;
     try {
-      ({ message: reply, malformed } = await opts.callModel(messages, signal));
+      if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
+        addUsage(usage, await compactConversation(conversation, opts, signal));
+      }
+      ({ message: reply, malformed } = await opts.callModel(conversation.messages, signal));
     } catch (err) {
       if (signal?.aborted) return result("interrupted", step - 1);
       throw err;
@@ -70,7 +74,8 @@ export async function runAgent(messages: MessageParam[], opts: AgentOptions, sig
     // decline is not a real answer, so it stays out of the history.
     if (reply.stop_reason === "refusal") return result("refusal", step);
 
-    messages.push({ role: "assistant", content: reply.content });
+    conversation.push({ role: "assistant", content: reply.content });
+    conversation.tokens = contextSize(reply.usage); // measured: the whole request plus this reply
     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
     // A reply with no tool calls is the final answer.
     if (calls.length === 0) return result(reply.stop_reason ?? "end_turn", step, replyText(reply));
@@ -79,18 +84,33 @@ export async function runAgent(messages: MessageParam[], opts: AgentOptions, sig
     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete
     const results: ToolResult[] = [];
     for (const call of calls) {
-      results.push(await handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, opts, signal));
+      results.push(await handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, conversation, opts, signal));
     }
-    messages.push({ role: "user", content: results }); // all results for one reply go in one message
+    conversation.push({ role: "user", content: results }); // all results for one reply go in one message
 
     if (signal?.aborted) return result("interrupted", step);
   }
   return result("max_steps", opts.maxSteps);
 }
 
+/**
+ * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
+ * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.
+ */
+async function compactConversation(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal) {
+  const last = conversation.messages.at(-1);
+  const isRequest = last?.role === "user" && typeof last.content === "string";
+  opts.ui.notice(`Compacting the conversation (${formatTokens(conversation.tokens)} tokens)…`);
+  const compacted = await compact(conversation, opts.callModel, { signal, keep: isRequest ? [last] : [], continueTask: !isRequest });
+  if (!compacted) return { input_tokens: 0, output_tokens: 0 } as Anthropic.Beta.BetaUsage;
+  opts.ui.notice(`Compacted ${formatTokens(compacted.before)} tokens into about ${formatTokens(compacted.after)}.`);
+  return compacted.usage;
+}
+
 async function handleToolCall(
   call: ToolUse,
   state: { cutOff: boolean; malformed?: string },
+  conversation: Conversation,
   opts: AgentOptions,
   signal?: AbortSignal,
 ): Promise<ToolResult> {
@@ -125,7 +145,7 @@ async function handleToolCall(
     return fail("The user declined this tool call. Ask them how they want to proceed.");
   }
   try {
-    const output = truncate(await tool.run(input, { cwd: opts.cwd, versions: opts.versions, signal }));
+    const output = truncate(await tool.run(input, { cwd: opts.cwd, versions: conversation.versions, signal }));
     opts.ui.toolResult(output, false);
     return { type: "tool_result", tool_use_id: call.id, content: output };
   } catch (err) {
@@ -142,4 +162,13 @@ function addUsage(total: Usage, usage: Anthropic.Beta.BetaUsage): void {
   total.cacheWrite += usage.cache_creation_input_tokens ?? 0;
   total.cacheRead += usage.cache_read_input_tokens ?? 0;
   total.output += usage.output_tokens;
+}
+
+/** Tokens in a request (cached or not) plus its reply: the size of the conversation after that step. */
+export function contextSize(usage: Anthropic.Beta.BetaUsage): number {
+  return usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + usage.output_tokens;
+}
+
+export function formatTokens(n: number): string {
+  return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }

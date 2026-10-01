@@ -1,0 +1,9 @@
+{
+  "instruction": "Users say that after they change their email address (ProfileService.change_email), their profile keeps showing the old one until the server restarts. Support sees the same thing after running the domain migration tool (admin.change_domain). Please fix both. Keep profiles cached, though: the user store is slow, so a profile that hasn't changed must not be read from the store again.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug fix",
+    "hard: cause is far from the symptom"
+  ]
+}

@@ -1,0 +1,702 @@
+{
+  "id": "2026-10-01T17-56-33_m2",
+  "label": "m2",
+  "version": "m2 (7a3437c)",
+  "model": "deepseek-flash",
+  "date": "2026-10-01T09:58:44.416Z",
+  "settings": {
+    "attempts": 3,
+    "maxSteps": 40,
+    "timeout": 900
+  },
+  "summary": {
+    "passRate": 0.9722222222222222,
+    "passRateSpread": 0.039283710065919325,
+    "passed": 35,
+    "attempts": 36,
+    "timeouts": 0,
+    "steps": 6.972222222222222,
+    "toolCalls": 8.63888888888889,
+    "toolErrors": 0.19444444444444445,
+    "tokensIn": 25605.555555555555,
+    "tokensOut": 1829.0555555555557,
+    "cost": 0.003536111111111112,
+    "seconds": 10.372222222222224
+  },
+  "attempts": [
+    {
+      "task": "config-migration",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 17.6,
+      "steps": 6,
+      "tokensIn": 26200,
+      "cacheRead": 22500,
+      "tokensOut": 4200,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 4,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00629
+    },
+    {
+      "task": "config-migration",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 18.4,
+      "steps": 5,
+      "tokensIn": 19600,
+      "cacheRead": 16400,
+      "tokensOut": 4200,
+      "toolCalls": {
+        "bash": 3,
+        "read_file": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.0061
+    },
+    {
+      "task": "config-migration",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 22.5,
+      "steps": 7,
+      "tokensIn": 36400,
+      "cacheRead": 31900,
+      "tokensOut": 5300,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 2,
+        "grep": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.0079
+    },
+    {
+      "task": "failing-tests",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 7.8,
+      "steps": 7,
+      "tokensIn": 21000,
+      "cacheRead": 17300,
+      "tokensOut": 1300,
+      "toolCalls": {
+        "bash": 4,
+        "glob": 1,
+        "read_file": 2,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00277
+    },
+    {
+      "task": "failing-tests",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 7.2,
+      "steps": 7,
+      "tokensIn": 20100,
+      "cacheRead": 16600,
+      "tokensOut": 1000,
+      "toolCalls": {
+        "bash": 4,
+        "glob": 1,
+        "read_file": 2,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00235
+    },
+    {
+      "task": "failing-tests",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8.3,
+      "steps": 7,
+      "tokensIn": 20200,
+      "cacheRead": 16800,
+      "tokensOut": 1200,
+      "toolCalls": {
+        "bash": 4,
+        "glob": 1,
+        "read_file": 2,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00256
+    },
+    {
+      "task": "git-merge",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 7.3,
+      "steps": 8,
+      "tokensIn": 19500,
+      "cacheRead": 16300,
+      "tokensOut": 663,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00185
+    },
+    {
+      "task": "git-merge",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8.8,
+      "steps": 8,
+      "tokensIn": 22700,
+      "cacheRead": 19200,
+      "tokensOut": 1000,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00237
+    },
+    {
+      "task": "git-merge",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 6.9,
+      "steps": 8,
+      "tokensIn": 20400,
+      "cacheRead": 17200,
+      "tokensOut": 667,
+      "toolCalls": {
+        "bash": 6,
+        "read_file": 2,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00186
+    },
+    {
+      "task": "inventory",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 5.2,
+      "steps": 6,
+      "tokensIn": 14900,
+      "cacheRead": 11900,
+      "tokensOut": 601,
+      "toolCalls": {
+        "grep": 1,
+        "bash": 4,
+        "read_file": 2,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00169
+    },
+    {
+      "task": "inventory",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8.2,
+      "steps": 8,
+      "tokensIn": 22000,
+      "cacheRead": 18600,
+      "tokensOut": 1200,
+      "toolCalls": {
+        "grep": 2,
+        "read_file": 4,
+        "glob": 2,
+        "edit_file": 1,
+        "bash": 2,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00257
+    },
+    {
+      "task": "inventory",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8.7,
+      "steps": 8,
+      "tokensIn": 24700,
+      "cacheRead": 21000,
+      "tokensOut": 1100,
+      "toolCalls": {
+        "grep": 2,
+        "read_file": 3,
+        "glob": 1,
+        "edit_file": 1,
+        "bash": 3
+      },
+      "toolErrors": 0,
+      "cost": 0.00256
+    },
+    {
+      "task": "log-report",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 11,
+      "steps": 7,
+      "tokensIn": 25500,
+      "cacheRead": 21800,
+      "tokensOut": 2100,
+      "toolCalls": {
+        "bash": 9
+      },
+      "toolErrors": 0,
+      "cost": 0.00376
+    },
+    {
+      "task": "log-report",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 15.1,
+      "steps": 8,
+      "tokensIn": 33600,
+      "cacheRead": 28900,
+      "tokensOut": 2800,
+      "toolCalls": {
+        "bash": 7,
+        "glob": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00494
+    },
+    {
+      "task": "log-report",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 13.6,
+      "steps": 9,
+      "tokensIn": 42300,
+      "cacheRead": 36900,
+      "tokensOut": 2600,
+      "toolCalls": {
+        "bash": 7,
+        "write_file": 1
+      },
+      "toolErrors": 1,
+      "cost": 0.00496
+    },
+    {
+      "task": "long-file",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 6.6,
+      "steps": 6,
+      "tokensIn": 56400,
+      "cacheRead": 44900,
+      "tokensOut": 671,
+      "toolCalls": {
+        "read_file": 2,
+        "grep": 1,
+        "edit_file": 1,
+        "bash": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00452
+    },
+    {
+      "task": "long-file",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 7,
+      "steps": 6,
+      "tokensIn": 56600,
+      "cacheRead": 45100,
+      "tokensOut": 613,
+      "toolCalls": {
+        "read_file": 2,
+        "grep": 1,
+        "edit_file": 1,
+        "bash": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00446
+    },
+    {
+      "task": "long-file",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 9.7,
+      "steps": 8,
+      "tokensIn": 80000,
+      "cacheRead": 68100,
+      "tokensOut": 1100,
+      "toolCalls": {
+        "read_file": 2,
+        "grep": 2,
+        "glob": 1,
+        "edit_file": 1,
+        "bash": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.0053
+    },
+    {
+      "task": "lru-cache",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 14.2,
+      "steps": 7,
+      "tokensIn": 21400,
+      "cacheRead": 18700,
+      "tokensOut": 2900,
+      "toolCalls": {
+        "read_file": 1,
+        "bash": 3,
+        "glob": 1,
+        "write_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.0044
+    },
+    {
+      "task": "lru-cache",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 12.7,
+      "steps": 6,
+      "tokensIn": 16800,
+      "cacheRead": 14200,
+      "tokensOut": 2700,
+      "toolCalls": {
+        "read_file": 1,
+        "bash": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00411
+    },
+    {
+      "task": "lru-cache",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 10.3,
+      "steps": 7,
+      "tokensIn": 20200,
+      "cacheRead": 17200,
+      "tokensOut": 2000,
+      "toolCalls": {
+        "bash": 3,
+        "write_file": 2,
+        "read_file": 1
+      },
+      "toolErrors": 1,
+      "cost": 0.0034
+    },
+    {
+      "task": "map-limit",
+      "attempt": 1,
+      "passed": false,
+      "timedOut": false,
+      "seconds": 17.7,
+      "steps": 6,
+      "tokensIn": 21600,
+      "cacheRead": 18800,
+      "tokensOut": 3700,
+      "toolCalls": {
+        "read_file": 2,
+        "bash": 4,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00539
+    },
+    {
+      "task": "map-limit",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 7.5,
+      "steps": 6,
+      "tokensIn": 14200,
+      "cacheRead": 11600,
+      "tokensOut": 1100,
+      "toolCalls": {
+        "read_file": 2,
+        "glob": 1,
+        "edit_file": 1,
+        "bash": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00217
+    },
+    {
+      "task": "map-limit",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 11,
+      "steps": 6,
+      "tokensIn": 16700,
+      "cacheRead": 13800,
+      "tokensOut": 2100,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 3,
+        "glob": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.00347
+    },
+    {
+      "task": "pagination",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8.3,
+      "steps": 7,
+      "tokensIn": 18800,
+      "cacheRead": 16000,
+      "tokensOut": 1400,
+      "toolCalls": {
+        "bash": 3,
+        "glob": 1,
+        "edit_file": 4,
+        "read_file": 1
+      },
+      "toolErrors": 2,
+      "cost": 0.00262
+    },
+    {
+      "task": "pagination",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8,
+      "steps": 5,
+      "tokensIn": 11700,
+      "cacheRead": 9200,
+      "tokensOut": 1200,
+      "toolCalls": {
+        "glob": 1,
+        "bash": 2,
+        "read_file": 2,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00225
+    },
+    {
+      "task": "pagination",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 6.6,
+      "steps": 5,
+      "tokensIn": 12300,
+      "cacheRead": 9700,
+      "tokensOut": 1200,
+      "toolCalls": {
+        "bash": 2,
+        "read_file": 2,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00228
+    },
+    {
+      "task": "rename-function",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 9.8,
+      "steps": 6,
+      "tokensIn": 19900,
+      "cacheRead": 16800,
+      "tokensOut": 2200,
+      "toolCalls": {
+        "grep": 1,
+        "glob": 1,
+        "read_file": 6,
+        "write_file": 1,
+        "edit_file": 6,
+        "bash": 3
+      },
+      "toolErrors": 0,
+      "cost": 0.00367
+    },
+    {
+      "task": "rename-function",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 13.6,
+      "steps": 9,
+      "tokensIn": 34000,
+      "cacheRead": 30500,
+      "tokensOut": 2800,
+      "toolCalls": {
+        "grep": 2,
+        "glob": 1,
+        "read_file": 6,
+        "write_file": 2,
+        "edit_file": 5,
+        "bash": 3
+      },
+      "toolErrors": 0,
+      "cost": 0.00459
+    },
+    {
+      "task": "rename-function",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 11.5,
+      "steps": 8,
+      "tokensIn": 28900,
+      "cacheRead": 24700,
+      "tokensOut": 2200,
+      "toolCalls": {
+        "grep": 2,
+        "bash": 4,
+        "read_file": 6,
+        "glob": 1,
+        "write_file": 1,
+        "edit_file": 6
+      },
+      "toolErrors": 0,
+      "cost": 0.00405
+    },
+    {
+      "task": "settings-crlf",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 5.8,
+      "steps": 6,
+      "tokensIn": 12100,
+      "cacheRead": 9600,
+      "tokensOut": 740,
+      "toolCalls": {
+        "glob": 1,
+        "read_file": 1,
+        "bash": 3
+      },
+      "toolErrors": 0,
+      "cost": 0.0017
+    },
+    {
+      "task": "settings-crlf",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 6.3,
+      "steps": 6,
+      "tokensIn": 16300,
+      "cacheRead": 12900,
+      "tokensOut": 922,
+      "toolCalls": {
+        "glob": 1,
+        "bash": 5,
+        "read_file": 1
+      },
+      "toolErrors": 0,
+      "cost": 0.0022
+    },
+    {
+      "task": "settings-crlf",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 5.7,
+      "steps": 6,
+      "tokensIn": 12100,
+      "cacheRead": 9600,
+      "tokensOut": 669,
+      "toolCalls": {
+        "glob": 1,
+        "read_file": 1,
+        "bash": 3
+      },
+      "toolErrors": 0,
+      "cost": 0.00161
+    },
+    {
+      "task": "wordfreq",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 12.7,
+      "steps": 10,
+      "tokensIn": 33600,
+      "cacheRead": 29400,
+      "tokensOut": 1900,
+      "toolCalls": {
+        "bash": 5,
+        "edit_file": 6,
+        "read_file": 2
+      },
+      "toolErrors": 2,
+      "cost": 0.00372
+    },
+    {
+      "task": "wordfreq",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 8,
+      "steps": 7,
+      "tokensIn": 18900,
+      "cacheRead": 15900,
+      "tokensOut": 1400,
+      "toolCalls": {
+        "bash": 3,
+        "edit_file": 2,
+        "read_file": 1
+      },
+      "toolErrors": 1,
+      "cost": 0.00268
+    },
+    {
+      "task": "wordfreq",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 13.8,
+      "steps": 9,
+      "tokensIn": 30200,
+      "cacheRead": 26400,
+      "tokensOut": 2400,
+      "toolCalls": {
+        "bash": 5,
+        "glob": 1,
+        "read_file": 3,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "cost": 0.00418
+    }
+  ]
+}

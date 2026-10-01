@@ -121,6 +121,15 @@ describe("edit_file", () => {
     await givenFile("win.py", "def f():\r\n    return 1\r\n");
     await edit("def f():\n    return 1", "def f():\n    return 2", "win.py");
     assert.equal(await readFile(join(cwd, "win.py"), "utf8"), "def f():\r\n    return 2\r\n");
+    // A one-line old_string matches as it is, but the lines its replacement adds must be CRLF too.
+    await edit("    return 2", "    x = 2\n    return x", "win.py");
+    assert.equal(await readFile(join(cwd, "win.py"), "utf8"), "def f():\r\n    x = 2\r\n    return x\r\n");
+  });
+
+  it("counts a file printed with cat as read", async () => {
+    await writeFile(join(cwd, "code.js"), "x = 1\n");
+    await bashTool.run({ command: "ls && cat -n code.js" }, ctx);
+    assert.match(await edit("x = 1", "x = 2"), /Edited code\.js/);
   });
 
   it("points at the nearest match when old_string is not found", async () => {

@@ -1,12 +1,42 @@
 import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
+import { dirname, join, relative } from "node:path";
+
+const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
+
+export interface Instructions {
+  path: string;
+  text: string;
+}
 
 /**
- * The system prompt. It is built once per session and never changes after that, so together with the
- * tool definitions it forms a stable prefix the API can cache.
+ * The project's instructions for agents: AGENTS.md (or CLAUDE.md where there is none) in each directory
+ * from the repository root down to the working directory, outermost first so the more specific come last.
  */
-export function systemPrompt(cwd: string): string {
-  return `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
+export function loadInstructions(cwd: string): Instructions[] {
+  const here = realpathSync(cwd);
+  const root = gitRoot(here) ?? here;
+  const dirs: string[] = [];
+  for (let dir = here; ; dir = dirname(dir)) {
+    dirs.unshift(dir);
+    if (dir === root || dir === dirname(dir)) break;
+  }
+  return dirs.flatMap((dir) => {
+    const path = ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).find((file) => existsSync(file));
+    if (!path) return [];
+    let text = readFileSync(path, "utf8").trim();
+    if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
+    return text ? [{ path: relative(here, path), text }] : [];
+  });
+}
+
+/**
+ * The system prompt. It is built once per conversation and never changes during it, so together with
+ * the tool definitions it forms a stable prefix the API can cache. Project instructions go at the end.
+ */
+export function systemPrompt(cwd: string, instructions: Instructions[] = []): string {
+  const base = `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
 
 How to work:
 - Look before you act: find the relevant code (grep, glob), read it, and run commands to understand the problem. Don't guess about code you haven't opened.
@@ -19,15 +49,17 @@ How to work:
 Environment:
 - Working directory: ${cwd}
 - Platform: ${os.type()} ${os.release()} (${os.arch()})
-- Git repository: ${isGitRepo(cwd) ? "yes" : "no"}
+- Git repository: ${gitRoot(cwd) ? "yes" : "no"}
 - Today's date: ${new Date().toLocaleDateString("en-CA")}`;
+  if (instructions.length === 0) return base;
+  const files = instructions.map(({ path, text }) => `<instructions file="${path}">\n${text}\n</instructions>`);
+  return `${base}\n\nThe project gives you these instructions. Follow them; where they conflict with the guidance above, they win.\n\n${files.join("\n\n")}`;
 }
 
-function isGitRepo(cwd: string): boolean {
+function gitRoot(cwd: string): string | null {
   try {
-    execFileSync("git", ["rev-parse", "--is-inside-work-tree"], { cwd, stdio: "ignore" });
-    return true;
+    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   } catch {
-    return false;
+    return null;
   }
 }

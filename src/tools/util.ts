@@ -62,6 +62,12 @@ export function toCRLF(text: string): string {
   return text.replace(/\r?\n/g, "\r\n");
 }
 
+/** Whether most of a file's lines end in \r\n. */
+export function usesCRLF(text: string): boolean {
+  const crlf = text.split("\r\n").length - 1;
+  return crlf > 0 && crlf >= text.split("\n").length - 1 - crlf;
+}
+
 export function countLines(text: string): number {
   if (text === "") return 0;
   return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);

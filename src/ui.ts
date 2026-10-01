@@ -123,6 +123,8 @@ export const terminalUI: AgentUI = {
     shown.forEach((line, i) => println(isError ? red(`  ${i === 0 ? "✗ " : "  "}${clip(line)}`) : dim(`  ${clip(line)}`)));
     if (lines.length > shown.length) println(dim(`  … ${moreLines(lines.length - shown.length)}`));
   },
+
+  notice: (text) => println(yellow(text)),
 };
 
 function clip(line: string): string {

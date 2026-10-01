@@ -1,5 +1,9 @@
 {
-  "instruction": "parse_settings in settings.py crashes when a value contains '=', for example a database URL with query parameters like `url = postgres://db/app?sslmode=require`. Please fix it. The file uses Windows (CRLF) line endings; keep them.",
+  "instruction": "parse_settings in settings.py has two problems. It crashes when a value contains '=', such as a database URL with query parameters (`url = postgres://db/app?sslmode=require`). And a line with no '=' at all fails with a confusing unpacking error: it should raise ValueError(\"line N: expected key = value\"), where N is the 1-based line number. Please fix both. The file uses Windows (CRLF) line endings; keep them.",
   "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
-  "tags": ["python", "bug fix", "CRLF line endings"]
+  "tags": [
+    "python",
+    "bug fix",
+    "CRLF line endings"
+  ]
 }

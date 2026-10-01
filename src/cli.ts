@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 import Anthropic from "@anthropic-ai/sdk";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { runAgent, type AgentOptions, type RunResult } from "./agent.ts";
-import { createModel, EFFORTS, type Effort } from "./model.ts";
+import { formatTokens, runAgent, type AgentOptions, type RunResult } from "./agent.ts";
+import { compact } from "./compact.ts";
+import { Conversation } from "./conversation.ts";
+import { contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { systemPrompt } from "./prompt.ts";
+import { loadInstructions, systemPrompt } from "./prompt.ts";
+import { SessionFile, sessionDir } from "./session.ts";
 import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
-import { FileVersions } from "./tools/util.ts";
 import * as ui from "./ui.ts";
 
 const HELP = `Usage: jig [options] [task]
@@ -15,22 +18,29 @@ const HELP = `Usage: jig [options] [task]
 Runs one task, or starts an interactive session if no task is given.
 
 Options:
-  -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
-  -e, --effort <level>  ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
-      --mode <mode>     when to ask before a tool call (default: edits)
-${MODES.map((mode) => `                          ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
-  -y, --yes             same as --mode auto
-      --hide-thinking   don't print the model's thinking (/thinking toggles it in a session)
-  -C, --cwd <dir>       project directory (default: the current directory)
-      --max-steps <n>   most model calls per task (default: 50)
-  -h, --help            show this help
+  -m, --model <id>        deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
+  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
+      --mode <mode>       when to ask before a tool call (default: edits)
+${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
+  -y, --yes               same as --mode auto
+      --hide-thinking     don't print the model's thinking (/thinking toggles it in a session)
+  -c, --continue          continue this project's most recent session
+      --resume <file>     continue a saved session (--sessions lists them)
+      --sessions          list this project's saved sessions
+      --compact-at <n>    summarize the conversation once it reaches n tokens (default: 200000; 0: never)
+  -C, --cwd <dir>         project directory (default: the current directory)
+      --max-steps <n>     most model calls per task (default: 50)
+  -h, --help              show this help
 
+jig follows the project's AGENTS.md (or CLAUDE.md), and saves every session under ~/.jig/sessions.
 Reading files, and read-only commands (ls, cat, grep, git status, ...) inside the project, never ask.
 Ctrl+C stops the current task (press it again to force quit).`;
 
 const COMMANDS = `  /mode [ask|edits|auto]  show or change when jig asks before a tool call
   /thinking               show or hide the model's thinking
-  /reset                  start a new conversation
+  /context                show how much context the conversation takes up
+  /compact                summarize the conversation to free up context
+  /reset                  start a new conversation (and reload AGENTS.md)
   /exit                   quit (Ctrl+D works too)`;
 
 async function main(): Promise<void> {
@@ -42,6 +52,10 @@ async function main(): Promise<void> {
       mode: { type: "string", default: "edits" },
       yes: { type: "boolean", short: "y", default: false },
       "hide-thinking": { type: "boolean", default: false },
+      continue: { type: "boolean", short: "c", default: false },
+      resume: { type: "string" },
+      sessions: { type: "boolean", default: false },
+      "compact-at": { type: "string", default: "200000" },
       cwd: { type: "string", short: "C", default: "." },
       "max-steps": { type: "string", default: "50" },
       help: { type: "boolean", short: "h", default: false },
@@ -51,17 +65,28 @@ async function main(): Promise<void> {
     console.log(HELP);
     return;
   }
+  const cwd = resolve(values.cwd);
+  if (values.sessions) return listSessions(cwd);
+  const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
   const mode = (values.yes ? "auto" : values.mode) as Mode;
   if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
   if (!Number.isInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer");
+  const compactAt = Number(values["compact-at"]);
+  if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
 
-  const cwd = resolve(values.cwd);
   const permissions = new Permissions(mode, cwd);
-  const messages: Anthropic.Beta.BetaMessageParam[] = []; // the conversation, kept across tasks in a session
+  // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
+  let instructions = loadInstructions(cwd);
+  const newModel = () => createModel({ model, effort, system: systemPrompt(cwd, instructions), tools: TOOLS });
+  const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
+  if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
+  let conversation = resumeFrom
+    ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
+    : new Conversation(SessionFile.create(cwd, model));
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
 
   async function approve(tool: Tool, input: ToolInput): Promise<boolean> {
@@ -82,17 +107,18 @@ async function main(): Promise<void> {
   }
 
   const agent: AgentOptions = {
-    callModel: createModel({ model: values.model, effort, system: systemPrompt(cwd), tools: TOOLS }),
+    callModel: newModel(),
     tools: TOOLS,
     cwd,
     maxSteps,
-    versions: new FileVersions(),
+    // Well before the context window fills: long contexts cost more per step and models use them less well.
+    compactAt: compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8)),
     approve,
     ui: ui.terminalUI,
   };
 
-  async function runTask(text: string): Promise<boolean> {
-    messages.push({ role: "user", content: text });
+  /** Runs `work` as the current task, so Ctrl+C stops it. */
+  async function asTask(work: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
     const controller = (task = new AbortController());
     const onSigint = () => {
       if (controller.signal.aborted) process.exit(130); // second Ctrl+C: give up waiting
@@ -100,28 +126,34 @@ async function main(): Promise<void> {
       controller.abort();
     };
     process.on("SIGINT", onSigint);
-    const started = Date.now();
     try {
-      report(await runAgent(messages, agent, controller.signal), Date.now() - started, maxSteps);
+      await work(controller.signal);
       return true;
     } catch (err) {
-      ui.error(describeError(err));
+      ui.error(controller.signal.aborted ? "Interrupted." : describeError(err));
       return false;
     } finally {
       process.off("SIGINT", onSigint);
     }
   }
 
+  function runTask(text: string): Promise<boolean> {
+    conversation.push({ role: "user", content: text });
+    const started = Date.now();
+    return asTask(async (signal) => report(await runAgent(conversation, agent, signal), Date.now() - started, maxSteps));
+  }
+
   /** Runs a slash command. Returns false to quit. */
-  function command(line: string): boolean {
+  async function command(line: string): Promise<boolean> {
     const [name, arg] = line.split(/\s+/);
     if (name === "/exit") return false;
     if (name === "/help") {
       ui.println(COMMANDS);
     } else if (name === "/reset") {
-      messages.length = 0;
-      agent.versions = new FileVersions();
-      ui.notice("Started a new conversation.");
+      instructions = loadInstructions(cwd);
+      agent.callModel = newModel();
+      conversation = new Conversation(SessionFile.create(cwd, model));
+      ui.notice(`Started a new conversation${instructions.length ? ` (with ${describeInstructions(instructions)})` : ""}.`);
     } else if (name === "/thinking") {
       ui.setThinkingVisible(!ui.thinkingVisible());
       ui.notice(`Thinking is now ${ui.thinkingVisible() ? "shown" : "hidden"}.`);
@@ -130,6 +162,16 @@ async function main(): Promise<void> {
     } else if (name === "/mode") {
       if (arg) permissions.mode = arg as Mode;
       ui.notice(`Mode: ${permissions.mode} (${MODE_HELP[permissions.mode]}).`);
+    } else if (name === "/context") {
+      const limit = agent.compactAt ? `it is compacted at ${formatTokens(agent.compactAt)}` : "automatic compaction is off";
+      ui.notice(`The conversation takes up about ${formatTokens(conversation.tokens)} tokens; ${limit}.`);
+      ui.println(ui.dim(`Saved in ${conversation.sessionPath}`));
+    } else if (name === "/compact") {
+      await asTask(async (signal) => {
+        ui.notice("Compacting the conversation…");
+        const done = await compact(conversation, agent.callModel, { signal });
+        ui.notice(done ? `Compacted ${formatTokens(done.before)} tokens into about ${formatTokens(done.after)}.` : "Nothing to compact yet.");
+      });
     } else {
       ui.notice(`Unknown command ${name}. Type /help to see the commands.`);
     }
@@ -141,7 +183,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${values.model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
+  if (resumeFrom) ui.println(ui.dim(`Continuing ${basename(resumeFrom)} (${conversation.messages.length} messages).`));
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
     ui.println();
@@ -149,11 +193,33 @@ async function main(): Promise<void> {
     if (line === null) break;
     const input = line.trim();
     if (input.startsWith("/")) {
-      if (!command(input)) break;
+      if (!(await command(input))) break;
     } else if (input) {
       await runTask(input);
     }
   }
+}
+
+function describeInstructions(instructions: { path: string }[]): string {
+  return instructions.map((file) => file.path).join(", ");
+}
+
+/** A session given by path, or by file name in the project's session directory. */
+function findSession(cwd: string, name: string): string {
+  for (const path of [resolve(name), join(sessionDir(cwd), name), join(sessionDir(cwd), `${name}.jsonl`)]) {
+    if (existsSync(path)) return path;
+  }
+  throw new Error(`No session "${name}". Run jig --sessions to list this project's sessions.`);
+}
+
+function listSessions(cwd: string): void {
+  const files = SessionFile.list(cwd);
+  if (files.length === 0) return console.log("No saved sessions for this project yet.");
+  for (const file of files.slice(-20)) {
+    const request = SessionFile.firstRequest(file).replace(/\s+/g, " ");
+    console.log(`${basename(file, ".jsonl")}  ${request.length > 70 ? `${request.slice(0, 70)}…` : request}`);
+  }
+  console.log("\nContinue one with jig --resume <name>, or the most recent with jig -c.");
 }
 
 function report(result: RunResult, ms: number, maxSteps: number): void {
@@ -161,7 +227,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     end_turn: "",
     max_steps: `Stopped after ${maxSteps} steps (raise the limit with --max-steps).`,
     max_tokens: "The reply was cut off at the output limit.",
-    model_context_window_exceeded: "The conversation no longer fits in the context window. Use /reset to start over.",
+    model_context_window_exceeded: "The conversation no longer fits in the context window. Use /compact or /reset.",
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
   };
@@ -172,14 +238,10 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
   const tokensIn = input + cacheWrite + cacheRead;
   ui.println(
     ui.dim(
-      `${result.steps} step${result.steps === 1 ? "" : "s"} · ${k(tokensIn)} tokens in (${k(cacheRead)} from cache)` +
-        ` · ${k(output)} out · ${(ms / 1000).toFixed(1)}s`,
+      `${result.steps} step${result.steps === 1 ? "" : "s"} · ${formatTokens(tokensIn)} tokens in (${formatTokens(cacheRead)} from cache)` +
+        ` · ${formatTokens(output)} out · ${(ms / 1000).toFixed(1)}s`,
     ),
   );
-}
-
-function k(n: number): string {
-  return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }
 
 function describeError(err: unknown): string {

@@ -13,6 +13,8 @@ export interface Attempt {
   cost: number | null;
   toolCalls: Record<string, number>;
   toolErrors: number;
+  /** Failed calls per tool (missing in results from before it was recorded). */
+  toolErrorsByTool?: Record<string, number>;
 }
 
 export type Summary = ReturnType<typeof summarize>;
@@ -33,8 +35,13 @@ const PRICES: Record<string, { input: number; cacheRead: number; output: number 
 export function parseTranscript(text: string) {
   const clean = text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
   const toolCalls: Record<string, number> = {};
-  for (const [, name] of clean.matchAll(/^● (\w+)/gm)) toolCalls[name] = (toolCalls[name] ?? 0) + 1;
-  const toolErrors = [...clean.matchAll(/^ {2}✗ /gm)].length;
+  const toolErrorsByTool: Record<string, number> = {};
+  let tool = "";
+  for (const [, name, failed] of clean.matchAll(/^(?:● (\w+)|( {2}✗ ))/gm)) {
+    if (name) toolCalls[(tool = name)] = (toolCalls[name] ?? 0) + 1;
+    else if (failed && tool) toolErrorsByTool[tool] = (toolErrorsByTool[tool] ?? 0) + 1;
+  }
+  const toolErrors = Object.values(toolErrorsByTool).reduce((sum, n) => sum + n, 0);
   const summary = [...clean.matchAll(/(\d+) steps? · ([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/g)].at(-1);
   const tokens = (value?: string) =>
     value === undefined ? null : Math.round(parseFloat(value) * (value.endsWith("k") ? 1000 : 1));
@@ -45,6 +52,7 @@ export function parseTranscript(text: string) {
     tokensOut: tokens(summary?.[4]),
     toolCalls,
     toolErrors,
+    toolErrorsByTool,
   };
 }
 
@@ -73,11 +81,18 @@ export function summarize(attempts: Attempt[]) {
     steps: mean(attempts.map((a) => a.steps)),
     toolCalls: mean(attempts.map((a) => Object.values(a.toolCalls).reduce((sum, n) => sum + n, 0))),
     toolErrors: mean(attempts.map((a) => a.toolErrors)),
+    toolErrorsByTool: totals(attempts.map((a) => a.toolErrorsByTool ?? {})),
     tokensIn: mean(attempts.map((a) => a.tokensIn)),
     tokensOut: mean(attempts.map((a) => a.tokensOut)),
     cost: mean(attempts.map((a) => a.cost)),
     seconds: mean(attempts.map((a) => a.seconds)),
   };
+}
+
+function totals(counts: Record<string, number>[]): Record<string, number> {
+  const total: Record<string, number> = {};
+  for (const count of counts) for (const [key, n] of Object.entries(count)) total[key] = (total[key] ?? 0) + n;
+  return total;
 }
 
 function mean(values: (number | null)[]): number | null {

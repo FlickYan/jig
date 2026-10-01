@@ -6,9 +6,9 @@ import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions } from "../src/agent.ts";
+import { Conversation } from "../src/conversation.ts";
 import type { ModelTurn } from "../src/model.ts";
 import { TOOLS } from "../src/tools/index.ts";
-import { FileVersions } from "../src/tools/util.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -37,13 +37,13 @@ function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
     tools: TOOLS,
     cwd,
     maxSteps: 10,
-    versions: new FileVersions(),
+    compactAt: 0,
     approve: async () => true,
-    ui: { toolCall() {}, toolResult() {} },
+    ui: { toolCall() {}, toolResult() {}, notice() {} },
     ...overrides,
   };
-  const messages: MessageParam[] = [{ role: "user", content: "do the task" }];
-  return { options, messages, historyLengths };
+  const conversation = new Conversation(undefined, [{ role: "user", content: "do the task" }]);
+  return { options, conversation, messages: conversation.messages, historyLengths };
 }
 
 function resultsIn(message: MessageParam): ToolResult[] {
@@ -57,12 +57,12 @@ beforeEach(async () => {
 
 describe("runAgent", () => {
   it("runs tools and feeds the results back until the model answers", async () => {
-    const { options, messages, historyLengths } = setup([
+    const { options, conversation, messages, historyLengths } = setup([
       reply([text("Creating it."), toolUse("t1", "write_file", { path: "hello.txt", content: "hi\n" })]),
       reply([toolUse("t2", "edit_file", { path: "hello.txt", old_string: "hi", new_string: "hello" })]),
       reply([text("Done.")]),
     ]);
-    const result = await runAgent(messages, options);
+    const result = await runAgent(conversation, options);
 
     assert.equal(result.stop, "end_turn");
     assert.equal(result.text, "Done.");
@@ -78,20 +78,20 @@ describe("runAgent", () => {
   });
 
   it("answers every call of a parallel reply in a single message", async () => {
-    const { options, messages } = setup([
+    const { options, conversation, messages } = setup([
       reply([toolUse("a", "bash", { command: "echo one" }), toolUse("b", "bash", { command: "echo two" })]),
       reply([text("ok")]),
     ]);
-    await runAgent(messages, options);
+    await runAgent(conversation, options);
     assert.deepEqual(resultsIn(messages[2]).map((r) => r.tool_use_id), ["a", "b"]);
   });
 
   it("does not run a call the user declines, and tells the model", async () => {
-    const { options, messages } = setup(
+    const { options, conversation, messages } = setup(
       [reply([toolUse("t1", "write_file", { path: "no.txt", content: "x" })]), reply([text("ok")])],
       { approve: async () => false },
     );
-    await runAgent(messages, options);
+    await runAgent(conversation, options);
     assert.ok(!existsSync(join(cwd, "no.txt")));
     const [result] = resultsIn(messages[2]);
     assert.equal(result.is_error, true);
@@ -99,12 +99,12 @@ describe("runAgent", () => {
   });
 
   it("sends invalid input back to the model instead of running the tool", async () => {
-    const { options, messages } = setup([
+    const { options, conversation, messages } = setup([
       reply([toolUse("t1", "write_file", { path: "x.txt" })]),
       reply([toolUse("t2", "write_file", { path: "y.txt", content: "cut" })], "tool_use", new Map([["t2", '{"path":"y.txt","content":"cut']])),
       reply([text("ok")]),
     ]);
-    await runAgent(messages, options);
+    await runAgent(conversation, options);
     const [missing] = resultsIn(messages[2]);
     assert.equal(missing.is_error, true);
     assert.match(String(missing.content), /INVALID_JSON.*missing required parameter/);
@@ -114,44 +114,44 @@ describe("runAgent", () => {
   });
 
   it("reports unknown tools as errors", async () => {
-    const { options, messages } = setup([reply([toolUse("t1", "teleport", {})]), reply([text("ok")])]);
-    await runAgent(messages, options);
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "teleport", {})]), reply([text("ok")])]);
+    await runAgent(conversation, options);
     assert.match(String(resultsIn(messages[2])[0].content), /Unknown tool "teleport"/);
   });
 
   it("does not run tool calls from a reply cut off at max_tokens", async () => {
-    const { options, messages } = setup([
+    const { options, conversation, messages } = setup([
       reply([toolUse("t1", "write_file", { path: "half.txt", content: "trunc" })], "max_tokens"),
       reply([text("ok")]),
     ]);
-    await runAgent(messages, options);
+    await runAgent(conversation, options);
     assert.ok(!existsSync(join(cwd, "half.txt")));
     assert.match(String(resultsIn(messages[2])[0].content), /output limit/);
   });
 
   it("stops at the step limit with a valid history", async () => {
     const forever = Array.from({ length: 5 }, (_, i) => reply([toolUse(`t${i}`, "bash", { command: "true" })]));
-    const { options, messages } = setup(forever, { maxSteps: 3 });
-    const result = await runAgent(messages, options);
+    const { options, conversation, messages } = setup(forever, { maxSteps: 3 });
+    const result = await runAgent(conversation, options);
     assert.equal(result.stop, "max_steps");
     assert.equal(result.steps, 3);
     assert.equal(messages.at(-1)?.role, "user"); // ends with tool results, so the next request is valid
   });
 
   it("keeps a refused reply out of the history", async () => {
-    const { options, messages } = setup([reply([text("Sure, here is")], "refusal")]);
-    const result = await runAgent(messages, options);
+    const { options, conversation, messages } = setup([reply([text("Sure, here is")], "refusal")]);
+    const result = await runAgent(conversation, options);
     assert.equal(result.stop, "refusal");
     assert.equal(messages.length, 1);
   });
 
   it("stops on Ctrl+C but still answers every tool call", async () => {
     const controller = new AbortController();
-    const { options, messages } = setup([
+    const { options, conversation, messages } = setup([
       reply([toolUse("slow", "bash", { command: "sleep 30" }), toolUse("next", "bash", { command: "echo hi" })]),
     ]);
     setTimeout(() => controller.abort(), 100);
-    const result = await runAgent(messages, options, controller.signal);
+    const result = await runAgent(conversation, options, controller.signal);
 
     assert.equal(result.stop, "interrupted");
     const [slow, next] = resultsIn(messages[2]);

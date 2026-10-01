@@ -1,0 +1,9 @@
+{
+  "instruction": "Add a function `split_evenly(total_cents, people)` to billing/split.py that splits a bill between `people` people as evenly as possible: the shares add up to the total exactly, differ by at most one cent, and the larger shares come first. Raise ValueError if people is less than 1.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "follow AGENTS.md"
+  ]
+}

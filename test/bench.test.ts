@@ -26,6 +26,7 @@ describe("parseTranscript", () => {
       tokensOut: 842,
       toolCalls: { read_file: 1, edit_file: 2, bash: 1 },
       toolErrors: 1,
+      toolErrorsByTool: { edit_file: 1 },
     });
   });
 

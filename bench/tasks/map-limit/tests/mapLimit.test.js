@@ -39,7 +39,8 @@ test("rejects with the first error and starts nothing after it", async () => {
 });
 
 test("a limit that is not a positive integer is a RangeError", async () => {
+  // Thrown right away or as a rejected promise: the documentation's "throws" allows either.
   for (const limit of [0, -1, 1.5, "2"]) {
-    await assert.rejects(mapLimit([1], limit, async (x) => x), RangeError);
+    await assert.rejects(async () => mapLimit([1], limit, async (x) => x), RangeError);
   }
 });

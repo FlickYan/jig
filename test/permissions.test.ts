@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { parseCommand, Permissions } from "../src/permissions.ts";
+import { Permissions } from "../src/permissions.ts";
+import { parseCommand } from "../src/tools/shell.ts";
 import { TOOLS } from "../src/tools/index.ts";
 
 const tool = (name: string) => TOOLS.find((t) => t.definition.name === name)!;

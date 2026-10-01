@@ -1,0 +1,9 @@
+{
+  "instruction": "parse_csv in csvlite.py is too naive: quoted fields break it. Rewrite it so it follows every rule in its docstring. Don't use Python's csv module (the import tool runs where it isn't available).",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "implement from a spec",
+    "hard: many edge cases"
+  ]
+}

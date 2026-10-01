@@ -15,8 +15,11 @@ export interface ModelTurn {
   malformed: Map<string, string>;
 }
 
-/** One model call: the conversation in, the model's next message out, streamed to the terminal on the way. */
-export type CallModel = (messages: MessageParam[], signal?: AbortSignal) => Promise<ModelTurn>;
+/**
+ * One model call: the conversation in, the model's next message out, streamed to the terminal on the way.
+ * With `summarize`, the model may not call tools and nothing is printed (used for compaction).
+ */
+export type CallModel = (messages: MessageParam[], signal?: AbortSignal, options?: { summarize?: boolean }) => Promise<ModelTurn>;
 
 export interface ModelOptions {
   model: string;
@@ -24,6 +27,11 @@ export interface ModelOptions {
   effort?: Effort;
   system: string;
   tools: Tool[];
+}
+
+/** How many tokens a model can take in. All current DeepSeek and Claude models have 1M, except Haiku. */
+export function contextWindow(model: string): number {
+  return model.startsWith("claude-haiku") ? 200_000 : 1_000_000;
 }
 
 /** Everything in a request except `messages`. It stays the same for the whole session. */
@@ -37,11 +45,13 @@ export function createModel(options: ModelOptions): CallModel {
   const client = deepseek ? deepseekClient() : new Anthropic(); // Anthropic() reads ANTHROPIC_API_KEY
   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
 
-  return async (messages, signal) => {
+  return async (messages, signal, { summarize = false } = {}) => {
     const sent = deepseek ? withoutIsError(messages) : messages;
+    // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
+    const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
     for (let attempt = 1; ; attempt++) {
       try {
-        return await streamTurn(client, { ...request, messages: sent }, signal);
+        return await streamTurn(client, params, signal, summarize);
       } catch (err) {
         // API errors are not retried here: the SDK already retries rate limits and overloads.
         if (!(err instanceof MalformedToolInput) || attempt === 3) throw err;
@@ -111,14 +121,15 @@ function withoutIsError(messages: MessageParam[]): MessageParam[] {
 /** A tool input so broken the SDK could not parse it at all, which fails the whole stream. */
 class MalformedToolInput extends Error {}
 
-async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal): Promise<ModelTurn> {
+async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal, quiet = false): Promise<ModelTurn> {
   const stream = client.beta.messages.stream(params, { signal });
   const rawInputs = new Map<number, string>(); // content block index -> tool input JSON as streamed
   let message: Anthropic.Beta.BetaMessage;
 
-  ui.status("thinking…");
+  if (!quiet) ui.status("thinking…");
   try {
     for await (const event of stream) {
+      if (quiet) continue;
       if (event.type === "content_block_start") {
         const block = event.content_block;
         if (block.type === "tool_use") ui.status(`${block.name}…`);

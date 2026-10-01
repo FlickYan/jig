@@ -3,10 +3,12 @@
 
 def parse_settings(text):
     settings = {}
-    for line in text.splitlines():
+    for number, line in enumerate(text.splitlines(), start=1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        if "=" not in line:
+            raise ValueError(f"line {number}: expected key = value")
         key, value = line.split("=", 1)
         settings[key.strip()] = value.strip()
     return settings
