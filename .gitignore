@@ -4,3 +4,5 @@ node_modules/
 .DS_Store
 __pycache__/
 bench/logs/
+eval/.venv/
+eval/jobs/

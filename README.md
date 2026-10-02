@@ -42,7 +42,11 @@ Usage: jig [options] [task]
       --resume <file>   continue a saved session (--sessions lists them)
       --compact-at <n>  summarize the conversation once it reaches n tokens (default: 200000; 0: never)
   -C, --cwd <dir>       project directory (default: the current directory)
+      --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
+                        (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
+      --no-subagents    leave out the subagent tool
+      --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
 ```
 
 In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
@@ -81,6 +85,10 @@ received (subagents included), and how many input tokens came from the prompt ca
   `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
   command. `/undo` again goes one task further back. Projects with more than 200 MB of files that aren't
   ignored aren't snapshotted.
+- **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
+  (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
+  runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key
+  into the conversation and the logs, where a prompt injection could also reach it.
 - **Prompt injection.** The system prompt tells the model that text in files and command output is data,
   not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
   are what protect you when that isn't enough.
@@ -163,7 +171,9 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
+| [`src/stats.ts`](src/stats.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs |
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
+| [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). Also on
 `--max-steps` model calls, on Ctrl+C, and when a safety classifier declines the request.
@@ -231,6 +241,10 @@ received (subagents included), and how many input tokens came from the prompt ca
   servers included, and servers crash. A tool call to a server that has stopped starts it again.
 - **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
   everything it read, so it gets one more call, without tools, to write up what it found.
+- **Waiting on the API is bounded and visible.** The SDK's timeout covers only the wait for a response
+  to start (a stream's first bytes arrive within seconds when the API is healthy, however long the reply
+  runs), so jig sets it to 2 minutes instead of 10, and prints a notice for each automatic retry. During a
+  DeepSeek outage in milestone 6, jig had sat silent for half an hour.
 - **Two providers, one format.** DeepSeek's Anthropic-compatible API lets the same SDK and message format
   serve both. DeepSeek does not support `is_error` on tool results, so for DeepSeek failures are marked
   with `Error:` in the text instead, and the Claude-only settings (adaptive thinking with short progress
@@ -304,7 +318,7 @@ features when it should, not just that they work. Their projects configure an MC
 copied into the attempt's home directory, which is how `hook-lint`'s linter is "installed".
 
 This is an in-house suite: good for comparing versions of jig and settings (models, effort, tools), not
-for comparing against other agents. For that, milestone 6 runs a public benchmark.
+for comparing against other agents. For that, see [Terminal-Bench](#terminal-bench) below.
 
 ### Results
 
@@ -385,11 +399,109 @@ Averages are per attempt. What the runs and their logs showed:
   model "this is a benchmark for injection" (it said so in its reasoning). Each was found by reading the
   logs of a failure or of a surprising pass, and fixed.
 
+## Terminal-Bench
+
+The in-house benchmark compares versions of jig; to compare jig with another agent, milestone 6 runs it
+on [Terminal-Bench 2.0](https://www.tbench.ai) through [Harbor](https://harborframework.com), against
+[mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent) (the SWE-agent team's minimal baseline: a
+bash tool, a short prompt, no other machinery) with the same model, deepseek-flash, on the same tasks.
+
+```bash
+python3 -m venv eval/.venv && eval/.venv/bin/pip install harbor
+export DEEPSEEK_API_KEY=sk-...
+eval/run.sh tb-jig jig                          # jig on the 20 tasks in eval/subset.txt
+eval/run.sh tb-mini mini-swe-agent              # the baseline
+eval/run.sh abl-effort-low jig --ak effort=low  # an ablation: any jig option, through the adapter
+python3 eval/report.py eval/results/tb-*.json   # the first table below, from the saved summaries
+python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json eval/results/abl-*.json
+```
+
+- [`eval/jig_agent.py`](eval/jig_agent.py) is jig's Harbor adapter. It installs Node and jig from this
+  checkout in each task's container, runs `jig --yes --add-dir / --stats …` on the instruction (the
+  container is the sandbox, so the whole file system is the project), and reads the turns and tokens back
+  from the stats file. The adapter hands the API key to jig's process only, and never writes it down.
+- The tasks are a seeded random sample of 20 of the 61 that ask for 2 GB of memory, one CPU and at most 30
+  minutes ([`eval/subset.txt`](eval/subset.txt)), because this Mac gives Docker 3 GB. The task images are
+  x86-64, so on Apple Silicon everything in them runs under emulation, for both agents alike, while the
+  time limits stay as they are.
+- One attempt per task, for budget: a difference of a task or two is noise, as the in-house benchmark showed.
+- Costs come from the token counts and one price table for both agents. DeepSeek's off-peak discount made
+  part of the actual bill lower (the first two tasks were billed at about half the table's price).
+
+### Results
+
+| run | passed | turns | tokens in | tokens out | cost | agent time |
+|-----|--------|-------|-----------|------------|------|------------|
+| jig | 75% (15/20) | 28.4 | 1,499k | 36k | $0.059 | 6.3 min |
+| mini-swe-agent | 80% (16/20) | 33.4 | 2,342k | 45k | $0.074 | 6.8 min |
+
+Averages are per task. The two disagree on three tasks: jig alone solved `dna-assembly`, mini-swe-agent
+alone `modernize-scientific-stack` and `mteb-retrieve`. Neither solved `adaptive-rejection-sampler`,
+`filter-js-from-html` or `make-mips-interpreter`. The full matrix is in `python3 eval/report.py eval/results/tb-*.json`.
+
+Ablations, on 8 of the 20 tasks ([`eval/ablation-subset.txt`](eval/ablation-subset.txt), again a seeded
+sample), against the default run on the same 8:
+
+| run | passed | turns | tokens in | tokens out | cost | agent time |
+|-----|--------|-------|-----------|------------|------|------------|
+| jig, default | 7/8 | 24.9 | 1,437k | 29k | $0.054 | 4.9 min |
+| `--effort low` | 7/8 | 18.6 | 779k | 20k | $0.034 | 3.2 min |
+| `--compact-at 50000` | 6/8 | 31.4 | 681k | 38k | $0.068 | 6.3 min |
+| `--no-subagents` | 7/8 | 17.4 | 865k | 22k | $0.036 | 4.0 min |
+
+The model never called the subagent tool on these tasks (see below), so `--no-subagents` is in effect a
+second run of the default, and shows how much two runs of the same thing differ.
+
+What the runs and their logs showed:
+
+- **The same success rate, for less.** 75% against 80% is one task, within noise. jig got there in fewer
+  turns (28 against 33) with smaller requests (53k tokens on average against 70k), so it used 36% fewer
+  input tokens and cost 20% less per task.
+- **In a container, the model works through bash.** Of jig's 615 tool calls, 500 were bash, 113 the file
+  tools, 2 grep or glob, and none a subagent. Terminal-Bench tasks are about a system more than a code
+  base, so jig's search tools and subagents had little to do here: what separates the two agents is the
+  loop and the prompt, not jig's extra tools.
+- **jig's failures were the model's judgment, not the harness.** In `modernize-scientific-stack` it kept the
+  legacy script's extra output, so the test read the wrong number, and its final summary claimed the output
+  was exactly the two required lines. In `mteb-retrieve` it ignored the hint to use the installed `mteb`
+  package and called the embedding model directly, which ranks slightly differently. In
+  `filter-js-from-html` its filter blocked every attack but also changed 5 of 12 clean files, and in
+  `adaptive-rejection-sampler` 7 of 8 tests passed.
+- **Two runs of the same thing differ as much as the settings do.** The default and the `--no-subagents`
+  run (the same agent, in effect) passed 7 of 8 each, but not the same 7: only the second solved
+  `make-mips-interpreter`, which every other run, and mini-swe-agent, failed. One took 199 turns in all,
+  the other 139, and most of that gap is that one long task (122 turns against 63). With one attempt per
+  task, neither the effort level nor the subagent tool moved the pass rate or the cost by more than that.
+- **Low effort thinks less per turn, but that isn't what decides the cost.** At `--effort low` a turn cost
+  about 15% less (less thinking), and the total came out like the second default run's. On the six short
+  tasks it cost more, because it took more turns (27 on `db-wal-recovery`, against 11 and 14).
+- **On DeepSeek, compaction saves context, not money.** Compacting at 50k tokens (7 compactions in 8
+  tasks) cut the context of an average turn by 62%, but the cost per turn stayed the same: what it saved
+  was cached input, which DeepSeek charges about 50 times less for, while new input per turn rose 40%,
+  since each compaction starts a prefix with nothing cached. It also took the most turns, 251 against 139
+  to 199, many of them on `tune-mjcf` (61 against 15 to 24), where after compacting it read the task's
+  files again and rewrote its test scripts: a summary keeps the conclusions, not the working state. At
+  the default 200k only one task ever compacted (200k tokens into 1.9k).
+- **A time limit doesn't stop the agent.** When a task's time runs out, Harbor stops waiting, but the
+  agent's processes in the container carry on into the verification: jig made up to 9 more model calls
+  after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
+  (`tune-mjcf` and `cobol-modernization`, for both agents) may owe something to it. Counting those as
+  failures gives 13/20 against 14/20: the same picture.
+- **The evaluation found five problems in jig, now fixed.** File tools confined to the project could not
+  touch `/etc` or `/var` in a container (`--add-dir`); there was no way to get turns and tokens out
+  (`--stats`); during a DeepSeek outage jig waited 10 minutes per attempt in silence (now 2 minutes, with
+  a notice on each retry); an instruction starting with "-" was read as an option, so the adapter now
+  passes `--` first (that task was re-run); and the commands the model ran could see jig's API key, which
+  the model printed with `env` in one run (mini-swe-agent's model did the same). The key only went to the
+  local logs (since scrubbed) and to DeepSeek itself; jig's commands no longer see it. That last fix came
+  after the runs, and changes nothing else.
+
 ## Tests
 
 ```bash
 npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, MCP (against a
-                    # hand-written server), hooks, subagents, benchmark metrics, and the loop: no API calls
+                    # hand-written server), hooks, subagents, running headless (--add-dir, --stats, a hung
+                    # API), benchmark metrics, and the loop: no API calls
 npm run typecheck
 ```
 
@@ -400,4 +512,4 @@ npm run typecheck
 - [x] **3. Context:** `AGENTS.md`; token tracking with automatic and manual compaction; sessions saved as JSON Lines, with `--continue` and `--resume`; fixes for the two problems the benchmark found; three new benchmark tasks
 - [x] **4. Safety:** macOS sandbox (writes only in the project, no network); `plan` mode; allow and deny rules; snapshots and `/undo`; prompt-injection guidance; read-before-edit narrowed to overwrites; two prompt-injection tasks
 - [x] **5. Extensions:** Agent Skills with progressive disclosure; MCP client over stdio (official SDK) with restart; `PreToolUse` and `PostToolUse` hooks; read-only subagents; parallel read-only tool calls; project trust; three benchmark tasks for the extensions
-- [ ] **6. Evaluation:** Terminal-Bench 2.x through Harbor; success rate, cost and turns per task; ablations (effort level, compaction, subagents) against mini-swe-agent on the same model
+- [x] **6. Evaluation:** Terminal-Bench 2.0 through Harbor against mini-swe-agent on the same model, with success rate, cost and turns per task; ablations of effort, compaction and subagents; `--add-dir`, `--stats`, and a 2-minute API timeout with retry notices

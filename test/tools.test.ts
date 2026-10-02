@@ -167,6 +167,19 @@ describe("bash", () => {
     assert.throws(() => process.kill(child, 0), "the background sleep should be gone too");
   });
 
+  it("keeps jig's API keys out of the commands' environment", async () => {
+    const saved = process.env.DEEPSEEK_API_KEY;
+    process.env.DEEPSEEK_API_KEY = "sk-test-secret";
+    try {
+      const output = await bashTool.run({ command: "env; echo HOME=$HOME" }, ctx);
+      assert.doesNotMatch(output, /sk-test-secret|DEEPSEEK_API_KEY/);
+      assert.match(output, /HOME=\//, "the rest of the environment is still there");
+    } finally {
+      if (saved === undefined) delete process.env.DEEPSEEK_API_KEY;
+      else process.env.DEEPSEEK_API_KEY = saved;
+    }
+  });
+
   it("stops when the task is interrupted", async () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 100);

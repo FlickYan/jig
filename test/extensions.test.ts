@@ -84,7 +84,7 @@ describe("skills", () => {
 
   it("puts only names and descriptions in the system prompt", async () => {
     await writeSkill(join(dir, ".jig/skills"), "release", "---\nname: release\ndescription: Cut a release.\n---\nSECRET STEPS");
-    const prompt = systemPrompt(dir, [], undefined, skillCatalog(discoverSkills(dir, join(dir, "home")).skills));
+    const prompt = systemPrompt(dir, { skills: skillCatalog(discoverSkills(dir, join(dir, "home")).skills) });
     assert.match(prompt, /<available_skills>\n<skill name="release">Cut a release\.<\/skill>\n<\/available_skills>/);
     assert.doesNotMatch(prompt, /SECRET STEPS/);
   });

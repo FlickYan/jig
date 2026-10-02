@@ -1,8 +1,8 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
-import { join, relative } from "node:path";
-import { resolveInRoot } from "./util.ts";
+import { dirname, join, relative } from "node:path";
+import { isInside, resolveInRoot } from "./util.ts";
 
 /** Directories that are never worth searching, even when git doesn't ignore them. */
 const SKIP_DIRS = new Set([
@@ -12,18 +12,22 @@ const SKIP_DIRS = new Set([
 const MAX_FILES = 20_000;
 
 /**
- * The files under `path` (a directory or a single file), as sorted paths relative to root. In a git
- * repository this is git's view of the project, so .gitignore applies; elsewhere it is a plain walk.
+ * The files under `path` (a directory or a single file), sorted: relative to root for files in the
+ * project, absolute for files in a directory added with --add-dir. In a git repository this is git's
+ * view of the files, so .gitignore applies; elsewhere it is a plain walk.
  */
-export async function listFiles(root: string, path = "."): Promise<string[]> {
-  const abs = resolveInRoot(root, path);
+export async function listFiles(root: string, path = ".", dirs: string[] = []): Promise<string[]> {
+  const abs = resolveInRoot(root, path, dirs);
   const info = await stat(abs).catch(() => null);
   if (!info) throw new Error(`No such file or directory: ${path}`);
-  if (info.isFile()) return [relative(root, abs)];
-  const files = (await gitFiles(root, abs)) ?? (await walk(root, abs, []));
+  const base = isInside(root, abs) ? root : info.isFile() ? dirname(abs) : abs;
+  const shown = (file: string) => (base === root ? file : join(base, file));
+  if (info.isFile()) return [shown(relative(base, abs))];
+  const files = (await gitFiles(base, abs)) ?? (await walk(base, abs, []));
   return files
     .filter((file) => !file.split("/").some((part) => SKIP_DIRS.has(part)))
     .slice(0, MAX_FILES)
+    .map(shown)
     .sort();
 }
 

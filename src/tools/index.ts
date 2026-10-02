@@ -18,6 +18,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** Where commands run, if not directly on the machine. */
   sandbox?: Sandbox;
+  /** Directories outside the project the file tools may use too (--add-dir). */
+  dirs?: string[];
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */

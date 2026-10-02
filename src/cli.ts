@@ -3,12 +3,12 @@ import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { formatTokens, runAgent, type AgentOptions, type RunResult, type ToolHooks } from "./agent.ts";
+import { type AgentOptions, type AgentUI, formatTokens, runAgent, type RunResult, type ToolHooks } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks } from "./hooks.ts";
 import { connectMcpServers } from "./mcp.ts";
-import { contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
+import { type CallModel, contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { createSandbox } from "./sandbox.ts";
@@ -16,6 +16,7 @@ import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { Snapshots } from "./snapshots.ts";
+import { Stats } from "./stats.ts";
 import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -38,7 +39,11 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --sessions          list this project's saved sessions
       --compact-at <n>    summarize the conversation once it reaches n tokens (default: 200000; 0: never)
   -C, --cwd <dir>         project directory (default: the current directory)
+      --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
+                          (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
+      --no-subagents      leave out the subagent tool
+      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
   -h, --help              show this help
 
 jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/.jig/sessions, and
@@ -80,7 +85,10 @@ async function main(): Promise<void> {
       sessions: { type: "boolean", default: false },
       "compact-at": { type: "string", default: "200000" },
       cwd: { type: "string", short: "C", default: "." },
+      "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      subagents: { type: "boolean", default: true },
+      stats: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
@@ -100,14 +108,17 @@ async function main(): Promise<void> {
   const compactAt = Number(values["compact-at"]);
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
+  const dirs = values["add-dir"].map((dir) => resolve(dir));
+  for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
+  const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
   const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
-  const sandbox = (values.sandbox ?? settings.sandbox ?? true) ? createSandbox(cwd, { network }) : undefined;
+  const sandbox = (values.sandbox ?? settings.sandbox ?? true) ? createSandbox(cwd, { network, dirs }) : undefined;
   if (values.sandbox && !sandbox) throw new Error("The sandbox is only available on macOS so far.");
   const contained = !!sandbox && !network;
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained });
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
   const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
@@ -124,14 +135,18 @@ async function main(): Promise<void> {
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
-  const research = new Permissions("plan", cwd, { deny: settings.deny, contained });
+  const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
   const researchTools = [...TOOLS, ...extensions].filter((tool) => tool.kind === "read" || tool.kind === "run");
-  const newSubagentModel = () =>
-    createModel({ model, effort, quiet: true, system: subagentPrompt(cwd, instructions, sandbox?.limits), tools: researchTools });
+  const metered = (callModel: CallModel, subagent = false) => stats?.meter(callModel, { subagent }) ?? callModel;
+  const newSubagentModel = () => {
+    const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs });
+    return metered(createModel({ model, effort, quiet: true, system, tools: researchTools }), true);
+  };
   const subagents: SubagentSetup = {
     callModel: newSubagentModel(),
     tools: researchTools,
     cwd,
+    dirs,
     maxSteps: SUBAGENT_MAX_STEPS,
     compactAt: compactLimit,
     async authorize(tool, input) {
@@ -142,9 +157,11 @@ async function main(): Promise<void> {
     hooks,
     ui: ui.subagentUI,
   };
-  const tools = [...TOOLS, subagentTool(subagents), ...extensions];
-  const newModel = () =>
-    createModel({ model, effort, system: systemPrompt(cwd, instructions, sandbox?.limits, skillCatalog(skills)), tools });
+  const tools = [...TOOLS, ...(values.subagents ? [subagentTool(subagents)] : []), ...extensions];
+  const newModel = () => {
+    const system = systemPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs });
+    return metered(createModel({ model, effort, system, tools }));
+  };
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
   let conversation = resumeFrom
@@ -179,12 +196,13 @@ async function main(): Promise<void> {
     callModel: newModel(),
     tools,
     cwd,
+    dirs,
     maxSteps,
     compactAt: compactLimit,
     authorize,
     sandbox,
     hooks,
-    ui: ui.terminalUI,
+    ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
 
   /** Runs `work` as the current task, so Ctrl+C stops it. */
@@ -200,7 +218,9 @@ async function main(): Promise<void> {
       await work(controller.signal);
       return true;
     } catch (err) {
-      ui.error(controller.signal.aborted ? "Interrupted." : describeError(err));
+      const message = controller.signal.aborted ? "Interrupted." : describeError(err);
+      ui.error(message);
+      stats?.failed(message);
       return false;
     } finally {
       process.off("SIGINT", onSigint);
@@ -221,7 +241,11 @@ async function main(): Promise<void> {
     notes.length = 0;
     conversation.push({ role: "user", content: message });
     const started = Date.now();
-    return asTask(async (signal) => report(await runAgent(conversation, agent, signal), Date.now() - started, maxSteps));
+    return asTask(async (signal) => {
+      const result = await runAgent(conversation, agent, signal);
+      stats?.finish(result);
+      report(result, Date.now() - started, maxSteps);
+    });
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
@@ -365,6 +389,16 @@ function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
   return {
     before: async (tool, input) => (await run("PreToolUse", { tool, input })).block ?? null,
     after: async (tool, input, output) => (await run("PostToolUse", { tool, input, output })).feedback ?? null,
+  };
+}
+
+function countToolCalls(base: AgentUI, stats: Stats): AgentUI {
+  return {
+    ...base,
+    toolCall(name, description, id) {
+      stats.toolCall(name);
+      base.toolCall(name, description, id);
+    },
   };
 }
 

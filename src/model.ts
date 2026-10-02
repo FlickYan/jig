@@ -25,6 +25,8 @@ export interface ModelOptions {
   model: string;
   /** Print nothing while streaming (for subagents, whose work the user sees as a summary). */
   quiet?: boolean;
+  /** Milliseconds to wait for the API to start answering (default: 2 minutes); for tests. */
+  timeout?: number;
   /** Left out, the model's own default is used. */
   effort?: Effort;
   system: string;
@@ -42,9 +44,35 @@ type Request = Omit<BetaMessageStreamParams, "messages">;
 // DeepSeek serves an Anthropic-compatible API, so the same SDK, streaming and message format work with it.
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic";
 
+/**
+ * How long to wait for the API to start answering. A stream's headers arrive within seconds when the
+ * API is healthy, however long the reply, and the SDK's timeout covers only that wait. Its default is
+ * 10 minutes, so a hung API (as DeepSeek was during the Terminal-Bench runs) cost 30 silent minutes with
+ * the two retries; now it fails within about 6, saying so as it goes.
+ */
+const REQUEST_TIMEOUT_MS = 120_000;
+
+/**
+ * The SDK retries rate limits, overloads, server errors and timeouts on its own, with backoff. It
+ * reports each retry in its log; this turns those lines into notices, so a struggling API doesn't
+ * look like a frozen agent.
+ */
+export const retryNotices = {
+  info(message: string) {
+    const retry = /(timed out|failed with status (\d+)|failed).* - retrying, (\d+) attempts? remaining/.exec(message);
+    if (!retry) return;
+    const what = retry[1] === "timed out" ? "didn't answer in time" : retry[2] ? `answered with status ${retry[2]}` : "couldn't be reached";
+    ui.notice(`The API ${what}; trying again (${retry[3]} ${retry[3] === "1" ? "try" : "tries"} left).`);
+  },
+  debug() {},
+  warn() {},
+  error() {},
+};
+
 export function createModel(options: ModelOptions): CallModel {
   const deepseek = options.model.startsWith("deepseek");
-  const client = deepseek ? deepseekClient() : new Anthropic(); // Anthropic() reads ANTHROPIC_API_KEY
+  const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
+  const client = deepseek ? deepseekClient(settings) : new Anthropic(settings); // Anthropic() reads ANTHROPIC_API_KEY
   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
 
   return async (messages, signal, { summarize = false } = {}) => {
@@ -85,11 +113,11 @@ function claudeRequest({ model, effort = "medium", system, tools }: ModelOptions
   };
 }
 
-function deepseekClient(): Anthropic {
+function deepseekClient(settings: ConstructorParameters<typeof Anthropic>[0]): Anthropic {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
   // Without authToken: null, the SDK would also send ANTHROPIC_AUTH_TOKEN from the environment to DeepSeek.
-  return new Anthropic({ baseURL: DEEPSEEK_BASE_URL, apiKey, authToken: null });
+  return new Anthropic({ ...settings, baseURL: DEEPSEEK_BASE_URL, apiKey, authToken: null });
 }
 
 /**

@@ -21,10 +21,11 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
  * keeps the user's own toolchain (python, node, compilers) working with no setup.
  * Returns undefined where jig has no sandbox yet (anything but macOS).
  */
-export function createSandbox(root: string, { network }: { network: boolean }): Sandbox | undefined {
+export function createSandbox(root: string, { network, dirs = [] }: { network: boolean; dirs?: string[] }): Sandbox | undefined {
   if (process.platform !== "darwin" || !existsSync(SANDBOX_EXEC)) return undefined;
   const project = realpathSync(root); // Seatbelt sees real paths: /var is /private/var
-  const writable = [project, gitDir(project), realpathSync(tmpdir()), "/private/tmp"].filter(
+  const added = dirs.map((dir) => realpathSync(dir));
+  const writable = [project, gitDir(project), ...added, realpathSync(tmpdir()), "/private/tmp"].filter(
     (dir, i, all): dir is string => !!dir && !all.slice(0, i).some((other) => other && isInside(other, dir)),
   );
   const profile = [
@@ -37,7 +38,7 @@ export function createSandbox(root: string, { network }: { network: boolean }): 
   ].join("\n");
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only inside the project and the temp directories${network ? "" : ", and can't use the network except localhost"}.`,
+    limits: `Commands can write only inside the project${added.length ? `, ${added.join(", ")}` : ""} and the temp directories${network ? "" : ", and can't use the network except localhost"}.`,
     wrap: (command) => ({ program: SANDBOX_EXEC, args: ["-p", profile, "/bin/bash", "-c", command] }),
   };
 }

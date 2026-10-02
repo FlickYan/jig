@@ -1,0 +1,102 @@
+{
+ "name": "abl-compact-50k",
+ "agent": "jig (compact_at=50000)",
+ "trials": [
+  {
+   "task": "db-wal-recovery",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 8,
+   "input": 57875,
+   "cached": 53120,
+   "output": 6028,
+   "model": "deepseek-flash",
+   "seconds": 31.522906
+  },
+  {
+   "task": "log-summary-date-ranges",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 77881,
+   "cached": 61056,
+   "output": 1594,
+   "model": "deepseek-flash",
+   "seconds": 36.218324
+  },
+  {
+   "task": "make-mips-interpreter",
+   "version": "0347e48+changes",
+   "passed": false,
+   "error": "AgentTimeoutError",
+   "turns": 142,
+   "input": 3834003,
+   "cached": 3420416,
+   "output": 206158,
+   "model": "deepseek-flash",
+   "seconds": 1800.006693
+  },
+  {
+   "task": "multi-source-data-merger",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 8,
+   "input": 60275,
+   "cached": 57472,
+   "output": 8103,
+   "model": "deepseek-flash",
+   "seconds": 47.945147
+  },
+  {
+   "task": "openssl-selfsigned-cert",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 32700,
+   "cached": 30848,
+   "output": 2558,
+   "model": "deepseek-flash",
+   "seconds": 19.413793
+  },
+  {
+   "task": "polyglot-rust-c",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 6,
+   "input": 115358,
+   "cached": 114176,
+   "output": 23626,
+   "model": "deepseek-flash",
+   "seconds": 117.920037
+  },
+  {
+   "task": "pytorch-model-recovery",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 12,
+   "input": 113056,
+   "cached": 107648,
+   "output": 8501,
+   "model": "deepseek-flash",
+   "seconds": 80.154165
+  },
+  {
+   "task": "tune-mjcf",
+   "version": "0347e48+changes",
+   "passed": false,
+   "error": "AgentTimeoutError",
+   "turns": 61,
+   "input": 1159103,
+   "cached": 1084928,
+   "output": 44083,
+   "model": "deepseek-flash",
+   "seconds": 900.006455
+  }
+ ]
+}

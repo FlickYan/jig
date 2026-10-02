@@ -1,0 +1,9 @@
+# The 8 tasks for the ablations: random.Random(2026).sample(sorted(eval/subset.txt tasks), 8).
+db-wal-recovery
+log-summary-date-ranges
+make-mips-interpreter
+multi-source-data-merger
+openssl-selfsigned-cert
+polyglot-rust-c
+pytorch-model-recovery
+tune-mjcf

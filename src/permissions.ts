@@ -33,6 +33,8 @@ export interface PolicyOptions {
   deny?: string[];
   /** Commands run in a sandbox that keeps them inside the project and off the network. */
   contained?: boolean;
+  /** Directories outside the project that count as part of it (--add-dir). */
+  dirs?: string[];
 }
 
 // Programs that only print: they don't change files or start other programs, whatever their arguments.
@@ -44,6 +46,7 @@ const FIND_ACTIONS = /^-(exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/;
 export class Permissions {
   mode: Mode;
   private readonly root: string;
+  private readonly dirs: string[];
   private readonly allowRules: string[][];
   private readonly denyRules: string[];
   private readonly contained: boolean;
@@ -52,9 +55,10 @@ export class Permissions {
   /** External tools (MCP) the user chose to always allow for this session. */
   private readonly externalTools = new Set<string>();
 
-  constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false }: PolicyOptions = {}) {
+  constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false, dirs = [] }: PolicyOptions = {}) {
     this.mode = mode;
     this.root = root;
+    this.dirs = dirs;
     this.allowRules = allow.map((rule) => rule.split(/\s+/));
     this.denyRules = deny;
     this.contained = contained;
@@ -128,12 +132,17 @@ export class Permissions {
     return false;
   }
 
-  /** False if any argument looks like a path outside the project: absolute, ~, or climbing out with "..". */
+  /**
+   * False if any argument looks like a path outside the project (and the added directories): an absolute
+   * path elsewhere, anything in ~, or climbing out with "..".
+   */
   private stayInside(args: string[]): boolean {
     return args.every((arg) => {
       const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : arg;
-      if (value.startsWith("/") || value.startsWith("~")) return false;
-      return !value.split("/").includes("..") || isInside(this.root, resolve(this.root, value));
+      if (value.startsWith("~")) return false;
+      if (!value.startsWith("/") && !value.split("/").includes("..")) return true;
+      const abs = resolve(this.root, value);
+      return [this.root, ...this.dirs].some((dir) => isInside(dir, abs));
     });
   }
 }

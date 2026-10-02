@@ -1,0 +1,102 @@
+{
+ "name": "abl-effort-low",
+ "agent": "jig (effort=low)",
+ "trials": [
+  {
+   "task": "db-wal-recovery",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 27,
+   "input": 690948,
+   "cached": 658560,
+   "output": 27888,
+   "model": "deepseek-flash",
+   "seconds": 151.182408
+  },
+  {
+   "task": "log-summary-date-ranges",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 6,
+   "input": 97857,
+   "cached": 79232,
+   "output": 1979,
+   "model": "deepseek-flash",
+   "seconds": 17.655722
+  },
+  {
+   "task": "make-mips-interpreter",
+   "version": "0347e48+changes",
+   "passed": false,
+   "error": null,
+   "turns": 63,
+   "input": 4689116,
+   "cached": 4627840,
+   "output": 73033,
+   "model": "deepseek-flash",
+   "seconds": 408.57047
+  },
+  {
+   "task": "multi-source-data-merger",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 8,
+   "input": 45150,
+   "cached": 42368,
+   "output": 5516,
+   "model": "deepseek-flash",
+   "seconds": 37.845632
+  },
+  {
+   "task": "openssl-selfsigned-cert",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 7,
+   "input": 20643,
+   "cached": 18944,
+   "output": 1429,
+   "model": "deepseek-flash",
+   "seconds": 13.556456
+  },
+  {
+   "task": "polyglot-rust-c",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 73830,
+   "cached": 72704,
+   "output": 16403,
+   "model": "deepseek-flash",
+   "seconds": 87.829145
+  },
+  {
+   "task": "pytorch-model-recovery",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 95750,
+   "cached": 90496,
+   "output": 10598,
+   "model": "deepseek-flash",
+   "seconds": 90.970527
+  },
+  {
+   "task": "tune-mjcf",
+   "version": "0347e48+changes",
+   "passed": true,
+   "error": null,
+   "turns": 24,
+   "input": 522554,
+   "cached": 497920,
+   "output": 20669,
+   "model": "deepseek-flash",
+   "seconds": 744.607962
+  }
+ ]
+}

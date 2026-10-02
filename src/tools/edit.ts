@@ -24,7 +24,7 @@ export const editTool: Tool = {
   describe: ({ path, old_string, new_string }) =>
     [String(path), ...prefixLines(String(old_string), "- "), ...prefixLines(String(new_string), "+ ")].join("\n"),
 
-  async run(input, { cwd, versions }) {
+  async run(input, { cwd, versions, dirs }) {
     const { path, old_string: oldText, new_string: newText } = input as {
       path: string;
       old_string: string;
@@ -34,7 +34,7 @@ export const editTool: Tool = {
       throw new Error("old_string is empty. Use write_file to create a file, or include a nearby line in old_string.");
     }
     if (oldText === newText) throw new Error("old_string and new_string are identical; there is nothing to change.");
-    const file = resolveInRoot(cwd, path);
+    const file = resolveInRoot(cwd, path, dirs);
     await assertFile(file, path);
     // No read-before-edit check here, unlike write_file: an exact, unique match of old_string already
     // shows the model knows the text it replaces, and can't overwrite anything it hasn't seen. In the

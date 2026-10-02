@@ -22,9 +22,9 @@ export const writeTool: Tool = {
   kind: "edit",
   describe: ({ path, content }) => `${path} (${lineCount(String(content))})`,
 
-  async run(input, { cwd, versions }) {
+  async run(input, { cwd, versions, dirs }) {
     const { path, content } = input as { path: string; content: string };
-    const file = resolveInRoot(cwd, path);
+    const file = resolveInRoot(cwd, path, dirs);
     const existing = await stat(file).catch(() => null);
     if (existing?.isDirectory()) throw new Error(`${path} is a directory.`);
 

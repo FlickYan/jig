@@ -1,4 +1,4 @@
-import { join, relative } from "node:path";
+import { relative, resolve } from "node:path";
 import { globToRegExp, listFiles } from "./files.ts";
 import type { Tool } from "./index.ts";
 import { resolveInRoot } from "./util.ts";
@@ -25,12 +25,12 @@ export const globTool: Tool = {
   kind: "read",
   describe: ({ pattern, path }) => (path ? `${pattern} in ${path}` : String(pattern)),
 
-  async run(input, { cwd }) {
+  async run(input, { cwd, dirs }) {
     const { pattern, path = "." } = input as { pattern: string; path?: string };
-    const base = resolveInRoot(cwd, path);
+    const base = resolveInRoot(cwd, path, dirs);
     const regex = globToRegExp(pattern);
     // The pattern is relative to `path`; results are relative to the project, ready for read_file.
-    const matches = (await listFiles(cwd, path)).filter((file) => regex.test(relative(base, join(cwd, file))));
+    const matches = (await listFiles(cwd, path, dirs)).filter((file) => regex.test(relative(base, resolve(cwd, file))));
     if (matches.length === 0) return "No files found.";
     const shown = matches.slice(0, MAX_RESULTS);
     if (matches.length > shown.length) {

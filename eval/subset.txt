@@ -1,0 +1,23 @@
+# 20 Terminal-Bench 2.0 tasks: a random sample (Python random.Random(2026).sample over the sorted
+# list) of the 61 tasks that ask for 2 GB of memory, one CPU and an agent time limit of at most 30
+# minutes, which is what fits this machine's 3 GB Docker VM. 13 medium, 6 hard, 1 easy.
+adaptive-rejection-sampler
+chess-best-move
+cobol-modernization
+db-wal-recovery
+dna-assembly
+filter-js-from-html
+headless-terminal
+kv-store-grpc
+llm-inference-batching-scheduler
+log-summary-date-ranges
+make-mips-interpreter
+model-extraction-relu-logits
+modernize-scientific-stack
+mteb-retrieve
+multi-source-data-merger
+openssl-selfsigned-cert
+polyglot-rust-c
+pytorch-model-recovery
+sparql-university
+tune-mjcf

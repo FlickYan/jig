@@ -35,7 +35,18 @@ export function loadInstructions(cwd: string): Instructions[] {
  * The system prompt. It is built once per conversation and never changes during it, so together with
  * the tool definitions it forms a stable prefix the API can cache. Project instructions go at the end.
  */
-export function systemPrompt(cwd: string, instructions: Instructions[] = [], sandboxLimits?: string, skills = ""): string {
+export interface PromptOptions {
+  /** The project's AGENTS.md files. */
+  instructions?: Instructions[];
+  /** What the sandbox stops commands from doing, if they run in one. */
+  sandboxLimits?: string;
+  /** The skill catalog (see skills.ts). */
+  skills?: string;
+  /** Directories outside the project the file tools may use too (--add-dir). */
+  dirs?: string[];
+}
+
+export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [] }: PromptOptions = {}): string {
   const prompt = `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
 
 How to work:
@@ -48,7 +59,7 @@ How to work:
 - Before your first tool call, say in one line what you are going to do. When you finish, briefly say what you changed and anything the user should check. Your replies are shown in a terminal: keep them short. Markdown is fine.
 
 Environment:
-- Working directory: ${cwd}
+- Working directory: ${cwd}${dirs.length ? `\n- The file tools also work in: ${dirs.join(", ")}` : ""}
 - Platform: ${os.type()} ${os.release()} (${os.arch()})
 - Git repository: ${gitRoot(cwd) ? "yes" : "no"}
 - Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted" or a connection error.` : "run directly on the user's machine."}
@@ -63,7 +74,7 @@ function projectInstructions(instructions: Instructions[]): string {
 }
 
 /** The system prompt of a subagent: a researcher that reports back to the main agent. */
-export function subagentPrompt(cwd: string, instructions: Instructions[] = [], sandboxLimits?: string): string {
+export function subagentPrompt(cwd: string, { instructions = [], sandboxLimits, dirs = [] }: PromptOptions = {}): string {
   const prompt = `You are a subagent of a coding agent working in the user's terminal. The agent gave you one task, usually research in the user's project; only your final reply goes back to it.
 
 How to work:
@@ -73,7 +84,7 @@ How to work:
 - Finish with a reply the agent can act on without redoing your work: what you found, with file paths and line numbers, and what you could not find. Be concise but complete.
 
 Environment:
-- Working directory: ${cwd}
+- Working directory: ${cwd}${dirs.length ? `\n- The file tools also work in: ${dirs.join(", ")}` : ""}
 - Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits}` : "run directly on the user's machine."}`;
   return [prompt, projectInstructions(instructions)].filter(Boolean).join("\n\n");
 }

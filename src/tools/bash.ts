@@ -7,6 +7,10 @@ import { parseCommand } from "./shell.ts";
 import { type FileVersions, isInside } from "./util.ts";
 
 const DEFAULT_TIMEOUT = 120; // seconds
+// jig's own credentials. The commands the model runs never need them, and they shouldn't see them: in
+// the Terminal-Bench runs the model printed the environment with `env` to look around, which put the key
+// into the conversation and the logs, and a prompt injection could send it somewhere instead.
+const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 const MAX_TIMEOUT = 600;
 const MAX_CAPTURE = 5_000_000; // characters; a command printing more than this is killed
 
@@ -33,11 +37,11 @@ export const bashTool: Tool = {
   kind: "run",
   describe: ({ command }) => String(command),
 
-  async run(input, { cwd, signal, versions, sandbox }) {
+  async run(input, { cwd, signal, versions, sandbox, dirs = [] }) {
     const { command, timeout = DEFAULT_TIMEOUT } = input as { command: string; timeout?: number };
     const seconds = Math.min(Math.max(timeout, 1), MAX_TIMEOUT);
     const output = await runCommand(command, cwd, seconds, signal, sandbox);
-    await recordViewedFiles(command, cwd, versions);
+    await recordViewedFiles(command, cwd, versions, dirs);
     return output;
   },
 };
@@ -49,12 +53,12 @@ const VIEWERS = new Set(["cat", "head", "tail", "nl"]);
  * A file the model printed with `cat` (or head, tail) counts as read for edit_file's read-before-edit
  * check. The benchmark showed why: without this, edits after a `cat` were refused and had to be redone.
  */
-async function recordViewedFiles(command: string, cwd: string, versions: FileVersions): Promise<void> {
+async function recordViewedFiles(command: string, cwd: string, versions: FileVersions, dirs: string[]): Promise<void> {
   for (const [program, ...args] of parseCommand(command) ?? []) {
     if (!VIEWERS.has(program)) continue;
     for (const arg of args) {
       const abs = resolve(cwd, arg);
-      if (arg.startsWith("-") || !isInside(cwd, abs)) continue;
+      if (arg.startsWith("-") || ![cwd, ...dirs].some((dir) => isInside(dir, abs))) continue;
       const info = await stat(abs).catch(() => null);
       if (info?.isFile()) await versions.record(abs, info);
     }
@@ -66,7 +70,8 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
-    const child = spawn(program, args, { cwd, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
+    const child = spawn(program, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let killedBecause = "";
     const kill = (reason: string) => {

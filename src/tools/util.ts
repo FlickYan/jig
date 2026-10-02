@@ -3,14 +3,15 @@ import { stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 /**
- * Resolves a path from the model against the project root and refuses anything outside it.
- * The check is lexical, so a symlink inside the root can still lead out. The bash tool is not confined
- * at all: real isolation needs a sandbox (milestone 4).
+ * Resolves a path from the model against the project root and refuses anything outside it and the
+ * directories added with --add-dir. The check is lexical, so a symlink inside can still lead out; the
+ * sandbox is what actually confines commands.
  */
-export function resolveInRoot(root: string, path: string): string {
+export function resolveInRoot(root: string, path: string, dirs: string[] = []): string {
   const abs = resolve(root, path);
-  if (!isInside(root, abs)) {
-    throw new Error(`${path} is outside the working directory (${root}). File tools only work inside it.`);
+  if (!isInside(root, abs) && !dirs.some((dir) => isInside(dir, abs))) {
+    const also = dirs.length ? ` and in ${dirs.join(", ")}` : "";
+    throw new Error(`${path} is outside the working directory (${root}). File tools only work inside it${also}.`);
   }
   return abs;
 }

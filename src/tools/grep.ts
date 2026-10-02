@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, resolve } from "node:path";
 import { globToRegExp, listFiles } from "./files.ts";
 import type { Tool } from "./index.ts";
 
@@ -34,7 +34,7 @@ export const grepTool: Tool = {
   describe: ({ pattern, path, include }) =>
     [String(pattern), path && `in ${path}`, include && `(${include})`].filter(Boolean).join(" "),
 
-  async run(input, { cwd }) {
+  async run(input, { cwd, dirs }) {
     const { pattern, path = ".", include, ignore_case } = input as {
       pattern: string;
       path?: string;
@@ -51,10 +51,10 @@ export const grepTool: Tool = {
 
     const shown: string[] = [];
     let total = 0;
-    for (const file of await listFiles(cwd, path)) {
+    for (const file of await listFiles(cwd, path, dirs)) {
       // Like ripgrep: a glob without "/" matches file names in any directory.
       if (includeRegex && !includeRegex.test(include!.includes("/") ? file : basename(file))) continue;
-      const bytes = await readFile(join(cwd, file)).catch(() => null);
+      const bytes = await readFile(resolve(cwd, file)).catch(() => null);
       if (!bytes || bytes.length > MAX_FILE_BYTES || bytes.subarray(0, 8192).includes(0)) continue;
       bytes
         .toString("utf8")

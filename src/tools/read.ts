@@ -28,9 +28,9 @@ export const readTool: Tool = {
   kind: "read",
   describe: ({ path, offset }) => (offset ? `${path}:${offset}` : String(path)),
 
-  async run(input, { cwd, versions }) {
+  async run(input, { cwd, versions, dirs }) {
     const { path, offset = 1, limit = DEFAULT_LIMIT } = input as { path: string; offset?: number; limit?: number };
-    const file = resolveInRoot(cwd, path);
+    const file = resolveInRoot(cwd, path, dirs);
     const info = await assertFile(file, path); // taken before reading, so a change during the read shows up later
     const bytes = await readFile(file);
     if (bytes.subarray(0, 8192).includes(0)) throw new Error(`${path} looks like a binary file; not reading it.`);

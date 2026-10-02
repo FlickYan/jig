@@ -147,7 +147,7 @@ describe("AGENTS.md", () => {
       { path: "../AGENTS.md", text: "Use tabs." },
       { path: "CLAUDE.md", text: "Run `make test` before you finish." },
     ]);
-    const prompt = systemPrompt(join(dir, "service"), instructions);
+    const prompt = systemPrompt(join(dir, "service"), { instructions });
     assert.match(prompt, /<instructions file="\.\.\/AGENTS\.md">\nUse tabs\.\n<\/instructions>/);
     assert.ok(prompt.indexOf("Use tabs") < prompt.indexOf("make test"), "the more specific file comes last");
   });
@@ -156,7 +156,7 @@ describe("AGENTS.md", () => {
     await writeFile(join(dir, "AGENTS.md"), "agents");
     await writeFile(join(dir, "CLAUDE.md"), "claude");
     assert.deepEqual(loadInstructions(dir).map((i) => i.text), ["agents"]);
-    assert.equal(systemPrompt(dir, []).includes("<instructions"), false);
+    assert.equal(systemPrompt(dir).includes("<instructions"), false);
     assert.ok((await readFile(join(dir, "AGENTS.md"), "utf8")).length > 0);
   });
 });
