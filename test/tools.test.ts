@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -144,6 +145,19 @@ describe("edit_file", () => {
   });
 });
 
+/**
+ * Whether a process is still running. A killed process whose parent died stays a zombie until its new
+ * parent reaps it, which in a container without a real init can be never: on Linux, that counts as gone.
+ */
+function running(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  return !existsSync(`/proc/${pid}/stat`) || !/^\d+ \(.*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+}
+
 describe("bash", () => {
   it("returns stdout, stderr and the exit code", async () => {
     const out = await bashTool.run({ command: "echo hello; echo oops >&2; exit 3" }, ctx);
@@ -164,7 +178,7 @@ describe("bash", () => {
     assert.match(out, /Killed: it timed out after 1s/);
     assert.ok(Date.now() - started < 5000);
     const child = Number(await readFile(join(cwd, "child.pid"), "utf8"));
-    assert.throws(() => process.kill(child, 0), "the background sleep should be gone too");
+    assert.equal(running(child), false, "the background sleep should be gone too");
   });
 
   it("keeps jig's API keys out of the commands' environment", async () => {

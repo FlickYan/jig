@@ -3,7 +3,7 @@
 A minimal coding agent for the terminal, written from scratch in TypeScript on the Anthropic Messages API
 (Claude, or DeepSeek through its Anthropic-compatible endpoint). There is no agent framework: it is one
 streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
-(a macOS sandbox, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
+(an OS sandbox on macOS and Linux, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
 servers, hooks, subagents), and a benchmark that measures each version.
 
 (A jig is the workshop fixture that holds a piece of work and guides the tool cutting it, which is what an
@@ -35,7 +35,8 @@ Usage: jig [options] [task]
                           edits  change files in the project freely; ask before commands the sandbox doesn't contain
                           auto   never ask
   -y, --yes             same as --mode auto
-      --no-sandbox      run commands directly on this machine instead of in the sandbox (macOS)
+      --no-sandbox      run commands directly on this machine instead of in the sandbox (Seatbelt on
+                        macOS, bubblewrap on Linux)
       --allow-network   let sandboxed commands use the network
       --hide-thinking   don't print the model's thinking (/thinking toggles it in a session)
   -c, --continue        continue this project's most recent session
@@ -55,11 +56,15 @@ received (subagents included), and how many input tokens came from the prompt ca
 
 ### Safety
 
-- **Sandbox.** On macOS, commands run under the operating system's sandbox (Seatbelt, as in Codex and
-  Claude Code): they can read anything but write only inside the project, its git directory and the temp
-  directories, and can't reach the network except localhost (`--allow-network` lifts that). Because a
-  sandboxed command can't harm anything outside the project or send data out, in the default `edits` mode
-  commands run without asking. `--no-sandbox` turns it off.
+- **Sandbox.** Commands run in the operating system's sandbox, as in Codex and Claude Code: Seatbelt on
+  macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but write
+  only inside the project, its git directory, the directories added with `--add-dir` and the temp
+  directories, and they can't reach the network (`--allow-network` lifts that). On macOS, localhost stays
+  open; on Linux each command gets an empty network of its own, so a test can still start a server and
+  talk to it, but only within one command. Because a sandboxed command can't harm anything outside the
+  project or send data out, in the default `edits` mode commands run without asking. On Linux the sandbox
+  needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where it can't
+  run, jig says why, and commands ask first. `--no-sandbox` turns it off.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
@@ -166,7 +171,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
 | [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
-| [`src/sandbox.ts`](src/sandbox.ts) | The macOS sandbox profile commands run under |
+| [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments on Linux |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
@@ -222,7 +227,14 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
   slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
   just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
-  Linux would use bubblewrap the same way; that isn't written yet.
+- **bubblewrap on Linux, rather than Landlock and seccomp.** Codex restricts writes with Landlock and
+  blocks sockets with seccomp, which needs native code to load the filters. bubblewrap does the same job
+  in one command jig can run: the file system mounted read-only with the writable directories bound back
+  in, a fresh `/dev`, and with `--unshare-net` a network namespace with nothing but loopback. It is small,
+  packaged everywhere (Flatpak uses it), and needs no privileges where user namespaces are allowed.
+  Each command gets its own namespace, so a server one command starts is out of reach of the next; on
+  macOS it isn't. Killing a command's process group still reaches everything inside, and
+  `--die-with-parent` takes the sandbox down if jig dies.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.
@@ -267,14 +279,14 @@ jig: `--ref m1` runs the code tagged `m1`, on today's tasks.
 
 ```bash
 npm run bench -- --ref m1 --label m1 --attempts 3   # milestone 1
-npm run bench -- --ref m4 --label m4 --attempts 3   # milestone 4
-npm run bench -- --label m5 --attempts 3            # the current code
+npm run bench -- --ref m6 --label m6 --attempts 3   # milestone 6
+npm run bench -- --label m7 --attempts 3            # the current code
 npm run bench:report                                # compare the saved runs (Markdown)
 ```
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
-Runs on earlier versions of the suite are in `suite-12/`, `suite-15/` and `suite-17/`, one-off experiments in
+Runs on earlier versions of the suite are in `suite-12/`, `suite-15/`, `suite-17/` and `suite-20/`, one-off experiments in
 `experiments/`; `npm run bench:report -- bench/results/experiments` reports a folder.
 Logs of every attempt (the transcript, the diff the agent made, the check's output and jig's session file)
 go to `bench/logs/`. Model output varies between runs, so use several `--attempts`: the report shows the
@@ -322,7 +334,23 @@ for comparing against other agents. For that, see [Terminal-Bench](#terminal-ben
 
 ### Results
 
-**M4 against M5, on the current 20-task suite** (deepseek-flash, three attempts per task):
+**M7 on macOS and on Linux**, on the current suite (deepseek-flash, three attempts per task):
+
+| run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
+|-----|--------|-------|------------|-------------------|-----------|------|------|
+| m7 (macOS, Seatbelt) | 100% (60/60) | 7.0 | 8.9 | 0.0 | 30,795 | $0.0047 | 14s |
+| m7-linux (Debian container, bubblewrap) | 100% (60/60) | 7.0 | 8.7 | 0.0 | 30,780 | $0.0043 | 13s |
+
+Every attempt passed on both systems, so nothing in milestones 6 and 7 cost a task. The Linux run ran
+jig as an ordinary user in a Debian container, every command in the bubblewrap sandbox; no command
+tripped over it (none was refused a write), and as on macOS no attempt acted on the prompt injections
+(0 of 6). Getting the benchmark onto Linux also found a bug in it: two tasks ran their hidden tests with
+`node --test bench_tests/`, which only Node 26 accepts, so on Node 22 and 24 their reference solutions
+failed. They now pass the test files by name. That changed the suite's fingerprint, so these runs aren't
+directly comparable with the ones below, though no task changed.
+
+**M4 against M5, on the 20-task suite as it was then** (in `bench/results/suite-20/`; deepseek-flash,
+three attempts per task):
 
 | run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
 |-----|--------|-------|------------|-------------------|-----------|------|------|
@@ -505,6 +533,11 @@ npm test            # the tools, permissions, sandbox, snapshots, search, contex
 npm run typecheck
 ```
 
+[CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests
+included (on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and
+checks the benchmark's tasks with the oracle and noop agents, which needs no API key. The Linux setup
+was tried locally in Debian containers as an ordinary user, with Node 22 and 24, before it went in.
+
 ## Roadmap
 
 - [x] **1. Core loop:** streaming, `read_file` / `write_file` / `edit_file` / `bash`, step limit, approval prompt
@@ -513,3 +546,4 @@ npm run typecheck
 - [x] **4. Safety:** macOS sandbox (writes only in the project, no network); `plan` mode; allow and deny rules; snapshots and `/undo`; prompt-injection guidance; read-before-edit narrowed to overwrites; two prompt-injection tasks
 - [x] **5. Extensions:** Agent Skills with progressive disclosure; MCP client over stdio (official SDK) with restart; `PreToolUse` and `PostToolUse` hooks; read-only subagents; parallel read-only tool calls; project trust; three benchmark tasks for the extensions
 - [x] **6. Evaluation:** Terminal-Bench 2.0 through Harbor against mini-swe-agent on the same model, with success rate, cost and turns per task; ablations of effort, compaction and subagents; `--add-dir`, `--stats`, and a 2-minute API timeout with retry notices
+- [x] **7. Linux and CI:** a bubblewrap sandbox on Linux with the same policy and tests as on macOS, and a clear reason when it can't run; GitHub Actions on Linux and macOS with Node 22 and 24; benchmark tasks checked in CI, which caught two task checks that only worked on Node 26

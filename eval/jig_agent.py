@@ -135,13 +135,14 @@ class Jig(BaseInstalledAgent):
         if not key:
             raise ValueError(f"Set {key_name} in the environment harbor runs in.")
         flags = self.build_cli_flags()
-        # The container is the sandbox, so the whole file system is the project (--add-dir /), and
-        # nobody is there to approve tool calls (--yes). jig's home goes in the logs, so the session
+        # The container is the sandbox (--no-sandbox: jig's own would need bubblewrap and user namespaces
+        # in the container), so the whole file system is the project (--add-dir /), and nobody is there
+        # to approve tool calls (--yes). jig's home goes in the logs, so the session
         # file (every message and tool input) comes back with the trial.
         await self.exec_as_agent(
             environment,
             command=(
-                f"{LOAD_NODE} && node {INSTALL_DIR}/src/cli.ts --yes --add-dir / --model {shlex.quote(model)} "
+                f"{LOAD_NODE} && node {INSTALL_DIR}/src/cli.ts --yes --no-sandbox --add-dir / --model {shlex.quote(model)} "
                 f"--stats /logs/agent/jig-stats.json {flags} -- {shlex.quote(instruction)} "
                 "</dev/null 2>&1 | tee /logs/agent/jig.txt"
             ),

@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
-import { createSandbox } from "../src/sandbox.ts";
+import { after, before, beforeEach, describe, it } from "node:test";
+import { createSandbox, type Sandbox, sandboxProblem } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { runCommand } from "../src/tools/bash.ts";
@@ -15,18 +15,48 @@ beforeEach(async () => {
   process.env.JIG_HOME = join(dir, ".jig-home");
 });
 
-describe("sandbox", { skip: process.platform !== "darwin" && "the sandbox is macOS only" }, () => {
-  it("lets commands write in the project but nowhere else, and keeps them offline", async () => {
-    const sandbox = createSandbox(dir, { network: false })!;
-    assert.match(await runCommand("echo ok > inside.txt && cat inside.txt", dir, 10, undefined, sandbox), /^ok/);
+describe("sandbox", { skip: sandboxProblem() }, () => {
+  // A project under the home directory, so "writes only in the project" isn't just the temp-directory rule.
+  let project: string;
+  before(async () => {
+    project = await mkdtemp(join(homedir(), ".jig-sandbox-project-"));
+  });
+  after(() => rm(project, { recursive: true, force: true }));
+  const run = (command: string, sandbox: Sandbox) => runCommand(command, project, 20, undefined, sandbox);
+  const denied = /Operation not permitted|Read-only file system/; // Seatbelt, bubblewrap
+
+  it("lets commands write in the project and the temp directories, but nowhere else", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    assert.match(await run("echo ok > inside.txt && cat inside.txt", sandbox), /^ok/);
+    assert.match(await run(`echo ok > ${join(tmpdir(), `jig-sandbox-${process.pid}.txt`)} && echo written`, sandbox), /^written/);
     const probe = join(homedir(), `.jig-sandbox-test-${process.pid}`);
-    assert.match(await runCommand(`echo bad > ${probe}`, dir, 10, undefined, sandbox), /Operation not permitted/);
+    assert.match(await run(`echo bad > ${probe}`, sandbox), denied);
     assert.equal(existsSync(probe), false);
-    assert.match(await runCommand("curl -sS -m 5 https://example.com", dir, 10, undefined, sandbox), /Exit code: [1-9]/);
   });
 
-  it("can allow the network", async () => {
-    assert.doesNotMatch(createSandbox(dir, { network: true })!.wrap("x").args[1], /deny network/);
+  it("lets commands write in an added directory too", async () => {
+    const added = await mkdtemp(join(homedir(), ".jig-sandbox-added-"));
+    try {
+      const sandbox = createSandbox(project, { network: false, dirs: [added] })!;
+      assert.match(await run(`echo ok > ${join(added, "a.txt")} && echo written`, sandbox), /^written/);
+      assert.match(sandbox.limits, new RegExp(`inside the project, ${(await realpath(added)).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    } finally {
+      await rm(added, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps commands off the network, but not off their own loopback", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    assert.match(await run("curl -sS -m 5 https://example.com", sandbox), /Exit code: [1-9]/);
+    // A server and a client in one command, as a test suite starting its own server does.
+    const loopback = `node -e "const s = require('net').createServer((c) => c.end('pong')).listen(0, '127.0.0.1', () => require('net').connect(s.address().port, '127.0.0.1').on('data', (d) => { console.log(String(d)); s.close(); }))"`;
+    assert.match(await run(loopback, sandbox), /^pong/);
+  });
+
+  it("can allow the network", () => {
+    const flags = (network: boolean) => createSandbox(project, { network })!.wrap("x").args.join(" ");
+    assert.match(flags(false), /deny network|--unshare-net/);
+    assert.doesNotMatch(flags(true), /deny network|--unshare-net/);
   });
 });
 

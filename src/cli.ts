@@ -11,7 +11,7 @@ import { connectMcpServers } from "./mcp.ts";
 import { type CallModel, contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, subagentPrompt, systemPrompt } from "./prompt.ts";
-import { createSandbox } from "./sandbox.ts";
+import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
@@ -31,7 +31,8 @@ Options:
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto
-      --no-sandbox        run commands directly on this machine instead of in the sandbox (macOS)
+      --no-sandbox        run commands directly on this machine instead of in the sandbox (Seatbelt on
+                          macOS, bubblewrap on Linux)
       --allow-network     let sandboxed commands use the network
       --hide-thinking     don't print the model's thinking (/thinking toggles it in a session)
   -c, --continue          continue this project's most recent session
@@ -115,8 +116,11 @@ async function main(): Promise<void> {
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
   const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
-  const sandbox = (values.sandbox ?? settings.sandbox ?? true) ? createSandbox(cwd, { network, dirs }) : undefined;
-  if (values.sandbox && !sandbox) throw new Error("The sandbox is only available on macOS so far.");
+  const wantSandbox = values.sandbox ?? settings.sandbox ?? true;
+  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs }) : undefined;
+  if (values.sandbox && !sandbox) throw new Error(`No sandbox: ${sandboxProblem()}.`);
+  // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
+  const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
   const contained = !!sandbox && !network;
   const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
@@ -326,12 +330,14 @@ async function main(): Promise<void> {
   }
 
   if (positionals.length > 0) {
+    if (noSandbox) ui.notice(noSandbox);
     if (!(await runTask(positionals.join(" ")))) process.exitCode = 1;
     return;
   }
 
   ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
-  ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (no sandbox)."));
+  if (noSandbox) ui.notice(`${noSandbox} Commands run directly on this machine.`);
+  else ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (sandbox off)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
   const extras = [
     skills.length && plural(skills.length, "skill") + " (/skills)",
