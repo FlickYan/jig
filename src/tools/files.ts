@@ -10,6 +10,8 @@ const SKIP_DIRS = new Set([
   ".next", "target",
 ]);
 const MAX_FILES = 20_000;
+// Kernel file systems, which a walk of / (--add-dir / in a container) would otherwise wander through.
+const PSEUDO_FILESYSTEMS = new Set(["/proc", "/sys", "/dev"]);
 
 /**
  * The files under `path` (a directory or a single file), sorted: relative to root for files in the
@@ -47,7 +49,7 @@ async function walk(root: string, dir: string, out: string[]): Promise<string[]>
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     if (out.length >= MAX_FILES) break;
     const abs = join(dir, entry.name);
-    if (entry.isDirectory() && !SKIP_DIRS.has(entry.name)) await walk(root, abs, out);
+    if (entry.isDirectory() && !SKIP_DIRS.has(entry.name) && !PSEUDO_FILESYSTEMS.has(abs)) await walk(root, abs, out);
     else if (entry.isFile()) out.push(relative(root, abs)); // symlinks are skipped, so walks can't loop
   }
   return out;

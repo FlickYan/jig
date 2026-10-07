@@ -17,6 +17,7 @@ import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, t
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { Snapshots } from "./snapshots.ts";
 import { Stats } from "./stats.ts";
+import { VERSION } from "./version.ts";
 import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -45,6 +46,7 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --max-steps <n>     most model calls per task (default: 50)
       --no-subagents      leave out the subagent tool
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+  -v, --version           print jig's version
   -h, --help              show this help
 
 jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/.jig/sessions, and
@@ -90,11 +92,16 @@ async function main(): Promise<void> {
       "max-steps": { type: "string", default: "50" },
       subagents: { type: "boolean", default: true },
       stats: { type: "string" },
+      version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     console.log(HELP);
+    return;
+  }
+  if (values.version) {
+    console.log(VERSION);
     return;
   }
   const cwd = resolve(values.cwd);

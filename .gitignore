@@ -6,3 +6,5 @@ __pycache__/
 bench/logs/
 eval/.venv/
 eval/jobs/
+dist/
+*.tgz

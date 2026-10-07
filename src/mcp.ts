@@ -3,8 +3,8 @@ import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotoc
 import type Anthropic from "@anthropic-ai/sdk";
 import type { McpServerConfig } from "./settings.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
+import { VERSION } from "./version.ts";
 
-const VERSION = "0.1.0"; // as in package.json
 const CONNECT_TIMEOUT = 30_000;
 const CALL_TIMEOUT = 300_000;
 

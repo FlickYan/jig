@@ -1,5 +1,6 @@
 {
-  // Type checking only: Node runs the .ts files directly by stripping the types, so there is no build step.
+  // Type checking (npm run typecheck): from a clone, Node runs the .ts files directly by stripping the
+  // types. tsconfig.build.json compiles src/ to dist/ for the npm package.
   "compilerOptions": {
     "target": "es2024",
     "module": "nodenext",

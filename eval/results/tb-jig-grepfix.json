@@ -1,0 +1,45 @@
+{
+ "name": "tb-jig-grepfix",
+ "agent": "jig",
+ "trials": [
+  {
+   "task": "headless-terminal",
+   "job": "tb-jig-grepfix",
+   "version": "d728489+changes",
+   "passed": false,
+   "error": null,
+   "turns": 16,
+   "input": 154069,
+   "cached": 146304,
+   "output": 9728,
+   "model": "deepseek-flash",
+   "seconds": 71.733025
+  },
+  {
+   "task": "headless-terminal",
+   "job": "tb-jig-grepfix",
+   "version": "d728489+changes",
+   "passed": true,
+   "error": null,
+   "turns": 24,
+   "input": 434760,
+   "cached": 424576,
+   "output": 20076,
+   "model": "deepseek-flash",
+   "seconds": 172.124363
+  },
+  {
+   "task": "headless-terminal",
+   "job": "tb-jig-grepfix",
+   "version": "d728489+changes",
+   "passed": true,
+   "error": null,
+   "turns": 14,
+   "input": 118545,
+   "cached": 115200,
+   "output": 9941,
+   "model": "deepseek-flash",
+   "seconds": 82.900434
+  }
+ ]
+}

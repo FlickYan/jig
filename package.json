@@ -1,17 +1,34 @@
 {
-  "name": "jig",
+  "name": "jig-agent",
   "version": "0.1.0",
-  "description": "A minimal terminal coding agent: a streaming tool-use loop over the Claude API",
-  "private": true,
+  "description": "A coding agent for the terminal, built from scratch on the Anthropic Messages API (Claude, or DeepSeek through its compatible endpoint)",
+  "keywords": [
+    "coding-agent",
+    "agent",
+    "cli",
+    "terminal",
+    "claude",
+    "anthropic",
+    "deepseek",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "FlickYan",
   "type": "module",
   "bin": {
-    "jig": "src/cli.ts"
+    "jig": "dist/cli.js"
   },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "engines": {
     "node": ">=22.18"
   },
   "scripts": {
     "start": "node src/cli.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc",
     "bench": "node bench/run.ts",

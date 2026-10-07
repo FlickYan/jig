@@ -11,6 +11,7 @@ cost tracking doesn't know every model, and jig's is computed the same way in it
 """
 
 import json
+import random
 import statistics
 import sys
 from pathlib import Path
@@ -32,6 +33,7 @@ def trials(job: Path) -> list[dict]:
         execution = result.get("agent_execution") or {}
         found.append({
             "task": result["task_name"],
+            "job": path.parent.parent.name,
             "version": (result.get("agent_info") or {}).get("version"),
             "passed": ((result.get("verifier_result") or {}).get("rewards") or {}).get("reward") == 1.0,
             "error": exception,
@@ -84,6 +86,22 @@ def label(job: Path) -> str:
     return f"{name}{f' ({settings})' if settings else ''}"
 
 
+def pass_rates(found: list[dict]) -> dict[str, float]:
+    """The share of each task's attempts that passed."""
+    tasks: dict[str, list[bool]] = {}
+    for trial in found:
+        tasks.setdefault(trial["task"], []).append(trial["passed"])
+    return {task: sum(results) / len(results) for task, results in tasks.items()}
+
+
+def interval(values: list[float], resamples: int = 10_000) -> tuple[float, float]:
+    """A 95% bootstrap interval for the mean of per-task values, resampling tasks: attempts at one task
+    are not independent of each other, so tasks are the unit."""
+    rng = random.Random(0)
+    means = sorted(statistics.mean(rng.choices(values, k=len(values))) for _ in range(resamples))
+    return means[int(0.025 * resamples)], means[int(0.975 * resamples) - 1]
+
+
 def mean(values: list) -> float | None:
     values = [value for value in values if value is not None]
     return statistics.mean(values) if values else None
@@ -127,21 +145,34 @@ def main(args: list[str]) -> None:
         for name, agent, found in runs:
             summary = {"name": name, "agent": agent, "trials": found}
             (save / f"{name}.json").write_text(json.dumps(summary, indent=1) + "\n")
-    print("| job | agent | passed | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
-    print("|-----|-------|--------|-----------|--------------|-------|-----------|------------|------|------------|")
+    print("| job | agent | passed | 95% CI | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
+    print("|-----|-------|--------|--------|-----------|--------------|-------|-----------|------------|------|------------|")
     for job, name, found in runs:
         if not found:
             continue
         passed = sum(trial["passed"] for trial in found)
         timeouts = sum(trial["error"] == "AgentTimeoutError" for trial in found)
         others = sum(bool(trial["error"]) and trial["error"] != "AgentTimeoutError" for trial in found)
+        low, high = interval(list(pass_rates(found).values()))
         print(
-            f"| {job} | {name} | {passed}/{len(found)} ({passed / len(found):.0%}) | {timeouts} | {others} "
+            f"| {job} | {name} | {passed}/{len(found)} ({passed / len(found):.0%}) | {low:.0%}–{high:.0%} | {timeouts} | {others} "
             f"| {fmt(mean([t['turns'] for t in found]), 'num')} | {fmt(mean([t['input'] for t in found]), 'tokens')} "
             f"| {fmt(mean([t['output'] for t in found]), 'tokens')} | {fmt(mean([cost(t) for t in found]), 'money')} "
             f"| {fmt(mean([t['seconds'] for t in found]), 'time')} |"
         )
-    print("\nAverages are per task. Per task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error):\n")
+    print("\nAverages are per attempt. The 95% interval resamples tasks (each task's share of passed attempts).")
+    named = [(job, found) for job, _, found in runs if found]
+    if len(named) > 1:
+        first_job, first = named[0]
+        base = pass_rates(first)
+        print("\nDifferences, paired by task (only tasks both runs attempted):\n")
+        for job, found in named[1:]:
+            rates = pass_rates(found)
+            common = sorted(set(base) & set(rates))
+            diffs = [rates[task] - base[task] for task in common]
+            low, high = interval(diffs)
+            print(f"- {job} minus {first_job}: {statistics.mean(diffs) * 100:+.0f} points (95% CI {low * 100:+.0f} to {high * 100:+.0f}), over {len(common)} tasks")
+    print("\nPer task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error):\n")
     tasks = sorted({trial["task"] for _, _, found in runs for trial in found})
     print("| task | " + " | ".join(job for job, _, _ in runs) + " |")
     print("|------|" + "|".join("---" for _ in runs) + "|")

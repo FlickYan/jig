@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { globToRegExp, listFiles } from "./files.ts";
 import type { Tool } from "./index.ts";
@@ -54,8 +54,12 @@ export const grepTool: Tool = {
     for (const file of await listFiles(cwd, path, dirs)) {
       // Like ripgrep: a glob without "/" matches file names in any directory.
       if (includeRegex && !includeRegex.test(include!.includes("/") ? file : basename(file))) continue;
+      // Size first: reading a big file only to skip it is how a search of a whole container ran out of
+      // memory in the Terminal-Bench runs (the process was killed at the container's 2 GB limit).
+      const info = await stat(resolve(cwd, file)).catch(() => null);
+      if (!info?.isFile() || info.size > MAX_FILE_BYTES) continue;
       const bytes = await readFile(resolve(cwd, file)).catch(() => null);
-      if (!bytes || bytes.length > MAX_FILE_BYTES || bytes.subarray(0, 8192).includes(0)) continue;
+      if (!bytes || bytes.subarray(0, 8192).includes(0)) continue;
       bytes
         .toString("utf8")
         .split("\n")

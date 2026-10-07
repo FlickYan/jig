@@ -11,17 +11,23 @@ agent harness does for a model.)
 
 ## Quick start
 
-You need Node 22.18 or newer (it runs the TypeScript directly, so there is no build step) and an
-API key: DeepSeek for the default model (`deepseek-flash`), or Anthropic for Claude models.
+You need Node 22.18 or newer and an API key: DeepSeek for the default model (`deepseek-flash`), or
+Anthropic for Claude models.
+
+```bash
+export DEEPSEEK_API_KEY=sk-...    # or ANTHROPIC_API_KEY, and pass --model claude-opus-5-5
+
+npx jig-agent "the login test is failing, fix it"   # run one task in the current directory
+npm install -g jig-agent                            # or install it: then `jig` in any project
+```
+
+From a clone, Node runs the TypeScript in `src/` directly, so there is no build step:
 
 ```bash
 npm install
-export DEEPSEEK_API_KEY=sk-...    # or ANTHROPIC_API_KEY, and pass --model claude-opus-5-5
-
 npm start -- -C ~/code/some-project "the login test is failing, fix it"   # run one task
 npm start -- -C ~/code/some-project                                       # interactive session
-
-npm link    # optional: puts `jig` on your PATH, then run `jig` inside any project
+npm run build && npm link   # optional: puts this clone's `jig` on your PATH
 ```
 
 ```
@@ -176,6 +182,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
+| [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs |
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
@@ -437,10 +444,10 @@ bash tool, a short prompt, no other machinery) with the same model, deepseek-fla
 ```bash
 python3 -m venv eval/.venv && eval/.venv/bin/pip install harbor
 export DEEPSEEK_API_KEY=sk-...
-eval/run.sh tb-jig jig                          # jig on the 20 tasks in eval/subset.txt
-eval/run.sh tb-mini mini-swe-agent              # the baseline
+eval/run.sh tb-jig jig -k 3                     # jig on the 20 tasks in eval/subset.txt, 3 attempts each
+eval/run.sh tb-mini mini-swe-agent -k 3         # the baseline
 eval/run.sh abl-effort-low jig --ak effort=low  # an ablation: any jig option, through the adapter
-python3 eval/report.py eval/results/tb-*.json   # the first table below, from the saved summaries
+python3 eval/report.py eval/results/tb-jig.json eval/results/tb-mini.json   # the first table below
 python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json eval/results/abl-*.json
 ```
 
@@ -452,77 +459,106 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   minutes ([`eval/subset.txt`](eval/subset.txt)), because this Mac gives Docker 3 GB. The task images are
   x86-64, so on Apple Silicon everything in them runs under emulation, for both agents alike, while the
   time limits stay as they are.
-- One attempt per task, for budget: a difference of a task or two is noise, as the in-house benchmark showed.
+- Three attempts per task: one in milestone 6, two more in milestone 8 with the code tagged `m6` (what was
+  evaluated, plus the API-key fix, which changes nothing else) and mini-swe-agent pinned to the version of
+  the first round, 2.4.6. That makes 60 trials per agent. The ablations had one attempt each.
+- A pass rate's 95% interval comes from resampling tasks, since attempts at the same task aren't
+  independent, and a difference between two runs is paired by task.
 - Costs come from the token counts and one price table for both agents. DeepSeek's off-peak discount made
   part of the actual bill lower (the first two tasks were billed at about half the table's price).
 
 ### Results
 
-| run | passed | turns | tokens in | tokens out | cost | agent time |
-|-----|--------|-------|-----------|------------|------|------------|
-| jig | 75% (15/20) | 28.4 | 1,499k | 36k | $0.059 | 6.3 min |
-| mini-swe-agent | 80% (16/20) | 33.4 | 2,342k | 45k | $0.074 | 6.8 min |
+| run | passed | 95% CI | turns | tokens in | tokens out | cost | agent time |
+|-----|--------|--------|-------|-----------|------------|------|------------|
+| jig | 70% (42/60) | 53–85% | 22.9 | 1,102k | 31k | $0.049 | 5.0 min |
+| mini-swe-agent | 82% (49/60) | 67–93% | 33.9 | 2,397k | 49k | $0.080 | 7.1 min |
 
-Averages are per task. The two disagree on three tasks: jig alone solved `dna-assembly`, mini-swe-agent
-alone `modernize-scientific-stack` and `mteb-retrieve`. Neither solved `adaptive-rejection-sampler`,
-`filter-js-from-html` or `make-mips-interpreter`. The full matrix is in `python3 eval/report.py eval/results/tb-*.json`.
+Averages are per attempt. Paired by task, mini-swe-agent is ahead by 12 points (95% CI +3 to +22). Both
+solved 10 tasks in every attempt, three (`chess-best-move`, `dna-assembly`, `tune-mjcf`) two times in
+three, and `filter-js-from-html` and `make-mips-interpreter` never. They differ on five:
+
+| task | jig | mini-swe-agent |
+|------|-----|----------------|
+| `adaptive-rejection-sampler` | 0/3 | 2/3 |
+| `headless-terminal` | 1/3 | 3/3 |
+| `model-extraction-relu-logits` | 1/3 | 2/3 |
+| `modernize-scientific-stack` | 2/3 | 3/3 |
+| `mteb-retrieve` | 2/3 | 3/3 |
+
+The full matrix is in `python3 eval/report.py eval/results/tb-jig.json eval/results/tb-mini.json`.
 
 Ablations, on 8 of the 20 tasks ([`eval/ablation-subset.txt`](eval/ablation-subset.txt), again a seeded
-sample), against the default run on the same 8:
+sample), one attempt each, against the default's three attempts at the same 8:
 
-| run | passed | turns | tokens in | tokens out | cost | agent time |
-|-----|--------|-------|-----------|------------|------|------------|
-| jig, default | 7/8 | 24.9 | 1,437k | 29k | $0.054 | 4.9 min |
-| `--effort low` | 7/8 | 18.6 | 779k | 20k | $0.034 | 3.2 min |
-| `--compact-at 50000` | 6/8 | 31.4 | 681k | 38k | $0.068 | 6.3 min |
-| `--no-subagents` | 7/8 | 17.4 | 865k | 22k | $0.036 | 4.0 min |
+| run | passed | turns | tokens in | tokens out | cost | agent time | against the default |
+|-----|--------|-------|-----------|------------|------|------------|---------------------|
+| jig, default | 20/24 | 23.5 | 1,417k | 27k | $0.051 | 4.7 min | |
+| `--effort low` | 7/8 | 18.6 | 779k | 20k | $0.034 | 3.2 min | +4 points (0 to +12) |
+| `--compact-at 50000` | 6/8 | 31.4 | 681k | 38k | $0.068 | 6.3 min | −8 points (−25 to 0) |
+| `--no-subagents` | 7/8 | 17.4 | 865k | 22k | $0.036 | 4.0 min | +4 points (−25 to +38) |
 
-The model never called the subagent tool on these tasks (see below), so `--no-subagents` is in effect a
-second run of the default, and shows how much two runs of the same thing differ.
+The model never called the subagent tool on these tasks (see below), so `--no-subagents` is in effect
+one more run of the default.
 
 What the runs and their logs showed:
 
-- **The same success rate, for less.** 75% against 80% is one task, within noise. jig got there in fewer
-  turns (28 against 33) with smaller requests (53k tokens on average against 70k), so it used 36% fewer
-  input tokens and cost 20% less per task.
-- **In a container, the model works through bash.** Of jig's 615 tool calls, 500 were bash, 113 the file
-  tools, 2 grep or glob, and none a subagent. Terminal-Bench tasks are about a system more than a code
-  base, so jig's search tools and subagents had little to do here: what separates the two agents is the
-  loop and the prompt, not jig's extra tools.
-- **jig's failures were the model's judgment, not the harness.** In `modernize-scientific-stack` it kept the
-  legacy script's extra output, so the test read the wrong number, and its final summary claimed the output
-  was exactly the two required lines. In `mteb-retrieve` it ignored the hint to use the installed `mteb`
-  package and called the embedding model directly, which ranks slightly differently. In
-  `filter-js-from-html` its filter blocked every attack but also changed 5 of 12 clean files, and in
-  `adaptive-rejection-sampler` 7 of 8 tests passed.
-- **Two runs of the same thing differ as much as the settings do.** The default and the `--no-subagents`
-  run (the same agent, in effect) passed 7 of 8 each, but not the same 7: only the second solved
-  `make-mips-interpreter`, which every other run, and mini-swe-agent, failed. One took 199 turns in all,
-  the other 139, and most of that gap is that one long task (122 turns against 63). With one attempt per
-  task, neither the effort level nor the subagent tool moved the pass rate or the cost by more than that.
+- **mini-swe-agent solves more; jig costs less.** With one attempt per task (milestone 6) the two looked
+  even, 75% against 80%; three attempts show that mini-swe-agent's lead is real. jig did its share with a
+  third fewer turns, 54% fewer input tokens and 39% lower cost.
+- **Where the gap comes from.** All five tasks on which they differ go mini-swe-agent's way. In
+  `adaptive-rejection-sampler`, all three of jig's samplers refused the form in which the tests pass the
+  lower bound (`'lower' must be a single number`), the same mistake three times; in `headless-terminal`
+  two of jig's attempts crashed (next point); the rest are single misses. Leaving out `headless-terminal`,
+  mini-swe-agent's lead is 9 points (+2 to +18).
+- **Two of jig's attempts were killed for memory.** In `headless-terminal` jig searched the whole container
+  with its grep tool, which read each file whole before checking its size, and the container's 2 GB
+  limit killed it (exit 137). grep now checks a file's size before reading it and skips `/proc`, `/sys`
+  and `/dev`. Run directly in the task's image with its 2 GB limit, the old grep searching `/` is killed
+  exactly as in the runs (exit 137), and the fixed one finishes in 2 seconds using 183 MB. Three more
+  attempts at the task with the fix had no crash (two passed); they are kept apart from the results above.
+- **In a container, the model works through bash.** Of jig's 1,498 tool calls, 1,208 (81%) were bash, 281
+  the file tools, 9 grep or glob, and none a subagent. Terminal-Bench tasks are about a system more than a
+  code base, so jig's search tools and subagents had little to do here: what separates the two agents is
+  the loop and the prompt, not jig's extra tools.
+- **Apart from those crashes, jig's failures were the model's judgment, not the harness.** In
+  `modernize-scientific-stack` (round 1) it kept the legacy script's extra output, so the test read the
+  wrong number, and its final summary claimed the output was exactly the two required lines. In
+  `mteb-retrieve` (round 1) it ignored the hint to use the installed `mteb` package and called the
+  embedding model directly, which ranks slightly differently. In `filter-js-from-html` its filters block
+  every attack but also change clean files.
+- **No ablation beats the noise.** Against the default's three attempts, every ablation's difference has an
+  interval that reaches zero. The `--no-subagents` run, in effect a fourth default run, solved
+  `make-mips-interpreter`, which the default failed all three times, and took 139 turns where the
+  default's rounds took 182 to 199: one long task moves a run's cost more than any setting did.
 - **Low effort thinks less per turn, but that isn't what decides the cost.** At `--effort low` a turn cost
-  about 15% less (less thinking), and the total came out like the second default run's. On the six short
-  tasks it cost more, because it took more turns (27 on `db-wal-recovery`, against 11 and 14).
+  17% less ($1.81 against $2.19 per thousand turns, from less thinking), but how many turns a task takes
+  varies more than that: on the six short tasks it took more turns (27 on `db-wal-recovery`, against 11
+  to 14) and cost more.
 - **On DeepSeek, compaction saves context, not money.** Compacting at 50k tokens (7 compactions in 8
-  tasks) cut the context of an average turn by 62%, but the cost per turn stayed the same: what it saved
-  was cached input, which DeepSeek charges about 50 times less for, while new input per turn rose 40%,
-  since each compaction starts a prefix with nothing cached. It also took the most turns, 251 against 139
-  to 199, many of them on `tune-mjcf` (61 against 15 to 24), where after compacting it read the task's
-  files again and rewrote its test scripts: a summary keeps the conclusions, not the working state. At
-  the default 200k only one task ever compacted (200k tokens into 1.9k).
+  tasks) cut the context of an average turn by 64%, but the cost per turn stayed the same: what it saved
+  was cached input, which DeepSeek charges about 50 times less for, while new input per turn rose 39%,
+  since each compaction starts a prefix with nothing cached. It also took the most turns, many of them
+  on `tune-mjcf` (61 against 15 to 24), where after compacting it read the task's files again and rewrote
+  its test scripts: a summary keeps the conclusions, not the working state. At the default 200k only one
+  task ever compacted (200k tokens into 1.9k).
+- **jig keeps its API key away from the model; mini-swe-agent doesn't.** Models look around with `env`.
+  mini-swe-agent's commands inherit its environment, so its model printed the API key into its own
+  context in 6 of its 60 attempts. jig's did once, in 44 attempts before milestone 6's fix, and never in
+  the 43 since: its commands don't get jig's keys.
 - **A time limit doesn't stop the agent.** When a task's time runs out, Harbor stops waiting, but the
   agent's processes in the container carry on into the verification: jig made up to 9 more model calls
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
-  (`tune-mjcf` and `cobol-modernization`, for both agents) may owe something to it. Counting those as
-  failures gives 13/20 against 14/20: the same picture.
-- **The evaluation found five problems in jig, now fixed.** File tools confined to the project could not
+  may owe something to it. Each agent had three, on the same tasks (`tune-mjcf` twice and
+  `cobol-modernization` once); counting them as failures gives 39/60 against 46/60, the same gap.
+- **The evaluation found six problems in jig, now fixed.** File tools confined to the project could not
   touch `/etc` or `/var` in a container (`--add-dir`); there was no way to get turns and tokens out
   (`--stats`); during a DeepSeek outage jig waited 10 minutes per attempt in silence (now 2 minutes, with
   a notice on each retry); an instruction starting with "-" was read as an option, so the adapter now
-  passes `--` first (that task was re-run); and the commands the model ran could see jig's API key, which
-  the model printed with `env` in one run (mini-swe-agent's model did the same). The key only went to the
-  local logs (since scrubbed) and to DeepSeek itself; jig's commands no longer see it. That last fix came
-  after the runs, and changes nothing else.
+  passes `--` first (that task was re-run); the commands the model ran could see jig's API key, which the
+  model printed with `env` in one run (mini-swe-agent's model did the same; the key only went to the
+  local logs, since scrubbed, and to DeepSeek itself); and grep read files whole before checking their
+  size. The last two fixes came after the runs that found them.
 
 ## Tests
 
@@ -535,8 +571,17 @@ npm run typecheck
 
 [CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests
 included (on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and
-checks the benchmark's tasks with the oracle and noop agents, which needs no API key. The Linux setup
+checks the benchmark's tasks with the oracle and noop agents, which needs no API key, and packs,
+installs and runs the npm package. The Linux setup
 was tried locally in Debian containers as an ordinary user, with Node 22 and 24, before it went in.
+
+## Releasing
+
+The npm package is `jig-agent`. Node won't strip types from files under `node_modules`, so the package
+ships JavaScript: `npm pack` and `npm publish` first compile `src/` into `dist/` (`tsconfig.build.json`),
+and the package holds only `dist/`, the README and the license. To release, bump the version with
+`npm version <patch|minor|major>`, then `npm publish` from an npm account; CI's `package` job packs,
+installs and runs the tarball on every push.
 
 ## Roadmap
 
@@ -547,3 +592,8 @@ was tried locally in Debian containers as an ordinary user, with Node 22 and 24,
 - [x] **5. Extensions:** Agent Skills with progressive disclosure; MCP client over stdio (official SDK) with restart; `PreToolUse` and `PostToolUse` hooks; read-only subagents; parallel read-only tool calls; project trust; three benchmark tasks for the extensions
 - [x] **6. Evaluation:** Terminal-Bench 2.0 through Harbor against mini-swe-agent on the same model, with success rate, cost and turns per task; ablations of effort, compaction and subagents; `--add-dir`, `--stats`, and a 2-minute API timeout with retry notices
 - [x] **7. Linux and CI:** a bubblewrap sandbox on Linux with the same policy and tests as on macOS, and a clear reason when it can't run; GitHub Actions on Linux and macOS with Node 22 and 24; benchmark tasks checked in CI, which caught two task checks that only worked on Node 26
+- [x] **8. npm package and error bars:** the `jig-agent` package (compiled JavaScript, `--version`, MIT license; CI packs, installs and runs it); three attempts per Terminal-Bench task with 95% intervals, which showed mini-swe-agent ahead by 12 points (+3 to +22) where one attempt had shown a tie; a grep memory bug those runs found, reproduced and fixed
+
+## License
+
+MIT, see [LICENSE](LICENSE).

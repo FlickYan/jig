@@ -73,6 +73,13 @@ describe("grep", () => {
     assert.equal(await grepTool.run({ pattern: "nothing like this" }, ctx), "No matches.");
   });
 
+  it("skips files over the size limit, checking the size before reading them", async () => {
+    const ctx = await project(false);
+    await writeFile(join(ctx.cwd, "big.log"), `needle\n${"x".repeat(6_000_000)}`);
+    await writeFile(join(ctx.cwd, "small.txt"), "needle\n");
+    assert.equal(await grepTool.run({ pattern: "needle" }, ctx), "small.txt:1: needle");
+  });
+
   it("explains a bad regular expression", async () => {
     const ctx = await project(false);
     await assert.rejects(grepTool.run({ pattern: "(unclosed" }, ctx), /Invalid regular expression/);
