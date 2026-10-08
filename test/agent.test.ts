@@ -55,6 +55,30 @@ beforeEach(async () => {
   cwd = await mkdtemp(join(tmpdir(), "jig-agent-"));
 });
 
+describe("checking the work before finishing (one-shot runs)", () => {
+  const REVIEW = "Check your work.";
+
+  it("asks once when the model first stops, and lets it carry on", async () => {
+    const { options, conversation, messages } = setup(
+      [reply([text("Done.")]), reply([toolUse("t1", "bash", { command: "echo checked" })]), reply([text("Verified: it prints checked.")])],
+      { review: REVIEW },
+    );
+    const result = await runAgent(conversation, options);
+    assert.equal(result.stop, "end_turn");
+    assert.equal(result.steps, 3);
+    assert.equal(result.text, "Verified: it prints checked.");
+    assert.deepEqual(messages[2], { role: "user", content: REVIEW }, "the check comes right after the first stop");
+  });
+
+  it("asks only once, and not at all without the option", async () => {
+    const twice = setup([reply([text("Done.")]), reply([text("Still done.")])], { review: REVIEW });
+    assert.equal((await runAgent(twice.conversation, twice.options)).text, "Still done.");
+    const never = setup([reply([text("Done.")])]);
+    const result = await runAgent(never.conversation, never.options);
+    assert.deepEqual([result.steps, result.text], [1, "Done."]);
+  });
+});
+
 describe("runAgent", () => {
   it("runs tools and feeds the results back until the model answers", async () => {
     const { options, conversation, messages, historyLengths } = setup([

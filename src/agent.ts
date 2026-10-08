@@ -33,6 +33,11 @@ export interface AgentOptions {
   dirs?: string[];
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
+  /**
+   * Sent once, the first time the model stops, so it checks its work before the task ends. For one-shot
+   * runs, where nobody is there to look at the result and ask for more.
+   */
+  review?: string;
   ui: AgentUI;
 }
 
@@ -70,6 +75,7 @@ export interface RunResult {
 export async function runAgent(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal): Promise<RunResult> {
   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
   const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage });
+  let reviewed = false;
 
   for (let step = 1; step <= opts.maxSteps; step++) {
     let reply: Message;
@@ -92,8 +98,16 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     conversation.push({ role: "assistant", content: reply.content });
     conversation.tokens = contextSize(reply.usage); // measured: the whole request plus this reply
     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
-    // A reply with no tool calls is the final answer.
-    if (calls.length === 0) return result(reply.stop_reason ?? "end_turn", step, replyText(reply));
+    // A reply with no tool calls is the final answer, unless the work is still to be checked.
+    if (calls.length === 0) {
+      if (opts.review && !reviewed && reply.stop_reason === "end_turn") {
+        reviewed = true;
+        opts.ui.notice("Checking the work before finishing.");
+        conversation.push({ role: "user", content: opts.review });
+        continue;
+      }
+      return result(reply.stop_reason ?? "end_turn", step, replyText(reply));
+    }
 
     // Every tool call gets a result, even ones that never run, or the next request is invalid.
     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete

@@ -51,6 +51,9 @@ class JigOptions(InstalledAgentOptions):
     no_subagents: Annotated[bool | None, Cli("--no-subagents")] = Field(
         default=None, description="leave out the subagent tool"
     )
+    check: Annotated[bool | None, Cli("--check")] = Field(
+        default=None, description="ask the model to check its work before finishing"
+    )
 
 
 class Jig(BaseInstalledAgent):

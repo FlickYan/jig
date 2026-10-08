@@ -61,6 +61,11 @@ describe("--add-dir", () => {
     assert.equal(new Permissions("edits", project, { dirs: [outside] }).decide(bash, { command: "cat ~/.ssh/id_rsa" }), "ask");
   });
 
+  it("tells the model when it is on its own (a one-shot run)", () => {
+    assert.match(systemPrompt(project, { oneShot: true }), /You are running one task on your own/);
+    assert.doesNotMatch(systemPrompt(project), /on your own/);
+  });
+
   it("tells the model about it", () => {
     assert.match(systemPrompt(project, { dirs: [outside] }), new RegExp(`The file tools also work in: ${outside}`));
     assert.doesNotMatch(systemPrompt(project), /also work in/);

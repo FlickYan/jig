@@ -44,9 +44,25 @@ export interface PromptOptions {
   skills?: string;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
+  /** A single task run on its own (jig "task"), rather than an interactive session. */
+  oneShot?: boolean;
 }
 
-export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [] }: PromptOptions = {}): string {
+/**
+ * For one-shot runs with --check: nobody can answer a question or look at the result before the task
+ * ends. On Terminal-Bench, most of jig's failures were tasks it declared done after a few turns without
+ * checking them. With this and REVIEW, jig solved the tasks that pattern had cost it, but ran out of
+ * time on others and solved no more overall, at 40-60% more cost (milestone 9), so it is opt-in.
+ */
+const ON_YOUR_OWN = `You are running one task on your own, not an interactive session: nobody can answer questions or look at your work until you have finished.
+- Don't stop to ask. Where a choice is yours, make a reasonable one and say in your summary what you assumed. (Destructive steps the task doesn't call for are still off limits.)
+- Finish only when the task is done and checked. Run the program or the tests and compare what they produce with what the task asks for: file names and paths, output formats, exact values. Try edge cases, and use your work the way the task says it will be used, not only the way you happen to have written it.
+- Don't state anything in your summary that you haven't seen: if you say what a command prints, you have run it.`;
+
+/** Sent once when the model first stops in a one-shot run (see AgentOptions.review). */
+export const REVIEW = `Before you finish, check your work against the task. Go through its requirements one by one, and for each, name what you ran or saw that shows it is met: file names and paths, output formats, exact values, and the ways the task says your work will be used. Verify anything you haven't actually seen, and fix whatever is wrong. Then give your final summary; if everything was already verified, say so briefly.`;
+
+export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false }: PromptOptions = {}): string {
   const prompt = `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
 
 How to work:
@@ -64,7 +80,7 @@ Environment:
 - Git repository: ${gitRoot(cwd) ? "yes" : "no"}
 - Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted" or a connection error.` : "run directly on the user's machine."}
 - Today's date: ${new Date().toLocaleDateString("en-CA")}`;
-  return [prompt, skills, projectInstructions(instructions)].filter(Boolean).join("\n\n");
+  return [prompt, oneShot ? ON_YOUR_OWN : "", skills, projectInstructions(instructions)].filter(Boolean).join("\n\n");
 }
 
 function projectInstructions(instructions: Instructions[]): string {

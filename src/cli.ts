@@ -10,7 +10,7 @@ import { runHooks } from "./hooks.ts";
 import { connectMcpServers } from "./mcp.ts";
 import { type CallModel, contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { loadInstructions, subagentPrompt, systemPrompt } from "./prompt.ts";
+import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
@@ -46,6 +46,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --max-steps <n>     most model calls per task (default: 50)
       --no-subagents      leave out the subagent tool
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --check             in a one-shot run, tell the model nobody can answer and ask it to check its
+                          work against the task before it finishes (costs turns; see the README)
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -92,6 +94,7 @@ async function main(): Promise<void> {
       "max-steps": { type: "string", default: "50" },
       subagents: { type: "boolean", default: true },
       stats: { type: "string" },
+      check: { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -106,6 +109,9 @@ async function main(): Promise<void> {
   }
   const cwd = resolve(values.cwd);
   if (values.sessions) return listSessions(cwd);
+  // A task on the command line with --check: nobody to talk to, so the model checks its own work.
+  // Off by default: on Terminal-Bench it cost 40-60% more without solving more (milestone 9).
+  const oneShot = positionals.length > 0 && values.check;
   const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
@@ -170,7 +176,7 @@ async function main(): Promise<void> {
   };
   const tools = [...TOOLS, ...(values.subagents ? [subagentTool(subagents)] : []), ...extensions];
   const newModel = () => {
-    const system = systemPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs });
+    const system = systemPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot });
     return metered(createModel({ model, effort, system, tools }));
   };
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
@@ -213,6 +219,7 @@ async function main(): Promise<void> {
     authorize,
     sandbox,
     hooks,
+    review: oneShot ? REVIEW : undefined,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
 

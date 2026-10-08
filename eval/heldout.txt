@@ -1,0 +1,22 @@
+# 20 held-out Terminal-Bench 2.0 tasks for milestone 9: random.Random(2027).sample over the 41 tasks
+# that meet eval/subset.txt's rule but are not in it. jig's changes were designed without them.
+break-filter-js-from-html
+build-pmars
+code-from-image
+configure-git-webserver
+count-dataset-tokens
+crack-7z-hash
+custom-memory-heap-crash
+extract-elf
+git-multibranch
+hf-model-inference
+large-scale-text-editing
+largest-eigenval
+nginx-request-logging
+password-recovery
+polyglot-c-py
+prove-plus-comm
+raman-fitting
+regex-log
+sanitize-git-repo
+sqlite-with-gcov

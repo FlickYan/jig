@@ -169,6 +169,9 @@ def main(args: list[str]) -> None:
         for job, found in named[1:]:
             rates = pass_rates(found)
             common = sorted(set(base) & set(rates))
+            if not common:
+                print(f"- {job} and {first_job} have no tasks in common")
+                continue
             diffs = [rates[task] - base[task] for task in common]
             low, high = interval(diffs)
             print(f"- {job} minus {first_job}: {statistics.mean(diffs) * 100:+.0f} points (95% CI {low * 100:+.0f} to {high * 100:+.0f}), over {len(common)} tasks")

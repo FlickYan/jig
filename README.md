@@ -54,6 +54,7 @@ Usage: jig [options] [task]
       --max-steps <n>   most model calls per task (default: 50)
       --no-subagents    leave out the subagent tool
       --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
+      --check           in a one-shot run, ask the model to check its work before it finishes
 ```
 
 In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
@@ -187,8 +188,10 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
-**When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). Also on
-`--max-steps` model calls, on Ctrl+C, and when a safety classifier declines the request.
+**When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
+`--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
+check its work against the task, and stops at the next such reply. Also on `--max-steps` model calls, on
+Ctrl+C, and when a safety classifier declines the request.
 
 ## Design decisions
 
@@ -260,6 +263,12 @@ received (subagents included), and how many input tokens came from the prompt ca
   servers included, and servers crash. A tool call to a server that has stopped starts it again.
 - **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
   everything it read, so it gets one more call, without tools, to write up what it found.
+- **Checking before finishing is opt-in.** With nobody to look at the result, a model that declares a
+  task done after a quick look has the last word; on Terminal-Bench, 15 of jig's 18 failures were tasks it
+  finished on its own and got wrong. `--check` makes one-shot runs tell the model nobody can answer and
+  ask it, the first time it stops, to show what proves each of the task's requirements. It fixed the
+  failures it was aimed at, but ran other tasks out of time and solved no more overall, at 38-65% more
+  cost (see [milestone 9's results](#milestone-9-checking-before-finishing)), so it is off by default.
 - **Waiting on the API is bounded and visible.** The SDK's timeout covers only the wait for a response
   to start (a stream's first bytes arrive within seconds when the API is healthy, however long the reply
   runs), so jig sets it to 2 minutes instead of 10, and prints a notice for each automatic retry. During a
@@ -560,6 +569,47 @@ What the runs and their logs showed:
   local logs, since scrubbed, and to DeepSeek itself); and grep read files whole before checking their
   size. The last two fixes came after the runs that found them.
 
+### Milestone 9: checking before finishing
+
+mini-swe-agent's lead invited a closer look at how jig loses. 15 of its 18 failures were tasks it
+finished on its own and got wrong, some after a quick look: on `mteb-retrieve` and
+`model-extraction-relu-logits` it stopped after 6 to 9 turns, where mini-swe-agent's passing attempts took
+19 to 36. mini-swe-agent's prompt prescribes a workflow (reproduce, fix, verify, test edge cases) and lets
+it stop only through an explicit command. So `--check` tells the model in one-shot runs that nobody can
+answer and to finish only once the work is checked, and the first time it stops, asks it to show what
+proves each of the task's requirements.
+
+To keep from fitting the change to the tasks it came from, it was also measured on 20 held-out tasks: a
+seeded sample of the 41 eligible tasks not in the original 20 ([`eval/heldout.txt`](eval/heldout.txt)),
+one attempt each, against `m8` (the same jig without the change) and mini-swe-agent.
+
+```bash
+eval/run.sh tb-jig-m9 jig -k 3 --ak check=true             # the original 20, with the check
+export TASKS="$(grep -v '^#' eval/heldout.txt)"
+eval/run.sh ho-jig-m8 jig --ak ref=m8                      # the held-out 20, without it
+eval/run.sh ho-jig-m9 jig --ak check=true                  # with it
+eval/run.sh ho-mini mini-swe-agent --ak version=2.4.6
+python3 eval/report.py eval/results/ho-jig-m8.json eval/results/ho-jig-m9.json eval/results/ho-mini.json
+```
+
+| tasks | jig without the check | jig with `--check` | difference | mini-swe-agent |
+|-------|-----------------------|--------------------|------------|----------------|
+| original 20, 3 attempts | 70% (42/60), $0.049 | 73% (44/60), $0.068 | +3 points (−7 to +13) | 82% (49/60), $0.080 |
+| held-out 20, 1 attempt | 75% (15/20), $0.033 | 70% (14/20), $0.054 | −5 points (−20 to +10) | 90% (18/20), $0.054 |
+
+- **It fixed what it aimed at, and lost as much to the clock.** On the original tasks it solved
+  `adaptive-rejection-sampler` twice (0 of 3 before), and `model-extraction-relu-logits` and
+  `modernize-scientific-stack` more often, but 12 attempts ran into their time limit against 4 before
+  (6 of them failed, against 1), costing `pytorch-model-recovery` and `tune-mjcf` a pass each, and
+  `mteb-retrieve` lost one to another wrong finish. On the held-out tasks, one task was won and two lost,
+  `code-from-image` by running out of time after twice the turns. jig doesn't know a task's time limit,
+  so checking more can't be weighed against the time left.
+- **No gain, more cost, so it stays opt-in.** Neither interval excludes zero, and the check cost 38% more
+  on the original tasks and 65% more on the held-out ones (68% more on the in-house benchmark, where
+  every task already passed).
+- **mini-swe-agent's lead holds on fresh tasks.** On the held-out tasks it is 15 points ahead of jig
+  without the check (0 to +30), as on the original ones.
+
 ## Tests
 
 ```bash
@@ -593,6 +643,7 @@ installs and runs the tarball on every push.
 - [x] **6. Evaluation:** Terminal-Bench 2.0 through Harbor against mini-swe-agent on the same model, with success rate, cost and turns per task; ablations of effort, compaction and subagents; `--add-dir`, `--stats`, and a 2-minute API timeout with retry notices
 - [x] **7. Linux and CI:** a bubblewrap sandbox on Linux with the same policy and tests as on macOS, and a clear reason when it can't run; GitHub Actions on Linux and macOS with Node 22 and 24; benchmark tasks checked in CI, which caught two task checks that only worked on Node 26
 - [x] **8. npm package and error bars:** the `jig-agent` package (compiled JavaScript, `--version`, MIT license; CI packs, installs and runs it); three attempts per Terminal-Bench task with 95% intervals, which showed mini-swe-agent ahead by 12 points (+3 to +22) where one attempt had shown a tie; a grep memory bug those runs found, reproduced and fixed
+- [x] **9. Checking before finishing:** a diagnosis of jig's failures (most were confident early finishes), `--check` to make one-shot runs verify against the task, measured on the original tasks and on 20 held-out ones: it fixed the failures it aimed at but ran others out of time, so it is opt-in
 
 ## License
 
