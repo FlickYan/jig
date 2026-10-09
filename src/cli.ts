@@ -18,13 +18,13 @@ import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "
 import { Snapshots } from "./snapshots.ts";
 import { Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
-import { TOOLS, type Tool, type ToolInput } from "./tools/index.ts";
+import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
 
 const HELP = `Usage: jig [options] [task]
 
-Runs one task, or starts an interactive session if no task is given.
+Runs one task, or starts an interactive session if no task is given. A task of - is read from stdin.
 
 Options:
   -m, --model <id>        deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
@@ -45,7 +45,12 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
       --no-subagents      leave out the subagent tool
+      --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
+                          (from ${TOOL_NAMES.join(", ")}; default: all)
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --system-prompt <text>
+                          use this system prompt instead of jig's own (the project's AGENTS.md and the
+                          skills are still added after it)
       --check             in a one-shot run, tell the model nobody can answer and ask it to check its
                           work against the task before it finishes (costs turns; see the README)
   -v, --version           print jig's version
@@ -74,6 +79,9 @@ const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks be
   /exit                        quit (Ctrl+D works too)`;
 
 async function main(): Promise<void> {
+  // The task is in jig's arguments, and models stop programs by matching command lines (pkill -f server.py),
+  // which could match jig itself. Where the title can't hide them (under emulation, say), pass the task as -.
+  process.title = "jig";
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     allowNegative: true,
@@ -93,7 +101,9 @@ async function main(): Promise<void> {
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
       subagents: { type: "boolean", default: true },
+      tools: { type: "string" },
       stats: { type: "string" },
+      "system-prompt": { type: "string" },
       check: { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -109,9 +119,11 @@ async function main(): Promise<void> {
   }
   const cwd = resolve(values.cwd);
   if (values.sessions) return listSessions(cwd);
+  const taskText = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
+  if (positionals.join(" ") === "-" && !taskText) throw new Error("The task was to come from stdin (jig -), but stdin was empty.");
   // A task on the command line with --check: nobody to talk to, so the model checks its own work.
-  // Off by default: on Terminal-Bench it cost 40-60% more without solving more (milestone 9).
-  const oneShot = positionals.length > 0 && values.check;
+  // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
+  const oneShot = taskText !== "" && values.check;
   const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
@@ -124,6 +136,7 @@ async function main(): Promise<void> {
   ui.setThinkingVisible(!values["hide-thinking"]);
   const dirs = values["add-dir"].map((dir) => resolve(dir));
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
+  const toolNames = values.tools === undefined ? undefined : parseToolList(values.tools);
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
@@ -151,12 +164,15 @@ async function main(): Promise<void> {
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
+  // jig's own tools, unless --tools picks some. The prompts then name only the tools there are.
+  const own = selectTools(toolNames);
+  const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
   const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
-  const researchTools = [...TOOLS, ...extensions].filter((tool) => tool.kind === "read" || tool.kind === "run");
+  const researchTools = [...own, ...extensions].filter((tool) => tool.kind === "read" || tool.kind === "run");
   const metered = (callModel: CallModel, subagent = false) => stats?.meter(callModel, { subagent }) ?? callModel;
   const newSubagentModel = () => {
-    const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs });
+    const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     return metered(createModel({ model, effort, quiet: true, system, tools: researchTools }), true);
   };
   const subagents: SubagentSetup = {
@@ -174,9 +190,11 @@ async function main(): Promise<void> {
     hooks,
     ui: ui.subagentUI,
   };
-  const tools = [...TOOLS, ...(values.subagents ? [subagentTool(subagents)] : []), ...extensions];
+  const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
+  const tools = [...own, ...(withSubagents ? [subagentTool(subagents)] : []), ...extensions];
   const newModel = () => {
-    const system = systemPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot });
+    const prompt = { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot, tools: named(tools), custom: values["system-prompt"] };
+    const system = systemPrompt(cwd, prompt);
     return metered(createModel({ model, effort, system, tools }));
   };
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
@@ -343,9 +361,9 @@ async function main(): Promise<void> {
     return true;
   }
 
-  if (positionals.length > 0) {
+  if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
-    if (!(await runTask(positionals.join(" ")))) process.exitCode = 1;
+    if (!(await runTask(taskText))) process.exitCode = 1;
     return;
   }
 
@@ -420,6 +438,12 @@ function countToolCalls(base: AgentUI, stats: Stats): AgentUI {
       base.toolCall(name, description, id);
     },
   };
+}
+
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 function plural(n: number, noun: string): string {

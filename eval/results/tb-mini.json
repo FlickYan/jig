@@ -13,7 +13,9 @@
    "cached": 40576,
    "output": 2631,
    "model": "deepseek-flash",
-   "seconds": 20.144654
+   "seconds": 20.144654,
+   "trial": "log-summary-date-ranges__vQjVjLW",
+   "looked_up": false
   },
   {
    "task": "adaptive-rejection-sampler",
@@ -26,7 +28,9 @@
    "cached": 1628544,
    "output": 53517,
    "model": "deepseek-flash",
-   "seconds": 900.009208
+   "seconds": 900.009208,
+   "trial": "adaptive-rejection-sampler__PNbGoM6",
+   "looked_up": false
   },
   {
    "task": "chess-best-move",
@@ -39,7 +43,9 @@
    "cached": 1663488,
    "output": 57368,
    "model": "deepseek-flash",
-   "seconds": 359.690049
+   "seconds": 359.690049,
+   "trial": "chess-best-move__RrhawQC",
+   "looked_up": false
   },
   {
    "task": "cobol-modernization",
@@ -52,7 +58,9 @@
    "cached": 4031488,
    "output": 86907,
    "model": "deepseek-flash",
-   "seconds": 900.003827
+   "seconds": 900.003827,
+   "trial": "cobol-modernization__HZaEoTP",
+   "looked_up": false
   },
   {
    "task": "db-wal-recovery",
@@ -65,7 +73,9 @@
    "cached": 32896,
    "output": 2585,
    "model": "deepseek-flash",
-   "seconds": 19.410167
+   "seconds": 19.410167,
+   "trial": "db-wal-recovery__NffG6Ck",
+   "looked_up": false
   },
   {
    "task": "dna-assembly",
@@ -78,7 +88,9 @@
    "cached": 2180224,
    "output": 108292,
    "model": "deepseek-flash",
-   "seconds": 529.770968
+   "seconds": 529.770968,
+   "trial": "dna-assembly__R4uKSBW",
+   "looked_up": false
   },
   {
    "task": "filter-js-from-html",
@@ -91,7 +103,9 @@
    "cached": 3142144,
    "output": 44710,
    "model": "deepseek-flash",
-   "seconds": 1084.135384
+   "seconds": 1084.135384,
+   "trial": "filter-js-from-html__WZnXHBb",
+   "looked_up": true
   },
   {
    "task": "headless-terminal",
@@ -104,7 +118,9 @@
    "cached": 697856,
    "output": 39971,
    "model": "deepseek-flash",
-   "seconds": 326.117818
+   "seconds": 326.117818,
+   "trial": "headless-terminal__DQnfokm",
+   "looked_up": false
   },
   {
    "task": "kv-store-grpc",
@@ -117,7 +133,9 @@
    "cached": 63744,
    "output": 5633,
    "model": "deepseek-flash",
-   "seconds": 44.076341
+   "seconds": 44.076341,
+   "trial": "kv-store-grpc__N3JXcCf",
+   "looked_up": false
   },
   {
    "task": "llm-inference-batching-scheduler",
@@ -130,7 +148,9 @@
    "cached": 1655296,
    "output": 61049,
    "model": "deepseek-flash",
-   "seconds": 636.907902
+   "seconds": 636.907902,
+   "trial": "llm-inference-batching-scheduler__abudjDf",
+   "looked_up": false
   },
   {
    "task": "make-mips-interpreter",
@@ -143,7 +163,9 @@
    "cached": 27119872,
    "output": 211614,
    "model": "deepseek-flash",
-   "seconds": 1273.671338
+   "seconds": 1273.671338,
+   "trial": "make-mips-interpreter__aWUkMW6",
+   "looked_up": false
   },
   {
    "task": "model-extraction-relu-logits",
@@ -156,7 +178,9 @@
    "cached": 949120,
    "output": 65961,
    "model": "deepseek-flash",
-   "seconds": 380.070096
+   "seconds": 380.070096,
+   "trial": "model-extraction-relu-logits__PiExe3t",
+   "looked_up": false
   },
   {
    "task": "modernize-scientific-stack",
@@ -169,7 +193,9 @@
    "cached": 79744,
    "output": 6761,
    "model": "deepseek-flash",
-   "seconds": 48.207273
+   "seconds": 48.207273,
+   "trial": "modernize-scientific-stack__pwHMKoM",
+   "looked_up": false
   },
   {
    "task": "mteb-retrieve",
@@ -182,7 +208,9 @@
    "cached": 374272,
    "output": 15581,
    "model": "deepseek-flash",
-   "seconds": 242.341443
+   "seconds": 242.341443,
+   "trial": "mteb-retrieve__FgWqaTT",
+   "looked_up": true
   },
   {
    "task": "multi-source-data-merger",
@@ -195,7 +223,9 @@
    "cached": 44416,
    "output": 6926,
    "model": "deepseek-flash",
-   "seconds": 45.176714
+   "seconds": 45.176714,
+   "trial": "multi-source-data-merger__c9mpJou",
+   "looked_up": false
   },
   {
    "task": "openssl-selfsigned-cert",
@@ -208,7 +238,9 @@
    "cached": 73344,
    "output": 8915,
    "model": "deepseek-flash",
-   "seconds": 47.117228
+   "seconds": 47.117228,
+   "trial": "openssl-selfsigned-cert__tzzu6zd",
+   "looked_up": false
   },
   {
    "task": "polyglot-rust-c",
@@ -221,7 +253,9 @@
    "cached": 576384,
    "output": 34936,
    "model": "deepseek-flash",
-   "seconds": 205.433546
+   "seconds": 205.433546,
+   "trial": "polyglot-rust-c__V6buVm8",
+   "looked_up": false
   },
   {
    "task": "pytorch-model-recovery",
@@ -234,7 +268,9 @@
    "cached": 115072,
    "output": 12528,
    "model": "deepseek-flash",
-   "seconds": 107.12483
+   "seconds": 107.12483,
+   "trial": "pytorch-model-recovery__AaZPVkM",
+   "looked_up": false
   },
   {
    "task": "sparql-university",
@@ -247,7 +283,9 @@
    "cached": 203264,
    "output": 13328,
    "model": "deepseek-flash",
-   "seconds": 88.507846
+   "seconds": 88.507846,
+   "trial": "sparql-university__U3JPKmj",
+   "looked_up": false
   },
   {
    "task": "tune-mjcf",
@@ -260,7 +298,9 @@
    "cached": 1726464,
    "output": 54036,
    "model": "deepseek-flash",
-   "seconds": 900.006253
+   "seconds": 900.006253,
+   "trial": "tune-mjcf__wWoaWDU",
+   "looked_up": false
   },
   {
    "task": "adaptive-rejection-sampler",
@@ -273,7 +313,9 @@
    "cached": 1174656,
    "output": 67239,
    "model": "deepseek-flash",
-   "seconds": 466.856852
+   "seconds": 466.856852,
+   "trial": "adaptive-rejection-sampler__BmvBwuJ",
+   "looked_up": false
   },
   {
    "task": "adaptive-rejection-sampler",
@@ -286,7 +328,9 @@
    "cached": 3632640,
    "output": 78184,
    "model": "deepseek-flash",
-   "seconds": 670.557304
+   "seconds": 670.557304,
+   "trial": "adaptive-rejection-sampler__yV2FqsJ",
+   "looked_up": false
   },
   {
    "task": "chess-best-move",
@@ -299,7 +343,9 @@
    "cached": 2112000,
    "output": 62916,
    "model": "deepseek-flash",
-   "seconds": 381.579022
+   "seconds": 381.579022,
+   "trial": "chess-best-move__KaVhqND",
+   "looked_up": false
   },
   {
    "task": "chess-best-move",
@@ -312,7 +358,9 @@
    "cached": 1330048,
    "output": 39549,
    "model": "deepseek-flash",
-   "seconds": 384.71807
+   "seconds": 384.71807,
+   "trial": "chess-best-move__wbqaFEC",
+   "looked_up": false
   },
   {
    "task": "cobol-modernization",
@@ -325,7 +373,9 @@
    "cached": 3626880,
    "output": 81935,
    "model": "deepseek-flash",
-   "seconds": 730.55831
+   "seconds": 730.55831,
+   "trial": "cobol-modernization__PHYGVMW",
+   "looked_up": false
   },
   {
    "task": "cobol-modernization",
@@ -338,7 +388,9 @@
    "cached": 1987456,
    "output": 80311,
    "model": "deepseek-flash",
-   "seconds": 507.950444
+   "seconds": 507.950444,
+   "trial": "cobol-modernization__yhY4t3e",
+   "looked_up": false
   },
   {
    "task": "db-wal-recovery",
@@ -351,7 +403,9 @@
    "cached": 92544,
    "output": 7258,
    "model": "deepseek-flash",
-   "seconds": 47.51442
+   "seconds": 47.51442,
+   "trial": "db-wal-recovery__Tgd3tw2",
+   "looked_up": false
   },
   {
    "task": "db-wal-recovery",
@@ -364,7 +418,9 @@
    "cached": 816000,
    "output": 24324,
    "model": "deepseek-flash",
-   "seconds": 175.570442
+   "seconds": 175.570442,
+   "trial": "db-wal-recovery__wc2s443",
+   "looked_up": true
   },
   {
    "task": "dna-assembly",
@@ -377,7 +433,9 @@
    "cached": 4244352,
    "output": 121609,
    "model": "deepseek-flash",
-   "seconds": 1308.271168
+   "seconds": 1308.271168,
+   "trial": "dna-assembly__f6oVKLE",
+   "looked_up": false
   },
   {
    "task": "dna-assembly",
@@ -390,7 +448,9 @@
    "cached": 3399808,
    "output": 153408,
    "model": "deepseek-flash",
-   "seconds": 1031.603622
+   "seconds": 1031.603622,
+   "trial": "dna-assembly__qVrfX4V",
+   "looked_up": false
   },
   {
    "task": "filter-js-from-html",
@@ -403,7 +463,9 @@
    "cached": 11265664,
    "output": 168347,
    "model": "deepseek-flash",
-   "seconds": 1800.010682
+   "seconds": 1800.010682,
+   "trial": "filter-js-from-html__hLJvpaP",
+   "looked_up": true
   },
   {
    "task": "filter-js-from-html",
@@ -416,7 +478,9 @@
    "cached": 1672320,
    "output": 86119,
    "model": "deepseek-flash",
-   "seconds": 498.104373
+   "seconds": 498.104373,
+   "trial": "filter-js-from-html__xpgdWci",
+   "looked_up": false
   },
   {
    "task": "headless-terminal",
@@ -429,7 +493,9 @@
    "cached": 834816,
    "output": 37334,
    "model": "deepseek-flash",
-   "seconds": 315.33729
+   "seconds": 315.33729,
+   "trial": "headless-terminal__AFPCEPD",
+   "looked_up": false
   },
   {
    "task": "headless-terminal",
@@ -442,7 +508,9 @@
    "cached": 1799424,
    "output": 45459,
    "model": "deepseek-flash",
-   "seconds": 361.173637
+   "seconds": 361.173637,
+   "trial": "headless-terminal__bpmkkqh",
+   "looked_up": true
   },
   {
    "task": "kv-store-grpc",
@@ -455,7 +523,9 @@
    "cached": 42496,
    "output": 3899,
    "model": "deepseek-flash",
-   "seconds": 35.114538
+   "seconds": 35.114538,
+   "trial": "kv-store-grpc__cF3AzAS",
+   "looked_up": false
   },
   {
    "task": "kv-store-grpc",
@@ -468,7 +538,9 @@
    "cached": 35968,
    "output": 3040,
    "model": "deepseek-flash",
-   "seconds": 31.483396
+   "seconds": 31.483396,
+   "trial": "kv-store-grpc__ty4JdC4",
+   "looked_up": false
   },
   {
    "task": "llm-inference-batching-scheduler",
@@ -481,7 +553,9 @@
    "cached": 860544,
    "output": 51215,
    "model": "deepseek-flash",
-   "seconds": 313.206342
+   "seconds": 313.206342,
+   "trial": "llm-inference-batching-scheduler__MUPJtsN",
+   "looked_up": false
   },
   {
    "task": "llm-inference-batching-scheduler",
@@ -494,7 +568,9 @@
    "cached": 1648128,
    "output": 71796,
    "model": "deepseek-flash",
-   "seconds": 656.524071
+   "seconds": 656.524071,
+   "trial": "llm-inference-batching-scheduler__r9ewWNn",
+   "looked_up": false
   },
   {
    "task": "log-summary-date-ranges",
@@ -507,7 +583,9 @@
    "cached": 220032,
    "output": 11433,
    "model": "deepseek-flash",
-   "seconds": 72.130143
+   "seconds": 72.130143,
+   "trial": "log-summary-date-ranges__dNMdLqu",
+   "looked_up": false
   },
   {
    "task": "log-summary-date-ranges",
@@ -520,7 +598,9 @@
    "cached": 42880,
    "output": 2582,
    "model": "deepseek-flash",
-   "seconds": 20.764972
+   "seconds": 20.764972,
+   "trial": "log-summary-date-ranges__zA4yxCj",
+   "looked_up": false
   },
   {
    "task": "make-mips-interpreter",
@@ -533,7 +613,9 @@
    "cached": 8105216,
    "output": 129511,
    "model": "deepseek-flash",
-   "seconds": 881.748097
+   "seconds": 881.748097,
+   "trial": "make-mips-interpreter__5fYypyK",
+   "looked_up": false
   },
   {
    "task": "make-mips-interpreter",
@@ -546,7 +628,9 @@
    "cached": 33662208,
    "output": 157918,
    "model": "deepseek-flash",
-   "seconds": 1398.82615
+   "seconds": 1398.82615,
+   "trial": "make-mips-interpreter__TS2JAZL",
+   "looked_up": false
   },
   {
    "task": "model-extraction-relu-logits",
@@ -559,7 +643,9 @@
    "cached": 2439808,
    "output": 108512,
    "model": "deepseek-flash",
-   "seconds": 649.73306
+   "seconds": 649.73306,
+   "trial": "model-extraction-relu-logits__75f6dnG",
+   "looked_up": false
   },
   {
    "task": "model-extraction-relu-logits",
@@ -572,7 +658,9 @@
    "cached": 2595584,
    "output": 100105,
    "model": "deepseek-flash",
-   "seconds": 772.570394
+   "seconds": 772.570394,
+   "trial": "model-extraction-relu-logits__LYiE76S",
+   "looked_up": false
   },
   {
    "task": "modernize-scientific-stack",
@@ -585,7 +673,9 @@
    "cached": 65280,
    "output": 4982,
    "model": "deepseek-flash",
-   "seconds": 45.165904
+   "seconds": 45.165904,
+   "trial": "modernize-scientific-stack__CeXShhs",
+   "looked_up": false
   },
   {
    "task": "modernize-scientific-stack",
@@ -598,7 +688,9 @@
    "cached": 192896,
    "output": 13095,
    "model": "deepseek-flash",
-   "seconds": 96.220553
+   "seconds": 96.220553,
+   "trial": "modernize-scientific-stack__zBr4qkn",
+   "looked_up": false
   },
   {
    "task": "mteb-retrieve",
@@ -611,7 +703,9 @@
    "cached": 192384,
    "output": 10391,
    "model": "deepseek-flash",
-   "seconds": 235.064241
+   "seconds": 235.064241,
+   "trial": "mteb-retrieve__E6iaJFq",
+   "looked_up": true
   },
   {
    "task": "mteb-retrieve",
@@ -624,7 +718,9 @@
    "cached": 461696,
    "output": 16494,
    "model": "deepseek-flash",
-   "seconds": 262.159145
+   "seconds": 262.159145,
+   "trial": "mteb-retrieve__dyoMRsW",
+   "looked_up": true
   },
   {
    "task": "multi-source-data-merger",
@@ -637,7 +733,9 @@
    "cached": 107648,
    "output": 10416,
    "model": "deepseek-flash",
-   "seconds": 65.725009
+   "seconds": 65.725009,
+   "trial": "multi-source-data-merger__BGXLgKb",
+   "looked_up": false
   },
   {
    "task": "multi-source-data-merger",
@@ -650,7 +748,9 @@
    "cached": 210048,
    "output": 20029,
    "model": "deepseek-flash",
-   "seconds": 116.175042
+   "seconds": 116.175042,
+   "trial": "multi-source-data-merger__ZQ5TVUM",
+   "looked_up": false
   },
   {
    "task": "openssl-selfsigned-cert",
@@ -663,7 +763,9 @@
    "cached": 45312,
    "output": 7102,
    "model": "deepseek-flash",
-   "seconds": 45.026983
+   "seconds": 45.026983,
+   "trial": "openssl-selfsigned-cert__iKxHbGD",
+   "looked_up": false
   },
   {
    "task": "openssl-selfsigned-cert",
@@ -676,7 +778,9 @@
    "cached": 114432,
    "output": 15858,
    "model": "deepseek-flash",
-   "seconds": 75.212334
+   "seconds": 75.212334,
+   "trial": "openssl-selfsigned-cert__qrTuUWq",
+   "looked_up": false
   },
   {
    "task": "polyglot-rust-c",
@@ -689,7 +793,9 @@
    "cached": 344960,
    "output": 40583,
    "model": "deepseek-flash",
-   "seconds": 202.933648
+   "seconds": 202.933648,
+   "trial": "polyglot-rust-c__2FDVuqb",
+   "looked_up": false
   },
   {
    "task": "polyglot-rust-c",
@@ -702,7 +808,9 @@
    "cached": 1026048,
    "output": 41443,
    "model": "deepseek-flash",
-   "seconds": 282.487124
+   "seconds": 282.487124,
+   "trial": "polyglot-rust-c__Dfv3Dji",
+   "looked_up": false
   },
   {
    "task": "pytorch-model-recovery",
@@ -715,7 +823,9 @@
    "cached": 723584,
    "output": 21139,
    "model": "deepseek-flash",
-   "seconds": 561.352681
+   "seconds": 561.352681,
+   "trial": "pytorch-model-recovery__QPmuh9E",
+   "looked_up": false
   },
   {
    "task": "pytorch-model-recovery",
@@ -728,7 +838,9 @@
    "cached": 88320,
    "output": 11332,
    "model": "deepseek-flash",
-   "seconds": 94.671021
+   "seconds": 94.671021,
+   "trial": "pytorch-model-recovery__yfvPdci",
+   "looked_up": false
   },
   {
    "task": "sparql-university",
@@ -741,7 +853,9 @@
    "cached": 136704,
    "output": 12201,
    "model": "deepseek-flash",
-   "seconds": 83.53816
+   "seconds": 83.53816,
+   "trial": "sparql-university__gW5NtfD",
+   "looked_up": false
   },
   {
    "task": "sparql-university",
@@ -754,7 +868,9 @@
    "cached": 137856,
    "output": 9619,
    "model": "deepseek-flash",
-   "seconds": 71.265346
+   "seconds": 71.265346,
+   "trial": "sparql-university__zeta2b6",
+   "looked_up": false
   },
   {
    "task": "tune-mjcf",
@@ -767,7 +883,9 @@
    "cached": 1705984,
    "output": 55019,
    "model": "deepseek-flash",
-   "seconds": 900.006471
+   "seconds": 900.006471,
+   "trial": "tune-mjcf__NknRN5G",
+   "looked_up": false
   },
   {
    "task": "tune-mjcf",
@@ -780,7 +898,9 @@
    "cached": 2735104,
    "output": 58909,
    "model": "deepseek-flash",
-   "seconds": 900.003744
+   "seconds": 900.003744,
+   "trial": "tune-mjcf__ZhV78Gs",
+   "looked_up": false
   }
  ]
 }

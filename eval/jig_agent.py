@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated, override
 
+import jinja2
 from pydantic import Field
 
 from harbor.agents.installed.base import BaseInstalledAgent, with_prompt_template
@@ -28,7 +29,9 @@ from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
 
 REPO = Path(__file__).resolve().parent.parent
+MINI_PROMPTS = Path(__file__).resolve().parent / "mini-swe-agent-prompts.json"
 INSTALL_DIR = "/installed-agent/jig"
+TASK_FILE = "/installed-agent/task.txt"
 LOAD_NODE = 'export NVM_DIR="$HOME/.nvm" && . "$NVM_DIR/nvm.sh"'
 # USD per million tokens: uncached input, cached input, output (the same table as bench/metrics.ts).
 PRICES = {
@@ -53,6 +56,12 @@ class JigOptions(InstalledAgentOptions):
     )
     check: Annotated[bool | None, Cli("--check")] = Field(
         default=None, description="ask the model to check its work before finishing"
+    )
+    tools: Annotated[str | None, Cli("--tools")] = Field(
+        default=None, description="jig's --tools: only these of its tools, e.g. bash"
+    )
+    prompts: str | None = Field(
+        default=None, description="mini: mini-swe-agent's system prompt and task template instead of jig's"
     )
 
 
@@ -138,6 +147,18 @@ class Jig(BaseInstalledAgent):
         if not key:
             raise ValueError(f"Set {key_name} in the environment harbor runs in.")
         flags = self.build_cli_flags()
+        if self.options.prompts == "mini":
+            system, instruction = await self._mini_prompts(instruction, environment)
+            flags += f" --system-prompt {shlex.quote(system)}"
+        elif self.options.prompts:
+            raise ValueError(f"Unknown prompts {self.options.prompts!r}: the choice is mini.")
+        # The task reaches jig on stdin (jig -), not on the command line: models stop programs by matching
+        # command lines (pkill -f server.py), and in milestone 10 that killed jig twice, through the task
+        # in its arguments (which its process title can't hide under emulation) or in the shell's.
+        with tempfile.TemporaryDirectory() as tmp:
+            task = Path(tmp) / "task.txt"
+            task.write_text(instruction)
+            await environment.upload_file(task, TASK_FILE)
         # The container is the sandbox (--no-sandbox: jig's own would need bubblewrap and user namespaces
         # in the container), so the whole file system is the project (--add-dir /), and nobody is there
         # to approve tool calls (--yes). jig's home goes in the logs, so the session
@@ -146,11 +167,20 @@ class Jig(BaseInstalledAgent):
             environment,
             command=(
                 f"{LOAD_NODE} && node {INSTALL_DIR}/src/cli.ts --yes --no-sandbox --add-dir / --model {shlex.quote(model)} "
-                f"--stats /logs/agent/jig-stats.json {flags} -- {shlex.quote(instruction)} "
-                "</dev/null 2>&1 | tee /logs/agent/jig.txt"
+                f"--stats /logs/agent/jig-stats.json {flags} -- - < {TASK_FILE} 2>&1 | tee /logs/agent/jig.txt"
             ),
             env={key_name: key, "NO_COLOR": "1", "JIG_HOME": "/logs/agent/jig-home"},
         )
+
+    async def _mini_prompts(self, instruction: str, environment: BaseEnvironment) -> tuple[str, str]:
+        """mini-swe-agent's system prompt, and the task in its template, rendered as mini-swe-agent renders
+        them: with Jinja, the task and the container's uname."""
+        result = await environment.exec("uname -s; uname -r; uname -v; uname -m")
+        system, release, version, machine = (result.stdout or "").strip().split("\n")
+        values = {"task": instruction, "system": system, "release": release, "version": version, "machine": machine}
+        templates = json.loads(MINI_PROMPTS.read_text())
+        render = lambda name: jinja2.Template(templates[name], undefined=jinja2.StrictUndefined).render(**values)  # noqa: E731
+        return render("system_template"), render("instance_template")
 
     @override
     def populate_context_post_run(self, context: AgentContext) -> None:

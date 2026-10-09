@@ -83,9 +83,18 @@ export function createModel(options: ModelOptions): CallModel {
       try {
         return await streamTurn(client, params, signal, summarize || options.quiet);
       } catch (err) {
-        // API errors are not retried here: the SDK already retries rate limits and overloads.
-        if (!(err instanceof MalformedToolInput) || attempt === 3) throw err;
-        ui.notice("The model sent malformed tool input; asking again.");
+        // API errors are mostly not retried here: the SDK already retries rate limits, overloads and
+        // requests that fail before a reply begins. What it can't retry is a reply that broke off partway,
+        // or one with malformed tool input.
+        if (attempt === 3 || signal?.aborted) throw err;
+        if (brokeOff(err)) {
+          ui.notice(`The reply broke off before it was finished; trying again (${3 - attempt} ${3 - attempt === 1 ? "try" : "tries"} left).`);
+          await new Promise((done) => setTimeout(done, 500));
+        } else if (err instanceof MalformedToolInput) {
+          ui.notice("The model sent malformed tool input; asking again.");
+        } else {
+          throw err;
+        }
       }
     }
   };
@@ -151,6 +160,17 @@ function withoutIsError(messages: MessageParam[]): MessageParam[] {
 /** A tool input so broken the SDK could not parse it at all, which fails the whole stream. */
 class MalformedToolInput extends Error {}
 
+/**
+ * Whether a reply broke off partway: the connection dropped ("terminated"), the stream ended early, or the
+ * server sent an overload or server error in the middle of it. A dropped connection ended a whole
+ * Terminal-Bench task once (milestone 10).
+ */
+function brokeOff(err: unknown): boolean {
+  if (err instanceof Anthropic.APIConnectionError || err instanceof Anthropic.APIUserAbortError) return false;
+  if (err instanceof Anthropic.APIError) return err.status === undefined && ["overloaded_error", "api_error"].includes(String(err.type));
+  return err instanceof Anthropic.AnthropicError && /terminated|ended without/.test(err.message);
+}
+
 async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal, quiet = false): Promise<ModelTurn> {
   const stream = client.beta.messages.stream(params, { signal });
   const rawInputs = new Map<number, string>(); // content block index -> tool input JSON as streamed
@@ -179,7 +199,7 @@ async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, si
   } catch (err) {
     // The reply never finished, so there is no tool call to answer with an error: the caller asks again.
     const brokenJson = [...rawInputs.values()].some((raw) => !isJson(raw));
-    if (brokenJson && !(err instanceof Anthropic.APIError)) {
+    if (brokenJson && !(err instanceof Anthropic.APIError) && !brokeOff(err)) {
       throw new MalformedToolInput("The model sent tool input that is not valid JSON.", { cause: err });
     }
     throw err;

@@ -4,9 +4,10 @@ import { mkdir, mkdtemp, readFile, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
+import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
 import { bashTool, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
-import { checkInput, truncate, type ToolContext } from "../src/tools/index.ts";
+import { checkInput, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
@@ -181,6 +182,20 @@ describe("bash", () => {
     assert.equal(running(child), false, "the background sleep should be gone too");
   });
 
+  it("returns once the command has finished, leaving what it started in the background running", async () => {
+    // `cd dir && job > log &` backgrounds the whole list, and the subshell running it holds the command's
+    // output open until the job ends.
+    const started = Date.now();
+    const out = await runCommand("cd . && sleep 5 > job.log 2>&1 & echo $! > job.pid; echo started", cwd, 30);
+    assert.ok(Date.now() - started < 4000, "it didn't wait for the job");
+    assert.match(out, /^started\n\n\(The command has finished, but something it started in the background is still running[^\n]*\)\nExit code: 0$/);
+    assert.ok(running(Number(await readFile(join(cwd, "job.pid"), "utf8"))), "the job is still running");
+  });
+
+  it("still shows what a background job prints just after the command ends", async () => {
+    assert.equal(await runCommand("(sleep 0.3; echo later) & echo now", cwd, 30), "now\nlater\n\nExit code: 0");
+  });
+
   it("keeps jig's API keys out of the commands' environment", async () => {
     const saved = process.env.DEEPSEEK_API_KEY;
     process.env.DEEPSEEK_API_KEY = "sk-test-secret";
@@ -212,6 +227,31 @@ describe("checkInput", () => {
     assert.match(checkInput(readTool, { path: "a", offset: 1.5 })!, /"offset" must be an integer/);
     assert.match(checkInput(readTool, { path: "a", mode: "fast" })!, /unknown parameter "mode"/);
     assert.match(checkInput(readTool, "a.txt")!, /must be a JSON object/);
+  });
+});
+
+describe("--tools", () => {
+  const names = (tools: { definition: { name: string } }[]) => tools.map((tool) => tool.definition.name);
+
+  it("picks jig's tools by name, and names the ones there are when one is unknown", () => {
+    assert.deepEqual(parseToolList(" bash, read_file "), ["bash", "read_file"]);
+    assert.deepEqual(parseToolList(""), []);
+    assert.throws(() => parseToolList("bash,Bash"), /there is no tool "Bash"\. jig's tools are read_file, grep, .*, subagent\./);
+    assert.deepEqual(names(selectTools(["bash", "edit_file"])), ["edit_file", "bash"]);
+    assert.equal(selectTools(), TOOLS);
+  });
+
+  it("never points the model at a tool it doesn't have", () => {
+    const description = selectTools(["bash"])[0].definition.description ?? "";
+    assert.doesNotMatch(description, /read_file|grep|glob/);
+    assert.match(description, /^Run a shell command .* Each call starts a fresh shell/);
+    assert.equal(selectTools(["bash", "grep", "glob", "read_file"]).at(-1), bashTool, "with the search tools, bash recommends them");
+
+    const prompt = systemPrompt(cwd, { tools: ["bash"], dirs: ["/"] });
+    assert.doesNotMatch(prompt, /read_file|edit_file|write_file|grep, glob|file tools/);
+    assert.match(prompt, /- Read a file before you edit it\.\n/);
+    assert.match(systemPrompt(cwd, { dirs: ["/"] }), /\(grep, glob\).*Use edit_file for targeted changes.*The file tools also work in: \//s);
+    assert.doesNotMatch(subagentPrompt(cwd, { tools: ["bash"], dirs: ["/"] }), /read_file|grep and glob|file tools/);
   });
 });
 

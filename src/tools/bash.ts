@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import type { Socket } from "node:net";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Sandbox } from "../sandbox.ts";
@@ -13,17 +14,23 @@ const DEFAULT_TIMEOUT = 120; // seconds
 const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
 const MAX_TIMEOUT = 600;
 const MAX_CAPTURE = 5_000_000; // characters; a command printing more than this is killed
+const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
+const STILL_RUNNING =
+  "(The command has finished, but something it started in the background is still running with this output " +
+  "open. jig didn't wait for it, so its later output isn't shown.)";
+
+const ABOUT = "Run a shell command with bash in the working directory. Returns stdout and stderr combined, then the exit code.";
+const RULES =
+  "Each call starts a fresh shell, so cd and variables do not carry over: chain commands with && instead. There is " +
+  "no stdin, so anything interactive gets end-of-file; use non-interactive flags. To leave a server running, start " +
+  "it in the background with its output redirected to a file.";
 
 export const bashTool: Tool = {
   definition: {
     name: "bash",
     description:
-      "Run a shell command with bash in the working directory. Returns stdout and stderr combined, then the " +
-      "exit code. Use it to run tests, builds and git; to search or read files, the grep, glob and read_file " +
-      "tools are usually better. Each call " +
-      "starts a fresh shell, so cd and variables do not carry over: chain commands with && instead. There is " +
-      "no stdin, so anything interactive gets end-of-file; use non-interactive flags. To leave a server " +
-      "running, start it in the background with its output redirected to a file.",
+      `${ABOUT} Use it to run tests, builds and git; to search or read files, the grep, glob and read_file tools ` +
+      `are usually better. ${RULES}`,
     input_schema: {
       type: "object",
       properties: {
@@ -74,6 +81,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     const child = spawn(program, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let killedBecause = "";
+    let done = false;
     const kill = (reason: string) => {
       killedBecause ||= reason;
       try {
@@ -83,6 +91,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
       }
     };
     const collect = (chunk: string) => {
+      if (done) return; // a background job's output, after the call has returned
       output += chunk;
       if (output.length > MAX_CAPTURE) kill(`it printed more than ${MAX_CAPTURE} characters`);
     };
@@ -92,21 +101,39 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     const timer = setTimeout(() => kill(`it timed out after ${seconds}s`), seconds * 1000);
     const onAbort = () => kill("the user interrupted it");
     signal?.addEventListener("abort", onAbort, { once: true });
-    const cleanUp = () => {
+    let lingering: NodeJS.Timeout | undefined;
+    const settle = () => {
+      done = true;
       clearTimeout(timer);
+      clearTimeout(lingering);
       signal?.removeEventListener("abort", onAbort);
     };
+    const finish = (status: string, note = "") => {
+      if (done) return;
+      settle();
+      resolve(`${output.trimEnd() || "(no output)"}\n\n${note ? `${note}\n` : ""}${status}`);
+    };
+    const status = (code: number | null, killSignal: NodeJS.Signals | null) =>
+      killedBecause ? `Killed: ${killedBecause}.` : `Exit code: ${code ?? killSignal}`;
 
     child.on("error", (err) => {
-      cleanUp();
+      settle();
       reject(err);
     });
-    // "close" waits for the output pipes to close, so a background process that keeps them open holds
-    // the call until the timeout. That is why the description says to redirect a server's output.
-    child.on("close", (code, killSignal) => {
-      cleanUp();
-      const status = killedBecause ? `Killed: ${killedBecause}.` : `Exit code: ${code ?? killSignal}`;
-      resolve(`${output.trimEnd() || "(no output)"}\n\n${status}`);
+    // "close" comes once the output pipes have closed, which is normally when the command has finished.
+    // But a job it left in the background can hold them: `cd app && server > log &` runs the whole list
+    // in a subshell, which keeps the pipes while it waits for the server. So once the shell has exited,
+    // wait a moment for the last output, then return and leave the job running, as a terminal would.
+    child.on("exit", (code, killSignal) => {
+      lingering = setTimeout(() => {
+        // Keep reading what the job prints, so it never blocks on a full pipe, without keeping jig alive.
+        for (const stream of [child.stdout, child.stderr]) (stream as Partial<Socket>).unref?.();
+        finish(status(code, killSignal), STILL_RUNNING);
+      }, LINGER_MS);
     });
+    child.on("close", (code, killSignal) => finish(status(code, killSignal)));
   });
 }
+
+/** bash without jig's search and read tools beside it (--tools): its description doesn't point at them. */
+export const bashOnItsOwn: Tool = { ...bashTool, definition: { ...bashTool.definition, description: `${ABOUT} ${RULES}` } };

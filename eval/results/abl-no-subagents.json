@@ -4,6 +4,7 @@
  "trials": [
   {
    "task": "db-wal-recovery",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -12,10 +13,13 @@
    "cached": 77312,
    "output": 5453,
    "model": "deepseek-flash",
-   "seconds": 31.756895
+   "seconds": 31.756895,
+   "trial": "db-wal-recovery__KGyGPaf",
+   "looked_up": false
   },
   {
    "task": "log-summary-date-ranges",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -24,10 +28,13 @@
    "cached": 18176,
    "output": 1414,
    "model": "deepseek-flash",
-   "seconds": 17.868787
+   "seconds": 17.868787,
+   "trial": "log-summary-date-ranges__TLvVwnw",
+   "looked_up": false
   },
   {
    "task": "make-mips-interpreter",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -36,10 +43,13 @@
    "cached": 5975168,
    "output": 96880,
    "model": "deepseek-flash",
-   "seconds": 707.678991
+   "seconds": 707.678991,
+   "trial": "make-mips-interpreter__T2tuaMN",
+   "looked_up": false
   },
   {
    "task": "multi-source-data-merger",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -48,10 +58,13 @@
    "cached": 38016,
    "output": 6231,
    "model": "deepseek-flash",
-   "seconds": 38.142215
+   "seconds": 38.142215,
+   "trial": "multi-source-data-merger__pnmLZWw",
+   "looked_up": false
   },
   {
    "task": "openssl-selfsigned-cert",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -60,10 +73,13 @@
    "cached": 70912,
    "output": 4739,
    "model": "deepseek-flash",
-   "seconds": 32.634691
+   "seconds": 32.634691,
+   "trial": "openssl-selfsigned-cert__xDQLc48",
+   "looked_up": false
   },
   {
    "task": "polyglot-rust-c",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -72,10 +88,13 @@
    "cached": 147328,
    "output": 28001,
    "model": "deepseek-flash",
-   "seconds": 142.323707
+   "seconds": 142.323707,
+   "trial": "polyglot-rust-c__wxPveeA",
+   "looked_up": false
   },
   {
    "task": "pytorch-model-recovery",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": true,
    "error": null,
@@ -84,10 +103,13 @@
    "cached": 66688,
    "output": 7308,
    "model": "deepseek-flash",
-   "seconds": 60.313902
+   "seconds": 60.313902,
+   "trial": "pytorch-model-recovery__wV5KFUt",
+   "looked_up": false
   },
   {
    "task": "tune-mjcf",
+   "job": "abl-no-subagents",
    "version": "0347e48+changes",
    "passed": false,
    "error": "AgentTimeoutError",
@@ -96,7 +118,9 @@
    "cached": 402816,
    "output": 24895,
    "model": "deepseek-flash",
-   "seconds": 900.005847
+   "seconds": 900.005847,
+   "trial": "tune-mjcf__tM85bPE",
+   "looked_up": false
   }
  ]
 }

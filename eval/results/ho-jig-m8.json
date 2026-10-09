@@ -13,7 +13,9 @@
    "cached": 128512,
    "output": 9424,
    "model": "deepseek-flash",
-   "seconds": 230.054827
+   "seconds": 230.054827,
+   "trial": "break-filter-js-from-html__TnPwLZH",
+   "looked_up": false
   },
   {
    "task": "build-pmars",
@@ -26,7 +28,9 @@
    "cached": 238592,
    "output": 6773,
    "model": "deepseek-flash",
-   "seconds": 74.031495
+   "seconds": 74.031495,
+   "trial": "build-pmars__SJzaYAv",
+   "looked_up": false
   },
   {
    "task": "code-from-image",
@@ -39,7 +43,9 @@
    "cached": 619904,
    "output": 24781,
    "model": "deepseek-flash",
-   "seconds": 238.17186
+   "seconds": 238.17186,
+   "trial": "code-from-image__8PWy8Gw",
+   "looked_up": false
   },
   {
    "task": "configure-git-webserver",
@@ -52,7 +58,9 @@
    "cached": 404224,
    "output": 19617,
    "model": "deepseek-flash",
-   "seconds": 407.228517
+   "seconds": 407.228517,
+   "trial": "configure-git-webserver__utYHLzA",
+   "looked_up": false
   },
   {
    "task": "count-dataset-tokens",
@@ -65,7 +73,9 @@
    "cached": 558720,
    "output": 24180,
    "model": "deepseek-flash",
-   "seconds": 872.817112
+   "seconds": 872.817112,
+   "trial": "count-dataset-tokens__UfS2P9y",
+   "looked_up": false
   },
   {
    "task": "crack-7z-hash",
@@ -78,7 +88,9 @@
    "cached": 377856,
    "output": 13810,
    "model": "deepseek-flash",
-   "seconds": 900.007239
+   "seconds": 900.007239,
+   "trial": "crack-7z-hash__nwUAEig",
+   "looked_up": false
   },
   {
    "task": "custom-memory-heap-crash",
@@ -91,7 +103,9 @@
    "cached": 496128,
    "output": 16209,
    "model": "deepseek-flash",
-   "seconds": 130.044245
+   "seconds": 130.044245,
+   "trial": "custom-memory-heap-crash__56gSPmn",
+   "looked_up": false
   },
   {
    "task": "extract-elf",
@@ -104,7 +118,9 @@
    "cached": 536576,
    "output": 16951,
    "model": "deepseek-flash",
-   "seconds": 102.728425
+   "seconds": 102.728425,
+   "trial": "extract-elf__Np2hUqP",
+   "looked_up": true
   },
   {
    "task": "git-multibranch",
@@ -117,7 +133,9 @@
    "cached": 388096,
    "output": 20765,
    "model": "deepseek-flash",
-   "seconds": 125.497706
+   "seconds": 125.497706,
+   "trial": "git-multibranch__DSmRRcY",
+   "looked_up": false
   },
   {
    "task": "hf-model-inference",
@@ -130,7 +148,9 @@
    "cached": 50432,
    "output": 2876,
    "model": "deepseek-flash",
-   "seconds": 222.860409
+   "seconds": 222.860409,
+   "trial": "hf-model-inference__NLsZMDp",
+   "looked_up": false
   },
   {
    "task": "large-scale-text-editing",
@@ -143,7 +163,9 @@
    "cached": 119296,
    "output": 10668,
    "model": "deepseek-flash",
-   "seconds": 204.178732
+   "seconds": 204.178732,
+   "trial": "large-scale-text-editing__TxTpLq3",
+   "looked_up": false
   },
   {
    "task": "largest-eigenval",
@@ -156,7 +178,9 @@
    "cached": 2151168,
    "output": 61286,
    "model": "deepseek-flash",
-   "seconds": 410.880226
+   "seconds": 410.880226,
+   "trial": "largest-eigenval__yYRaQJq",
+   "looked_up": false
   },
   {
    "task": "nginx-request-logging",
@@ -169,7 +193,9 @@
    "cached": 47872,
    "output": 2991,
    "model": "deepseek-flash",
-   "seconds": 31.279548
+   "seconds": 31.279548,
+   "trial": "nginx-request-logging__wEoRTKU",
+   "looked_up": false
   },
   {
    "task": "password-recovery",
@@ -182,7 +208,9 @@
    "cached": 358912,
    "output": 14783,
    "model": "deepseek-flash",
-   "seconds": 76.063798
+   "seconds": 76.063798,
+   "trial": "password-recovery__789CKiT",
+   "looked_up": false
   },
   {
    "task": "polyglot-c-py",
@@ -195,7 +223,9 @@
    "cached": 201088,
    "output": 16455,
    "model": "deepseek-flash",
-   "seconds": 95.787137
+   "seconds": 95.787137,
+   "trial": "polyglot-c-py__bH66zhm",
+   "looked_up": false
   },
   {
    "task": "prove-plus-comm",
@@ -208,7 +238,9 @@
    "cached": 49152,
    "output": 3871,
    "model": "deepseek-flash",
-   "seconds": 27.990569
+   "seconds": 27.990569,
+   "trial": "prove-plus-comm__4Vc5MtZ",
+   "looked_up": false
   },
   {
    "task": "raman-fitting",
@@ -221,7 +253,9 @@
    "cached": 2588928,
    "output": 124578,
    "model": "deepseek-flash",
-   "seconds": 661.553873
+   "seconds": 661.553873,
+   "trial": "raman-fitting__HPTKhzh",
+   "looked_up": false
   },
   {
    "task": "regex-log",
@@ -234,7 +268,9 @@
    "cached": 154240,
    "output": 17203,
    "model": "deepseek-flash",
-   "seconds": 81.591001
+   "seconds": 81.591001,
+   "trial": "regex-log__mF7NfPP",
+   "looked_up": false
   },
   {
    "task": "sanitize-git-repo",
@@ -247,7 +283,9 @@
    "cached": 489728,
    "output": 9941,
    "model": "deepseek-flash",
-   "seconds": 56.189078
+   "seconds": 56.189078,
+   "trial": "sanitize-git-repo__NvjSf6f",
+   "looked_up": false
   },
   {
    "task": "sqlite-with-gcov",
@@ -260,7 +298,9 @@
    "cached": 297344,
    "output": 9521,
    "model": "deepseek-flash",
-   "seconds": 202.829694
+   "seconds": 202.829694,
+   "trial": "sqlite-with-gcov__B6BH8Ar",
+   "looked_up": false
   }
  ]
 }

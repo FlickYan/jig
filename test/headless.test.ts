@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -66,6 +67,12 @@ describe("--add-dir", () => {
     assert.doesNotMatch(systemPrompt(project), /on your own/);
   });
 
+  it("can replace jig's own system prompt, keeping what follows it", () => {
+    const prompt = systemPrompt(project, { custom: "You are a helpful assistant.\n", oneShot: true, dirs: [outside] });
+    assert.match(prompt, /^You are a helpful assistant\.\n\nYou are running one task on your own/);
+    assert.doesNotMatch(prompt, /coding agent|Working directory/);
+  });
+
   it("tells the model about it", () => {
     assert.match(systemPrompt(project, { dirs: [outside] }), new RegExp(`The file tools also work in: ${outside}`));
     assert.doesNotMatch(systemPrompt(project), /also work in/);
@@ -131,5 +138,131 @@ describe("a hung API", () => {
     const notices = printed.join("").split("\n").filter((line) => line.includes("trying again"));
     assert.equal(notices.length, 2);
     assert.match(notices[0], /The API didn't answer in time; trying again \(2 tries left\)/);
+  });
+});
+
+/** A server-sent event of the Messages API's stream. */
+const event = (type: string, data: object) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+const message = { id: "msg", type: "message", role: "assistant", model: "m", content: [], stop_reason: null, stop_sequence: null };
+/** A streamed reply saying "Hello", in two parts, so a test can cut it off between them. */
+const begin =
+  event("message_start", { message: { ...message, usage: { input_tokens: 5, output_tokens: 1 } } }) +
+  event("content_block_start", { index: 0, content_block: { type: "text", text: "" } }) +
+  event("content_block_delta", { index: 0, delta: { type: "text_delta", text: "Hel" } });
+const finish =
+  event("content_block_delta", { index: 0, delta: { type: "text_delta", text: "lo" } }) +
+  event("content_block_stop", { index: 0 }) +
+  event("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }) +
+  event("message_stop", {});
+
+describe("a reply that breaks off", () => {
+
+  /** Calls the model against a local server whose first `drops` replies break off halfway: the connection
+   * drops, or the server sends an overload error. */
+  async function callWithDrops(drops: number, how: "drop" | "overload" = "drop"): Promise<{ result: Promise<ModelTurn>; notices: () => string[]; done: () => void }> {
+    let requests = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(begin);
+      if (++requests > drops) res.end(finish);
+      else if (how === "overload") res.end(event("error", { error: { type: "overloaded_error", message: "Overloaded" } }));
+      else setTimeout(() => res.socket?.destroy(), 20);
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const env = { ...process.env };
+    process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const printed: string[] = [];
+    const write = process.stdout.write;
+    process.stdout.write = ((chunk: string | Uint8Array) => printed.push(String(chunk)) > 0) as typeof process.stdout.write;
+    const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [] })([{ role: "user", content: "hi" }]);
+    return {
+      result,
+      notices: () => printed.join("").split("\n").filter((line) => line.includes("broke off")),
+      done() {
+        process.stdout.write = write;
+        process.env = env;
+        server.closeAllConnections();
+        server.close();
+      },
+    };
+  }
+
+  it("asks again, with a notice, and gets the whole reply", async () => {
+    const call = await callWithDrops(1);
+    try {
+      const turn = await call.result;
+      assert.deepEqual(turn.message.content, [{ type: "text", text: "Hello" }]);
+    } finally {
+      call.done();
+    }
+    assert.match(call.notices()[0], /The reply broke off before it was finished; trying again \(2 tries left\)/);
+  });
+
+  it("asks again after an overload error in the middle of the reply", async () => {
+    const call = await callWithDrops(1, "overload");
+    try {
+      assert.deepEqual((await call.result).message.content, [{ type: "text", text: "Hello" }]);
+    } finally {
+      call.done();
+    }
+    assert.equal(call.notices().length, 1);
+  });
+
+  it("gives up after three tries", async () => {
+    const call = await callWithDrops(3);
+    try {
+      await assert.rejects(call.result, /terminated/);
+    } finally {
+      call.done();
+    }
+    assert.equal(call.notices().length, 2);
+  });
+});
+
+describe("the task's place on the command line", () => {
+  /** Runs the CLI on a task against a local fake API, which answers "Hello". Returns what the API received,
+   * and the CLI's command line as `ps` showed it while the request was open. */
+  async function runCli(args: string[], stdin = ""): Promise<{ code: number | null; received: string; commandLine: string }> {
+    let received = "";
+    let commandLine = "";
+    let pid = 0;
+    const server = createServer((req, res) => {
+      req.on("data", (chunk) => (received += chunk));
+      req.on("end", () => {
+        commandLine = execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(begin + finish);
+      });
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: home, NO_COLOR: "1" };
+      const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+      const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", ...args], { cwd: project, env });
+      pid = child.pid!;
+      child.stdout.resume();
+      child.stderr.resume();
+      child.stdin.end(stdin);
+      const code = await new Promise<number | null>((done) => child.on("close", done));
+      return { code, received, commandLine };
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  }
+
+  it("reads the task from stdin when it is -", async () => {
+    const { code, received } = await runCli(["-"], "Rename server.py to app.py.\n");
+    assert.equal(code, 0);
+    assert.match(received, /"content":"Rename server\.py to app\.py\."/);
+  });
+
+  it("keeps a task given as an argument out of ps, so pkill -f can't match jig", async () => {
+    const { code, commandLine } = await runCli(["Rename server.py to app.py."]);
+    assert.equal(code, 0);
+    assert.equal(commandLine, "jig");
   });
 });

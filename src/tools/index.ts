@@ -1,6 +1,6 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Usage } from "../agent.ts";
-import { bashTool } from "./bash.ts";
+import { bashOnItsOwn, bashTool } from "./bash.ts";
 import { editTool } from "./edit.ts";
 import { globTool } from "./glob.ts";
 import { grepTool } from "./grep.ts";
@@ -43,6 +43,24 @@ export interface Tool {
 }
 
 export const TOOLS: Tool[] = [readTool, grepTool, globTool, writeTool, editTool, bashTool];
+
+/** What --tools can name: jig's own tools, and the subagent tool, which the CLI builds. */
+export const TOOL_NAMES = [...TOOLS.map((tool) => tool.definition.name), "subagent"];
+
+/** The tools in a --tools list ("bash,read_file"), checked against TOOL_NAMES. An empty list means none. */
+export function parseToolList(list: string): string[] {
+  const names = list.split(",").map((name) => name.trim()).filter(Boolean);
+  const unknown = names.find((name) => !TOOL_NAMES.includes(name));
+  if (unknown) throw new Error(`--tools: there is no tool "${unknown}". jig's tools are ${TOOL_NAMES.join(", ")}.`);
+  return names;
+}
+
+/** jig's own tools, or only the named ones. Without grep, glob and read_file, bash stops recommending them. */
+export function selectTools(names?: string[]): Tool[] {
+  if (!names) return TOOLS;
+  const searching = ["grep", "glob", "read_file"].every((name) => names.includes(name));
+  return TOOLS.filter((tool) => names.includes(tool.definition.name)).map((tool) => (tool === bashTool && !searching ? bashOnItsOwn : tool));
+}
 
 /** Tool output longer than this (~10k tokens) is cut from the middle before the model sees it. */
 export const MAX_OUTPUT_CHARS = 40_000;

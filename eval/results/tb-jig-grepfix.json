@@ -13,7 +13,9 @@
    "cached": 146304,
    "output": 9728,
    "model": "deepseek-flash",
-   "seconds": 71.733025
+   "seconds": 71.733025,
+   "trial": "headless-terminal__RfYMymW",
+   "looked_up": false
   },
   {
    "task": "headless-terminal",
@@ -26,7 +28,9 @@
    "cached": 424576,
    "output": 20076,
    "model": "deepseek-flash",
-   "seconds": 172.124363
+   "seconds": 172.124363,
+   "trial": "headless-terminal__p8TH4sw",
+   "looked_up": false
   },
   {
    "task": "headless-terminal",
@@ -39,7 +43,9 @@
    "cached": 115200,
    "output": 9941,
    "model": "deepseek-flash",
-   "seconds": 82.900434
+   "seconds": 82.900434,
+   "trial": "headless-terminal__sqgf9n3",
+   "looked_up": false
   }
  ]
 }

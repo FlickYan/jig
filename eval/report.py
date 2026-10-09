@@ -8,13 +8,21 @@
 
 Cost comes from the token counts and one price table, the same for every agent: mini-swe-agent's own
 cost tracking doesn't know every model, and jig's is computed the same way in its adapter.
+
+Terminal-Bench's tasks, with their tests and reference solutions, are public on GitHub, and the task
+containers can reach the internet. A trial in which the agent fetched anything from the benchmark's
+repositories counts as failed, whatever the verifier said: both agents did it now and then.
 """
 
 import json
 import random
+import re
 import statistics
 import sys
 from pathlib import Path
+
+# The benchmark's own repositories: Terminal-Bench 1 (laude-institute, now harbor-framework) and 2.
+BENCHMARK_REPOSITORY = re.compile(r"(harbor-framework|laude-institute)/terminal-bench", re.I)
 
 PRICES = {  # USD per million tokens: uncached input, cached input, output
     "deepseek-flash": (0.3, 0.006, 1.2),
@@ -43,8 +51,36 @@ def trials(job: Path) -> list[dict]:
             "output": agent.get("n_output_tokens") or 0,
             "model": model,
             "seconds": seconds(execution),
+            "trial": path.parent.name,
+            "looked_up": any(BENCHMARK_REPOSITORY.search(command) for command in commands(path.parent)),
         })
     return found
+
+
+def commands(trial: Path) -> list[str]:
+    """What the agent ran: the tool inputs in jig's session file, or the bash commands in mini-swe-agent's
+    trajectory. Runs from before jig kept its session in the logs have only its transcript, which shows
+    every command in full, along with their output."""
+    agent = trial / "agent"
+    sessions = sorted((agent / "jig-home" / "sessions").glob("*/*.jsonl"))
+    if sessions:
+        inputs = []
+        for line in sessions[0].read_text().splitlines():
+            content = (json.loads(line).get("message") or {}).get("content")
+            inputs += [json.dumps(block["input"]) for block in content or [] if isinstance(block, dict) and block.get("type") == "tool_use"]
+        return inputs
+    if (agent / "jig.txt").exists():
+        return [(agent / "jig.txt").read_text(errors="replace")]
+    trajectory = agent / "mini-swe-agent.trajectory.json"
+    if trajectory.exists():
+        messages = json.loads(trajectory.read_text()).get("messages") or []
+        return [call["function"]["arguments"] for message in messages for call in message.get("tool_calls") or []]
+    return []
+
+
+def solved(trial: dict) -> bool:
+    """Passed, without the benchmark's own files."""
+    return trial["passed"] and not trial.get("looked_up")
 
 
 def turns(trial: Path, agent: dict) -> int | None:
@@ -87,10 +123,10 @@ def label(job: Path) -> str:
 
 
 def pass_rates(found: list[dict]) -> dict[str, float]:
-    """The share of each task's attempts that passed."""
+    """The share of each task's attempts that passed (without looking up the benchmark)."""
     tasks: dict[str, list[bool]] = {}
     for trial in found:
-        tasks.setdefault(trial["task"], []).append(trial["passed"])
+        tasks.setdefault(trial["task"], []).append(solved(trial))
     return {task: sum(results) / len(results) for task, results in tasks.items()}
 
 
@@ -145,22 +181,25 @@ def main(args: list[str]) -> None:
         for name, agent, found in runs:
             summary = {"name": name, "agent": agent, "trials": found}
             (save / f"{name}.json").write_text(json.dumps(summary, indent=1) + "\n")
-    print("| job | agent | passed | 95% CI | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
-    print("|-----|-------|--------|--------|-----------|--------------|-------|-----------|------------|------|------------|")
+    print("| job | agent | passed | 95% CI | looked up | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
+    print("|-----|-------|--------|--------|-----------|-----------|--------------|-------|-----------|------------|------|------------|")
     for job, name, found in runs:
         if not found:
             continue
-        passed = sum(trial["passed"] for trial in found)
+        passed = sum(solved(trial) for trial in found)
+        looked = [trial for trial in found if trial.get("looked_up")]
+        looked_up = f"{len(looked)} ({sum(t['passed'] for t in looked)} passed)" if looked else "0"
         timeouts = sum(trial["error"] == "AgentTimeoutError" for trial in found)
         others = sum(bool(trial["error"]) and trial["error"] != "AgentTimeoutError" for trial in found)
         low, high = interval(list(pass_rates(found).values()))
         print(
-            f"| {job} | {name} | {passed}/{len(found)} ({passed / len(found):.0%}) | {low:.0%}–{high:.0%} | {timeouts} | {others} "
+            f"| {job} | {name} | {passed}/{len(found)} ({passed / len(found):.0%}) | {low:.0%}–{high:.0%} | {looked_up} | {timeouts} | {others} "
             f"| {fmt(mean([t['turns'] for t in found]), 'num')} | {fmt(mean([t['input'] for t in found]), 'tokens')} "
             f"| {fmt(mean([t['output'] for t in found]), 'tokens')} | {fmt(mean([cost(t) for t in found]), 'money')} "
             f"| {fmt(mean([t['seconds'] for t in found]), 'time')} |"
         )
     print("\nAverages are per attempt. The 95% interval resamples tasks (each task's share of passed attempts).")
+    print("\"Looked up\": attempts that fetched the benchmark's own files from GitHub; they count as failed.")
     named = [(job, found) for job, _, found in runs if found]
     if len(named) > 1:
         first_job, first = named[0]
@@ -175,7 +214,7 @@ def main(args: list[str]) -> None:
             diffs = [rates[task] - base[task] for task in common]
             low, high = interval(diffs)
             print(f"- {job} minus {first_job}: {statistics.mean(diffs) * 100:+.0f} points (95% CI {low * 100:+.0f} to {high * 100:+.0f}), over {len(common)} tasks")
-    print("\nPer task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error):\n")
+    print("\nPer task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error, ⊘ looked up the benchmark):\n")
     tasks = sorted({trial["task"] for _, _, found in runs for trial in found})
     print("| task | " + " | ".join(job for job, _, _ in runs) + " |")
     print("|------|" + "|".join("---" for _ in runs) + "|")
@@ -185,7 +224,7 @@ def main(args: list[str]) -> None:
             marks = []
             for trial in (t for t in found if t["task"] == task):
                 error = trial["error"]
-                marks.append("✓" if trial["passed"] else "⏱" if error == "AgentTimeoutError" else "!" if error else "✗")
+                marks.append("⊘" if trial.get("looked_up") else "✓" if trial["passed"] else "⏱" if error == "AgentTimeoutError" else "!" if error else "✗")
             cells.append("".join(marks) or " ")
         print(f"| {task} | " + " | ".join(cells) + " |")
 

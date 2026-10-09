@@ -31,7 +31,7 @@ npm run build && npm link   # optional: puts this clone's `jig` on your PATH
 ```
 
 ```
-Usage: jig [options] [task]
+Usage: jig [options] [task]          (a task of - is read from stdin)
 
   -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
   -e, --effort <level>  low | medium | high | xhigh | max (default: the model's own; DeepSeek takes low | high | max)
@@ -53,6 +53,8 @@ Usage: jig [options] [task]
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
       --no-subagents    leave out the subagent tool
+      --tools <names>   give the model only some of jig's tools, e.g. --tools bash
+      --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
       --check           in a one-shot run, ask the model to check its work before it finishes
 ```
@@ -234,6 +236,19 @@ Ctrl+C, and when a safety classifier declines the request.
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
   runner's worker processes die too. Commands get no stdin, so an interactive prompt gets end-of-file
   instead of hanging the agent.
+- **jig hides its arguments.** Models stop programs by matching their command lines
+  (`pkill -f server.py`), and jig's arguments hold the task, which names the very files and programs a
+  model might stop: twice in milestone 10 the model's command killed jig. So jig sets its process title to
+  `jig`, which hides its arguments on macOS and Linux, and reads the task from stdin when it is `-`, for
+  the places the title can't reach (an x86-64 container on Apple Silicon, where Rosetta keeps the
+  original command line, and the shell that started jig).
+- **A command is done when its shell exits.** Waiting until the output pipes close, as jig did before
+  milestone 10, also waits for whatever still holds them, and a server started with
+  `cd app && server > log &` does: `&` puts the whole list in the background, and the subshell running it
+  keeps the pipes open while it waits for the server. jig sat out the timeout and then killed the server
+  with the process group. On Terminal-Bench that happened in 22 of the 55 calls that started something in
+  the background. Now a call returns a second after the shell exits, tells the model that something it
+  started is still running, and leaves it running.
 - **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
   slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
   just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
@@ -272,7 +287,10 @@ Ctrl+C, and when a safety classifier declines the request.
 - **Waiting on the API is bounded and visible.** The SDK's timeout covers only the wait for a response
   to start (a stream's first bytes arrive within seconds when the API is healthy, however long the reply
   runs), so jig sets it to 2 minutes instead of 10, and prints a notice for each automatic retry. During a
-  DeepSeek outage in milestone 6, jig had sat silent for half an hour.
+  DeepSeek outage in milestone 6, jig had sat silent for half an hour. The SDK retries only requests that
+  fail before their reply begins, so jig itself asks again, up to twice, when a reply breaks off partway:
+  the connection drops, the stream ends early, or an overload error arrives mid-stream. In milestone 10
+  one dropped connection had ended a Terminal-Bench task.
 - **Two providers, one format.** DeepSeek's Anthropic-compatible API lets the same SDK and message format
   serve both. DeepSeek does not support `is_error` on tool results, so for DeepSeek failures are marked
   with `Error:` in the text instead, and the Claude-only settings (adaptive thinking with short progress
@@ -350,12 +368,13 @@ for comparing against other agents. For that, see [Terminal-Bench](#terminal-ben
 
 ### Results
 
-**M7 on macOS and on Linux**, on the current suite (deepseek-flash, three attempts per task):
+**M7 on macOS and on Linux, and M10**, on the current suite (deepseek-flash, three attempts per task):
 
 | run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
 |-----|--------|-------|------------|-------------------|-----------|------|------|
 | m7 (macOS, Seatbelt) | 100% (60/60) | 7.0 | 8.9 | 0.0 | 30,795 | $0.0047 | 14s |
 | m7-linux (Debian container, bubblewrap) | 100% (60/60) | 7.0 | 8.7 | 0.0 | 30,780 | $0.0043 | 13s |
+| m10 (macOS) | 100% (60/60) | 6.7 | 8.5 | 0.0 | 27,645 | $0.0041 | 13s |
 
 Every attempt passed on both systems, so nothing in milestones 6 and 7 cost a task. The Linux run ran
 jig as an ordinary user in a Debian container, every command in the bubblewrap sandbox; no command
@@ -364,6 +383,9 @@ tripped over it (none was refused a write), and as on macOS no attempt acted on 
 `node --test bench_tests/`, which only Node 26 accepts, so on Node 22 and 24 their reference solutions
 failed. They now pass the test files by name. That changed the suite's fingerprint, so these runs aren't
 directly comparable with the ones below, though no task changed.
+
+M10 changed how commands end, retries and the process title; it cost no task here either, and again no
+attempt acted on the prompt injections (0 of 6).
 
 **M4 against M5, on the 20-task suite as it was then** (in `bench/results/suite-20/`; deepseek-flash,
 three attempts per task):
@@ -475,25 +497,34 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   independent, and a difference between two runs is paired by task.
 - Costs come from the token counts and one price table for both agents. DeepSeek's off-peak discount made
   part of the actual bill lower (the first two tasks were billed at about half the table's price).
+- **Looking up the benchmark counts as failing.** The tasks, with their tests and reference solutions, are
+  public on GitHub, and the task containers can reach the internet. Milestone 10 found that both agents
+  sometimes fetched them, so [`eval/report.py`](eval/report.py) checks every command of every trial, and an
+  attempt that fetched anything from the benchmark's repositories counts as failed, whatever the verifier
+  said. The numbers here are all counted that way; before milestone 10, this section counted those passes.
 
 ### Results
 
-| run | passed | 95% CI | turns | tokens in | tokens out | cost | agent time |
-|-----|--------|--------|-------|-----------|------------|------|------------|
-| jig | 70% (42/60) | 53–85% | 22.9 | 1,102k | 31k | $0.049 | 5.0 min |
-| mini-swe-agent | 82% (49/60) | 67–93% | 33.9 | 2,397k | 49k | $0.080 | 7.1 min |
+| run | passed | 95% CI | looked up | turns | tokens in | tokens out | cost | agent time |
+|-----|--------|--------|-----------|-------|-----------|------------|------|------------|
+| jig | 68% (41/60) | 52–83% | 1 (passed) | 22.9 | 1,102k | 31k | $0.049 | 5.0 min |
+| mini-swe-agent | 73% (44/60) | 58–87% | 7 (5 passed) | 33.9 | 2,397k | 49k | $0.080 | 7.1 min |
 
-Averages are per attempt. Paired by task, mini-swe-agent is ahead by 12 points (95% CI +3 to +22). Both
-solved 10 tasks in every attempt, three (`chess-best-move`, `dna-assembly`, `tune-mjcf`) two times in
-three, and `filter-js-from-html` and `make-mips-interpreter` never. They differ on five:
+Averages are per attempt; "looked up" counts the attempts that fetched the benchmark's own files, which
+count as failed. Paired by task, mini-swe-agent is ahead by 5 points (95% CI −3 to +15), which these
+runs can't tell from noise. (Counting the look-ups as passes, as this section did before milestone 10,
+put it 12 points ahead, +3 to +22.) Both solved 9 tasks in every attempt, three (`chess-best-move`,
+`dna-assembly`, `tune-mjcf`) two times in three, and `filter-js-from-html` and `make-mips-interpreter`
+never. They differ on six:
 
 | task | jig | mini-swe-agent |
 |------|-----|----------------|
 | `adaptive-rejection-sampler` | 0/3 | 2/3 |
-| `headless-terminal` | 1/3 | 3/3 |
+| `db-wal-recovery` | 3/3 | 2/3, and a look-up |
+| `headless-terminal` | 1/3 | 2/3, and a look-up |
 | `model-extraction-relu-logits` | 1/3 | 2/3 |
 | `modernize-scientific-stack` | 2/3 | 3/3 |
-| `mteb-retrieve` | 2/3 | 3/3 |
+| `mteb-retrieve` | 1/3, and a look-up | 0/3: three look-ups |
 
 The full matrix is in `python3 eval/report.py eval/results/tb-jig.json eval/results/tb-mini.json`.
 
@@ -512,14 +543,14 @@ one more run of the default.
 
 What the runs and their logs showed:
 
-- **mini-swe-agent solves more; jig costs less.** With one attempt per task (milestone 6) the two looked
-  even, 75% against 80%; three attempts show that mini-swe-agent's lead is real. jig did its share with a
-  third fewer turns, 54% fewer input tokens and 39% lower cost.
-- **Where the gap comes from.** All five tasks on which they differ go mini-swe-agent's way. In
-  `adaptive-rejection-sampler`, all three of jig's samplers refused the form in which the tests pass the
-  lower bound (`'lower' must be a single number`), the same mistake three times; in `headless-terminal`
-  two of jig's attempts crashed (next point); the rest are single misses. Leaving out `headless-terminal`,
-  mini-swe-agent's lead is 9 points (+2 to +18).
+- **The two solve about as many; jig costs less.** With one attempt per task (milestone 6) they were
+  even, 75% each (80% for mini-swe-agent as scored then); three attempts put mini-swe-agent 5 points
+  ahead, within the noise. jig did its share with a third fewer turns, 54% fewer input tokens and 39%
+  lower cost.
+- **Where they differ.** In `adaptive-rejection-sampler`, all three of jig's samplers refused the form in
+  which the tests pass the lower bound (`'lower' must be a single number`), the same mistake three times;
+  in `headless-terminal` two of jig's attempts crashed (next point); the rest are single misses either
+  way.
 - **Two of jig's attempts were killed for memory.** In `headless-terminal` jig searched the whole container
   with its grep tool, which read each file whole before checking its size, and the container's 2 GB
   limit killed it (exit 137). grep now checks a file's size before reading it and skips `/proc`, `/sys`
@@ -559,7 +590,7 @@ What the runs and their logs showed:
   agent's processes in the container carry on into the verification: jig made up to 9 more model calls
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
   may owe something to it. Each agent had three, on the same tasks (`tune-mjcf` twice and
-  `cobol-modernization` once); counting them as failures gives 39/60 against 46/60, the same gap.
+  `cobol-modernization` once); counting them as failures gives 38/60 against 41/60, the same gap.
 - **The evaluation found six problems in jig, now fixed.** File tools confined to the project could not
   touch `/etc` or `/var` in a container (`--add-dir`); there was no way to get turns and tokens out
   (`--stats`); during a DeepSeek outage jig waited 10 minutes per attempt in silence (now 2 minutes, with
@@ -571,7 +602,7 @@ What the runs and their logs showed:
 
 ### Milestone 9: checking before finishing
 
-mini-swe-agent's lead invited a closer look at how jig loses. 15 of its 18 failures were tasks it
+mini-swe-agent's apparent lead invited a closer look at how jig loses. 15 of its 18 failures were tasks it
 finished on its own and got wrong, some after a quick look: on `mteb-retrieve` and
 `model-extraction-relu-logits` it stopped after 6 to 9 turns, where mini-swe-agent's passing attempts took
 19 to 36. mini-swe-agent's prompt prescribes a workflow (reproduce, fix, verify, test edge cases) and lets
@@ -594,21 +625,89 @@ python3 eval/report.py eval/results/ho-jig-m8.json eval/results/ho-jig-m9.json e
 
 | tasks | jig without the check | jig with `--check` | difference | mini-swe-agent |
 |-------|-----------------------|--------------------|------------|----------------|
-| original 20, 3 attempts | 70% (42/60), $0.049 | 73% (44/60), $0.068 | +3 points (−7 to +13) | 82% (49/60), $0.080 |
-| held-out 20, 1 attempt | 75% (15/20), $0.033 | 70% (14/20), $0.054 | −5 points (−20 to +10) | 90% (18/20), $0.054 |
+| original 20, 3 attempts | 68% (41/60), $0.049 | 73% (44/60), $0.068 | +5 points (−3 to +15) | 73% (44/60), $0.080 |
+| held-out 20, 1 attempt | 70% (14/20), $0.033 | 70% (14/20), $0.054 | +0 points (−20 to +20) | 80% (16/20), $0.054 |
+
+Attempts that fetched the benchmark's own files count as failed (see milestone 10, which found them);
+the first version of this table counted them as passes.
 
 - **It fixed what it aimed at, and lost as much to the clock.** On the original tasks it solved
   `adaptive-rejection-sampler` twice (0 of 3 before), and `model-extraction-relu-logits` and
   `modernize-scientific-stack` more often, but 12 attempts ran into their time limit against 4 before
-  (6 of them failed, against 1), costing `pytorch-model-recovery` and `tune-mjcf` a pass each, and
-  `mteb-retrieve` lost one to another wrong finish. On the held-out tasks, one task was won and two lost,
-  `code-from-image` by running out of time after twice the turns. jig doesn't know a task's time limit,
-  so checking more can't be weighed against the time left.
+  (6 of them failed, against 1), costing `pytorch-model-recovery` and `tune-mjcf` a pass each. On the
+  held-out tasks, two tasks were won and two lost, `code-from-image` by running out of time after twice
+  the turns. jig doesn't know a task's time limit, so checking more can't be weighed against the time
+  left.
 - **No gain, more cost, so it stays opt-in.** Neither interval excludes zero, and the check cost 38% more
   on the original tasks and 65% more on the held-out ones (68% more on the in-house benchmark, where
   every task already passed).
-- **mini-swe-agent's lead holds on fresh tasks.** On the held-out tasks it is 15 points ahead of jig
-  without the check (0 to +30), as on the original ones.
+- **mini-swe-agent stays a little ahead on fresh tasks.** On the held-out tasks it is 10 points ahead of
+  jig without the check (0 to +25).
+
+### Milestone 10: what mini-swe-agent's lead was made of
+
+Milestone 10 looked for the cause of mini-swe-agent's lead by taking the differences between the agents
+one at a time, first on the 20 held-out tasks (one attempt each, against `m8`), then on the original 20
+(three attempts) to confirm. The answer turned out to be mostly not about either agent's design: both
+agents sometimes fetched the benchmark's answers from GitHub, mini-swe-agent more often, and counting
+those attempts as failed leaves a lead these runs can't tell from noise. Of the design differences,
+neither jig's extra tools nor mini-swe-agent's prompts made a reliable one. The logs also showed three
+bugs in jig's harness, now fixed.
+
+```bash
+export TASKS="$(grep -v '^#' eval/heldout.txt)"
+eval/run.sh ho-jig-bash jig --ak tools=bash                    # jig with bash as its only tool
+eval/run.sh ho-jig-mini jig --ak tools=bash --ak prompts=mini  # and with mini-swe-agent's prompts
+unset TASKS
+eval/run.sh tb-jig-mini jig -k 3 --ak tools=bash --ak prompts=mini   # the same on the original 20
+python3 eval/report.py eval/results/ho-jig-m8.json eval/results/ho-jig-bash.json eval/results/ho-jig-mini.json eval/results/ho-mini.json
+python3 eval/report.py eval/results/tb-jig.json eval/results/tb-jig-mini.json eval/results/tb-mini.json
+```
+
+| held-out 20, 1 attempt | passed | looked up | against `m8` | turns | cost |
+|------------------------|--------|-----------|--------------|-------|------|
+| jig `m8` | 70% (14/20) | 1 (passed) | | 23.1 | $0.033 |
+| jig, bash only | 80% (16/20) | 0 | +10 points (0 to +25) | 20.9 | $0.036 |
+| jig, bash only, mini-swe-agent's prompts | 85% (17/20) | 2 (passed) | +15 points (0 to +30) | 27.8 | $0.054 |
+| mini-swe-agent | 80% (16/20) | 2 (passed) | +10 points (0 to +25) | 28.7 | $0.054 |
+
+| original 20, 3 attempts | passed | looked up | against jig | timed out | errors | turns | cost |
+|-------------------------|--------|-----------|-------------|-----------|--------|-------|------|
+| jig (milestone 8's runs) | 68% (41/60) | 1 (passed) | | 4 | 2 | 22.9 | $0.049 |
+| jig, bash only, mini-swe-agent's prompts | 63% (38/60) | 3 (passed) | −5 points (−15 to +5) | 9 | 4 | 31.4 | $0.084 |
+| mini-swe-agent | 73% (44/60) | 7 (5 passed) | +5 points (−3 to +15) | 6 | 1 | 33.9 | $0.080 |
+
+- **Both agents looked up the answers.** Now and then the model went looking for the task itself:
+  searching the web for the task's name, its instructions in quotes or mini-swe-agent's submit command,
+  then fetching `solve.sh` and `test_outputs.py` from the benchmark's GitHub repositories. That happened
+  in 14 of the 160 attempts that used mini-swe-agent's prompts, by either agent, and in 2 of the 180
+  under jig's own (Fisher's exact test, p = 0.001). `mteb-retrieve`, whose instructions mention
+  "terminal-bench", sent mini-swe-agent to the benchmark in all three attempts. Counting these attempts as
+  failed, as [`eval/report.py`](eval/report.py) now does for every run, shrinks mini-swe-agent's lead on
+  the original tasks from 12 points (+3 to +22) to 5 (−3 to +15), and on the held-out tasks from 15 to 10
+  (0 to +25): more than half of what milestones 8 and 9 set out to explain.
+- **jig's tools aren't the difference.** mini-swe-agent has only bash. With bash only (`--tools bash`),
+  jig did no worse on the held-out tasks, and on Terminal-Bench its model ran bash for 81% of its calls
+  anyway.
+- **mini-swe-agent's prompts didn't carry over.** They present the task as a job to finish (reproduce,
+  fix, verify, try edge cases, then submit, after which nothing more can be done), and with them jig
+  worked like mini-swe-agent: on the held-out tasks it took as many turns, ended every task with the
+  submit command and solved 85%, with one attempt each. Three attempts at the original tasks said otherwise:
+  5 points below jig's own prompt (−15 to +5) and 10 below mini-swe-agent itself (−20 to −2), with 70%
+  more cost and twice the timeouts. The prompts suit mini-swe-agent's harness, not jig's, and jig keeps
+  its own.
+- **Three bugs in jig's harness, all fixed:**
+  - *Background jobs held commands open.* Commands that started something in the background timed out
+    far more often than others: 22 of 55, against 19 of about 3,900. `cd app && server > log &` kept the
+    command's output open (see [the design decision](#design-decisions)), so jig waited out the timeout, 2
+    minutes unless the model set one, then killed the server along with the command. That cost 11
+    attempts 2 to 5 minutes each. mini-swe-agent's harness has the same flaw, with a 30-second limit.
+  - *A dropped connection ended the task.* Twice in the last run, DeepSeek's connection dropped in the
+    middle of a reply, which the SDK doesn't retry. jig now asks again.
+  - *The model's commands killed jig.* Twice in the last run, the model stopped programs by their command
+    lines (`server.py`, `vm.js`), and jig's command line held the task, which named them. jig now sets its
+    process title to `jig`, and the adapter passes the task on stdin (`jig -`). mini-swe-agent, which gets
+    the task as an argument too, has the same exposure.
 
 ## Tests
 
@@ -642,8 +741,9 @@ installs and runs the tarball on every push.
 - [x] **5. Extensions:** Agent Skills with progressive disclosure; MCP client over stdio (official SDK) with restart; `PreToolUse` and `PostToolUse` hooks; read-only subagents; parallel read-only tool calls; project trust; three benchmark tasks for the extensions
 - [x] **6. Evaluation:** Terminal-Bench 2.0 through Harbor against mini-swe-agent on the same model, with success rate, cost and turns per task; ablations of effort, compaction and subagents; `--add-dir`, `--stats`, and a 2-minute API timeout with retry notices
 - [x] **7. Linux and CI:** a bubblewrap sandbox on Linux with the same policy and tests as on macOS, and a clear reason when it can't run; GitHub Actions on Linux and macOS with Node 22 and 24; benchmark tasks checked in CI, which caught two task checks that only worked on Node 26
-- [x] **8. npm package and error bars:** the `jig-agent` package (compiled JavaScript, `--version`, MIT license; CI packs, installs and runs it); three attempts per Terminal-Bench task with 95% intervals, which showed mini-swe-agent ahead by 12 points (+3 to +22) where one attempt had shown a tie; a grep memory bug those runs found, reproduced and fixed
+- [x] **8. npm package and error bars:** the `jig-agent` package (compiled JavaScript, `--version`, MIT license; CI packs, installs and runs it); three attempts per Terminal-Bench task with 95% intervals, which showed mini-swe-agent ahead by 12 points (+3 to +22) where one attempt had shown a tie (milestone 10 found that 5 of its passes were look-ups of the benchmark's answers: without them, +5, −3 to +15); a grep memory bug those runs found, reproduced and fixed
 - [x] **9. Checking before finishing:** a diagnosis of jig's failures (most were confident early finishes), `--check` to make one-shot runs verify against the task, measured on the original tasks and on 20 held-out ones: it fixed the failures it aimed at but ran others out of time, so it is opt-in
+- [x] **10. What mini-swe-agent's lead was made of:** experiments one difference at a time, on held-out tasks and then three attempts at the original ones (`--tools`, `--system-prompt`, mini-swe-agent's prompts through the adapter); the finding that both agents sometimes fetched the benchmark's answers, now counted as failures, which shrank mini-swe-agent's lead from 12 points to 5, within the noise; neither jig's tools nor mini-swe-agent's prompts made a reliable difference; three harness fixes: background jobs that held a command open, replies that broke off, and models killing jig through its command line (`jig -` reads the task from stdin)
 
 ## License
 
