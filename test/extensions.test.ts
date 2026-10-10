@@ -75,7 +75,7 @@ describe("skills", () => {
     await writeSkill(join(home, ".jig/skills"), "review", "---\nname: review\ndescription: Review a diff.\n---\nLook closely.");
     await writeSkill(join(dir, ".jig/skills"), "broken", "---\nname: broken\n---\nNo description.");
 
-    const { skills, warnings } = discoverSkills(dir, home);
+    const { skills, warnings } = discoverSkills(dir, home, { builtin: null });
     assert.deepEqual(skills.map((skill) => [skill.name, skill.description]), [["release", "Cut a release."], ["review", "Review a diff."]]);
     assert.equal(warnings.length, 2);
     assert.match(warnings.join("\n"), /broken.*no description/);
@@ -84,7 +84,7 @@ describe("skills", () => {
 
   it("puts only names and descriptions in the system prompt", async () => {
     await writeSkill(join(dir, ".jig/skills"), "release", "---\nname: release\ndescription: Cut a release.\n---\nSECRET STEPS");
-    const prompt = systemPrompt(dir, { skills: skillCatalog(discoverSkills(dir, join(dir, "home")).skills) });
+    const prompt = systemPrompt(dir, { skills: skillCatalog(discoverSkills(dir, join(dir, "home"), { builtin: null }).skills) });
     assert.match(prompt, /<available_skills>\n<skill name="release">Cut a release\.<\/skill>\n<\/available_skills>/);
     assert.doesNotMatch(prompt, /SECRET STEPS/);
   });

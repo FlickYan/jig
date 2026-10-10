@@ -1,6 +1,8 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { jigHome } from "./paths.ts";
 import type { Tool } from "./tools/index.ts";
 import { isInside } from "./tools/util.ts";
 
@@ -10,39 +12,116 @@ export interface Skill {
   description: string;
   /** The skill's directory, which holds SKILL.md. */
   dir: string;
+  /** Where it was found: the project's skill directories, the user's, or the ones that come with jig. */
+  scope: SkillScope;
 }
+
+export type SkillScope = "project" | "user" | "builtin";
 
 // jig's own directory, the cross-client .agents convention, and Claude Code's, where many skills live.
 const SKILL_DIRS = [".jig/skills", ".agents/skills", ".claude/skills"];
 const MAX_FILE_CHARS = 30_000;
 const MAX_RESOURCES = 50;
 
+/** The skills that come with jig: skills/ beside src/ (or dist/, in the package). */
+export const BUILTIN_SKILLS = join(dirname(fileURLToPath(import.meta.url)), "..", "skills");
+
+/** Where `jig skills add` puts a user's skills: $JIG_HOME/skills, which is ~/.jig/skills unless JIG_HOME says. */
+export function userSkillsDir(): string {
+  return join(jigHome(), "skills");
+}
+
+export interface DiscoverOptions {
+  /** The directory of jig's own skills; null leaves them out (for tests). */
+  builtin?: string | null;
+  /** Skills to leave out by name (--hide-skill), as if they weren't installed. */
+  hidden?: string[];
+}
+
 /**
- * The skills available in a project: under the project's skill directories, then the user's. A project
- * skill wins over a user skill of the same name. Like the integration guide suggests, problems are warnings,
- * not errors; only a skill without a description is skipped, since the model couldn't know when to use it.
+ * The skills available in a project: under the project's skill directories, then the user's, then jig's
+ * own. A project skill wins over a user skill of the same name, and either over one of jig's. Like the
+ * integration guide suggests, problems are warnings, not errors; only a skill without a description is
+ * skipped, since the model couldn't know when to use it.
  */
-export function discoverSkills(root: string, home = homedir()): { skills: Skill[]; warnings: string[] } {
+export function discoverSkills(root: string, home = homedir(), { builtin = BUILTIN_SKILLS, hidden = [] }: DiscoverOptions = {}): { skills: Skill[]; warnings: string[] } {
   const skills = new Map<string, Skill>();
   const warnings: string[] = [];
-  for (const base of [root, home]) {
-    for (const dir of SKILL_DIRS.map((sub) => join(base, sub)).filter((d) => existsSync(d) && statSync(d).isDirectory())) {
-      for (const entry of readdirSync(dir).sort()) {
-        const skillDir = join(dir, entry);
-        if (!existsSync(join(skillDir, "SKILL.md"))) continue;
-        const { name = entry, description } = frontmatter(readFileSync(join(skillDir, "SKILL.md"), "utf8"));
-        if (!description) {
-          warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md has no description.`);
-        } else if (skills.has(name)) {
-          warnings.push(`The skill "${name}" in ${skillDir} is hidden by the one in ${skills.get(name)!.dir}.`);
-        } else {
-          if (name !== entry) warnings.push(`The skill "${name}" is in a directory named "${entry}"; they should match.`);
-          skills.set(name, { name, description, dir: skillDir });
-        }
+  const user = [...new Set([userSkillsDir(), ...SKILL_DIRS.map((sub) => join(home, sub))])];
+  const places: [string, SkillScope][] = [
+    ...SKILL_DIRS.map((sub): [string, SkillScope] => [join(root, sub), "project"]),
+    ...user.map((dir): [string, SkillScope] => [dir, "user"]),
+    ...(builtin ? [[builtin, "builtin"] as [string, SkillScope]] : []),
+  ];
+  for (const [dir, scope] of places.filter(([d]) => existsSync(d) && statSync(d).isDirectory())) {
+    for (const entry of readdirSync(dir).sort()) {
+      const skillDir = join(dir, entry);
+      if (!existsSync(join(skillDir, "SKILL.md"))) continue;
+      const { name = entry, description } = frontmatter(readFileSync(join(skillDir, "SKILL.md"), "utf8"));
+      if (hidden.includes(name)) continue;
+      if (!description) {
+        warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md has no description.`);
+      } else if (skills.has(name)) {
+        if (scope !== "builtin") warnings.push(`The skill "${name}" in ${skillDir} is hidden by the one in ${skills.get(name)!.dir}.`);
+      } else {
+        if (name !== entry) warnings.push(`The skill "${name}" is in a directory named "${entry}"; they should match.`);
+        skills.set(name, { name, description, dir: skillDir, scope });
       }
     }
   }
   return { skills: [...skills.values()], warnings };
+}
+
+/**
+ * What is wrong with a skill by the Agent Skills specification: the name (1-64 lowercase letters, digits
+ * and single hyphens, matching its directory), the description (1-1024 characters) and compatibility (at
+ * most 500). Discovery is lenient; installing and saving a skill check it strictly.
+ */
+export function skillProblems(skillDir: string): string[] {
+  const path = join(skillDir, "SKILL.md");
+  if (!existsSync(path)) return [`${skillDir} has no SKILL.md.`];
+  const text = readFileSync(path, "utf8");
+  const fields = frontmatterFields(text);
+  const problems = [...nameProblems(fields.name ?? ""), ...descriptionProblems(fields.description ?? "")];
+  if (fields.name && fields.name !== basename(skillDir)) problems.push(`The name "${fields.name}" doesn't match its directory, "${basename(skillDir)}".`);
+  if (fields.compatibility && fields.compatibility.length > 500) problems.push("The compatibility field is longer than 500 characters.");
+  return problems;
+}
+
+export function nameProblems(name: string): string[] {
+  if (!name) return ["The skill has no name."];
+  if (name.length > 64) return [`The name "${name}" is longer than 64 characters.`];
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(name)) return [`The name "${name}" may only have lowercase letters, digits and single hyphens between them.`];
+  return [];
+}
+
+export function descriptionProblems(description: string): string[] {
+  if (!description.trim()) return ["The skill has no description, so the model couldn't know when to use it."];
+  return description.length > 1024 ? ["The description is longer than 1024 characters."] : [];
+}
+
+/**
+ * Counts each time a skill's instructions were loaded, in $JIG_HOME/skills-usage.json, so `jig skills list`
+ * can show which skills are used and which lie idle. Best effort: a failure to write is ignored.
+ */
+export function recordSkillUse(name: string, now = new Date()): void {
+  const path = join(jigHome(), "skills-usage.json");
+  try {
+    const usage = skillUsage();
+    usage[name] = { loads: (usage[name]?.loads ?? 0) + 1, last: now.toISOString() };
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, `${JSON.stringify(usage, null, 1)}\n`);
+  } catch {
+    // statistics only
+  }
+}
+
+export function skillUsage(): Record<string, { loads: number; last: string }> {
+  try {
+    return JSON.parse(readFileSync(join(jigHome(), "skills-usage.json"), "utf8"));
+  } catch {
+    return {};
+  }
 }
 
 /** The part of the system prompt that lists the skills: only names and descriptions, about 100 tokens each. */
@@ -85,6 +164,7 @@ export function skillTool(skills: Skill[]): Tool {
       }
       const content = loadSkill(skill);
       ctx.pin?.(`skill:${name}`, content); // keep the instructions through compaction
+      recordSkillUse(name);
       return content;
     },
   };
@@ -93,7 +173,7 @@ export function skillTool(skills: Skill[]): Tool {
 /** A skill's instructions as the model sees them: the SKILL.md body, where it lives, and what else is there. */
 export function loadSkill(skill: Skill): string {
   const body = readFileSync(join(skill.dir, "SKILL.md"), "utf8").replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
-  const files = listFiles(skill.dir).filter((file) => file !== "SKILL.md");
+  const files = listSkillFiles(skill.dir).filter((file) => file !== "SKILL.md");
   const resources = files.length
     ? `\n<skill_resources>\n${files.slice(0, MAX_RESOURCES).join("\n")}${files.length > MAX_RESOURCES ? "\n…" : ""}\n</skill_resources>`
     : "";
@@ -102,6 +182,12 @@ export function loadSkill(skill: Skill): string {
 
 /** name and description from the YAML frontmatter, read leniently: values may hold unquoted colons. */
 export function frontmatter(text: string): { name?: string; description?: string } {
+  const fields = frontmatterFields(text);
+  return { ...(fields.name && { name: fields.name }), ...(fields.description && { description: fields.description }) };
+}
+
+/** The frontmatter's top-level fields as strings (a nested map, like metadata, as its lines joined). */
+export function frontmatterFields(text: string): Record<string, string> {
   const block = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1];
   if (!block) return {};
   const fields: Record<string, string> = {};
@@ -116,15 +202,31 @@ export function frontmatter(text: string): { name?: string; description?: string
       while (i + 1 < lines.length && /^\s+\S/.test(lines[i + 1])) more.push(lines[++i].trim());
       value = value.startsWith("|") ? more.join("\n") : more.join(" ");
     }
-    fields[match[1]] = value.replace(/^(["'])([\s\S]*)\1$/, "$2");
+    fields[match[1]] = unquote(value);
   }
-  return { name: fields.name || undefined, description: fields.description || undefined };
+  return fields;
 }
 
-function listFiles(dir: string, base = dir): string[] {
-  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
-    if (entry.name.startsWith(".")) return [];
-    const path = join(dir, entry.name);
-    return entry.isDirectory() ? listFiles(path, base) : [relative(base, path)];
-  });
+/** A YAML scalar's value: a double-quoted one with its escapes decoded (JSON's are valid YAML), a
+ * single-quoted one with '' as a quote, a plain one as it is. */
+function unquote(value: string): string {
+  if (/^".*"$/s.test(value)) {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value.slice(1, -1);
+    }
+  }
+  return /^'.*'$/s.test(value) ? value.slice(1, -1).replace(/''/g, "'") : value;
+}
+
+/** The files of a skill, relative to its folder, leaving out hidden ones (.git, .DS_Store). */
+export function listSkillFiles(dir: string, base = dir): string[] {
+  return readdirSync(dir, { withFileTypes: true })
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .flatMap((entry) => {
+      if (entry.name.startsWith(".")) return [];
+      const path = join(dir, entry.name);
+      return entry.isDirectory() ? listSkillFiles(path, base) : [relative(base, path)];
+    });
 }

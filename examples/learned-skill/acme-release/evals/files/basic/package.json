@@ -1,0 +1,6 @@
+{
+  "name": "acme-dashboard",
+  "version": "1.4.3",
+  "private": true,
+  "scripts": { "build": "echo build" }
+}

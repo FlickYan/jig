@@ -66,6 +66,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --max-steps <n>   most model calls per task (default: 50)
       --no-subagents    leave out the subagent tool
       --tools <names>   give the model only some of jig's tools, e.g. --tools bash
+      --hide-skill <name>  leave a skill out, as if it weren't installed (repeatable)
       --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
       --check           in a one-shot run, ask the model to check its work before it finishes
@@ -136,11 +137,34 @@ received (subagents included), and how many input tokens came from the prompt ca
 
 - **Skills.** jig reads [Agent Skills](https://agentskills.io): folders with a `SKILL.md` (a name and a
   description in YAML frontmatter, then instructions) and maybe scripts and reference files. They are found
-  in `.jig/skills`, `.agents/skills` and `.claude/skills`, in the project and in your home directory, the
-  project's winning on a name clash. Loading is progressive: the system prompt lists only each skill's name
-  and description; the model calls the `skill` tool to load the instructions when a task matches, and
-  reads the skill's other files only if the instructions point to them. `/<skill> [task]` loads one
-  yourself.
+  in `.jig/skills`, `.agents/skills` and `.claude/skills`, in the project and in your home directory, then
+  among jig's own (`skill-writer`), the project's winning on a name clash. jig's own skills are for
+  writing skills, so a plain one-shot task leaves them out and a benchmark measures what it did before. Loading is progressive: the
+  system prompt lists only each skill's name and description; the model calls the `skill` tool to load the
+  instructions when a task matches, and reads the skill's other files only if the instructions point to
+  them. `/<skill> [task]` loads one yourself. Skills can be installed, written and measured:
+
+  ```bash
+  jig skills add anthropics/skills/skills/pdf      # from GitHub: owner/repo/path[@ref], a git URL, or a folder
+  jig skills add anthropics/skills/skills --skill mcp-builder --project   # one skill of a collection, for this project
+  jig skills list                                  # where each skill comes from, and how often it was used
+  jig skills update                                # fetch installed skills again; jig skills remove <name>
+  jig skills new "write release notes from the merged pull requests"   # the model writes a skill with you
+  jig skills learn                                 # turn your last session here into a skill, if it holds one
+  jig skills test release-notes --attempts 3       # run its evals with the skill and without it
+  ```
+
+  `jig skills add` shows what it is about to install, scripts first, and records the source and commit of
+  each skill in a lockfile beside it (`~/.jig/skills-lock.json`, or `.jig/skills-lock.json` with
+  `--project`); nothing runs at install. A skill the model writes (`jig skills new`, or `/skills new` and
+  `/learn` in a session) is a proposal: jig checks it against the specification and shows it to you, and
+  saves it only where you say, in the project or for all your projects. With no one to ask, it goes to
+  `.jig/proposals/skills/`, a folder `jig skills add` can install once you have read it. A skill's evals
+  live in `evals/evals.json`, in the format of Anthropic's `skill-creator` (a prompt, the expected output,
+  expectations, input files) plus `check`, a shell command whose exit code says whether the result is
+  right; `jig skills test` runs each eval in a fresh project with its own home directory, once with the
+  skill and once with it hidden (`--hide-skill`), and grades it by the check and by the model judging the
+  expectations.
 - **MCP servers.** jig is an MCP client over stdio, on the official TypeScript SDK. Servers configured in
   the settings start with jig, and their tools join jig's own as `mcp__<server>__<tool>`:
 
@@ -189,7 +213,11 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
 | [`src/openai.ts`](src/openai.ts) | The OpenAI-compatible API: the conversation as chat messages on the way out, the streamed reply as Messages API blocks on the way in |
 | [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent` |
-| [`src/skills.ts`](src/skills.ts) | Finding skills, the catalog in the system prompt, and the `skill` tool |
+| [`src/skills.ts`](src/skills.ts) | Finding skills (the project's, the user's, jig's own), checking them against the specification, the catalog in the system prompt, and the `skill` tool |
+| [`src/skill-store.ts`](src/skill-store.ts), [`src/skills-cli.ts`](src/skills-cli.ts) | `jig skills`: installing skills from folders and git repositories, the lockfile, updating and removing |
+| [`src/skill-proposals.ts`](src/skill-proposals.ts) | `propose_skill`: a skill the model wrote, checked and shown to the user, saved where they say |
+| [`src/skill-evals.ts`](src/skill-evals.ts) | `jig skills test`: a skill's evals, run with and without it, graded by their checks and a model |
+| [`skills/`](skills) | The skills that come with jig: `skill-writer`, which `/skills new` and `/learn` follow |
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
 | [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
@@ -199,7 +227,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
-| [`src/stats.ts`](src/stats.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs |
+| [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs; the price table |
 | [`bench/`](bench) | The benchmark: tasks, runner and report |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
@@ -283,6 +311,20 @@ Ctrl+C, and when a safety classifier declines the request.
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than
   summarizing them away mid-task.
+- **A skill the model writes is a proposal.** A skill outlives the session that made it: its description
+  is in every later system prompt and its instructions get followed, so a wrong one keeps doing harm. The
+  model therefore can't write skill files; it calls `propose_skill`, jig checks the skill against the
+  specification and shows it, and you choose where it goes, or that it goes nowhere. This is the first
+  piece of jig changing itself, and it follows the rule the later pieces will: jig proposes, you approve.
+- **A skill is measured against its own absence.** A skill that changes nothing still costs about 100
+  tokens in every request, and a pass rate alone can't tell a helpful skill from an easy eval. So `jig
+  skills test` runs each eval twice, with the skill and with it hidden, in a fresh project with a home
+  directory of its own, so no other skill or setting takes part. A check command grades what can be
+  checked; a model grades the rest, from the diff and the agent's final message only.
+- **Installed skills carry their provenance.** A skill can bring scripts the model will run, so `jig
+  skills add` lists them before anything is installed, runs nothing, and records the source and commit in
+  a lockfile; `update` shows which files changed before replacing any. Repositories are cloned shallow
+  and sparse, so one skill from a large collection fetches only its own folder.
 - **Calls that only read run at the same time.** When every call in a reply is a read (file reads,
   searches, subagents, read-only MCP tools), they run in parallel; if any call changes something, they
   all run in order, since one may depend on another. Results still go back in the order of the calls, and
@@ -386,7 +428,7 @@ for comparing against other agents. For that, see [Terminal-Bench](#terminal-ben
 
 ### Results
 
-**M7 on macOS and on Linux, M10, and M11 through the OpenAI-compatible API**, on the current suite
+**M7 on macOS and on Linux, M10, M11 through the OpenAI-compatible API, and M12**, on the current suite
 (deepseek-flash, three attempts per task):
 
 | run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
@@ -395,6 +437,7 @@ for comparing against other agents. For that, see [Terminal-Bench](#terminal-ben
 | m7-linux (Debian container, bubblewrap) | 100% (60/60) | 7.0 | 8.7 | 0.0 | 30,780 | $0.0043 | 13s |
 | m10 (macOS) | 100% (60/60) | 6.7 | 8.5 | 0.0 | 27,645 | $0.0041 | 13s |
 | m11, `--api openai` (macOS) | 100% (60/60) | 7.2 | 9.2 | 0.0 | 35,683 | $0.0045 | 14s |
+| m12 (macOS) | 100% (60/60) | 6.7 | 8.8 | 0.0 | 28,773 | $0.0044 | 13s |
 
 Every attempt passed on both systems, so nothing in milestones 6 and 7 cost a task. The Linux run ran
 jig as an ordinary user in a Debian container, every command in the bubblewrap sandbox; no command
@@ -406,7 +449,8 @@ directly comparable with the ones below, though no task changed.
 
 M10 changed how commands end, retries and the process title; it cost no task here either, and again no
 attempt acted on the prompt injections (0 of 6). Through DeepSeek's OpenAI-compatible API (M11), jig
-passed every attempt too, at about the same cost.
+passed every attempt too, at about the same cost. M12's skills left the benchmark's tasks as they were
+(jig's own skills stay out of a plain one-shot task): all passed again.
 
 **M4 against M5, on the 20-task suite as it was then** (in `bench/results/suite-20/`; deepseek-flash,
 three attempts per task):
@@ -760,6 +804,49 @@ python3 eval/report.py eval/results/tb-jig-anthropic.json eval/results/tb-jig-op
   10's last run four to dropped connections and self-kills; with those fixes, none failed that way here.
 - The two look-ups on the OpenAI endpoint (counted as failed) bring jig's own prompt to 4 in 300 attempts.
 
+### Milestone 12: skills to install, write and measure
+
+Milestone 12 starts the plan for a jig that improves itself (see the roadmap) with skills. jig can
+install skills from wherever they are shared, write new ones with you, learn one from a session, and
+measure whether a skill helps. The last matters most: a skill earns its place in every prompt only if
+tasks go better with it.
+
+- **Installing.** `jig skills add anthropics/skills/skills/skill-creator` fetched Anthropic's
+  `skill-creator` (18 files) in 2.3 seconds through a sparse clone, listing its ten scripts and its license
+  first; `--skill` took `mcp-builder` and `webapp-testing` out of the same collection. The lockfile records
+  each one's folder and commit, so `jig skills update` saw they were up to date, and `remove` took one out.
+- **Learning a skill from a session.** A scratch project, "acme", has a release procedure written down
+  nowhere: three files hold the version and must agree, the changelog moves its `[Unreleased]` entries
+  into a dated section, a script checks the result, and the release commit and annotated tag have set
+  wordings. In a first session the user explained all that while asking for release 1.4.3, and jig did
+  it. Then `jig skills learn` turned the session into a skill, `acme-release`: the steps with the exact
+  strings, a check after each, and a list of pitfalls (a partial version bump, a heading that fails the
+  check, a lightweight tag), plus three evals with starting projects of their own: a patch release, a
+  2.0.0 release, and one where the version files had drifted apart.
+- **Measuring it** ([`examples/learned-skill/`](examples/learned-skill) has the project, the skill and every run). `jig skills test acme-release --attempts 3` ran each eval three times with the skill
+  and three times without it, each in a fresh project with a home directory of its own:
+
+  | 3 evals × 3 attempts | with the skill | without |
+  |----------------------|----------------|---------|
+  | passed (check and expectations) | 9/9 | 0/9 |
+  | check passed | 9/9 | 0/9 |
+  | expectations met | 51/51 | 29/51 |
+  | steps | 7.8 | 7.7 |
+  | cost per run | $0.0037 | $0.0041 |
+
+  Without the skill, jig did a plausible release that missed the project's own conventions: the tag's
+  message in all nine runs, the commit message in six, the changelog's form in three, the version files
+  in two. Those conventions were only ever in the first session, and the skill carried every one of them
+  to the tasks after it. It loaded the skill in all nine runs, and the runs cost no more for it.
+- **The first measurements found the harness at fault, twice.** At first every run failed, with the
+  skill or without: the grader saw the diff against the agent's last commit, so a task that committed its
+  work looked as if it had done nothing. With that fixed, the check passed in all nine runs with the skill
+  and none without, but the grader still failed four runs with the skill, from what it couldn't see: the
+  output of the script the agent ran, today's date (it took 2026-04-27 for today), and files a diff
+  doesn't show because they didn't change. The grader now gets today's date, the files the task changed
+  or the expectations name as they ended up, and the commands the agent ran with their output; tests
+  cover both fixes. A model grader is only as good as its evidence, which is why `check` exists.
+
 ## Tests
 
 ```bash
@@ -796,6 +883,7 @@ installs and runs the tarball on every push.
 - [x] **9. Checking before finishing:** a diagnosis of jig's failures (most were confident early finishes), `--check` to make one-shot runs verify against the task, measured on the original tasks and on 20 held-out ones: it fixed the failures it aimed at but ran others out of time, so it is opt-in
 - [x] **10. What mini-swe-agent's lead was made of:** experiments one difference at a time, on held-out tasks and then three attempts at the original ones (`--tools`, `--system-prompt`, mini-swe-agent's prompts through the adapter); the finding that both agents sometimes fetched the benchmark's answers, now counted as failures, which shrank mini-swe-agent's lead from 12 points to 5, within the noise; neither jig's tools nor mini-swe-agent's prompts made a reliable difference; three harness fixes: background jobs that held a command open, replies that broke off, and models killing jig through its command line (`jig -` reads the task from stdin)
 - [x] **11. One model, two APIs:** an OpenAI-compatible API (`--api openai`, `--base-url`) for OpenAI, local models through Ollama or vLLM, and DeepSeek's chat completions endpoint, translated at the edge so the rest of jig is unchanged; today's jig on both of DeepSeek's endpoints, in alternating rounds: no difference (−2 points, −10 to +7), and no agent errors in 120 attempts
+- [x] **12. Skills to install, write and measure:** `jig skills add/list/update/remove` from folders and git repositories, with a lockfile; the bundled `skill-writer`, `jig skills new` and `/skills new`, `jig skills learn` and `/learn`, all through `propose_skill`, which shows you the skill and saves it only where you say; `jig skills test`, each eval with and without the skill; a skill learned from one session passed 9 of 9 eval runs with it, against 0 of 9 without
 
 ## License
 

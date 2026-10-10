@@ -1,5 +1,7 @@
 // What the benchmark measures, shared by the runner (run.ts), the report (report.ts) and the tests.
 
+import { PRICES } from "../src/prices.ts";
+
 export interface Attempt {
   task: string;
   attempt: number;
@@ -20,14 +22,6 @@ export interface Attempt {
 }
 
 export type Summary = ReturnType<typeof summarize>;
-
-/** USD per million tokens. DeepSeek bills half of this off-peak. Checked 2026-10-01; prices change. */
-const PRICES: Record<string, { input: number; cacheRead: number; output: number }> = {
-  "deepseek-flash": { input: 0.3, cacheRead: 0.006, output: 1.2 },
-  "deepseek-v4-pro": { input: 1.32, cacheRead: 0.044, output: 3.96 },
-  "claude-opus-5-5": { input: 4, cacheRead: 0.2, output: 20 },
-  "claude-sonnet-5-5": { input: 2, cacheRead: 0.2, output: 10 },
-};
 
 /**
  * Reads jig's terminal output: "● tool" lines are tool calls, "  ✗" lines are failed ones, and the

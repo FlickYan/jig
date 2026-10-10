@@ -15,7 +15,9 @@ import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
+import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
+import { skillsCommand } from "./skills-cli.ts";
 import { Snapshots } from "./snapshots.ts";
 import { Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
@@ -54,6 +56,7 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
                           (from ${TOOL_NAMES.join(", ")}; default: all)
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --system-prompt <text>
                           use this system prompt instead of jig's own (the project's AGENTS.md and the
                           skills are still added after it)
@@ -64,6 +67,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
 
 jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/.jig/sessions, and
 snapshots the project's files before each task so /undo can put them back.
+
+jig skills list | add | remove | update | new | learn | test manages skills (jig skills --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
 commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
@@ -78,17 +83,41 @@ const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks be
   /undo                        put the files back the way they were before the last task
   /thinking                    show or hide the model's thinking
   /skills                      list the skills; /<skill> [task] runs one
+  /skills new <what it is for> write a new skill with the model; you approve it before it is saved
+  /learn [focus]               turn what this conversation did into a skill, if it holds one
   /mcp                         list the MCP servers and their tools
   /context                     show how much context the conversation takes up
   /compact                     summarize the conversation to free up context
   /reset                       start a new conversation (and reload AGENTS.md)
   /exit                        quit (Ctrl+D works too)`;
 
-async function main(): Promise<void> {
+/** A new skill, written by the model with skill-writer's instructions and submitted with propose_skill. */
+function newSkillTask(what: string, interactive: boolean): string {
+  const asking = interactive
+    ? "ask me about anything you would otherwise have to guess, "
+    : "don't ask questions (no one can answer them now): where you have to assume something, say so in the skill, and ";
+  return `Write a new skill: ${what}\n\nFollow the skill-writer skill above. Look at the project as far as the skill depends on it, ${asking}then submit the skill with propose_skill.`;
+}
+
+/** /learn: what the conversation so far did, distilled into a skill if it holds a procedure worth keeping. */
+function learnTask(focus: string): string {
+  return (
+    "Look back over this conversation for a procedure worth keeping: steps that worked, or that had to be found out, " +
+    "and that would help with similar tasks later. If there is one, write it up as a skill following the skill-writer " +
+    "skill above, and submit it with propose_skill. If nothing here is worth a skill, say so in one line." +
+    (focus ? `\n\nFocus on: ${focus}` : "")
+  );
+}
+
+async function main(argv = process.argv.slice(2)): Promise<void> {
   // The task is in jig's arguments, and models stop programs by matching command lines (pkill -f server.py),
   // which could match jig itself. Where the title can't hide them (under emulation, say), pass the task as -.
   process.title = "jig";
+  // `jig skills <command>` manages skills; new and learn run the model, so they carry on below.
+  const skillsVerb = argv[0] === "skills" && (argv[1] === "new" || argv[1] === "learn") ? argv[1] : undefined;
+  if (argv[0] === "skills" && !skillsVerb) return skillsCommand(argv.slice(1));
   const { values, positionals } = parseArgs({
+    args: skillsVerb ? argv.slice(2) : argv,
     allowPositionals: true,
     allowNegative: true,
     options: {
@@ -112,6 +141,7 @@ async function main(): Promise<void> {
       tools: { type: "string" },
       stats: { type: "string" },
       "system-prompt": { type: "string" },
+      "hide-skill": { type: "string", multiple: true, default: [] },
       check: { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -127,8 +157,10 @@ async function main(): Promise<void> {
   }
   const cwd = resolve(values.cwd);
   if (values.sessions) return listSessions(cwd);
-  const taskText = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
-  if (positionals.join(" ") === "-" && !taskText) throw new Error("The task was to come from stdin (jig -), but stdin was empty.");
+  const given = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
+  if (positionals.join(" ") === "-" && !given) throw new Error("The task was to come from stdin (jig -), but stdin was empty.");
+  if (skillsVerb === "new" && !given) throw new Error("Usage: jig skills new <what the skill is for>");
+  const taskText = skillsVerb === "new" ? newSkillTask(given, false) : skillsVerb === "learn" ? learnTask(given) : given;
   // A task on the command line with --check: nobody to talk to, so the model checks its own work.
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
@@ -165,13 +197,17 @@ async function main(): Promise<void> {
   const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
 
   // Extensions: skills, the MCP servers' tools, hooks, and subagents.
-  const { skills, warnings } = discoverSkills(cwd);
+  // jig's own skills are for writing skills; a plain one-shot task (a benchmark's, say) sees only yours.
+  const skillOptions = { hidden: values["hide-skill"], ...(taskText && !skillsVerb && { builtin: null }) };
+  let { skills, warnings } = discoverSkills(cwd, undefined, skillOptions);
   for (const warning of warnings) ui.notice(warning);
   const mcp = await connectMcpServers(settings.mcpServers, cwd);
   cleanup.push(mcp.close);
   for (const error of mcp.errors) ui.notice(error);
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
-  const extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
+  let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
+  // Writing skills: in a session, whenever the user asks; on the command line, only for jig skills new and learn.
+  const proposals = !taskText || skillsVerb ? [proposeSkillTool()] : [];
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
@@ -180,7 +216,8 @@ async function main(): Promise<void> {
   const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
   const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
-  const researchTools = [...own, ...extensions].filter((tool) => tool.kind === "read" || tool.kind === "run");
+  const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
+  let researchTools = researchFrom(extensions);
   const metered = (callModel: CallModel, subagent = false) => stats?.meter(callModel, { subagent }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
@@ -202,14 +239,17 @@ async function main(): Promise<void> {
     ui: ui.subagentUI,
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
-  const tools = [...own, ...(withSubagents ? [subagentTool(subagents)] : []), ...extensions];
+  const toolsFrom = (extra: Tool[]) => [...own, ...(withSubagents ? [subagentTool(subagents)] : []), ...extra, ...proposals];
+  let tools = toolsFrom(extensions);
   const newModel = () => {
     const prompt = { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot, tools: named(tools), custom: values["system-prompt"] };
     const system = systemPrompt(cwd, prompt);
     return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
-  const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
+  // jig skills learn works on the last session, unless --resume names another.
+  const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue || skillsVerb === "learn" ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
+  if (skillsVerb === "learn" && !resumeFrom) throw new Error("There is no saved session in this project to learn from.");
   let conversation = resumeFrom
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
@@ -302,6 +342,25 @@ async function main(): Promise<void> {
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
 
+  /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
+  function runSkillWriting(task: string, label: string): Promise<boolean> {
+    const writer = skills.find((skill) => skill.name === "skill-writer");
+    if (!writer) return runTask(task, label);
+    const content = loadSkill(writer);
+    conversation.pin(`skill:${writer.name}`, content);
+    return runTask(`${content}\n\n${task}`, label);
+  }
+
+  /** Finds the skills again (a new one may have been saved) and gives the model the new list. */
+  function refreshSkills(): void {
+    ({ skills } = discoverSkills(cwd, undefined, skillOptions));
+    extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
+    researchTools = researchFrom(extensions);
+    tools = toolsFrom(extensions);
+    agent.tools = tools;
+    subagents.tools = researchTools;
+  }
+
   function takeSnapshot(label: string): void {
     try {
       snapshots?.take(label.slice(0, 200));
@@ -333,6 +392,7 @@ async function main(): Promise<void> {
       undo();
     } else if (name === "/reset") {
       instructions = loadInstructions(cwd);
+      refreshSkills();
       agent.callModel = newModel();
       subagents.callModel = newSubagentModel();
       conversation = new Conversation(SessionFile.create(cwd, model));
@@ -347,9 +407,16 @@ async function main(): Promise<void> {
     } else if (name === "/mode") {
       if (arg) permissions.mode = arg as Mode;
       ui.notice(`Mode: ${permissions.mode} (${MODE_HELP[permissions.mode]}).`);
+    } else if (name === "/skills" && arg === "new") {
+      const what = line.slice(line.indexOf("new") + 3).trim();
+      if (!what) ui.notice("Say what the skill is for: /skills new <what it is for>");
+      else await runSkillWriting(newSkillTask(what, true), line);
+    } else if (name === "/learn") {
+      await runSkillWriting(learnTask(line.slice(name.length).trim()), line);
     } else if (name === "/skills") {
       if (!skills.length) ui.notice("No skills found. A skill is a folder with a SKILL.md, in .jig/skills, .agents/skills or .claude/skills.");
-      for (const skill of skills) ui.println(`  /${skill.name}  ${ui.dim(skill.description)}`);
+      for (const skill of skills) ui.println(`  /${skill.name}  ${ui.dim(`${skill.description}${skill.scope === "project" ? "" : ` (${skill.scope})`}`)}`);
+      ui.println(ui.dim("/skills new <what it is for> writes a new one; jig skills add installs one."));
     } else if (name === "/mcp") {
       if (!Object.keys(settings.mcpServers).length) ui.notice('No MCP servers. Add them under "mcpServers" in jig\'s settings.');
       for (const line of [...mcp.status, ...mcp.errors]) ui.println(`  ${line}`);
@@ -374,7 +441,8 @@ async function main(): Promise<void> {
 
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
-    if (!(await runTask(taskText))) process.exitCode = 1;
+    const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText);
+    if (!(await run)) process.exitCode = 1;
     return;
   }
 

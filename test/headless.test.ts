@@ -220,7 +220,7 @@ describe("a reply that breaks off", () => {
 describe("the task's place on the command line", () => {
   /** Runs the CLI on a task against a local fake API, which answers "Hello". Returns what the API received,
    * and the CLI's command line as `ps` showed it while the request was open. */
-  async function runCli(args: string[], stdin = ""): Promise<{ code: number | null; received: string; commandLine: string }> {
+  async function runCli(args: string[], stdin = "", lead: string[] = []): Promise<{ code: number | null; received: string; commandLine: string }> {
     let received = "";
     let commandLine = "";
     let pid = 0;
@@ -237,7 +237,7 @@ describe("the task's place on the command line", () => {
       const home = await mkdtemp(join(tmpdir(), "jig-home-"));
       const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: home, NO_COLOR: "1" };
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
-      const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", ...args], { cwd: project, env });
+      const child = spawn(process.execPath, [cli, ...lead, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", ...args], { cwd: project, env });
       pid = child.pid!;
       child.stdout.resume();
       child.stderr.resume();
@@ -254,6 +254,16 @@ describe("the task's place on the command line", () => {
     const { code, received } = await runCli(["-"], "Rename server.py to app.py.\n");
     assert.equal(code, 0);
     assert.match(received, /"content":"Rename server\.py to app\.py\."/);
+  });
+
+  it("keeps jig's own skills and propose_skill out of a plain task, and gives them to jig skills new", async () => {
+    const plain = JSON.parse((await runCli(["Rename server.py to app.py."])).received);
+    assert.doesNotMatch(JSON.stringify(plain.system), /skill-writer/);
+    assert.ok(!plain.tools.some((tool: { name: string }) => tool.name === "propose_skill"));
+    const writing = await runCli(["release notes from the git log"], "", ["skills", "new"]);
+    const request = JSON.parse(writing.received);
+    assert.ok(request.tools.some((tool: { name: string }) => tool.name === "propose_skill"));
+    assert.match(JSON.stringify(request.messages[0].content), /skill_content name=\\"skill-writer\\"[\s\S]*Write a new skill: release notes from the git log/);
   });
 
   it("keeps a task given as an argument out of ps, so pkill -f can't match jig", async () => {
