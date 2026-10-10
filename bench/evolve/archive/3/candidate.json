@@ -1,0 +1,29 @@
+{
+  "n": 3,
+  "branch": "evolve/3",
+  "base": "92db012",
+  "cause": "**Single-change → full-verify churn.** Consecutive attempts burn steps on one-line edits, whole-file rewrites (once byte-identical), and full test-plus-probe runs after each. It should batch related changes and verify once, and never re-write a file it just read unchanged.",
+  "subject": "Prompt now batches edits and verifies once.",
+  "description": "I added one bullet to jig's system prompt in `src/prompt.ts`, between the \"keep changes focused\" and \"Verify your work\" bullets. It tells the model to batch related edits and verify once rather than after each one, to re-run only the failing check after a fix, and not to write a file's same content back. The first two clauses target the edit→full-test churn loop; the last targets the byte-identical whole-file rewrites. It's general (no task, file or test named), adds ~30 words to the stable, cacheable prompt prefix, and doesn't weaken verification — it just makes it happen once, at the right time. The suite shows only the 7 pre-existing sandbox/`ps` failures and no new ones; the prompt/`--tools` assertions in `test/tools.test.ts` still pass.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.22982938,
+  "runs": {
+    "train": "bench/results/evolve/2026-10-11T02-08-05_evolve-3-train.json"
+  },
+  "train": {
+    "tasks": 5,
+    "candidate": 1,
+    "baseline": 0.9333333333333332,
+    "difference": 0.06666666666666668,
+    "low": 0,
+    "high": 0.2666666666666667,
+    "ahead": 0.5264,
+    "costRatio": 0.9193815331010453
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+7 points, ahead in 53% of resamples, cost ×0.92)"
+  }
+}

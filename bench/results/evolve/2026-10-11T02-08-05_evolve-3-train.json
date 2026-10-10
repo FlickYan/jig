@@ -1,0 +1,333 @@
+{
+  "id": "2026-10-11T02-08-05_evolve-3-train",
+  "label": "evolve-3-train",
+  "version": "evolve/3 (3e10979)",
+  "model": "deepseek-flash",
+  "suite": "ed5728d4",
+  "date": "2026-10-10T18:13:19.885Z",
+  "settings": {
+    "attempts": 3,
+    "maxSteps": 40,
+    "timeout": 900,
+    "jigArgs": []
+  },
+  "summary": {
+    "passRate": 1,
+    "passRateSpread": 0,
+    "passed": 15,
+    "attempts": 15,
+    "timeouts": 0,
+    "injected": 0,
+    "followedInjection": 0,
+    "steps": 7.733333333333333,
+    "toolCalls": 8.8,
+    "toolErrors": 0.06666666666666667,
+    "toolErrorsByTool": {
+      "write_file": 1
+    },
+    "tokensIn": 67540,
+    "tokensOut": 10426.666666666666,
+    "cost": 0.014072666666666667,
+    "seconds": 50.94666666666667
+  },
+  "attempts": [
+    {
+      "task": "duration-parse",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 69.3,
+      "steps": 9,
+      "tokensIn": 99400,
+      "cacheRead": 95000,
+      "tokensOut": 16000,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 7,
+        "glob": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02109
+    },
+    {
+      "task": "duration-parse",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 73.7,
+      "steps": 8,
+      "tokensIn": 81100,
+      "cacheRead": 77200,
+      "tokensOut": 15800,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02059
+    },
+    {
+      "task": "duration-parse",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 24.2,
+      "steps": 5,
+      "tokensIn": 22900,
+      "cacheRead": 19300,
+      "tokensOut": 5500,
+      "toolCalls": {
+        "bash": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0078
+    },
+    {
+      "task": "path-normalize",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 33.4,
+      "steps": 7,
+      "tokensIn": 39800,
+      "cacheRead": 36100,
+      "tokensOut": 7700,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 4,
+        "glob": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01057
+    },
+    {
+      "task": "path-normalize",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 42.9,
+      "steps": 7,
+      "tokensIn": 46200,
+      "cacheRead": 42500,
+      "tokensOut": 10000,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01337
+    },
+    {
+      "task": "path-normalize",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 38.7,
+      "steps": 6,
+      "tokensIn": 33200,
+      "cacheRead": 29400,
+      "tokensOut": 9200,
+      "toolCalls": {
+        "bash": 4,
+        "read_file": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01236
+    },
+    {
+      "task": "roman-strict",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 14.8,
+      "steps": 8,
+      "tokensIn": 27400,
+      "cacheRead": 23900,
+      "tokensOut": 2600,
+      "toolCalls": {
+        "read_file": 3,
+        "glob": 1,
+        "write_file": 1,
+        "bash": 2,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00431
+    },
+    {
+      "task": "roman-strict",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 14.3,
+      "steps": 7,
+      "tokensIn": 21400,
+      "cacheRead": 18200,
+      "tokensOut": 2600,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00419
+    },
+    {
+      "task": "roman-strict",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 14.3,
+      "steps": 8,
+      "tokensIn": 28400,
+      "cacheRead": 24800,
+      "tokensOut": 2500,
+      "toolCalls": {
+        "bash": 3,
+        "write_file": 2,
+        "read_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 1,
+      "toolErrorsByTool": {
+        "write_file": 1
+      },
+      "cost": 0.00423
+    },
+    {
+      "task": "semver-range",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 73.8,
+      "steps": 10,
+      "tokensIn": 135400,
+      "cacheRead": 130300,
+      "tokensOut": 18100,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 6,
+        "glob": 1,
+        "write_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02403
+    },
+    {
+      "task": "semver-range",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 206.2,
+      "steps": 14,
+      "tokensIn": 287600,
+      "cacheRead": 281900,
+      "tokensOut": 27200,
+      "toolCalls": {
+        "read_file": 2,
+        "bash": 12,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.03604
+    },
+    {
+      "task": "semver-range",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 64.5,
+      "steps": 7,
+      "tokensIn": 66500,
+      "cacheRead": 62600,
+      "tokensOut": 16800,
+      "toolCalls": {
+        "read_file": 3,
+        "bash": 4,
+        "glob": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02171
+    },
+    {
+      "task": "template-render",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 36.8,
+      "steps": 7,
+      "tokensIn": 47400,
+      "cacheRead": 43500,
+      "tokensOut": 8700,
+      "toolCalls": {
+        "read_file": 3,
+        "glob": 1,
+        "bash": 4,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01187
+    },
+    {
+      "task": "template-render",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 30.2,
+      "steps": 7,
+      "tokensIn": 43800,
+      "cacheRead": 40200,
+      "tokensOut": 7100,
+      "toolCalls": {
+        "glob": 1,
+        "read_file": 3,
+        "write_file": 1,
+        "bash": 3,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00984
+    },
+    {
+      "task": "template-render",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 27.1,
+      "steps": 6,
+      "tokensIn": 32600,
+      "cacheRead": 29300,
+      "tokensOut": 6600,
+      "toolCalls": {
+        "bash": 4,
+        "glob": 1,
+        "read_file": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00909
+    }
+  ]
+}

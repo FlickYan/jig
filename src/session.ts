@@ -7,7 +7,7 @@ type MessageParam = Anthropic.Beta.BetaMessageParam;
 
 /** One line of a session file. */
 type Entry =
-  | { type: "start"; cwd: string; model: string; date: string }
+  | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
   | { type: "message"; message: MessageParam }
   | { type: "compaction"; messages: MessageParam[] };
 
@@ -44,6 +44,14 @@ export class SessionFile {
       .filter((name) => name.endsWith(".jsonl"))
       .sort()
       .map((name) => join(dir, name));
+  }
+
+  /**
+   * Records what the model is given besides the messages, its system prompt and tools, with the start of
+   * the session, for jig sessions export. A resumed session keeps the record it began with.
+   */
+  describe(context: { system: string; tools: Anthropic.Beta.BetaTool[] }): void {
+    if (this.start?.type === "start") this.start = { ...this.start, ...context };
   }
 
   write(entry: Entry): void {

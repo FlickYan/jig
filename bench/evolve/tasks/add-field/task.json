@@ -1,0 +1,9 @@
+{
+  "instruction": "Add a priority to tasks. A task's priority is low, normal or high, and normal when not given; anything else is an error, both from the command line and when a Task is created. It must be saved with each task, and tasks saved before this change (which have no priority) must load as normal. The add command takes --priority. The list command shows the priority as a tag before the title, like `1. [ ] [high] Buy milk`, for low and high tasks only: normal tasks show no tag. The CSV export gets a priority column right after the title. Document all of it in docs/USAGE.md.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "many files"
+  ]
+}

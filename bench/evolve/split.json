@@ -1,0 +1,30 @@
+{
+  "seed": 14,
+  "baseline": "bench/results/evolve/2026-10-11T01-17-27_baseline.json",
+  "train": [
+    "duration-parse",
+    "path-normalize",
+    "roman-strict",
+    "semver-range",
+    "template-render"
+  ],
+  "heldOut": [
+    "add-field",
+    "cron-next",
+    "ini-config",
+    "money-format",
+    "rename-setting"
+  ],
+  "acceptance": {
+    "baselines": [
+      "bench/results/evolve/2026-10-11T01-17-27_baseline.json",
+      "bench/results/evolve/2026-10-11T02-21-35_baseline-again.json"
+    ],
+    "nothing": 0.004,
+    "cheaper25": 0.341
+  },
+  "acceptanceBefore": {
+    "nothing": 0.002,
+    "cheaper25": 0.566
+  }
+}

@@ -33,7 +33,8 @@
     "test": "node --test test/*.test.ts",
     "typecheck": "tsc",
     "bench": "node bench/run.ts",
-    "bench:report": "node bench/report.ts"
+    "bench:report": "node bench/report.ts",
+    "evolve": "node bench/evolve.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.129.0",

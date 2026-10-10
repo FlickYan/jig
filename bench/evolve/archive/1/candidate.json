@@ -1,0 +1,29 @@
+{
+  "n": 1,
+  "branch": "evolve/1",
+  "base": "92db012",
+  "cause": "**Verification is example-driven, not rule-complete.** jig probes the behaviours the spec illustrates and the ones it inferred, rarely the spec's explicit rejection clauses; the failed run never tested an operator with no version, so an invalid range passed. It should enumerate every stated rule — especially \"X raises / X is invalid\" — and exercise each before finishing.",
+  "subject": "Exercise every rule the task states, not only its examples",
+  "description": "I changed jig's base system prompt (`src/prompt.ts`), extending its \"Verify your work\" bullet so the model must \"Exercise every rule the task states, not only the examples it gives — including the cases it says are invalid or must raise.\" The analysis showed jig's verification is example-driven: it probes the behaviours the spec illustrates and the ones it infers, but skips the spec's explicit rejection clauses (e.g. an operator with no version, an invalid range), so rules it never exercised silently fail. Putting this in the always-present base prompt (rather than the opt-in `--check` REVIEW text) means it applies to every task at negligible cost — roughly twenty extra words in the cached system prefix — and works even when no example is given for a rule. It stays general: it names no task, function or file, and just tells the model to enumerate stated rules and actively test the negative ones as part of the existing verify-and-fix step. `npm test` results are unchanged; the 7 failures in this sandbox are pre-existing environmental ones (`ps` and `sandbox-exec` are blocked here), all in unrelated tests.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.270627724,
+  "runs": {
+    "train": "bench/results/evolve/2026-10-11T01-56-09_evolve-1-train.json"
+  },
+  "train": {
+    "tasks": 5,
+    "candidate": 0.8666666666666668,
+    "baseline": 0.9333333333333332,
+    "difference": -0.06666666666666667,
+    "low": -0.2666666666666667,
+    "high": 0.06666666666666667,
+    "ahead": 0.0563,
+    "costRatio": 1.0548780487804879
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (-7 points, ahead in 6% of resamples, cost ×1.05)"
+  }
+}

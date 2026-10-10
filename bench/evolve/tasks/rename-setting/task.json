@@ -1,0 +1,9 @@
+{
+  "instruction": "Rename the max_retries setting to retry_limit everywhere it appears: the Settings field and the code that uses it, the APP_MAX_RETRIES environment variable (now APP_RETRY_LIMIT), the --max-retries command-line flag (now --retry-limit), the default config file, the .env example, the JSON schema, the docs and the tests. Keep the old environment variable and the old flag working for now, as deprecated aliases: using either still sets retry_limit, and prints a warning to stderr that names the new spelling.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "refactor",
+    "many files"
+  ]
+}

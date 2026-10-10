@@ -14,6 +14,7 @@ import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
+import { listSessions, sessionsCommand } from "./sessions-cli.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
 import { proposeInstructionsTool } from "./instructions-proposals.ts";
 import { loadMemories, memoryPrompt, memoryTool, proposeMemoryTool } from "./memory.ts";
@@ -75,6 +76,7 @@ snapshots the project's files before each task so /undo can put them back.
 
 jig skills list | add | remove | update | new | learn | test manages skills (jig skills --help).
 jig memory list | show | remove | reflect manages what jig remembers (jig memory --help).
+jig sessions list | export lists sessions, or exports them as fine-tuning data (jig sessions --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
 commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
@@ -139,12 +141,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // The task is in jig's arguments, and models stop programs by matching command lines (pkill -f server.py),
   // which could match jig itself. Where the title can't hide them (under emulation, say), pass the task as -.
   process.title = "jig";
-  // `jig skills <command>` manages skills and `jig memory <command>` memories; skills new and learn, and
-  // memory reflect, run the model, so they carry on below.
+  // `jig skills <command>` manages skills, `jig memory <command>` memories and `jig sessions <command>`
+  // sessions; skills new and learn, and memory reflect, run the model, so they carry on below.
   const skillsVerb = argv[0] === "skills" && (argv[1] === "new" || argv[1] === "learn") ? argv[1] : undefined;
   const memoryVerb = argv[0] === "memory" && argv[1] === "reflect" ? argv[1] : undefined;
   if (argv[0] === "skills" && !skillsVerb) return skillsCommand(argv.slice(1));
   if (argv[0] === "memory" && !memoryVerb) return memoryCommand(argv.slice(1));
+  if (argv[0] === "sessions") return sessionsCommand(argv.slice(1));
   const { values, positionals } = parseArgs({
     args: skillsVerb || memoryVerb ? argv.slice(2) : argv,
     allowPositionals: true,
@@ -285,6 +288,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     ...proposals,
   ];
   let tools = toolsFrom(extensions);
+  // What the model is given besides the messages, for the session to record (see jig sessions export).
+  let context: { system: string; tools: Tool["definition"][] } | undefined;
   const newModel = () => {
     const prompt = {
       instructions,
@@ -297,6 +302,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       custom: values["system-prompt"],
     };
     const system = systemPrompt(cwd, prompt);
+    context = { system, tools: tools.map((tool) => tool.definition) };
     return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
   // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
@@ -345,6 +351,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     review: oneShot ? REVIEW : undefined,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
+  conversation.describe(context);
 
   /** Runs `work` as the current task, so Ctrl+C stops it. */
   async function asTask(work: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
@@ -451,6 +458,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       agent.callModel = newModel();
       subagents.callModel = newSubagentModel();
       conversation = new Conversation(SessionFile.create(cwd, model));
+      conversation.describe(context);
       modelKnowsPlanMode = false;
       notes.length = 0;
       ui.notice(`Started a new conversation${instructions.length ? ` (with ${describeInstructions(instructions)})` : ""}.`);
@@ -606,16 +614,6 @@ function findSession(cwd: string, name: string): string {
     if (existsSync(path)) return path;
   }
   throw new Error(`No session "${name}". Run jig --sessions to list this project's sessions.`);
-}
-
-function listSessions(cwd: string): void {
-  const files = SessionFile.list(cwd);
-  if (files.length === 0) return console.log("No saved sessions for this project yet.");
-  for (const file of files.slice(-20)) {
-    const request = SessionFile.firstRequest(file).replace(/\s+/g, " ");
-    console.log(`${basename(file, ".jsonl")}  ${request.length > 70 ? `${request.slice(0, 70)}…` : request}`);
-  }
-  console.log("\nContinue one with jig --resume <name>, or the most recent with jig -c.");
 }
 
 function report(result: RunResult, ms: number, maxSteps: number): void {

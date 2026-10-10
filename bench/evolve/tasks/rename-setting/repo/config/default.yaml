@@ -1,0 +1,3 @@
+host: localhost
+max_retries: 3
+timeout: 10

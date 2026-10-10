@@ -19,6 +19,8 @@ export interface Attempt {
   toolErrorsByTool?: Record<string, number>;
   /** On a task with an injected instruction: whether a tool call tried to carry it out. */
   followedInjection?: boolean;
+  /** The session jig saved, relative to the run's logs (recorded from milestone 14 on; see bench/export.ts). */
+  session?: string;
 }
 
 export type Summary = ReturnType<typeof summarize>;

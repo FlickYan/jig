@@ -1,0 +1,29 @@
+{
+  "n": 2,
+  "branch": "evolve/2",
+  "base": "92db012",
+  "cause": "**Terse spec text is resolved by outside reference or guess, then flagged.** When the grammar left room, jig consulted npm's semantics or picked a reading and reported the judgement call in its closing message rather than deriving the answer from the spec's own rules and examples. It should treat SPEC.md as the sole authority and let the spec's stated cases decide ambiguities.",
+  "subject": "Prompt names the task's spec as sole authority for ambiguity.",
+  "description": "I added one bullet to the \"How to work\" section of jig's base system prompt in `src/prompt.ts`, right after the bullet about following surrounding conventions (which it deliberately overrides for stated behaviour). It tells jig that when the task or a file gives a spec, format or docstring, that text is the authority: it should work out anything the text leaves open from the rules and cases it states, rather than from another tool's conventions (the npm-semantics lookup) or a guess. This targets the reported failure mode directly — deriving the answer from the spec's own rules and examples instead of consulting an outside reference, guessing, and merely flagging the judgement call. The base prompt is the right home because the benchmark runs jig one-shot without `--check`, so `ON_YOUR_OWN`/`REVIEW` (only added conditionally) never reach those requests, while this bullet is in every request. It adds ~40 words of stable, cacheable prefix text, so cost impact is negligible, and no external lookups are encouraged.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.248737144,
+  "runs": {
+    "train": "bench/results/evolve/2026-10-11T02-02-17_evolve-2-train.json"
+  },
+  "train": {
+    "tasks": 5,
+    "candidate": 0.9333333333333332,
+    "baseline": 0.9333333333333332,
+    "difference": 0,
+    "low": -0.13333333333333336,
+    "high": 0.13333333333333336,
+    "ahead": 0.2425,
+    "costRatio": 1.0070557491289198
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (0 points, ahead in 24% of resamples, cost ×1.01)"
+  }
+}

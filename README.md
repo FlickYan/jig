@@ -5,7 +5,8 @@ A minimal coding agent for the terminal, written from scratch in TypeScript on t
 DeepSeek's, or a local model through Ollama or vLLM). There is no agent framework: it is one
 streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
 (an OS sandbox on macOS and Linux, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
-servers, hooks, subagents), and a benchmark that measures each version.
+servers, hooks, subagents), a benchmark that measures each version, and a loop in which jig proposes
+changes to its own code and a referee it can't reach measures them.
 
 (A jig is the workshop fixture that holds a piece of work and guides the tool cutting it, which is what an
 agent harness does for a model.)
@@ -213,6 +214,34 @@ received (subagents included), and how many input tokens came from the prompt ca
   mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the
   main conversation. Several subagent calls in one reply run at the same time.
 
+### Improving itself
+
+What jig can change about itself, and who decides whether it does:
+
+| what | how | who decides |
+|------|-----|-------------|
+| its skills | `propose_skill` (`jig skills new`, `/learn`), measured with and without by `jig skills test` | you, when jig shows it to you |
+| what it remembers, and a project's AGENTS.md | `propose_memory` and `propose_instructions` (`/remember`, `/reflect`) | you, one proposal at a time |
+| its prompts, tools and loop | `npm run evolve -- run`: jig changes a copy of its own code, and a referee measures the change on benchmark tasks it wasn't made from | the referee, then you, by merging its branch or not |
+| its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests | whoever trains a model: jig doesn't |
+
+```bash
+node bench/run.ts --suite evolve --attempts 3 --label baseline   # the baseline: 10 tasks, 3 attempts each
+npm run evolve -- split       # training and held-out halves, and how often the referee would be fooled
+npm run evolve -- analyze     # the model's diagnosis of the training attempts (bench/evolve/analysis.md)
+node bench/run.ts --suite evolve --attempts 3 --label baseline-2 # the baseline again, to compare with
+npm run evolve -- calibrate   # how often the referee would be fooled, from both runs
+npm run evolve -- run         # a candidate for each cause found: jig changes itself, the referee judges
+npm run evolve -- list        # every candidate, its change and the verdict
+
+jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
+node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # attempts that passed, only
+```
+
+A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
+change only `src/` and `skills/`; the referee runs from the main checkout, so nothing a candidate
+changes can change how it is judged. Milestone 14 describes the loop and what it found.
+
 ## How it works
 
 ```
@@ -367,6 +396,26 @@ Ctrl+C, and when a safety classifier declines the request.
 - **Nothing that looks like a secret is written down.** A memory goes into every later prompt, so a key
   pasted into one would leak from then on. Memories, AGENTS.md edits and skills are refused if they hold
   something shaped like an API key, a token, a private key or a password assignment.
+- **jig never judges its own changes.** Reading a change to a prompt says little about whether it helps,
+  and a judge the change could reach could be changed with it. So a candidate may change only `src/` and
+  `skills/`; it works on a copy that has no benchmarks and, being a new repository, no history to find
+  them in (the analysis caught jig searching git history for hidden tests, and in milestone 10 both
+  agents fetched a benchmark's answers); and it is judged by the main checkout's tests, tasks, runner
+  and referee. A candidate that names the tasks (their ids, files, functions or flags) is rejected
+  unread.
+- **A referee is worth its false acceptances.** Before any candidate ran, the referee was run on
+  simulated candidates that change nothing: judged on point estimates (solve more, or as many for less),
+  11% of them were accepted, and with its rules 0.2%. That figure held the baseline fixed, and a second
+  run of the baseline showed what it missed: the run the analysis comes from is a sample too, and its
+  bad luck becomes every candidate's gain (4% against that run). So the simulation draws the baseline as
+  well, and candidates are compared with a baseline run the analysis didn't see.
+- **Training data is checked by something other than the model.** jig doesn't train models, but its
+  sessions are what one would be trained on, and the benchmark knows which of them succeeded:
+  `bench/export.ts` keeps only attempts that passed hidden tests the model never saw, as in rejection-
+  sampling fine-tuning. Exports blank out anything that looks like a secret, in the strings rather than
+  the JSON text, so an escaped quote can't be cut in half, and only what looks like a secret: the rule
+  that refuses a memory with `token = ...` in it blanked out `token = tokens[index]` in the first
+  export, which would have taught a model to write `[REDACTED]`.
 - **Calls that only read run at the same time.** When every call in a reply is a read (file reads,
   searches, subagents, read-only MCP tools), they run in parallel; if any call changes something, they
   all run in order, since one may depend on another. Results still go back in the order of the calls, and
@@ -422,6 +471,9 @@ npm run bench:report                                # compare the saved runs (Ma
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
+Since milestone 14 each attempt also records its session, the conversation jig saved, for
+`bench/export.ts`. A second suite, `--suite evolve` (`bench/evolve/tasks`, results in
+`bench/results/evolve/`), is the one jig evolves on.
 Runs on earlier versions of the suite are in `suite-12/`, `suite-15/`, `suite-17/` and `suite-20/`, one-off experiments in
 `experiments/`; `npm run bench:report -- bench/results/experiments` reports a folder.
 Logs of every attempt (the transcript, the diff the agent made, the check's output and jig's session file)
@@ -929,12 +981,110 @@ it was), each graded by a check:
 The in-house benchmark wasn't rerun: with nothing remembered, a one-shot task's prompt and tools are the
 same as in milestone 12 (the proposal tools come only in sessions and `jig memory reflect`).
 
+### Milestone 14: jig changes itself, and a referee decides
+
+Milestone 14 is the last piece of the plan: jig changing its own prompts, tools and loop. A skill or a
+memory can be judged by reading it; whether a line in the system prompt helps can't be, so jig proposes
+the change and a referee measures it, on tasks the change wasn't made from, before anyone is asked to
+merge it ([`bench/evolve.ts`](bench/evolve.ts); the commands are under [Improving itself](#improving-itself)).
+
+```text
+baseline: the evolve suite, 3 attempts a task
+ ├─ split by pass rate: 5 training tasks, 5 held out
+ ├─ analysis of the training attempts (what failed, where the steps went) → causes
+ └─ for each cause, a candidate: jig changes a copy of itself (src/, skills/) → branch evolve/<n>
+     ├─ the referee, in the main checkout:
+     │    only src/ and skills/ changed · no words from the tasks · jig's tests pass
+     │    training tasks, then held-out ones: more solved in 80% of resamples, or as many for 15% less
+     └─ bench/evolve/archive/<n>: the cause, the change, the runs, the verdict
+          accepted: the branch waits for a person · rejected: the branch is deleted
+```
+
+**The suite.** [`bench/evolve/tasks/`](bench/evolve/tasks) has ten small Python tasks: eight are a
+`SPEC.md` to implement exactly (durations, cron's next run, an INI parser, money, Roman numerals, URL
+paths, semver ranges, templates) and two a change across a small project (add a field, rename a
+setting), each with visible tests and hidden ones. It is simple on purpose, a first version to build the
+loop on. A calibration run (26 of 30) found two checks at fault, a rule the spec didn't state and a test
+that read too much into a paragraph, and both were fixed before the baseline. The baseline, today's
+jig: 28 of 30 (93%), $0.0138 an attempt.
+
+**What a verdict was worth, before any candidate ran.** The referee was run on simulated candidates,
+drawn from the baseline's own pass rates (shrunk toward its overall rate) and costs:
+
+| a candidate that | accepted |
+|------------------|----------|
+| changes nothing | 0.2% (1.1% with costs half again as variable, and lower pass rates) |
+| fixes both of the baseline's failed attempts | 0.5% |
+| costs 15% less | 21% |
+| costs 25% less | 57% |
+
+Judged on point estimates instead (solve any more, or as many for 15% less), a change that does nothing
+would have been accepted 11% of the time. With one failed attempt in each half, the suite can't tell a
+fix from luck: it can confirm that jig got cheaper, not that it got better at the tasks.
+
+**What the analysis found.** One model call ($0.005) over the training half's two failed attempts and
+each task's longest passing one (tool calls, failed hidden tests, last message) named four causes:
+verification that tries the spec's examples but not its rules (a range that was only an operator, `^`,
+passed as valid); filling what a spec leaves open with a guess or npm's conventions rather than its own
+rules; editing a line, rerunning everything, editing again (once rewriting a file with its own contents);
+and searching git history, tags and remotes for the hidden tests.
+
+**The candidates.** One per cause, each proposed by jig for about $0.02, each a line in the system
+prompt:
+
+| # | the change | training tasks: solved | cost | verdict |
+|---|------------|------------------------|------|---------|
+| 1 | "Exercise every rule the task states, not only the examples it gives — including the cases it says are invalid or must raise." | 13/15 (baseline 14/15) | ×1.05 | rejected |
+| 2 | "When the task or a file states how something must work — a spec, a format, a docstring — that text is the authority …" | 14/15 | ×1.01 | rejected |
+| 3 | "Batch related edits and verify once, not after each one; after a fix, re-run only the check that failed. Don't write the same content back to a file." | 15/15 | ×0.92 | rejected |
+| 4 | "Work from the task as written … Don't hunt for the hidden tests that grade you." | 15/15 | ×0.99 | rejected |
+
+None reached the held-out tasks. The four cost $1.00, almost all of it in scoring ($0.23 a training run).
+
+**Then the baseline was run again, unchanged** (29 of 30, $0.0137 an attempt), and judged as if it were
+a candidate. On the training tasks it solved as many as the first run for ×0.86 the cost, a point short
+of the bar; on the held-out tasks it solved 15 of 15 against 14, which the referee, as it was, would
+have accepted. The first run had been unlucky, and the candidates were measured against its luck: its
+duration-parse attempts cost $0.0209 on average, the rerun's $0.0117, and every candidate's $0.0148
+to $0.0165, whatever it changed. Against the rerun, the four candidates cost ×1.06 to ×1.22, candidate 3's
+"8% less" included. Simulated with the baseline drawn as a sample too (from both runs), the referee as
+it was would have accepted a change that does nothing 4% of the time against the first run, not 0.2%.
+
+So the referee changed, in a way that only makes it stricter: the held-out tasks now need what the
+training tasks need (one more attempt in fifteen isn't more), a candidate is compared with a baseline
+run the analysis didn't see, and `calibrate` draws the baseline as well as the candidate. Against both
+runs, a change that does nothing is now accepted 0.4% of the time, and one that costs 25% less 34%.
+
+- **The loop works; this suite can't reward it.** Every candidate was general, small and passed jig's
+  tests, and the referee rejected all four for reasons the record shows. On a suite at 93 to 97% there
+  is little to gain, and one attempt in fifteen is 7 points either way; the next suite needs tasks jig
+  solves half the time, and more of them.
+- **A word check stops naming the tasks, not fitting the setting.** Candidate 4 tells jig not to hunt
+  for "the hidden tests that grade you", which only means anything on a benchmark. No candidate named a
+  task, and that one passed; a person reading the diff would not merge it.
+- **The analysis found jig looking for the answers.** It spent steps on `git log --all`, tags and remotes
+  in hopes of finding the hidden tests. Candidates now work on a copy with no history: until this commit
+  the suite wasn't in the history to find, but from now on it is.
+- **The proposer had to be told about its own sandbox.** The first candidate took 13 minutes and 25
+  commands, most of them on seven tests that can't pass inside jig's sandbox (they start sandboxes of
+  their own, or run `ps`, which it won't allow), and some reading the old benchmark, which its copy then
+  still held. The loop now runs the tests in the candidate's sandbox first, in 5 seconds, and names those
+  seven in the task; the next three proposals took about a minute each.
+
+**The model.** jig doesn't train a model; it produces the data. Sessions now record the system prompt
+and tools they were given, and `jig sessions export` writes them in the format of OpenAI's chat
+fine-tuning (secrets blanked out, thinking left out, and an example whose messages are in an order a
+trainer would reject left out too). `bench/export.ts` writes only attempts that passed their hidden tests: from the rerun, 29
+examples, all valid, 23 messages on average. Training a model on them, and routing between models by
+task, are left for later.
+
 ## Tests
 
 ```bash
-npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, MCP (against a
-                    # hand-written server), hooks, subagents, running headless (--add-dir, --stats, a hung
-                    # API), benchmark metrics, and the loop: no API calls
+npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, memory, MCP
+                    # (against a hand-written server), hooks, subagents, running headless (--add-dir,
+                    # --stats, a hung API), benchmark metrics, the evolve referee and the copies candidates
+                    # work in, exporting sessions, and the loop: no API calls
 npm run typecheck
 ```
 
@@ -967,6 +1117,7 @@ installs and runs the tarball on every push.
 - [x] **11. One model, two APIs:** an OpenAI-compatible API (`--api openai`, `--base-url`) for OpenAI, local models through Ollama or vLLM, and DeepSeek's chat completions endpoint, translated at the edge so the rest of jig is unchanged; today's jig on both of DeepSeek's endpoints, in alternating rounds: no difference (−2 points, −10 to +7), and no agent errors in 120 attempts
 - [x] **12. Skills to install, write and measure:** `jig skills add/list/update/remove` from folders and git repositories, with a lockfile; the bundled `skill-writer`, `jig skills new` and `/skills new`, `jig skills learn` and `/learn`, all through `propose_skill`, which shows you the skill and saves it only where you say; `jig skills test`, each eval with and without the skill; a skill learned from one session passed 9 of 9 eval runs with it, against 0 of 9 without
 - [x] **13. Memory and context:** user and project memories under `~/.jig/memory/`, indexed in the system prompt and read with the `memory` tool; `propose_memory` and `propose_instructions` (AGENTS.md edits as diffs), approved one at a time, secrets refused; `/remember`, `/reflect`, `/memory` and `jig memory list|show|remove|reflect`; `--no-memory`; the memory benchmark: a convention or preference said once, in an earlier session, was followed in 9 of 9 later runs with what reflection kept and 0 of 9 without
+- [x] **14. jig changes itself, under a referee:** `bench/evolve.ts`: an analysis of jig's own attempts on a new ten-task suite, candidate changes jig makes to a copy of itself (no benchmarks, no history, its own sandbox and home), and a referee in the main checkout (changed files, task words, jig's tests, training then held-out tasks, a bootstrap over tasks and their attempts) whose false acceptance was measured before any candidate ran (0.2%); four candidates for the four causes found, all rejected on the training tasks, the best solving 15 of 15 for 8% less; a second run of the unchanged baseline, which the referee as it was would nearly have accepted, showed that saving to be the first run's bad luck and the 0.2% to be 4% against that run, so the held-out tasks now need what the training ones do, candidates are compared with a run the analysis didn't see, and the simulation draws the baseline too (0.4%); sessions record their system prompt and tools, and `jig sessions export` and `bench/export.ts` write them as fine-tuning data, the latter only attempts that passed their hidden tests
 
 ## License
 

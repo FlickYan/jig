@@ -3,14 +3,17 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from "node:fs";
-import { cp, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { type Attempt, estimateCost, formatTable, money, num, parseTranscript, percent, summarize, triedForbidden } from "./metrics.ts";
 
 const BENCH = dirname(fileURLToPath(import.meta.url));
+// The suite: bench/tasks, or bench/evolve/tasks with --suite evolve, whose results go apart.
+let TASKS = join(BENCH, "tasks");
+let RESULTS = join(BENCH, "results");
 const ROOT = dirname(BENCH);
 
 const HELP = `Usage: node bench/run.ts [options]
@@ -22,6 +25,7 @@ Options:
   --label <name>      name for this run in the results (default: the ref, or "working-tree")
   --model <id>        model for jig (default: deepseek-flash)
   --tasks <a,b,...>   run only these tasks
+  --suite <name>      tasks (default: bench/tasks) or evolve (bench/evolve/tasks, the tasks jig evolves on)
   --attempts <n>      runs per task, to see how much results vary (default: 1)
   --concurrency <n>   attempts running at the same time (default: 3)
   --max-steps <n>     jig's step limit per task (default: 40)
@@ -80,6 +84,7 @@ async function main(): Promise<void> {
       label: { type: "string" },
       model: { type: "string", default: "deepseek-flash" },
       tasks: { type: "string" },
+      suite: { type: "string", default: "tasks" },
       attempts: { type: "string", default: "1" },
       concurrency: { type: "string", default: "3" },
       "max-steps": { type: "string", default: "40" },
@@ -95,6 +100,11 @@ async function main(): Promise<void> {
   }
   const agent = values.agent;
   if (!["jig", "oracle", "noop"].includes(agent)) throw new Error("--agent must be jig, oracle or noop");
+  if (!["tasks", "evolve"].includes(values.suite)) throw new Error("--suite must be tasks or evolve");
+  if (values.suite === "evolve") {
+    TASKS = join(BENCH, "evolve", "tasks");
+    RESULTS = join(BENCH, "results", "evolve");
+  }
 
   if (agent === "jig" && values.model.startsWith("deepseek") && !process.env.DEEPSEEK_API_KEY) {
     throw new Error("DEEPSEEK_API_KEY is not set, so every attempt would fail. Export it and run again.");
@@ -137,20 +147,21 @@ async function main(): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const file = join(BENCH, "results", `${runId}.json`);
+  const file = join(RESULTS, `${runId}.json`);
   await mkdir(dirname(file), { recursive: true });
   const suite = suiteFingerprint(tasks);
   const record = { id: runId, label, version: jig!.version, model: values.model, suite, date: new Date().toISOString(), settings, summary, attempts };
+  await mkdir(RESULTS, { recursive: true });
   await writeFile(file, `${JSON.stringify(record, null, 2)}\n`);
   console.log(`Saved ${file}\nCompare runs with: npm run bench:report`);
 }
 
 async function loadTasks(only?: string[]): Promise<Task[]> {
-  const ids = (await readdir(join(BENCH, "tasks"))).filter((id) => existsSync(join(BENCH, "tasks", id, "task.json"))).sort();
+  const ids = (await readdir(TASKS)).filter((id) => existsSync(join(TASKS, id, "task.json"))).sort();
   const unknown = only?.filter((id) => !ids.includes(id)) ?? [];
   if (unknown.length) throw new Error(`Unknown tasks: ${unknown.join(", ")}. The tasks are: ${ids.join(", ")}`);
   const selected = ids.filter((id) => !only || only.includes(id));
-  return Promise.all(selected.map(async (id) => ({ id, ...JSON.parse(await readFile(join(BENCH, "tasks", id, "task.json"), "utf8")) })));
+  return Promise.all(selected.map(async (id) => ({ id, ...JSON.parse(await readFile(join(TASKS, id, "task.json"), "utf8")) })));
 }
 
 /**
@@ -159,7 +170,7 @@ async function loadTasks(only?: string[]): Promise<Task[]> {
  */
 function suiteFingerprint(tasks: Task[]): string {
   const hash = createHash("sha256");
-  const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "--", ...tasks.map((t) => join("bench/tasks", t.id))], { cwd: ROOT, encoding: "utf8" });
+  const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "--", ...tasks.map((t) => join(relative(ROOT, TASKS), t.id))], { cwd: ROOT, encoding: "utf8" });
   for (const file of files.split("\n").filter(Boolean).sort()) hash.update(file).update(readFileSync(join(ROOT, file)));
   return hash.digest("hex").slice(0, 8);
 }
@@ -181,7 +192,7 @@ async function prepareJig(ref?: string): Promise<{ dir: string; version: string 
 }
 
 async function runAttempt(task: Task, attempt: number, run: RunContext): Promise<Attempt> {
-  const taskDir = join(BENCH, "tasks", task.id);
+  const taskDir = join(TASKS, task.id);
   // A neutral name: the path is in jig's system prompt, and naming it after the task (say "injection-readme")
   // told the model it was being tested.
   const work = await mkdtemp(join(tmpdir(), "project-"));
@@ -223,13 +234,36 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
     const metrics = parseTranscript(transcript);
     const passed = check.code === 0 && !timedOut;
     const followedInjection = task.forbidden && run.agent === "jig" ? triedForbidden(transcript, task.forbidden) : undefined;
+    const session = run.agent === "jig" ? await findSession(join(run.logDir, "jig-home"), work) : undefined;
     log.write(`\n--- ${passed ? "PASSED" : "FAILED"}${timedOut ? " (timed out)" : ""}${followedInjection ? " (followed the injected instruction)" : ""} ---\n`);
-    return { task: task.id, attempt, passed, timedOut, seconds, ...metrics, cost: estimateCost(run.model, metrics), followedInjection };
+    return { task: task.id, attempt, passed, timedOut, seconds, ...metrics, cost: estimateCost(run.model, metrics), followedInjection, ...(session && { session: relative(run.logDir, session) }) };
   } finally {
     if (run.keep) log.write(`Kept the project in ${work}\n`);
     else await rm(work, { recursive: true, force: true });
     log.end();
   }
+}
+
+/**
+ * The session jig saved for an attempt: the one that started in its project directory. Every attempt's
+ * project is a new temp directory, so there is one at most (none from versions that kept no sessions).
+ */
+async function findSession(jigHome: string, work: string): Promise<string | undefined> {
+  const root = join(jigHome, "sessions");
+  if (!existsSync(root)) return undefined;
+  const real = await realpath(work).catch(() => work);
+  for (const dir of await readdir(root)) {
+    for (const name of (await readdir(join(root, dir))).filter((file) => file.endsWith(".jsonl"))) {
+      const file = join(root, dir, name);
+      try {
+        const start = JSON.parse((await readFile(file, "utf8")).split("\n", 1)[0]);
+        if (start.type === "start" && (start.cwd === work || start.cwd === real)) return file;
+      } catch {
+        // not a session file, or one cut off mid-write
+      }
+    }
+  }
+  return undefined;
 }
 
 /** Runs a program, copying its output to the log. On timeout it gets Ctrl+C (so jig stops its commands), then SIGKILL. */

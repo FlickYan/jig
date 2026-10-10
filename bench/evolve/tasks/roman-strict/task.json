@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement to_roman and from_roman in roman.py, following SPEC.md exactly.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "parsing"
+  ]
+}

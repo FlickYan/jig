@@ -31,6 +31,11 @@ export class Conversation {
     this.pinned.set(key, text);
   }
 
+  /** What the model is given besides the messages, for the session file to record. */
+  describe(context?: { system: string; tools: Anthropic.Beta.BetaTool[] }): void {
+    if (context) this.session?.describe(context);
+  }
+
   push(message: MessageParam): void {
     this.messages.push(message);
     this.tokens += estimateTokens(message.content);

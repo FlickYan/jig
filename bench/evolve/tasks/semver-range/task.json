@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement satisfies(version, range) in semver_range.py, following SPEC.md exactly.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "versions"
+  ]
+}
