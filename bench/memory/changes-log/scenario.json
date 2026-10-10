@@ -1,0 +1,11 @@
+{
+  "description": "A preference for every project, said once in another one: log each change in CHANGES.md.",
+  "first": "Add a one-line docstring to main() in tool.py. And from now on, in every project I work on, not just this one: whenever I ask you for a change, add a line for it to CHANGES.md in the project's root: the date (YYYY-MM-DD), a colon, and what changed in a few words.",
+  "followups": [
+    {
+      "project": "other-project",
+      "prompt": "Rename the function getdata to get_data everywhere in this project.",
+      "check": "! grep -rq 'getdata' --include='*.py' . && grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}: .*get_data' CHANGES.md"
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { findSecret } from "./secrets.ts";
 import type { SkillEval } from "./skill-evals.ts";
 import { descriptionProblems, nameProblems, userSkillsDir } from "./skills.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
@@ -49,7 +50,7 @@ export function proposeSkillTool(approve: Approver = askInTerminal): Tool {
         additionalProperties: false,
       },
     },
-    kind: "read", // it changes nothing itself: the user decides
+    kind: "propose", // it changes nothing itself: the user decides
     describe: ({ name }) => String(name),
 
     async run(input, ctx) {
@@ -83,6 +84,8 @@ function toProposal(input: ToolInput): SkillProposal {
     if (typeof content !== "string") problems.push(`The content of ${path} isn't text.`);
   }
   if (!Array.isArray(evals) || evals.some((item) => typeof item?.prompt !== "string")) problems.push("Each eval needs a prompt.");
+  const secret = findSecret([description, instructions, ...Object.values(files ?? {}).map(String)].join("\n"));
+  if (secret) problems.push(`It seems to hold ${secret}; a skill must not contain secrets (point to where one is kept instead).`);
   if (problems.length) throw new Error(`The skill can't be proposed as it is: ${problems.join(" ")}`);
   return { name, description, instructions, files, evals };
 }

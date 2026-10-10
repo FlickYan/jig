@@ -70,7 +70,8 @@ export class Permissions {
     const command = tool.kind === "run" ? String(input.command) : "";
     const rule = command && this.denyRules.find((r) => matchesDenyRule(command, r));
     if (rule) return { refuse: `Refused: the command matches the deny rule "${rule}" in jig's settings. Don't try to get around it.` };
-    if (tool.kind === "read") return "allow";
+    // A proposal asks the user itself, and changes nothing until they agree.
+    if (tool.kind === "read" || tool.kind === "propose") return "allow";
     if (tool.kind === "external") return this.decideExternal(tool.definition.name);
     const commands = command ? parseCommand(command) : null;
     if (this.mode === "plan") {

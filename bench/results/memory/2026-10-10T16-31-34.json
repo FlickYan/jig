@@ -1,0 +1,184 @@
+{
+ "model": "deepseek-flash",
+ "attempts": 3,
+ "kept": {
+  "changes-log": {
+   "memories": [
+    "user/changes-md-log: On every change I ask for, add a line to CHANGES.md in the project root: YYYY-MM-DD, colon, what changed in a few words."
+   ],
+   "instructions": "# Agent notes\n\n## Changelog\n\nRecord every change in `CHANGES.md` at the repo root: one line per change, formatted `YYYY-MM-DD: what changed in a few words`. Create the file if it is missing.\n"
+  },
+  "commit-style": {
+   "memories": [],
+   "instructions": "# Project conventions\n\n## Commit messages\n\nCommit messages follow `<area>: <summary>`.\n\n- `area`: the module or file touched, lowercase (e.g. `readme`, `pagination`).\n- `summary`: imperative, lowercase, no period at the end.\n\nExample: `parser: handle empty lines`\n"
+  },
+  "vendor": {
+   "memories": [],
+   "instructions": "# Project conventions\n\n## Never edit `vendor/`\n\n`vendor/` is regenerated from upstream; any edits there are lost. Patch behaviour\nin `src/compat.py` instead.\n"
+  }
+ },
+ "runs": [
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 1,
+   "passed": true,
+   "steps": 5,
+   "cost": 0.001869072
+  },
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 1,
+   "passed": false,
+   "steps": 5,
+   "cost": 0.001229688
+  },
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 2,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.001828668
+  },
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 2,
+   "passed": false,
+   "steps": 6,
+   "cost": 0.001118028
+  },
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 3,
+   "passed": true,
+   "steps": 5,
+   "cost": 0.001497696
+  },
+  {
+   "scenario": "changes-log",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 3,
+   "passed": false,
+   "steps": 5,
+   "cost": 0.001123572
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 1,
+   "passed": true,
+   "steps": 7,
+   "cost": 0.001628472
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 1,
+   "passed": false,
+   "steps": 7,
+   "cost": 0.0013805760000000001
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 2,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.0013694879999999999
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 2,
+   "passed": false,
+   "steps": 8,
+   "cost": 0.001765044
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 3,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.0012760199999999999
+  },
+  {
+   "scenario": "commit-style",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 3,
+   "passed": false,
+   "steps": 6,
+   "cost": 0.0012107759999999998
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 1,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.002289648
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 1,
+   "passed": false,
+   "steps": 6,
+   "cost": 0.002058924
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 2,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.001983132
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 2,
+   "passed": false,
+   "steps": 7,
+   "cost": 0.002424228
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "with",
+   "attempt": 3,
+   "passed": true,
+   "steps": 6,
+   "cost": 0.0020088959999999996
+  },
+  {
+   "scenario": "vendor",
+   "followup": 1,
+   "arm": "without",
+   "attempt": 3,
+   "passed": false,
+   "steps": 6,
+   "cost": 0.0014376480000000001
+  }
+ ]
+}

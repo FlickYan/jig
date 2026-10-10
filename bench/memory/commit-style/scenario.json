@@ -1,0 +1,10 @@
+{
+  "description": "A commit message convention, said once: <area>: <summary>, lowercase, no period.",
+  "first": "Fix the typo in README.md ('Teh' should be 'The') and commit it. One thing for the future: commit messages in this project are '<area>: <summary>': the area is the module or file you touched, lowercase; the summary is imperative, lowercase, with no period at the end, for example 'parser: handle empty lines'.",
+  "followups": [
+    {
+      "prompt": "page() is off by one: page 1 should be the first page. Fix it, run the tests, and commit the fix.",
+      "check": "python3 test_pagination.py >/dev/null 2>&1 && git log -1 --format=%s | grep -Eq '^[a-z][a-z0-9_.-]*: [a-z][^A-Z]*[^.]$' && [ \"$(git log -1 --format=%s)\" != start ]"
+    }
+  ]
+}

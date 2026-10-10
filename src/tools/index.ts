@@ -33,9 +33,10 @@ export interface Tool {
   definition: Anthropic.Beta.BetaTool;
   /**
    * What the tool can do, which decides whether it needs approval: look, change files in the project,
-   * run commands, or act outside the sandbox's reach (an MCP server's tools).
+   * run commands, act outside the sandbox's reach (an MCP server's tools), or propose a change to jig itself
+   * (a memory, a skill), which the tool puts to the user on its own.
    */
-  kind: "read" | "edit" | "run" | "external";
+  kind: "read" | "edit" | "run" | "external" | "propose";
   /** What the terminal shows for a call: the first line goes next to the tool name, the rest below it. */
   describe(input: ToolInput): string;
   /** Returns the text the model sees. To report a failure, throw an Error: its message goes to the model. */

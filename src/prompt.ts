@@ -51,6 +51,8 @@ export interface PromptOptions {
   tools?: string[];
   /** A system prompt to use instead of jig's own (--system-prompt). The sections that follow it stay. */
   custom?: string;
+  /** The memory section: what memory is for, and the index of what is remembered (see memory.ts). */
+  memory?: string;
 }
 
 /**
@@ -67,7 +69,7 @@ const ON_YOUR_OWN = `You are running one task on your own, not an interactive se
 /** Sent once when the model first stops in a one-shot run (see AgentOptions.review). */
 export const REVIEW = `Before you finish, check your work against the task. Go through its requirements one by one, and for each, name what you ran or saw that shows it is met: file names and paths, output formats, exact values, and the ways the task says your work will be used. Verify anything you haven't actually seen, and fix whatever is wrong. Then give your final summary; if everything was already verified, say so briefly.`;
 
-export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false, tools, custom }: PromptOptions = {}): string {
+export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false, tools, custom, memory = "" }: PromptOptions = {}): string {
   const has = (...names: string[]) => !tools || names.every((name) => tools.includes(name));
   const fileTools = !tools || tools.some((name) => FILE_TOOLS.includes(name));
   const prompt = custom?.trim() || `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
@@ -87,7 +89,7 @@ Environment:
 - Git repository: ${gitRoot(cwd) ? "yes" : "no"}
 - Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted" or a connection error.` : "run directly on the user's machine."}
 - Today's date: ${new Date().toLocaleDateString("en-CA")}`;
-  return [prompt, oneShot ? ON_YOUR_OWN : "", skills, projectInstructions(instructions)].filter(Boolean).join("\n\n");
+  return [prompt, oneShot ? ON_YOUR_OWN : "", skills, memory, projectInstructions(instructions)].filter(Boolean).join("\n\n");
 }
 
 function projectInstructions(instructions: Instructions[]): string {

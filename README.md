@@ -67,6 +67,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --no-subagents    leave out the subagent tool
       --tools <names>   give the model only some of jig's tools, e.g. --tools bash
       --hide-skill <name>  leave a skill out, as if it weren't installed (repeatable)
+      --no-memory       leave out what jig remembers from earlier sessions
       --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
       --check           in a one-shot run, ask the model to check its work before it finishes
@@ -132,6 +133,26 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
   continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
+- **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
+  User memories (how you like to work) hold in every project; project memories (facts about a project
+  that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,
+  outside the repository; the system prompt lists them by name and one-line description, newest first,
+  and the `memory` tool reads one in full. Conventions every agent working on a project should follow
+  belong in its AGENTS.md instead, and jig proposes edits to it as diffs.
+
+  ```text
+  /remember tests run with make check, never pytest directly      in a session: proposes a memory
+  /reflect                     proposes what this conversation should leave behind: memories, AGENTS.md edits
+  /memory                      lists what jig remembers
+  jig memory reflect           the same for your last session here (--yes keeps every proposal, for scripts)
+  jig memory list | show <name> | remove <name>
+  ```
+
+  The model proposes with `propose_memory` and `propose_instructions`; jig checks each proposal (a memory
+  is one fact, its description one line, and nothing that looks like a secret), shows it to you, and keeps
+  it only if you say yes. Memories were true when saved, so the prompt asks the model to check one that
+  names a file, function or command before relying on it, and to propose forgetting one that turned out
+  wrong. `--no-memory` leaves memory out.
 
 ### Extensions
 
@@ -217,6 +238,9 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/skill-store.ts`](src/skill-store.ts), [`src/skills-cli.ts`](src/skills-cli.ts) | `jig skills`: installing skills from folders and git repositories, the lockfile, updating and removing |
 | [`src/skill-proposals.ts`](src/skill-proposals.ts) | `propose_skill`: a skill the model wrote, checked and shown to the user, saved where they say |
 | [`src/skill-evals.ts`](src/skill-evals.ts) | `jig skills test`: a skill's evals, run with and without it, graded by their checks and a model |
+| [`src/memory.ts`](src/memory.ts), [`src/memory-cli.ts`](src/memory-cli.ts) | Memory: the files, their index in the system prompt, the `memory` tool, `propose_memory`, and `jig memory` |
+| [`src/instructions-proposals.ts`](src/instructions-proposals.ts) | `propose_instructions`: an edit to the project's AGENTS.md, shown as a diff and written if approved |
+| [`src/proposals.ts`](src/proposals.ts), [`src/secrets.ts`](src/secrets.ts) | Putting a proposal to the user; what jig refuses to write down because it looks like a secret |
 | [`skills/`](skills) | The skills that come with jig: `skill-writer`, which `/skills new` and `/learn` follow |
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
 | [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
@@ -228,7 +252,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs; the price table |
-| [`bench/`](bench) | The benchmark: tasks, runner and report |
+| [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
@@ -325,6 +349,24 @@ Ctrl+C, and when a safety classifier declines the request.
   skills add` lists them before anything is installed, runs nothing, and records the source and commit in
   a lockfile; `update` shows which files changed before replacing any. Repositories are cloned shallow
   and sparse, so one skill from a large collection fetches only its own folder.
+- **Memory lives outside the repository.** A memory is something the model takes as its own past
+  learning, so a file in a cloned repository must not be able to plant one. Memories go under
+  `~/.jig/memory/`, a project's keyed by its real path; what everyone working on a project should know
+  goes in its AGENTS.md, where it is visible and reviewed like any other change, and jig proposes those
+  edits as diffs.
+- **One file per memory, and jig builds the index.** The model never maintains a list that could drift
+  from the files: at the start of a session jig reads each memory's frontmatter and puts the index in the
+  system prompt, and each memory stays a file you can read, edit or delete.
+- **Reflection happens when you ask for it.** Proposals interrupt, so they come together at the end
+  (`/reflect`, `jig memory reflect`) or when you say to remember something, not in the middle of a task.
+  The model is told to keep one fact per memory, to update rather than duplicate, and to leave out what
+  the code, git history or AGENTS.md already say.
+- **Proposals run one at a time, in any mode.** Tools that propose a change to jig itself have their own
+  kind, `propose`: plan mode allows them (nothing changes unless you agree), they never run in parallel
+  (their questions would overlap, as `propose_skill`'s could in milestone 12), and subagents don't get them.
+- **Nothing that looks like a secret is written down.** A memory goes into every later prompt, so a key
+  pasted into one would leak from then on. Memories, AGENTS.md edits and skills are refused if they hold
+  something shaped like an API key, a token, a private key or a password assignment.
 - **Calls that only read run at the same time.** When every call in a reply is a read (file reads,
   searches, subagents, read-only MCP tools), they run in parallel; if any call changes something, they
   all run in order, since one may depend on another. Results still go back in the order of the calls, and
@@ -847,6 +889,46 @@ tasks go better with it.
   or the expectations name as they ended up, and the commands the agent ran with their output; tests
   cover both fixes. A model grader is only as good as its evidence, which is why `check` exists.
 
+### Milestone 13: memory and context
+
+Milestone 13 gives jig a memory across sessions, and lets it propose edits to a project's AGENTS.md:
+the second piece of the plan, after skills, and under the same rule (jig proposes, you approve). The
+measure is whether a later session goes better for what an earlier one left behind.
+
+The memory benchmark ([`bench/memory/`](bench/memory), run by `node bench/memory.ts`) has three
+scenarios. In each, the user says something once, in a first session, while asking for something else;
+then `jig memory reflect --yes` keeps what it proposes; then a follow-up task, which doesn't mention it,
+runs three times with what reflection kept and three times without it (`--no-memory`, and AGENTS.md as
+it was), each graded by a check:
+
+- **commit-style:** commit messages here are `<area>: <summary>`, lowercase, without a period. The
+  follow-up fixes a bug and commits; nothing in the repository shows the convention.
+- **vendor:** never edit `vendor/`, which is regenerated; patch behaviour in `src/compat.py`. The
+  follow-up's bug is in the vendored code, the obvious place to fix it.
+- **changes-log:** "in every project", log each change in `CHANGES.md` with the date. The follow-up runs
+  in a different project, so only a user memory can carry it there.
+
+| scenario | what reflection kept | with it | without |
+|----------|----------------------|---------|---------|
+| commit-style | a "Commit messages" section in AGENTS.md | 3/3 | 0/3 |
+| vendor | a "Never edit `vendor/`" section in AGENTS.md | 3/3 | 0/3 |
+| changes-log | a user memory (and an AGENTS.md note in the first project) | 3/3 | 0/3 |
+| all | | 9/9 | 0/9 |
+
+- **What was said once carried over every time.** Without it, jig did each task competently and missed
+  the point: in one run it wrote "Fix off-by-one in page() so page 1 is the first page"; it fixed the
+  vendored code, where the bug was; it logged nothing. With it, the same tasks took no more steps (5.9 against 6.2).
+- **Reflection put each thing where it belonged.** It made the two project conventions sections of
+  AGENTS.md, as the prompt asks for rules every agent should follow, and the preference stated for "every
+  project" a user memory, which is what carried it into a project the first session never saw.
+- **The first run measured the benchmark, not jig.** `vendor` failed with the memory as well as without,
+  because checking the fixtures had left Python's bytecode caches in them: the runs committed them as part
+  of the starting point, and every test run then "changed" `vendor/`. The runner now leaves caches out
+  and has git ignore them; the scenario was rerun with the others.
+
+The in-house benchmark wasn't rerun: with nothing remembered, a one-shot task's prompt and tools are the
+same as in milestone 12 (the proposal tools come only in sessions and `jig memory reflect`).
+
 ## Tests
 
 ```bash
@@ -884,6 +966,7 @@ installs and runs the tarball on every push.
 - [x] **10. What mini-swe-agent's lead was made of:** experiments one difference at a time, on held-out tasks and then three attempts at the original ones (`--tools`, `--system-prompt`, mini-swe-agent's prompts through the adapter); the finding that both agents sometimes fetched the benchmark's answers, now counted as failures, which shrank mini-swe-agent's lead from 12 points to 5, within the noise; neither jig's tools nor mini-swe-agent's prompts made a reliable difference; three harness fixes: background jobs that held a command open, replies that broke off, and models killing jig through its command line (`jig -` reads the task from stdin)
 - [x] **11. One model, two APIs:** an OpenAI-compatible API (`--api openai`, `--base-url`) for OpenAI, local models through Ollama or vLLM, and DeepSeek's chat completions endpoint, translated at the edge so the rest of jig is unchanged; today's jig on both of DeepSeek's endpoints, in alternating rounds: no difference (−2 points, −10 to +7), and no agent errors in 120 attempts
 - [x] **12. Skills to install, write and measure:** `jig skills add/list/update/remove` from folders and git repositories, with a lockfile; the bundled `skill-writer`, `jig skills new` and `/skills new`, `jig skills learn` and `/learn`, all through `propose_skill`, which shows you the skill and saves it only where you say; `jig skills test`, each eval with and without the skill; a skill learned from one session passed 9 of 9 eval runs with it, against 0 of 9 without
+- [x] **13. Memory and context:** user and project memories under `~/.jig/memory/`, indexed in the system prompt and read with the `memory` tool; `propose_memory` and `propose_instructions` (AGENTS.md edits as diffs), approved one at a time, secrets refused; `/remember`, `/reflect`, `/memory` and `jig memory list|show|remove|reflect`; `--no-memory`; the memory benchmark: a convention or preference said once, in an earlier session, was followed in 9 of 9 later runs with what reflection kept and 0 of 9 without
 
 ## License
 

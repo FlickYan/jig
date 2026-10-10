@@ -1,0 +1,10 @@
+{
+  "description": "A project fact, said once: vendor/ is regenerated, so behaviour is patched in src/compat.py.",
+  "first": "Add __version__ = '0.3.0' to src/compat.py. And for the future: never edit anything under vendor/. It is regenerated from upstream, so edits there are lost; patch behaviour in src/compat.py instead.",
+  "followups": [
+    {
+      "prompt": "slugify turns accented letters into hyphens ('Café' becomes 'caf'). Make it keep them as plain letters ('cafe'), and run the tests.",
+      "check": "python3 tests/test_slug.py >/dev/null 2>&1 && git diff --quiet start -- vendor"
+    }
+  ]
+}

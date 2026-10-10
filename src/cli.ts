@@ -15,6 +15,10 @@ import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
+import { proposeInstructionsTool } from "./instructions-proposals.ts";
+import { loadMemories, memoryPrompt, memoryTool, proposeMemoryTool } from "./memory.ts";
+import { memoryCommand } from "./memory-cli.ts";
+import { terminalApprover } from "./proposals.ts";
 import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
@@ -57,6 +61,7 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           (from ${TOOL_NAMES.join(", ")}; default: all)
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
+      --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
                           use this system prompt instead of jig's own (the project's AGENTS.md and the
                           skills are still added after it)
@@ -69,6 +74,7 @@ jig follows the project's AGENTS.md (or CLAUDE.md), saves every session under ~/
 snapshots the project's files before each task so /undo can put them back.
 
 jig skills list | add | remove | update | new | learn | test manages skills (jig skills --help).
+jig memory list | show | remove | reflect manages what jig remembers (jig memory --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
 commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
@@ -85,6 +91,9 @@ const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks be
   /skills                      list the skills; /<skill> [task] runs one
   /skills new <what it is for> write a new skill with the model; you approve it before it is saved
   /learn [focus]               turn what this conversation did into a skill, if it holds one
+  /memory                      list what jig remembers, yours and this project's
+  /remember <what>             save something for later sessions (you approve it)
+  /reflect [focus]             propose what this conversation should leave behind: memories, AGENTS.md edits
   /mcp                         list the MCP servers and their tools
   /context                     show how much context the conversation takes up
   /compact                     summarize the conversation to free up context
@@ -97,6 +106,23 @@ function newSkillTask(what: string, interactive: boolean): string {
     ? "ask me about anything you would otherwise have to guess, "
     : "don't ask questions (no one can answer them now): where you have to assume something, say so in the skill, and ";
   return `Write a new skill: ${what}\n\nFollow the skill-writer skill above. Look at the project as far as the skill depends on it, ${asking}then submit the skill with propose_skill.`;
+}
+
+/** /reflect: what this conversation showed that later sessions should know, proposed for the user to approve. */
+function reflectTask(focus: string): string {
+  return (
+    "Look back over this conversation for what later sessions should know, and propose it for the user to approve:\n" +
+    "- how the user wants you to work: their preferences, and the corrections they made (user scope if it holds in every project, project scope if only here);\n" +
+    "- facts about this project that its code, git history and AGENTS.md don't already say: decisions and their reasons, constraints, what turned out to be tricky;\n" +
+    "- conventions every agent working on this project should follow: propose those as an edit to AGENTS.md with propose_instructions, not as memories.\n" +
+    "Propose each memory with propose_memory: one fact each, its description the fact itself. Update an existing memory rather than adding a near-duplicate, and forget one that this conversation showed to be wrong. Leave out what matters only to this task, and anything secret. If nothing is worth keeping, say so in one line." +
+    (focus ? `\n\nFocus on: ${focus}` : "")
+  );
+}
+
+/** /remember: one thing the user wants kept. */
+function rememberTask(what: string): string {
+  return `Remember this for later sessions: ${what}\n\nPropose it with propose_memory: the scope (user if it holds in every project, project if only here), a short name, and a description that states it in one line. If it is a convention every agent working here should follow, propose it for AGENTS.md with propose_instructions instead.`;
 }
 
 /** /learn: what the conversation so far did, distilled into a skill if it holds a procedure worth keeping. */
@@ -113,11 +139,14 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // The task is in jig's arguments, and models stop programs by matching command lines (pkill -f server.py),
   // which could match jig itself. Where the title can't hide them (under emulation, say), pass the task as -.
   process.title = "jig";
-  // `jig skills <command>` manages skills; new and learn run the model, so they carry on below.
+  // `jig skills <command>` manages skills and `jig memory <command>` memories; skills new and learn, and
+  // memory reflect, run the model, so they carry on below.
   const skillsVerb = argv[0] === "skills" && (argv[1] === "new" || argv[1] === "learn") ? argv[1] : undefined;
+  const memoryVerb = argv[0] === "memory" && argv[1] === "reflect" ? argv[1] : undefined;
   if (argv[0] === "skills" && !skillsVerb) return skillsCommand(argv.slice(1));
+  if (argv[0] === "memory" && !memoryVerb) return memoryCommand(argv.slice(1));
   const { values, positionals } = parseArgs({
-    args: skillsVerb ? argv.slice(2) : argv,
+    args: skillsVerb || memoryVerb ? argv.slice(2) : argv,
     allowPositionals: true,
     allowNegative: true,
     options: {
@@ -142,6 +171,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       stats: { type: "string" },
       "system-prompt": { type: "string" },
       "hide-skill": { type: "string", multiple: true, default: [] },
+      memory: { type: "boolean", default: true },
       check: { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -160,7 +190,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const given = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
   if (positionals.join(" ") === "-" && !given) throw new Error("The task was to come from stdin (jig -), but stdin was empty.");
   if (skillsVerb === "new" && !given) throw new Error("Usage: jig skills new <what the skill is for>");
-  const taskText = skillsVerb === "new" ? newSkillTask(given, false) : skillsVerb === "learn" ? learnTask(given) : given;
+  const taskText = skillsVerb === "new" ? newSkillTask(given, false) : skillsVerb === "learn" ? learnTask(given) : memoryVerb ? reflectTask(given) : given;
   // A task on the command line with --check: nobody to talk to, so the model checks its own work.
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
@@ -206,8 +236,16 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const error of mcp.errors) ui.notice(error);
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
   let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
-  // Writing skills: in a session, whenever the user asks; on the command line, only for jig skills new and learn.
-  const proposals = !taskText || skillsVerb ? [proposeSkillTool()] : [];
+  // Memory: notes from earlier sessions (--no-memory leaves them out, for a with-and-without comparison).
+  let memories = values.memory ? loadMemories(cwd) : [];
+  const proposingMemory = values.memory && (!taskText || !!memoryVerb);
+  // What jig may propose about itself: skills in a session or jig skills new and learn; memories and
+  // AGENTS.md edits in a session or jig memory reflect. --yes there keeps every proposal, for scripts.
+  const approve = terminalApprover({ yes: !!memoryVerb && values.yes });
+  const proposals = [
+    ...(!taskText || skillsVerb ? [proposeSkillTool()] : []),
+    ...(proposingMemory ? [proposeMemoryTool(cwd, approve), proposeInstructionsTool(approve)] : []),
+  ];
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
   let instructions = loadInstructions(cwd);
@@ -239,17 +277,33 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     ui: ui.subagentUI,
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
-  const toolsFrom = (extra: Tool[]) => [...own, ...(withSubagents ? [subagentTool(subagents)] : []), ...extra, ...proposals];
+  const toolsFrom = (extra: Tool[]) => [
+    ...own,
+    ...(withSubagents ? [subagentTool(subagents)] : []),
+    ...extra,
+    ...(memories.length ? [memoryTool(memories)] : []),
+    ...proposals,
+  ];
   let tools = toolsFrom(extensions);
   const newModel = () => {
-    const prompt = { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot, tools: named(tools), custom: values["system-prompt"] };
+    const prompt = {
+      instructions,
+      sandboxLimits: sandbox?.limits,
+      skills: skillCatalog(skills),
+      memory: memoryPrompt(memories, { proposing: proposingMemory }),
+      dirs,
+      oneShot,
+      tools: named(tools),
+      custom: values["system-prompt"],
+    };
     const system = systemPrompt(cwd, prompt);
     return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
-  // jig skills learn works on the last session, unless --resume names another.
-  const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue || skillsVerb === "learn" ? SessionFile.list(cwd).at(-1) : undefined;
+  // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
+  const fromLast = values.continue || skillsVerb === "learn" || !!memoryVerb;
+  const resumeFrom = values.resume ? findSession(cwd, values.resume) : fromLast ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
-  if (skillsVerb === "learn" && !resumeFrom) throw new Error("There is no saved session in this project to learn from.");
+  if ((skillsVerb === "learn" || memoryVerb) && !resumeFrom) throw new Error(`There is no saved session in this project to ${memoryVerb ? "reflect on" : "learn from"}.`);
   let conversation = resumeFrom
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
@@ -351,9 +405,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return runTask(`${content}\n\n${task}`, label);
   }
 
-  /** Finds the skills again (a new one may have been saved) and gives the model the new list. */
+  /** Finds the skills and memories again (new ones may have been saved) and gives the model the new lists. */
   function refreshSkills(): void {
     ({ skills } = discoverSkills(cwd, undefined, skillOptions));
+    memories = values.memory ? loadMemories(cwd) : [];
     extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
     researchTools = researchFrom(extensions);
     tools = toolsFrom(extensions);
@@ -413,6 +468,17 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       else await runSkillWriting(newSkillTask(what, true), line);
     } else if (name === "/learn") {
       await runSkillWriting(learnTask(line.slice(name.length).trim()), line);
+    } else if (name === "/reflect") {
+      await runTask(reflectTask(line.slice(name.length).trim()), line);
+    } else if (name === "/remember") {
+      const what = line.slice(name.length).trim();
+      if (!what) ui.notice("Say what to remember: /remember <what>");
+      else await runTask(rememberTask(what), line);
+    } else if (name === "/memory") {
+      const now = loadMemories(cwd);
+      if (!now.length) ui.notice("Nothing remembered yet. /remember saves something; /reflect proposes what this conversation should leave behind.");
+      for (const memory of now) ui.println(`  ${memory.name}  ${ui.dim(`${memory.description} (${memory.scope}${memory.updated ? `, ${memory.updated}` : ""})`)}`);
+      if (now.length !== memories.length) ui.println(ui.dim("New memories are in the model's view from the next session (or after /reset)."));
     } else if (name === "/skills") {
       if (!skills.length) ui.notice("No skills found. A skill is a folder with a SKILL.md, in .jig/skills, .agents/skills or .claude/skills.");
       for (const skill of skills) ui.println(`  /${skill.name}  ${ui.dim(`${skill.description}${skill.scope === "project" ? "" : ` (${skill.scope})`}`)}`);
@@ -441,7 +507,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
-    const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText);
+    const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText, memoryVerb ? `jig memory reflect ${given}` : taskText);
     if (!(await run)) process.exitCode = 1;
     return;
   }
