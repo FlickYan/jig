@@ -19,6 +19,7 @@ import { TOOLS, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { collectNotices } from "./notices.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
 
@@ -123,19 +124,16 @@ describe("a hung API", () => {
     const env = { ...process.env };
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.ANTHROPIC_API_KEY = "test-key";
-    const printed: string[] = [];
-    const write = process.stdout.write;
-    process.stdout.write = ((chunk: string | Uint8Array) => printed.push(String(chunk)) > 0) as typeof process.stdout.write;
+    const { notices, stop } = collectNotices("trying again");
     try {
       const callModel = createModel({ model: "claude-haiku-4-5", system: "", tools: [], timeout: 100 });
       await assert.rejects(callModel([{ role: "user", content: "hi" }]), /timed out/i);
     } finally {
-      process.stdout.write = write;
+      stop();
       process.env = env;
       server.closeAllConnections();
       server.close();
     }
-    const notices = printed.join("").split("\n").filter((line) => line.includes("trying again"));
     assert.equal(notices.length, 2);
     assert.match(notices[0], /The API didn't answer in time; trying again \(2 tries left\)/);
   });
@@ -173,15 +171,13 @@ describe("a reply that breaks off", () => {
     const env = { ...process.env };
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.ANTHROPIC_API_KEY = "test-key";
-    const printed: string[] = [];
-    const write = process.stdout.write;
-    process.stdout.write = ((chunk: string | Uint8Array) => printed.push(String(chunk)) > 0) as typeof process.stdout.write;
+    const { notices, stop } = collectNotices("broke off");
     const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [] })([{ role: "user", content: "hi" }]);
     return {
       result,
-      notices: () => printed.join("").split("\n").filter((line) => line.includes("broke off")),
+      notices: () => notices,
       done() {
-        process.stdout.write = write;
+        stop();
         process.env = env;
         server.closeAllConnections();
         server.close();

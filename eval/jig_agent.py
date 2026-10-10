@@ -63,6 +63,9 @@ class JigOptions(InstalledAgentOptions):
     prompts: str | None = Field(
         default=None, description="mini: mini-swe-agent's system prompt and task template instead of jig's"
     )
+    api: Annotated[str | None, Cli("--api")] = Field(
+        default=None, description="jig's --api: anthropic or openai (DeepSeek serves both)"
+    )
 
 
 class Jig(BaseInstalledAgent):
@@ -142,7 +145,7 @@ class Jig(BaseInstalledAgent):
     @with_prompt_template
     async def run(self, instruction: str, environment: BaseEnvironment, context: AgentContext) -> None:
         model = (self.model_name or "deepseek-flash").split("/", 1)[-1]
-        key_name = "ANTHROPIC_API_KEY" if model.startswith("claude") else "DEEPSEEK_API_KEY"
+        key_name = "ANTHROPIC_API_KEY" if model.startswith("claude") else "DEEPSEEK_API_KEY" if model.startswith("deepseek") else "OPENAI_API_KEY"
         key = self._get_env(key_name)
         if not key:
             raise ValueError(f"Set {key_name} in the environment harbor runs in.")

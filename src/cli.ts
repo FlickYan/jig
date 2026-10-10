@@ -8,7 +8,8 @@ import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks } from "./hooks.ts";
 import { connectMcpServers } from "./mcp.ts";
-import { type CallModel, contextWindow, createModel, EFFORTS, type Effort } from "./model.ts";
+import OpenAI from "openai";
+import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
@@ -27,7 +28,12 @@ const HELP = `Usage: jig [options] [task]
 Runs one task, or starts an interactive session if no task is given. A task of - is read from stdin.
 
 Options:
-  -m, --model <id>        deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
+  -m, --model <id>        deepseek-flash (default), deepseek-v4-pro, a Claude model like claude-opus-5-5, or
+                          a model an OpenAI-compatible API serves (gpt-5, or a local model with --base-url)
+      --api <format>      ${APIS.join(" | ")}: the API format (default: anthropic for Claude and DeepSeek
+                          models, openai for others; DeepSeek serves both)
+      --base-url <url>    the API's address, e.g. http://localhost:11434/v1 for Ollama (default: the
+                          provider's own; OPENAI_BASE_URL works too)
   -e, --effort <level>    ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
@@ -87,6 +93,8 @@ async function main(): Promise<void> {
     allowNegative: true,
     options: {
       model: { type: "string", short: "m", default: "deepseek-flash" },
+      api: { type: "string" },
+      "base-url": { type: "string" },
       effort: { type: "string", short: "e" },
       mode: { type: "string", default: "edits" },
       yes: { type: "boolean", short: "y", default: false },
@@ -127,6 +135,9 @@ async function main(): Promise<void> {
   const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
+  const api = (values.api ?? defaultApi(model)) as Api;
+  if (!APIS.includes(api)) throw new Error(`--api must be one of: ${APIS.join(", ")}`);
+  const baseURL = values["base-url"];
   const mode = (values.yes ? "auto" : values.mode) as Mode;
   if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
@@ -173,7 +184,7 @@ async function main(): Promise<void> {
   const metered = (callModel: CallModel, subagent = false) => stats?.meter(callModel, { subagent }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
-    return metered(createModel({ model, effort, quiet: true, system, tools: researchTools }), true);
+    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
   };
   const subagents: SubagentSetup = {
     callModel: newSubagentModel(),
@@ -195,7 +206,7 @@ async function main(): Promise<void> {
   const newModel = () => {
     const prompt = { instructions, sandboxLimits: sandbox?.limits, skills: skillCatalog(skills), dirs, oneShot, tools: named(tools), custom: values["system-prompt"] };
     const system = systemPrompt(cwd, prompt);
-    return metered(createModel({ model, effort, system, tools }));
+    return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
   const resumeFrom = values.resume ? findSession(cwd, values.resume) : values.continue ? SessionFile.list(cwd).at(-1) : undefined;
   if (values.continue && !resumeFrom) throw new Error("There is no saved session in this project to continue.");
@@ -367,7 +378,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  const through = api === defaultApi(model) && !baseURL ? "" : ` (${api} API${baseURL ? ` at ${baseURL}` : ""})`;
+  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model}${through} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
   if (noSandbox) ui.notice(`${noSandbox} Commands run directly on this machine.`);
   else ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (sandbox off)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
@@ -495,10 +507,10 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
 }
 
 function describeError(err: unknown): string {
-  if (err instanceof Anthropic.AuthenticationError) {
-    return "Authentication failed: check DEEPSEEK_API_KEY (DeepSeek models) or ANTHROPIC_API_KEY (Claude models).";
+  if (err instanceof Anthropic.AuthenticationError || err instanceof OpenAI.AuthenticationError) {
+    return "Authentication failed: check DEEPSEEK_API_KEY (DeepSeek models), ANTHROPIC_API_KEY (Claude models) or OPENAI_API_KEY (others).";
   }
-  if (err instanceof Anthropic.APIError) return `API error${err.status ? ` ${err.status}` : ""}: ${err.message}`;
+  if (err instanceof Anthropic.APIError || err instanceof OpenAI.APIError) return `API error${err.status ? ` ${err.status}` : ""}: ${err.message}`;
   return err instanceof Error ? err.message : String(err);
 }
 

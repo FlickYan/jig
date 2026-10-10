@@ -11,7 +11,7 @@ const DEFAULT_TIMEOUT = 120; // seconds
 // jig's own credentials. The commands the model runs never need them, and they shouldn't see them: in
 // the Terminal-Bench runs the model printed the environment with `env` to look around, which put the key
 // into the conversation and the logs, and a prompt injection could send it somewhere instead.
-const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
+const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
 const MAX_TIMEOUT = 600;
 const MAX_CAPTURE = 5_000_000; // characters; a command printing more than this is killed
 const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output

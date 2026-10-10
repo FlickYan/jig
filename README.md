@@ -1,7 +1,8 @@
 # jig
 
 A minimal coding agent for the terminal, written from scratch in TypeScript on the Anthropic Messages API
-(Claude, or DeepSeek through its Anthropic-compatible endpoint). There is no agent framework: it is one
+(Claude, or DeepSeek through its Anthropic-compatible endpoint), and on any OpenAI-compatible API (OpenAI,
+DeepSeek's, or a local model through Ollama or vLLM). There is no agent framework: it is one
 streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
 (an OS sandbox on macOS and Linux, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
 servers, hooks, subagents), and a benchmark that measures each version.
@@ -11,14 +12,22 @@ agent harness does for a model.)
 
 ## Quick start
 
-You need Node 22.18 or newer and an API key: DeepSeek for the default model (`deepseek-flash`), or
-Anthropic for Claude models.
+You need Node 22.18 or newer and an API key: DeepSeek for the default model (`deepseek-flash`),
+Anthropic for Claude models, or whatever an OpenAI-compatible API asks for.
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...    # or ANTHROPIC_API_KEY, and pass --model claude-opus-5-5
 
 npx jig-agent "the login test is failing, fix it"   # run one task in the current directory
 npm install -g jig-agent                            # or install it: then `jig` in any project
+```
+
+Other models go through an OpenAI-compatible API:
+
+```bash
+OPENAI_API_KEY=sk-... jig --model gpt-5 "..."                                  # OpenAI
+jig --model qwen3-coder:30b --base-url http://localhost:11434/v1 "..."          # a local model (Ollama)
+jig --api openai "..."                                    # DeepSeek through its OpenAI-compatible API
 ```
 
 From a clone, Node runs the TypeScript in `src/` directly, so there is no build step:
@@ -33,7 +42,10 @@ npm run build && npm link   # optional: puts this clone's `jig` on your PATH
 ```
 Usage: jig [options] [task]          (a task of - is read from stdin)
 
-  -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, or a Claude model like claude-opus-5-5
+  -m, --model <id>      deepseek-flash (default), deepseek-v4-pro, a Claude model like claude-opus-5-5, or
+                        a model an OpenAI-compatible API serves (gpt-5, or a local model with --base-url)
+      --api <format>    anthropic | openai (default: anthropic for Claude and DeepSeek, openai for others)
+      --base-url <url>  the API's address, e.g. http://localhost:11434/v1 for Ollama
   -e, --effort <level>  low | medium | high | xhigh | max (default: the model's own; DeepSeek takes low | high | max)
       --mode <mode>     when to ask before a tool call (default: edits)
                           plan   look around and plan; refuse every change
@@ -174,7 +186,8 @@ received (subagents included), and how many input tokens came from the prompt ca
 | [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed |
 | [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
-| [`src/model.ts`](src/model.ts) | The only file that talks to the API: request settings per provider, streaming, checking streamed tool input |
+| [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
+| [`src/openai.ts`](src/openai.ts) | The OpenAI-compatible API: the conversation as chat messages on the way out, the streamed reply as Messages API blocks on the way in |
 | [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent` |
 | [`src/skills.ts`](src/skills.ts) | Finding skills, the catalog in the system prompt, and the `skill` tool |
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
@@ -291,11 +304,16 @@ Ctrl+C, and when a safety classifier declines the request.
   fail before their reply begins, so jig itself asks again, up to twice, when a reply breaks off partway:
   the connection drops, the stream ends early, or an overload error arrives mid-stream. In milestone 10
   one dropped connection had ended a Terminal-Bench task.
-- **Two providers, one format.** DeepSeek's Anthropic-compatible API lets the same SDK and message format
-  serve both. DeepSeek does not support `is_error` on tool results, so for DeepSeek failures are marked
-  with `Error:` in the text instead, and the Claude-only settings (adaptive thinking with short progress
-  notes, prompt-cache breakpoints, a server-side fallback model if a safety classifier declines) are left
-  out.
+- **One message format, translated at the edge.** DeepSeek's Anthropic-compatible API lets the same SDK
+  and message format serve Claude and DeepSeek. DeepSeek does not support `is_error` on tool results, so
+  for DeepSeek failures are marked with `Error:` in the text instead, and the Claude-only settings
+  (adaptive thinking with short progress notes, prompt-cache breakpoints, a server-side fallback model if a
+  safety classifier declines) are left out. An OpenAI-compatible API gets the same conversation translated
+  in [`src/openai.ts`](src/openai.ts), and its reply is translated back into the Messages API's blocks, so
+  the agent loop, sessions, compaction and tools don't know which API they ran on. Thinking goes back as
+  `reasoning_content`, which DeepSeek requires on every earlier reply once tools are declared; each tool
+  result becomes a `tool` message right after its call; cached tokens, which the chat API counts inside
+  the prompt, are counted apart as on the Messages API. Claude stays on the Messages API.
 
 ## Benchmark
 
@@ -368,13 +386,15 @@ for comparing against other agents. For that, see [Terminal-Bench](#terminal-ben
 
 ### Results
 
-**M7 on macOS and on Linux, and M10**, on the current suite (deepseek-flash, three attempts per task):
+**M7 on macOS and on Linux, M10, and M11 through the OpenAI-compatible API**, on the current suite
+(deepseek-flash, three attempts per task):
 
 | run | passed | steps | tool calls | failed tool calls | tokens in | cost | time |
 |-----|--------|-------|------------|-------------------|-----------|------|------|
 | m7 (macOS, Seatbelt) | 100% (60/60) | 7.0 | 8.9 | 0.0 | 30,795 | $0.0047 | 14s |
 | m7-linux (Debian container, bubblewrap) | 100% (60/60) | 7.0 | 8.7 | 0.0 | 30,780 | $0.0043 | 13s |
 | m10 (macOS) | 100% (60/60) | 6.7 | 8.5 | 0.0 | 27,645 | $0.0041 | 13s |
+| m11, `--api openai` (macOS) | 100% (60/60) | 7.2 | 9.2 | 0.0 | 35,683 | $0.0045 | 14s |
 
 Every attempt passed on both systems, so nothing in milestones 6 and 7 cost a task. The Linux run ran
 jig as an ordinary user in a Debian container, every command in the bubblewrap sandbox; no command
@@ -385,7 +405,8 @@ failed. They now pass the test files by name. That changed the suite's fingerpri
 directly comparable with the ones below, though no task changed.
 
 M10 changed how commands end, retries and the process title; it cost no task here either, and again no
-attempt acted on the prompt injections (0 of 6).
+attempt acted on the prompt injections (0 of 6). Through DeepSeek's OpenAI-compatible API (M11), jig
+passed every attempt too, at about the same cost.
 
 **M4 against M5, on the 20-task suite as it was then** (in `bench/results/suite-20/`; deepseek-flash,
 three attempts per task):
@@ -709,6 +730,36 @@ python3 eval/report.py eval/results/tb-jig.json eval/results/tb-jig-mini.json ev
     process title to `jig`, and the adapter passes the task on stdin (`jig -`). mini-swe-agent, which gets
     the task as an argument too, has the same exposure.
 
+### Milestone 11: one model, two APIs
+
+Milestone 11 gave jig a second API format, OpenAI-compatible chat completions. It reaches OpenAI, local
+models through Ollama or vLLM, and DeepSeek's other endpoint, the one mini-swe-agent uses, which made it
+possible to test milestone 10's last suspect. Today's jig ran on both of DeepSeek's endpoints, three
+attempts at the original 20 tasks each, alternating one round of each so that whatever DeepSeek's service
+did over the 12 hours fell on both alike.
+
+```bash
+eval/run.sh tb-jig-anthropic jig                   # one attempt per job, alternating: then
+eval/run.sh tb-jig-openai jig --ak api=openai      # tb-jig-anthropic-r2, tb-jig-openai-r2, and so on
+python3 eval/report.py eval/results/tb-jig-anthropic.json eval/results/tb-jig-openai.json eval/results/tb-mini.json
+```
+
+| original 20, 3 attempts | passed | looked up | against the Anthropic endpoint | timed out | errors | turns | cost |
+|-------------------------|--------|-----------|--------------------------------|-----------|--------|-------|------|
+| jig, DeepSeek's Anthropic-compatible endpoint | 68% (41/60) | 0 | | 4 | 0 | 21.9 | $0.048 |
+| jig, DeepSeek's OpenAI-compatible endpoint | 67% (40/60) | 2 (passed) | −2 points (−10 to +7) | 3 | 0 | 21.6 | $0.050 |
+| mini-swe-agent (milestone 8's runs) | 73% (44/60) | 7 (5 passed) | +5 points (−3 to +13) | 6 | 1 | 33.9 | $0.080 |
+
+- **The endpoint makes no difference.** The same agent and model solved as much through either API, with
+  the same turns, tokens and cost. The rounds moved together, 14, 12 and 15 passes on one endpoint and
+  14, 12 and 14 on the other: the second round was harder on both, which is what alternating them was for.
+- **Where that leaves mini-swe-agent's lead.** Today's jig is 5 points behind (−3 to +13) at 40% less cost,
+  once look-ups count as failures. Neither the tools, nor the prompts, nor the endpoint accounts for that
+  remainder, and three attempts at 20 tasks can't tell it from noise.
+- **No agent errors in 120 attempts.** Milestone 8's runs lost two attempts to the grep bug, and milestone
+  10's last run four to dropped connections and self-kills; with those fixes, none failed that way here.
+- The two look-ups on the OpenAI endpoint (counted as failed) bring jig's own prompt to 4 in 300 attempts.
+
 ## Tests
 
 ```bash
@@ -744,6 +795,7 @@ installs and runs the tarball on every push.
 - [x] **8. npm package and error bars:** the `jig-agent` package (compiled JavaScript, `--version`, MIT license; CI packs, installs and runs it); three attempts per Terminal-Bench task with 95% intervals, which showed mini-swe-agent ahead by 12 points (+3 to +22) where one attempt had shown a tie (milestone 10 found that 5 of its passes were look-ups of the benchmark's answers: without them, +5, −3 to +15); a grep memory bug those runs found, reproduced and fixed
 - [x] **9. Checking before finishing:** a diagnosis of jig's failures (most were confident early finishes), `--check` to make one-shot runs verify against the task, measured on the original tasks and on 20 held-out ones: it fixed the failures it aimed at but ran others out of time, so it is opt-in
 - [x] **10. What mini-swe-agent's lead was made of:** experiments one difference at a time, on held-out tasks and then three attempts at the original ones (`--tools`, `--system-prompt`, mini-swe-agent's prompts through the adapter); the finding that both agents sometimes fetched the benchmark's answers, now counted as failures, which shrank mini-swe-agent's lead from 12 points to 5, within the noise; neither jig's tools nor mini-swe-agent's prompts made a reliable difference; three harness fixes: background jobs that held a command open, replies that broke off, and models killing jig through its command line (`jig -` reads the task from stdin)
+- [x] **11. One model, two APIs:** an OpenAI-compatible API (`--api openai`, `--base-url`) for OpenAI, local models through Ollama or vLLM, and DeepSeek's chat completions endpoint, translated at the edge so the rest of jig is unchanged; today's jig on both of DeepSeek's endpoints, in alternating rounds: no difference (−2 points, −10 to +7), and no agent errors in 120 attempts
 
 ## License
 

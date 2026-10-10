@@ -1,5 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages";
+import OpenAI from "openai";
+import { chatTurn, ReplyBrokeOff } from "./openai.ts";
 import type { Tool } from "./tools/index.ts";
 import * as ui from "./ui.ts";
 
@@ -8,6 +10,18 @@ type ContentBlock = Anthropic.Beta.BetaContentBlock;
 
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
+
+/** The API formats jig speaks: Anthropic's Messages API, and OpenAI-compatible chat completions. */
+export const APIS = ["anthropic", "openai"] as const;
+export type Api = (typeof APIS)[number];
+
+/**
+ * Claude and DeepSeek models go through the Messages API (DeepSeek's Anthropic-compatible endpoint), any
+ * other model through an OpenAI-compatible one. DeepSeek serves both, so --api openai reaches it there too.
+ */
+export function defaultApi(model: string): Api {
+  return model.startsWith("claude") || model.startsWith("deepseek") ? "anthropic" : "openai";
+}
 
 export interface ModelTurn {
   message: Anthropic.Beta.BetaMessage;
@@ -31,18 +45,28 @@ export interface ModelOptions {
   effort?: Effort;
   system: string;
   tools: Tool[];
+  /** The API format (default: defaultApi). */
+  api?: Api;
+  /** The API's address, instead of the provider's own. */
+  baseURL?: string;
 }
 
-/** How many tokens a model can take in. All current DeepSeek and Claude models have 1M, except Haiku. */
+/**
+ * How many tokens a model can take in. All current DeepSeek and Claude models have 1M, except Haiku; for
+ * anything else, 128k is a common size (a smaller window needs --compact-at to match).
+ */
 export function contextWindow(model: string): number {
-  return model.startsWith("claude-haiku") ? 200_000 : 1_000_000;
+  if (model.startsWith("claude-haiku")) return 200_000;
+  return model.startsWith("claude") || model.startsWith("deepseek") ? 1_000_000 : 128_000;
 }
 
 /** Everything in a request except `messages`. It stays the same for the whole session. */
 type Request = Omit<BetaMessageStreamParams, "messages">;
 
-// DeepSeek serves an Anthropic-compatible API, so the same SDK, streaming and message format work with it.
+// DeepSeek serves an Anthropic-compatible API, so the same SDK, streaming and message format work with it,
+// and an OpenAI-compatible one.
 const DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic";
+const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
 
 /**
  * How long to wait for the API to start answering. A stream's headers arrive within seconds when the
@@ -69,19 +93,16 @@ export const retryNotices = {
   error() {},
 };
 
+type Turn = (messages: MessageParam[], signal: AbortSignal | undefined, summarize: boolean) => Promise<ModelTurn>;
+
 export function createModel(options: ModelOptions): CallModel {
-  const deepseek = options.model.startsWith("deepseek");
   const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
-  const client = deepseek ? deepseekClient(settings) : new Anthropic(settings); // Anthropic() reads ANTHROPIC_API_KEY
-  const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
+  const turn = (options.api ?? defaultApi(options.model)) === "openai" ? chatCompletions(options, settings) : messagesApi(options, settings);
 
   return async (messages, signal, { summarize = false } = {}) => {
-    const sent = deepseek ? withoutIsError(messages) : messages;
-    // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
-    const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
     for (let attempt = 1; ; attempt++) {
       try {
-        return await streamTurn(client, params, signal, summarize || options.quiet);
+        return await turn(messages, signal, summarize);
       } catch (err) {
         // API errors are mostly not retried here: the SDK already retries rate limits, overloads and
         // requests that fail before a reply begins. What it can't retry is a reply that broke off partway,
@@ -98,6 +119,41 @@ export function createModel(options: ModelOptions): CallModel {
       }
     }
   };
+}
+
+type ClientSettings = { timeout: number; logger: typeof retryNotices; logLevel: "info" };
+
+/** Claude, or DeepSeek through its Anthropic-compatible endpoint. */
+function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
+  const deepseek = options.model.startsWith("deepseek");
+  const baseURL = options.baseURL ? { baseURL: options.baseURL } : {};
+  // Anthropic() reads ANTHROPIC_API_KEY.
+  const client = deepseek ? deepseekClient({ ...settings, ...baseURL }) : new Anthropic({ ...settings, ...baseURL });
+  const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
+  return (messages, signal, summarize) => {
+    const sent = deepseek ? withoutIsError(messages) : messages;
+    // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
+    const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
+    return streamTurn(client, params, signal, summarize || options.quiet);
+  };
+}
+
+/**
+ * An OpenAI-compatible API: DeepSeek's (with DEEPSEEK_API_KEY), or OpenAI's or any other (OPENAI_API_KEY,
+ * and --base-url or OPENAI_BASE_URL for its address; a local server may need no key at all).
+ */
+function chatCompletions(options: ModelOptions, settings: ClientSettings): Turn {
+  if (options.model.startsWith("claude")) throw new Error("Claude models are reached through the Anthropic API: leave out --api openai.");
+  const deepseek = options.model.startsWith("deepseek");
+  if (deepseek && !process.env.DEEPSEEK_API_KEY) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
+  const baseURL = options.baseURL ?? (deepseek ? DEEPSEEK_OPENAI_BASE_URL : process.env.OPENAI_BASE_URL);
+  const apiKey = deepseek ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY || (baseURL ? "none" : undefined);
+  // Without an apiKey (no OPENAI_API_KEY, and OpenAI's own address) the SDK stops with an error naming the variable.
+  const client = new OpenAI({ ...settings, apiKey, baseURL });
+  // DeepSeek gets the output limit its Anthropic endpoint gets; elsewhere the server's default stands (OpenAI's
+  // reasoning models refuse max_tokens).
+  const chat = { ...options, maxTokens: deepseek ? 64_000 : undefined };
+  return (messages, signal, summarize) => chatTurn(client, chat, messages, { signal, quiet: summarize || options.quiet, summarize });
 }
 
 function claudeRequest({ model, effort = "medium", system, tools }: ModelOptions): Request {
@@ -162,13 +218,20 @@ class MalformedToolInput extends Error {}
 
 /**
  * Whether a reply broke off partway: the connection dropped ("terminated"), the stream ended early, or the
- * server sent an overload or server error in the middle of it. A dropped connection ended a whole
- * Terminal-Bench task once (milestone 10).
+ * server sent an error in the middle of it (for Claude, an overload or server error). A dropped connection
+ * ended a whole Terminal-Bench task twice (milestone 10).
  */
 function brokeOff(err: unknown): boolean {
-  if (err instanceof Anthropic.APIConnectionError || err instanceof Anthropic.APIUserAbortError) return false;
+  if (err instanceof ReplyBrokeOff) return true;
+  for (const sdk of [Anthropic, OpenAI]) {
+    // Failing before the reply began, the SDK has already retried; an abort is the user's.
+    if (err instanceof sdk.APIConnectionError || err instanceof sdk.APIUserAbortError) return false;
+  }
   if (err instanceof Anthropic.APIError) return err.status === undefined && ["overloaded_error", "api_error"].includes(String(err.type));
-  return err instanceof Anthropic.AnthropicError && /terminated|ended without/.test(err.message);
+  if (err instanceof OpenAI.APIError) return err.status === undefined;
+  // fetch's own error for a body cut off mid-stream, which the OpenAI SDK passes on as it is
+  if (err instanceof TypeError) return err.message === "terminated";
+  return (err instanceof Anthropic.AnthropicError || err instanceof OpenAI.OpenAIError) && /^terminated$|ended without/.test(err.message);
 }
 
 async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal, quiet = false): Promise<ModelTurn> {
