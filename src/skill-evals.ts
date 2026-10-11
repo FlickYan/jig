@@ -26,6 +26,7 @@ export interface SkillEval {
   check?: string;
 }
 
+/** A skill's evals, from evals/evals.json; throws, saying what to fix, if there are none or one has no prompt. */
 export function readEvals(skill: Skill): SkillEval[] {
   const path = join(skill.dir, "evals", "evals.json");
   if (!existsSync(path)) throw new Error(`The skill "${skill.name}" has no evals: write some in ${path} (the skill-writer skill describes the format).`);

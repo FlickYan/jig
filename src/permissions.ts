@@ -43,6 +43,11 @@ const READERS = new Set(["cat", "cut", "diff", "du", "echo", "grep", "head", "ls
 const GIT_READERS = new Set(["blame", "diff", "log", "ls-files", "rev-parse", "show", "status"]);
 const FIND_ACTIONS = /^-(exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/;
 
+/**
+ * The permission policy for a session: decides each tool call (run it, ask the user, or refuse) by the
+ * mode, the settings' allow and deny rules, whether the sandbox contains commands, and the "always"
+ * answers the user has given so far.
+ */
 export class Permissions {
   mode: Mode;
   private readonly root: string;
@@ -64,6 +69,7 @@ export class Permissions {
     this.contained = contained;
   }
 
+  /** Whether a call runs, asks first, or is refused (and why). */
   decide(tool: Tool, input: ToolInput): Decision {
     const name = tool.definition.name;
     if (this.denyRules.includes(name)) return { refuse: `Refused: the ${name} tool is denied in jig's settings.` };

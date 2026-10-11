@@ -1,3 +1,7 @@
+// The agent loop (runAgent), and what happens around one tool call: checking the model's input, the
+// user's hooks, the permission policy, running the tool and trimming its output. The CLI and subagents
+// drive the same loop; what differs between them comes in through AgentOptions.
+
 import type Anthropic from "@anthropic-ai/sdk";
 import { compact } from "./compact.ts";
 import type { Conversation } from "./conversation.ts";
@@ -17,6 +21,7 @@ export interface AgentUI {
   notice(text: string): void;
 }
 
+/** How a run of the loop is set up: the model, the tools, and the checks every tool call goes through. */
 export interface AgentOptions {
   callModel: CallModel;
   tools: Tool[];
@@ -41,6 +46,7 @@ export interface AgentOptions {
   ui: AgentUI;
 }
 
+/** The user's hooks, as the loop sees them (the CLI builds them from the settings). */
 export interface ToolHooks {
   /** Before a call runs: resolves to why it is blocked, or null. */
   before(tool: string, input: ToolInput): Promise<string | null>;
@@ -48,6 +54,7 @@ export interface ToolHooks {
   after(tool: string, input: ToolInput, output: string): Promise<string | null>;
 }
 
+/** Tokens, summed over a run's model calls. */
 export interface Usage {
   input: number; // uncached input tokens
   cacheWrite: number;
@@ -55,6 +62,7 @@ export interface Usage {
   output: number;
 }
 
+/** How a run ended. */
 export interface RunResult {
   /** Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours. */
   stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted";
@@ -139,6 +147,12 @@ async function compactConversation(conversation: Conversation, opts: AgentOption
   return compacted.usage;
 }
 
+/**
+ * One tool call, through each check in turn: the tool exists, the run wasn't interrupted, the call wasn't
+ * cut off mid-input, the input is valid, the hooks and then the permission policy allow it. Then it runs,
+ * its output is trimmed, and the after-hooks have their say. A failed check becomes an error result that
+ * says what went wrong, which the model can act on.
+ */
 async function handleToolCall(
   call: ToolUse,
   state: { cutOff: boolean; malformed?: string },
@@ -197,6 +211,7 @@ function replyText(reply: Message): string {
   return reply.content.map((block) => (block.type === "text" ? block.text : "")).join("");
 }
 
+/** Adds one reply's token counts to a run's totals. */
 export function addUsage(total: Usage, usage: Anthropic.Beta.BetaUsage): void {
   total.input += usage.input_tokens;
   total.cacheWrite += usage.cache_creation_input_tokens ?? 0;
@@ -209,6 +224,7 @@ export function contextSize(usage: Anthropic.Beta.BetaUsage): number {
   return usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + usage.output_tokens;
 }
 
+/** 950 → "950", 12_345 → "12.3k". */
 export function formatTokens(n: number): string {
   return n < 1000 ? String(n) : `${(n / 1000).toFixed(1)}k`;
 }

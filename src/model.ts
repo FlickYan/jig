@@ -1,3 +1,8 @@
+// Calling the model. createModel returns one function, CallModel: the conversation in, the model's next
+// message out, streamed to the terminal on the way. Claude and DeepSeek go through the Messages API, any
+// other model through an OpenAI-compatible one (openai.ts). It retries what the SDK can't (a reply that
+// broke off, malformed tool input) and checks streamed tool input strictly before any tool sees it.
+
 import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages";
 import OpenAI from "openai";
@@ -8,6 +13,7 @@ import * as ui from "./ui.ts";
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 type ContentBlock = Anthropic.Beta.BetaContentBlock;
 
+/** What --effort takes: how much the model thinks. Not every model takes all of them (DeepSeek: low, high, max). */
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 
@@ -23,6 +29,7 @@ export function defaultApi(model: string): Api {
   return model.startsWith("claude") || model.startsWith("deepseek") ? "anthropic" : "openai";
 }
 
+/** What one model call returns. */
 export interface ModelTurn {
   message: Anthropic.Beta.BetaMessage;
   /** Raw input of each tool call whose streamed JSON did not parse, keyed by tool_use id. */
@@ -35,6 +42,7 @@ export interface ModelTurn {
  */
 export type CallModel = (messages: MessageParam[], signal?: AbortSignal, options?: { summarize?: boolean }) => Promise<ModelTurn>;
 
+/** The model and how to reach it, and the system prompt and tools that go with every request. */
 export interface ModelOptions {
   model: string;
   /** Print nothing while streaming (for subagents, whose work the user sees as a summary). */
@@ -95,6 +103,10 @@ export const retryNotices = {
 
 type Turn = (messages: MessageParam[], signal: AbortSignal | undefined, summarize: boolean) => Promise<ModelTurn>;
 
+/**
+ * The model, as a CallModel. A call is tried up to three times when the reply broke off or its tool input
+ * was malformed; other errors go to the caller, after whatever retries the SDK made of them.
+ */
 export function createModel(options: ModelOptions): CallModel {
   const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
   const turn = (options.api ?? defaultApi(options.model)) === "openai" ? chatCompletions(options, settings) : messagesApi(options, settings);
@@ -234,6 +246,10 @@ function brokeOff(err: unknown): boolean {
   return (err instanceof Anthropic.AnthropicError || err instanceof OpenAI.OpenAIError) && /^terminated$|ended without/.test(err.message);
 }
 
+/**
+ * One streamed reply from the Messages API. Text and thinking go to the terminal as they arrive (unless
+ * quiet); each tool call's input is kept as it streamed, to be checked strictly once the reply is complete.
+ */
 async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal, quiet = false): Promise<ModelTurn> {
   const stream = client.beta.messages.stream(params, { signal });
   const rawInputs = new Map<number, string>(); // content block index -> tool input JSON as streamed

@@ -1,3 +1,6 @@
+// write_file: creates a file, or replaces one whole. A file it overwrites must have been read as it is now
+// (FileVersions), so the model can't replace what it hasn't seen; a file's Windows line endings are kept.
+
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Tool } from "./index.ts";

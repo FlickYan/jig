@@ -1,3 +1,7 @@
+// bash: runs a command in a fresh shell, in the sandbox when there is one and in a process group of its
+// own, so a timeout or Ctrl+C stops everything it started; jig's API keys are kept out of its environment.
+// The model gets the output and the exit code; a job left in the background keeps running, as in a terminal.
+
 import { spawn } from "node:child_process";
 import type { Socket } from "node:net";
 import { stat } from "node:fs/promises";
@@ -57,8 +61,9 @@ export const bashTool: Tool = {
 const VIEWERS = new Set(["cat", "head", "tail", "nl"]);
 
 /**
- * A file the model printed with `cat` (or head, tail) counts as read for edit_file's read-before-edit
- * check. The benchmark showed why: without this, edits after a `cat` were refused and had to be redone.
+ * A file the model printed with `cat` (or head, tail, nl) counts as read, for write_file's check that a
+ * file it overwrites was read as it is. The benchmark showed why: without this, changes after a `cat`
+ * were refused and had to be redone.
  */
 async function recordViewedFiles(command: string, cwd: string, versions: FileVersions, dirs: string[]): Promise<void> {
   for (const [program, ...args] of parseCommand(command) ?? []) {
@@ -72,6 +77,7 @@ async function recordViewedFiles(command: string, cwd: string, versions: FileVer
   }
 }
 
+/** Runs a command; resolves to its output and how it ended, and rejects only if it can't be started. */
 export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal, sandbox?: Sandbox): Promise<string> {
   return new Promise((resolve, reject) => {
     const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };

@@ -16,6 +16,7 @@ export function resolveInRoot(root: string, path: string, dirs: string[] = []): 
   return abs;
 }
 
+/** Whether an absolute path is root itself or below it. */
 export function isInside(root: string, abs: string): boolean {
   const rel = relative(root, abs);
   return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
@@ -74,6 +75,7 @@ export function usesCRLF(text: string): boolean {
   return crlf > 0 && crlf >= text.split("\n").length - 1 - crlf;
 }
 
+/** Lines in a text, where a trailing newline ends the last line rather than starting another. */
 export function countLines(text: string): number {
   if (text === "") return 0;
   return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);

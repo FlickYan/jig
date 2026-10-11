@@ -26,6 +26,7 @@ export type Approver = (proposal: SkillProposal, files: Map<string, string>) => 
 
 const MAX_BYTES = 1_000_000;
 
+/** propose_skill: a skill the model wrote, checked, then put to the user, who decides where it goes. */
 export function proposeSkillTool(approve: Approver = askInTerminal): Tool {
   return {
     definition: {

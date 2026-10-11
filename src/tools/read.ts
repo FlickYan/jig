@@ -1,3 +1,6 @@
+// read_file: a text file's lines with their numbers, like `cat -n`, a page at a time for long files. It
+// records the version of the file the model saw (FileVersions), which write_file checks before overwriting.
+
 import { readFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
 import { assertFile, resolveInRoot } from "./util.ts";

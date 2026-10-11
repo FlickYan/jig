@@ -1,3 +1,7 @@
+// Settings, the user's (~/.jig/settings.json) and a project's (.jig/settings.json): which commands run
+// without asking and which never run, the sandbox and the network, hooks and MCP servers. A project's
+// settings could run programs, so apart from its deny rules they apply only once the user trusts the file.
+
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -6,6 +10,7 @@ import { jigHome } from "./paths.ts";
 export const HOOK_EVENTS = ["PreToolUse", "PostToolUse"] as const;
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
+/** A command the settings run before or after tool calls (see hooks.ts). */
 export interface Hook {
   event: HookEvent;
   /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default: all). */
@@ -14,18 +19,20 @@ export interface Hook {
   command: string;
 }
 
+/** An MCP server, started as a program that speaks MCP over stdio. */
 export interface McpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
 }
 
+/** What a settings file sets. The user's and a trusted project's are merged (mergeSettings). */
 export interface Settings {
   /** Commands that run without asking, matched by their first words: "npm test" allows `npm test -- -u`. */
   allow: string[];
   /** Commands that are refused outright, in every mode: "git push" also blocks `git -C repo push`. */
   deny: string[];
-  /** Run commands in the sandbox (default: on where jig has one, which is macOS). */
+  /** Run commands in the sandbox (default: on where jig has one, which is macOS and Linux). */
   sandbox?: boolean;
   /** Let sandboxed commands use the network (default: off). */
   network?: boolean;
@@ -33,6 +40,7 @@ export interface Settings {
   mcpServers: Record<string, McpServerConfig>;
 }
 
+/** A project's settings, with the hash of its file that trust is recorded against. */
 export interface ProjectSettings {
   path: string;
   /** Hash of the file, so trust in one version doesn't carry over to edits. */
@@ -92,6 +100,7 @@ export function isTrusted(root: string, project: ProjectSettings): boolean {
   return JSON.parse(readFileSync(trustFile(), "utf8"))[root] === project.hash;
 }
 
+/** Records that the user trusts this version of the project's settings, in ~/.jig/trusted-projects.json. */
 export function trust(root: string, project: ProjectSettings): void {
   const trusted = existsSync(trustFile()) ? JSON.parse(readFileSync(trustFile(), "utf8")) : {};
   trusted[root] = project.hash;

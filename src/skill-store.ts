@@ -122,6 +122,7 @@ export interface SkillInfo {
   problems: string[];
 }
 
+/** What a skill holds, for the user to read before installing it: its files, which of them run, and its problems. */
 export function describeSkill(dir: string): SkillInfo {
   const fields = frontmatterFields(readFileSync(join(dir, "SKILL.md"), "utf8"));
   const files = listSkillFiles(dir);
@@ -156,6 +157,7 @@ export interface LockEntry {
   installed: string;
 }
 
+/** The lockfile's entries, by skill name; empty when there is no lockfile yet. */
 export function readLock(scope: InstallScope, project: string): Record<string, LockEntry> {
   try {
     return JSON.parse(readFileSync(lockPath(scope, project), "utf8")).skills ?? {};

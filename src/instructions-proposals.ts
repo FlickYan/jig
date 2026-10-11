@@ -15,6 +15,7 @@ export function instructionsFile(project: string): string {
   return !existsSync(agents) && existsSync(claude) ? claude : agents;
 }
 
+/** propose_instructions: an addition to AGENTS.md, or a replacement of one passage, shown as a diff first. */
 export function proposeInstructionsTool(approve: Approve): Tool {
   return {
     definition: {

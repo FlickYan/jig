@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { isInside } from "./tools/util.ts";
 
+/** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
   /** For the user, e.g. "macOS sandbox, no network". */
   description: string;

@@ -1,3 +1,6 @@
+// glob: finds files by a path pattern (*, **, ?, {a,b}, [abc]), skipping .git, node_modules and what git
+// ignores. Paths come back relative to the project, ready for read_file.
+
 import { relative, resolve } from "node:path";
 import { globToRegExp, listFiles } from "./files.ts";
 import type { Tool } from "./index.ts";

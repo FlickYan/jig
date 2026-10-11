@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+// jig's entry point. `jig skills`, `jig memory` and `jig sessions` have modules of their own; anything
+// else is an agent session. main() turns the options and settings into what the loop needs (the
+// permission policy, the sandbox, the tools: jig's own, subagents, skills, the MCP servers' and the
+// proposal tools; then the system prompt and the model) and runs the task it was given, or an interactive
+// session that reads tasks and /commands until /exit or Ctrl+D.
+
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";

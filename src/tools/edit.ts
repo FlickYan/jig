@@ -1,3 +1,7 @@
+// edit_file: replaces a string that must occur exactly once in the file. When it doesn't match, the error
+// points at the nearest thing the file does hold (leftover line numbers, other indentation, a first line
+// that matches), so the model can fix its next try in one step. A file's Windows line endings are kept.
+
 import { readFile, writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
 import { assertFile, lineCount, numbered, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";

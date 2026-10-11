@@ -1,3 +1,6 @@
+// What the model is told: the system prompt of a session and of a subagent, put together from jig's own
+// guidance, the environment, and what the project and the user add (AGENTS.md files, skills, memory).
+
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
@@ -6,6 +9,7 @@ import { dirname, join, relative } from "node:path";
 const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
 const FILE_TOOLS = ["read_file", "grep", "glob", "write_file", "edit_file"];
 
+/** One instructions file: its path, relative to the working directory, and its text. */
 export interface Instructions {
   path: string;
   text: string;
@@ -32,10 +36,7 @@ export function loadInstructions(cwd: string): Instructions[] {
   });
 }
 
-/**
- * The system prompt. It is built once per conversation and never changes during it, so together with
- * the tool definitions it forms a stable prefix the API can cache. Project instructions go at the end.
- */
+/** What a system prompt holds besides jig's own guidance. */
 export interface PromptOptions {
   /** The project's AGENTS.md files. */
   instructions?: Instructions[];
@@ -69,6 +70,12 @@ const ON_YOUR_OWN = `You are running one task on your own, not an interactive se
 /** Sent once when the model first stops in a one-shot run (see AgentOptions.review). */
 export const REVIEW = `Before you finish, check your work against the task. Go through its requirements one by one, and for each, name what you ran or saw that shows it is met: file names and paths, output formats, exact values, and the ways the task says your work will be used. Verify anything you haven't actually seen, and fix whatever is wrong. Then give your final summary; if everything was already verified, say so briefly.`;
 
+/**
+ * The system prompt. It is built once per conversation and never changes during it, so together with
+ * the tool definitions it forms a stable prefix the API can cache. In order: jig's guidance (or
+ * --system-prompt's) and the environment, the rules for a one-shot run with --check, the skill catalog,
+ * memory, and the project's instructions last, which win where they conflict with what comes before.
+ */
 export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false, tools, custom, memory = "" }: PromptOptions = {}): string {
   const has = (...names: string[]) => !tools || names.every((name) => tools.includes(name));
   const fileTools = !tools || tools.some((name) => FILE_TOOLS.includes(name));

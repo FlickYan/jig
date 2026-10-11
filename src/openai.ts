@@ -68,6 +68,7 @@ function toolResultText(block: Anthropic.Beta.BetaToolResultBlockParam): string 
   return block.is_error ? `Error: ${text}` : text;
 }
 
+/** jig's tool definitions as chat completions functions: the same names, descriptions and schemas. */
 export function toChatTools(tools: Tool[]): ChatCompletionFunctionTool[] {
   return tools.map(({ definition }) => ({
     type: "function",

@@ -1,3 +1,7 @@
+// The terminal: the model's reply and thinking as they stream, each tool call with a few lines of its
+// result, notices, a status line while waiting, and the prompt for the user's input. Everything jig prints
+// goes through here, so lines and blocks don't run into each other.
+
 import * as readline from "node:readline/promises";
 import { styleText } from "node:util";
 import type { AgentUI } from "./agent.ts";
@@ -36,6 +40,7 @@ function freshLine(): void {
   if (!atLineStart) write("\n");
 }
 
+/** Prints a line, starting a new one first if the cursor isn't at the start of one. */
 export function println(text = ""): void {
   freshLine();
   write(`${text}\n`);
@@ -50,6 +55,7 @@ export function status(text: string): void {
   statusShown = true;
 }
 
+/** Something the user should know, in yellow: a retry, a compaction, a warning. */
 export function notice(text: string): void {
   println(yellow(text));
 }
@@ -65,6 +71,7 @@ let showThinking = true;
 let thinkingStarted = 0; // when the hidden thinking block began, for the status line
 let thinkingShownAt = 0;
 
+/** Shows or hides the model's thinking (--hide-thinking, /thinking). */
 export function setThinkingVisible(visible: boolean): void {
   showThinking = visible;
 }
@@ -73,11 +80,13 @@ export function thinkingVisible(): boolean {
   return showThinking;
 }
 
+/** A piece of the model's reply, as it streams. */
 export function text(delta: string): void {
   startBlockOutput(delta);
   write(delta);
 }
 
+/** A piece of the model's thinking: dimmed, or, when hidden, a status line counting the seconds. */
 export function thinking(delta: string): void {
   if (!delta) return;
   if (showThinking) {
@@ -94,6 +103,7 @@ export function thinking(delta: string): void {
   }
 }
 
+/** A content block of the reply has ended: the next one starts on a line of its own. */
 export function endBlock(): void {
   if (blockHasOutput) freshLine();
   blockHasOutput = false;
@@ -112,6 +122,7 @@ function startBlockOutput(delta: string): void {
 const callLabels = new Map<string, string>();
 let lastCall: string | undefined; // the call the last tool line was about
 
+/** The main agent's tool calls: a line per call, the diff or command below it, and a preview of the result. */
 export const terminalUI: AgentUI = {
   toolCall(name, description, id) {
     const [summary = "", ...details] = description.split("\n");

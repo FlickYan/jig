@@ -1,3 +1,7 @@
+// Agent Skills, as jig uses them: finding the skills a project can see (its own, the user's, jig's), the
+// catalog of names and descriptions in the system prompt, and the skill tool that loads the rest only when
+// the model asks for it (progressive disclosure). Installing skills is in skill-store.ts.
+
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
@@ -16,6 +20,7 @@ export interface Skill {
   scope: SkillScope;
 }
 
+/** Where a skill was found, which also decides which wins when two have the same name. */
 export type SkillScope = "project" | "user" | "builtin";
 
 // jig's own directory, the cross-client .agents convention, and Claude Code's, where many skills live.
@@ -31,6 +36,7 @@ export function userSkillsDir(): string {
   return join(jigHome(), "skills");
 }
 
+/** Which skills discoverSkills leaves out. */
 export interface DiscoverOptions {
   /** The directory of jig's own skills; null leaves them out (for tests). */
   builtin?: string | null;
@@ -88,6 +94,7 @@ export function skillProblems(skillDir: string): string[] {
   return problems;
 }
 
+/** What is wrong with a skill's name by the specification, if anything. */
 export function nameProblems(name: string): string[] {
   if (!name) return ["The skill has no name."];
   if (name.length > 64) return [`The name "${name}" is longer than 64 characters.`];
@@ -95,6 +102,7 @@ export function nameProblems(name: string): string[] {
   return [];
 }
 
+/** What is wrong with a skill's description by the specification, if anything. */
 export function descriptionProblems(description: string): string[] {
   if (!description.trim()) return ["The skill has no description, so the model couldn't know when to use it."];
   return description.length > 1024 ? ["The description is longer than 1024 characters."] : [];
@@ -116,6 +124,7 @@ export function recordSkillUse(name: string, now = new Date()): void {
   }
 }
 
+/** How often each skill was loaded, and when last (see recordSkillUse); empty if nothing was recorded. */
 export function skillUsage(): Record<string, { loads: number; last: string }> {
   try {
     return JSON.parse(readFileSync(join(jigHome(), "skills-usage.json"), "utf8"));

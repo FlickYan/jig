@@ -1,3 +1,6 @@
+// grep: a regular expression over the project's files, skipping what git ignores, binary files and files
+// over 5 MB. Each match comes back as file:line: text, up to 200 of them.
+
 import { readFile, stat } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 import { globToRegExp, listFiles } from "./files.ts";

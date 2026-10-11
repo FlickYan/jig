@@ -1,3 +1,7 @@
+// The tool interface and jig's own tools: read_file, grep, glob, write_file, edit_file and bash, each in
+// its own file here. The other tools have the same shape and are built where they are needed (the
+// subagent tool in subagent.ts, the skill, MCP and proposal tools), so the loop treats every tool alike.
+
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Usage } from "../agent.ts";
 import { bashOnItsOwn, bashTool } from "./bash.ts";
@@ -9,6 +13,7 @@ import type { Sandbox } from "../sandbox.ts";
 import type { FileVersions } from "./util.ts";
 import { writeTool } from "./write.ts";
 
+/** What a tool gets besides its input. */
 export interface ToolContext {
   /** Project root. Relative paths resolve against it, and the file tools refuse to leave it. */
   cwd: string;
@@ -28,6 +33,7 @@ export interface ToolContext {
 
 export type ToolInput = Record<string, unknown>;
 
+/** A tool the model can call. */
 export interface Tool {
   /** Name, description and input schema, sent to the model as-is. */
   definition: Anthropic.Beta.BetaTool;
@@ -43,6 +49,7 @@ export interface Tool {
   run(input: ToolInput, ctx: ToolContext): Promise<string>;
 }
 
+/** jig's own tools, in the order the model sees them. */
 export const TOOLS: Tool[] = [readTool, grepTool, globTool, writeTool, editTool, bashTool];
 
 /** What --tools can name: jig's own tools, and the subagent tool, which the CLI builds. */
