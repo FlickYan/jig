@@ -1,0 +1,29 @@
+{
+  "n": 2,
+  "branch": "evolve2/2",
+  "base": "ae5d61a",
+  "cause": "No run-and-repair step. When it does implement, it emits one large whole-file rewrite and stops, so defects in what it wrote (bad arithmetic, off-by-one indexing, an attribute that is never set) are never observed or corrected before the hidden tests. It should reserve a step to execute the tests or a probe and iterate on what fails.",
+  "subject": "Prompt lands the change early, then forces running and fixing it.",
+  "description": "I revised the \"How to work\" guidance in `src/prompt.ts`. Two related edits, one of which builds on the already-accepted reconnaissance cut: the \"look before you act\" bullet now says to read the task and only the files the change touches, and not to survey the project, its history or its environment, so steps aren't burned before any code lands. The old \"Verify your work\" bullet (which the analysis shows jig ignores) is replaced by a concrete run-and-repair instruction: land every part of the change in the first draft, keep a step to run it — the tests or a short probe that exercises it — and fix what fails, with the blunt reminder that work you haven't run is not done. This directly targets the failure mode of a single whole-file rewrite that stops before its defects (bad arithmetic, off-by-one indexing, an unset attribute) can be observed, and it stays general: no task, file, function or test is named, the wording lives inside the existing conditional that keeps `(grep, glob)` and file-tool mentions out of tool-restricted prompts, and it adds only about 30 words per request. It should help because jig will now have a step left after implementing and will spend it executing its own work instead of finishing on an unverified draft.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.47433799200000004,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-11T19-37-38_evolve-2-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.5333333333333333,
+    "baseline": 0.45,
+    "difference": 0.08333333333333334,
+    "low": -0.20000000000000004,
+    "high": 0.3666666666666667,
+    "ahead": 0.6983,
+    "costRatio": 0.9949892460617337
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+8 points, ahead in 70% of resamples, cost ×0.99)"
+  }
+}

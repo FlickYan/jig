@@ -106,6 +106,21 @@ describe("the evolve referee", () => {
     assert.ok(rates[0] < 0.05 && rates[0] < rates[1] && rates[1] < rates[2], rates.join(", "));
   });
 
+  it("counts the luck of the baseline runs candidates meet, and gains from pooling more of them", () => {
+    const halfway = [...runOf({ a: 1, b: 2, c: 1, d: 2, e: 1, f: 2, g: 1, h: 2, i: 1, j: 2 }), ...runOf({ a: 2, b: 1, c: 2, d: 1, e: 2, f: 1, g: 2, h: 1, i: 2, j: 1 })];
+    const train = ["a", "b", "c", "d", "e"];
+    const heldOut = ["f", "g", "h", "i", "j"];
+    const drawn = simulateReferee(halfway, train, heldOut, { trials: 300 });
+    // Held fixed: a run that failed its training tasks more than they deserve lets a change that does
+    // nothing through more often, and a lucky one less.
+    const unlucky = simulateReferee(halfway, train, heldOut, { trials: 300, against: runOf({ a: 0, b: 1, c: 0, d: 1, e: 0, f: 2, g: 1, h: 2, i: 1, j: 2 }) });
+    const lucky = simulateReferee(halfway, train, heldOut, { trials: 300, against: runOf({ a: 3, b: 3, c: 2, d: 3, e: 2, f: 2, g: 2, h: 2, i: 2, j: 2 }) });
+    assert.ok(lucky < drawn && drawn * 3 < unlucky, `${lucky}, ${drawn}, ${unlucky}`);
+    // A baseline of more attempts finds a real gain more often.
+    const fixes = [3, 12].map((baselineAttempts) => simulateReferee(halfway, train, heldOut, { trials: 300, fixShare: 1 / 3, baselineAttempts }));
+    assert.ok(fixes[1] > fixes[0] + 0.05, fixes.join(", "));
+  });
+
   it("gives each task its share of passed attempts", () => {
     assert.deepEqual(passRates(runOf({ a: 3, b: 1 })), new Map([["a", 1], ["b", 1 / 3]]));
   });

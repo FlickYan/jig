@@ -29,10 +29,21 @@
   "acceptance": {
     "baselines": [
       "bench/results/evolve2/2026-10-11T14-51-52_baseline.json",
-      "bench/results/evolve2/2026-10-11T14-51-55_baseline-2.json"
+      "bench/results/evolve2/2026-10-11T14-51-55_baseline-2.json",
+      "bench/results/evolve2/2026-10-11T18-56-02_baseline-3.json",
+      "bench/results/evolve2/2026-10-11T20-16-36_baseline-4.json"
     ],
-    "nothing": 0.02,
-    "cheaper25": 0.204,
-    "fixesThird": 0.448
+    "nothing": 0.025,
+    "cheaper25": 0.299,
+    "fixesThird": 0.542,
+    "against": {
+      "runs": [
+        "bench/results/evolve2/2026-10-11T14-51-55_baseline-2.json",
+        "bench/results/evolve2/2026-10-11T18-56-02_baseline-3.json",
+        "bench/results/evolve2/2026-10-11T20-16-36_baseline-4.json"
+      ],
+      "nothing": 0.037,
+      "fixesThird": 0.718
+    }
   }
 }

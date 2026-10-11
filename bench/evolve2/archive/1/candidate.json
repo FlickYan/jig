@@ -1,0 +1,40 @@
+{
+  "n": 1,
+  "branch": "evolve2/1",
+  "base": "ae5d61a",
+  "cause": "Reconnaissance crowds out the work. jig begins by enumerating everything — directory trees, every module, every test file, git history, interpreter and library availability — and frequently exhausts the step budget before reaching an edit, or reaches it only for one fragment of the change. It should read the spec and only the files the change actually touches, land a first complete implementation early, and use the remaining steps to verify.",
+  "subject": "Prompt cuts reconnaissance, lands the whole change early.",
+  "description": "I changed the \"How to work\" guidance in `src/prompt.ts`. The first bullet previously said \"find the relevant code (grep, glob), read it, and run commands to understand the problem\", which licensed enumerating the project, git history, versions and reference implementations — on the 4-model-call budget the analysis showed half of jig's failures never edited a file before running out. It now says to read the task and only the files the change touches, and not to survey the project, its history or its environment. I added one bullet telling jig to make every part of the change in a first draft and then verify, so a complete implementation lands early and the remaining calls go to checking rather than looking around. The change is general (nothing task-specific), word-neutral apart from the one short bullet, and preserves the tool-dependent wording the tests assert. Full suite: 174 tests, 167 pass, 7 fail — exactly the seven pre-existing sandbox/`ps` failures listed in the task, so no new failures.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.88988752,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-11T19-16-34_evolve-1-train.json",
+    "heldOut": "bench/results/evolve2/2026-10-11T19-24-39_evolve-1-heldout.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.6,
+    "baseline": 0.45,
+    "difference": 0.15000000000000002,
+    "low": -0.03333333333333335,
+    "high": 0.36666666666666664,
+    "ahead": 0.9286,
+    "costRatio": 0.9797128407835843
+  },
+  "heldOut": {
+    "tasks": 11,
+    "candidate": 0.6666666666666666,
+    "baseline": 0.5,
+    "difference": 0.16666666666666663,
+    "low": -0.07575757575757575,
+    "high": 0.393939393939394,
+    "ahead": 0.9029,
+    "costRatio": 1.1025098199255219
+  },
+  "verdict": {
+    "stage": "accepted",
+    "reason": "solved more held-out tasks too (+17 points, ahead in 90% of resamples)"
+  }
+}

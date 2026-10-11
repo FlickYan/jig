@@ -134,11 +134,19 @@ function cheaper(comparison: Comparison): boolean {
  * the candidate changes nothing, and the share is the referee's false acceptance rate: what an "accepted"
  * is worth. With fixShare, the candidate also turns that share of the baseline's failures into passes
  * (each task's pass rate p becomes p + fixShare × (1 − p)): how often a real improvement is accepted.
- * Both runs have `attempts` attempts a task, as a candidate and a baseline run do. The baseline is drawn
- * too because it is a sample as well: milestone 14 first held it fixed, which made the rate look ten
- * times smaller than a second run of the baseline showed it to be.
+ * The candidate has `attempts` attempts a task, and the baseline `baselineAttempts` (more when the
+ * candidate is compared with several runs pooled). The baseline is drawn too because it is a sample as
+ * well: milestone 14 first held it fixed, which made the rate look ten times smaller than a second run of
+ * the baseline showed it to be. Given `against`, the baseline is held fixed after all, at the runs a
+ * candidate will actually be compared with: once they are made, their luck is part of every verdict, and
+ * this is the rate that applies (milestone 16: against one unlucky run, 9% where the drawn rate said 2%).
  */
-export function simulateReferee(baselines: Attempt[], train: string[], heldOut: string[], { costScale = 1, fixShare = 0, attempts = 3, trials = 1000, seed = 1 } = {}): number {
+export function simulateReferee(
+  baselines: Attempt[],
+  train: string[],
+  heldOut: string[],
+  { costScale = 1, fixShare = 0, attempts = 3, baselineAttempts = attempts, against, trials = 1000, seed = 1 }: { costScale?: number; fixShare?: number; attempts?: number; baselineAttempts?: number; against?: Attempt[]; trials?: number; seed?: number } = {},
+): number {
   const overall = rate(baselines.map((attempt) => attempt.passed));
   let state = seed;
   const random = () => ((state = (state * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
@@ -155,7 +163,8 @@ export function simulateReferee(baselines: Attempt[], train: string[], heldOut: 
       const rate = p + fix * (1 - p);
       return Array.from({ length: count }, () => ({ task, passed: random() < rate, cost: costs.length ? costs[Math.floor(random() * costs.length)] * scale : null }));
     });
-  const stage = (tasks: string[]) => compare(draw(tasks, costScale, fixShare, attempts), draw(tasks, 1, 0, attempts), 400, state);
+  const base = (tasks: string[]) => (against ? against.filter((attempt) => tasks.includes(attempt.task)) : draw(tasks, 1, 0, baselineAttempts));
+  const stage = (tasks: string[]) => compare(draw(tasks, costScale, fixShare, attempts), base(tasks), 400, state);
   let accepted = 0;
   for (let trial = 1; trial <= trials; trial++) {
     if (judgeTrain(stage(train)).stage === "rejected") continue;

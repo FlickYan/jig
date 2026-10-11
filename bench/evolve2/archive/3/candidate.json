@@ -1,0 +1,29 @@
+{
+  "n": 3,
+  "branch": "evolve2/3",
+  "base": "ae5d61a",
+  "cause": "A multi-file change is propagated incompletely. Edits land in the files it happened to read while related call sites, constructors, or command registrations are left untouched, so the result is internally inconsistent (missing attribute, unregistered subcommand). It should trace each requirement to every site it affects and finish them all before stopping.",
+  "subject": "Prompt lands each change at every site it affects.",
+  "description": "I changed the \"How to work\" guidance in `src/prompt.ts`. The first bullet keeps the already-accepted reconnaissance cut (read the task and the files the change touches, don't survey the whole project) so steps aren't spent before any code lands. The second bullet is the fix for this cause: candidate 1's accepted completeness wording is extended to name the sites a change has to reach — \"make every part of it (including the callers, constructors, registrations and config it affects) in your first draft, then verify and fix. Don't leave part of the work for later.\" That directly targets the failure mode where an edit lands only in the files jig happened to read, leaving a call site, constructor or command registration stale; naming the site kinds makes jig enumerate them as part of the draft rather than stopping at the first file. It is general (no task, file, function or test is named), it stays within the existing tool-conditional wording the tests assert, and it adds only about a dozen words per request. It should help because it keeps the accepted \"land the whole change early\" behaviour while making \"whole\" include everything the change touches, so multi-file tasks finish internally consistent instead of half-wired.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.46792395999999997,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-11T19-48-02_evolve-3-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4,
+    "baseline": 0.45,
+    "difference": -0.05000000000000001,
+    "low": -0.31666666666666676,
+    "high": 0.2166666666666667,
+    "ahead": 0.3635,
+    "costRatio": 0.9821775271754928
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (-5 points, ahead in 36% of resamples, cost ×0.98)"
+  }
+}

@@ -5,7 +5,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { addUsage, type Usage } from "../src/agent.ts";
@@ -76,8 +76,9 @@ interface Split {
   train: string[];
   heldOut: string[];
   /** How often the referee would accept a change that does nothing, one that cuts cost by 25%, or one that
-   * fixes a third of the failures, judged against the baseline runs named (see calibrate). */
-  acceptance: { baselines: string[]; nothing: number; cheaper25: number; fixesThird?: number };
+   * fixes a third of the failures, judged against the baseline runs named (see calibrate); and, in
+   * against, how often against the runs candidates are compared with, as those came out. */
+  acceptance: { baselines: string[]; nothing: number; cheaper25: number; fixesThird?: number; against?: { runs: string[]; nothing: number; fixesThird: number } };
   /** What it said before milestone 14's candidates ran: the first baseline held fixed, and any more solved
    * on the held-out tasks enough to be accepted. */
   acceptanceBefore?: { nothing: number; cheaper25: number };
@@ -141,10 +142,26 @@ function makeSplit(): Split {
 function calibrate(current = loadSplit()): Split {
   const runs = baselineRuns(current);
   const pooled = runs.flatMap((run) => run.attempts);
-  const simulate = (costScale: number, fixShare = 0) => simulateReferee(pooled, current.train, current.heldOut, { attempts: Number(values.attempts), costScale, fixShare });
-  const result: Split = { ...current, acceptance: { baselines: runs.map((run) => relative(ROOT, run.file)), nothing: simulate(1), cheaper25: simulate(0.75), fixesThird: simulate(1, 1 / 3) } };
+  const comparison = comparisonRuns(current);
+  const against = comparison.flatMap((run) => run.attempts);
+  const attempts = Number(values.attempts);
+  // The baseline a candidate meets is the comparison runs pooled, so the drawn one has as many attempts.
+  const baselineAttempts = Math.round(against.length / new Set(against.map((attempt) => attempt.task)).size);
+  const simulate = (costScale: number, fixShare = 0, fixed?: Attempt[]) => simulateReferee(pooled, current.train, current.heldOut, { attempts, baselineAttempts, costScale, fixShare, against: fixed });
+  const result: Split = {
+    ...current,
+    acceptance: {
+      baselines: runs.map((run) => relative(ROOT, run.file)),
+      nothing: simulate(1),
+      cheaper25: simulate(0.75),
+      fixesThird: simulate(1, 1 / 3),
+      against: { runs: comparison.map((run) => relative(ROOT, run.file)), nothing: simulate(1, 0, against), fixesThird: simulate(1, 1 / 3, against) },
+    },
+  };
   writeFileSync(join(EVOLVE, "split.json"), `${JSON.stringify(result, null, 2)}\n`);
-  console.log(`Against ${runs.length === 1 ? "the baseline run" : `the ${runs.length} baseline runs`}, the referee would accept a change that does nothing ${pct(result.acceptance.nothing, 1)} of the time, one that cuts cost by 25% ${pct(result.acceptance.cheaper25)}, and one that fixes a third of the failures ${pct(result.acceptance.fixesThird ?? 0)}.`);
+  const { acceptance } = result;
+  console.log(`From ${runs.length === 1 ? "the baseline run" : `the ${runs.length} baseline runs`}, the referee would accept a change that does nothing ${pct(acceptance.nothing, 1)} of the time, one that cuts cost by 25% ${pct(acceptance.cheaper25)}, and one that fixes a third of the failures ${pct(acceptance.fixesThird ?? 0)}.`);
+  console.log(`Against the ${comparison.length === 1 ? "run" : `${comparison.length} runs`} candidates are compared with (${comparison.map((run) => basename(run.file)).join(", ")}), as ${comparison.length === 1 ? "it" : "they"} came out: ${pct(acceptance.against!.nothing, 1)} and ${pct(acceptance.against!.fixesThird)}.`);
   return result;
 }
 
@@ -163,13 +180,15 @@ function baselineRuns(current: Split): Run[] {
 }
 
 /**
- * The baseline a candidate is compared with: the latest run the analysis didn't see, if there is one.
- * The analysis works from the first run's failures and slow attempts, which another run of the same jig
- * mostly doesn't repeat, so against that run, any change looks better (milestone 14: unchanged jig would
- * have been accepted). The latest run has as many attempts as a candidate's, so the two compare evenly.
+ * The baseline a candidate is compared with: every run the analysis didn't see, pooled, or the first if
+ * there is no other. The analysis works from the first run's failures and slow attempts, which another
+ * run of the same jig mostly doesn't repeat, so against that run, any change looks better (milestone 14:
+ * unchanged jig would have been accepted). Until milestone 16 it was only the latest run, whose luck then
+ * became every candidate's: pooling more runs leaves less of it.
  */
-function comparisonBaseline(current: Split): Run {
-  return baselineRuns(current).at(-1)!;
+function comparisonRuns(current: Split): Run[] {
+  const runs = baselineRuns(current);
+  return runs.length > 1 ? runs.slice(1) : runs;
 }
 
 function loadSplit(): Split {
@@ -227,7 +246,7 @@ First, one line per attempt: what went wrong, or which steps were wasted. Then a
   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
   addUsage(usage, message.usage);
   const text = message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-  const header = `<!-- The analysis of ${baseline}'s training attempts by ${model}, for $${(costOf(model, usage) ?? 0).toFixed(4)}. What it was shown: bench/evolve/analysis-prompt.md -->`;
+  const header = `<!-- The analysis of ${baseline}'s training attempts by ${model}, for $${(costOf(model, usage) ?? 0).toFixed(4)}. What it was shown: bench/${suite}/analysis-prompt.md -->`;
   writeFileSync(join(EVOLVE, "analysis-prompt.md"), `${prompt}\n`);
   writeFileSync(file, `${header}\n\n${text.trim()}\n`);
   return readFileSync(file, "utf8");
@@ -237,7 +256,7 @@ First, one line per attempt: what went wrong, or which steps were wasted. Then a
 async function causes(): Promise<string[]> {
   const text = (await analysis()).split(/^#+\s*Causes\s*$/im)[1] ?? "";
   const found = [...text.matchAll(/^\s*\d+\.\s+(.+(?:\n(?!\s*\d+\.)(?!\s*#).+)*)/gm)].map((match) => match[1].replace(/\s+/g, " ").trim());
-  if (!found.length) throw new Error("The analysis lists no causes under a \"## Causes\" heading (bench/evolve/analysis.md).");
+  if (!found.length) throw new Error(`The analysis lists no causes under a "## Causes" heading (bench/${suite}/analysis.md).`);
   return found;
 }
 
@@ -312,10 +331,12 @@ async function score(n: number): Promise<Candidate> {
   if (!candidate) throw new Error(`No candidate ${n} in ${relative(ROOT, ARCHIVE)}.`);
   const current = loadSplit();
   const { train, heldOut } = current;
-  const base = comparisonBaseline(current);
-  console.log(`candidate ${n}: compared with ${relative(ROOT, base.file)}`);
+  const bases = comparisonRuns(current);
+  const base = bases.flatMap((run) => run.attempts);
+  console.log(`candidate ${n}: compared with ${bases.map((run) => relative(ROOT, run.file)).join(" and ")}`);
   const limit = (run: Run) => JSON.parse(readFileSync(run.file, "utf8")).settings.maxSteps;
-  if (suiteLimit() !== limit(base)) throw new Error(`The baseline ran with a step limit of ${limit(base)}, and the suite's is now ${suiteLimit()}: run the baseline again first.`);
+  const limits = new Set(bases.map(limit));
+  if (limits.size > 1 || !limits.has(suiteLimit())) throw new Error(`The baseline runs had a step limit of ${[...limits].join(" and ")}, and the suite's is now ${suiteLimit()}: run the baseline again first.`);
   const decide = (verdict: Verdict) => {
     candidate.verdict = verdict;
     save(candidate);
@@ -332,16 +353,16 @@ async function score(n: number): Promise<Candidate> {
   if (!testsPass(candidate)) return decide({ stage: "rejected", reason: "jig's tests fail with it" });
 
   const trainRun = await bench(candidate, train, "train");
-  if (limit(trainRun) !== limit(base)) throw new Error(`The baseline ran with a step limit of ${limit(base)} and the candidate with ${limit(trainRun)}: they can't be compared.`);
+  if (!limits.has(limit(trainRun))) throw new Error(`The baseline ran with a step limit of ${[...limits].join(" and ")} and the candidate with ${limit(trainRun)}: they can't be compared.`);
   candidate.runs.train = relative(ROOT, trainRun.file);
-  candidate.train = compare(trainRun.attempts, base.attempts.filter((a) => train.includes(a.task)));
+  candidate.train = compare(trainRun.attempts, base.filter((a) => train.includes(a.task)));
   candidate.spent += sum(trainRun.attempts);
   const first = judgeTrain(candidate.train);
   if (first.stage === "rejected") return decide(first);
   console.log(`candidate ${n}: ${first.reason}; now the held-out tasks`);
   const heldOutRun = await bench(candidate, heldOut, "heldout");
   candidate.runs.heldOut = relative(ROOT, heldOutRun.file);
-  candidate.heldOut = compare(heldOutRun.attempts, base.attempts.filter((a) => heldOut.includes(a.task)));
+  candidate.heldOut = compare(heldOutRun.attempts, base.filter((a) => heldOut.includes(a.task)));
   candidate.spent += sum(heldOutRun.attempts);
   return decide(judgeHeldOut(candidate.heldOut));
 }
