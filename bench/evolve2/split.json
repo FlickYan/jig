@@ -1,0 +1,38 @@
+{
+  "seed": 14,
+  "baseline": "bench/results/evolve2/2026-10-11T14-51-52_baseline.json",
+  "train": [
+    "bank-statement",
+    "gitignore-match",
+    "json-patch",
+    "library-issues",
+    "number-words",
+    "shift-pay",
+    "shop-cents",
+    "text-table",
+    "toml-subset",
+    "unit-convert"
+  ],
+  "heldOut": [
+    "build-order",
+    "business-days",
+    "expression-eval",
+    "inventory-bugs",
+    "league-standings",
+    "ledger-balances",
+    "reminder-times",
+    "rrule-dates",
+    "semver-range",
+    "ttl-cache",
+    "upload-hang"
+  ],
+  "acceptance": {
+    "baselines": [
+      "bench/results/evolve2/2026-10-11T14-51-52_baseline.json",
+      "bench/results/evolve2/2026-10-11T14-51-55_baseline-2.json"
+    ],
+    "nothing": 0.02,
+    "cheaper25": 0.204,
+    "fixesThird": 0.448
+  }
+}

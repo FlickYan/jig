@@ -1,0 +1,4 @@
+{
+  "max_steps": 4,
+  "why": "jig solves almost every task in this suite given 40 steps (94 to 100% in calibration), so the pass rate couldn't show a change for the better. With 4 steps it solves about half: what is measured is how much it gets right with few model calls. See milestone 15 in the README."
+}

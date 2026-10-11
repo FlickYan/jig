@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement to_words, to_ordinal, from_words and to_cheque in words.py so that they follow SPEC.md exactly.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "text"
+  ]
+}

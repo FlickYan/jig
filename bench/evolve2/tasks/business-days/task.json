@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement holidays_in, add_business_days and business_days_between in workdays.py so that they follow SPEC.md exactly.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "dates"
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "instruction": "Fix the problems the shop reported in ISSUE.md, without changing anything else about how the inventory package behaves.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bugs",
+    "many files"
+  ]
+}

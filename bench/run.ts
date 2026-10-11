@@ -11,7 +11,8 @@ import { parseArgs } from "node:util";
 import { type Attempt, estimateCost, formatTable, money, num, parseTranscript, percent, summarize, triedForbidden } from "./metrics.ts";
 
 const BENCH = dirname(fileURLToPath(import.meta.url));
-// The suite: bench/tasks, or bench/evolve/tasks with --suite evolve, whose results go apart.
+// The suite: bench/tasks, or with --suite <name> one that jig evolves on, bench/<name>/tasks, whose
+// results go apart, in bench/results/<name>.
 let TASKS = join(BENCH, "tasks");
 let RESULTS = join(BENCH, "results");
 const ROOT = dirname(BENCH);
@@ -25,10 +26,11 @@ Options:
   --label <name>      name for this run in the results (default: the ref, or "working-tree")
   --model <id>        model for jig (default: deepseek-flash)
   --tasks <a,b,...>   run only these tasks
-  --suite <name>      tasks (default: bench/tasks) or evolve (bench/evolve/tasks, the tasks jig evolves on)
+  --suite <name>      tasks (default: bench/tasks), or a suite jig evolves on: evolve (bench/evolve/tasks,
+                      milestone 14's) or evolve2 (bench/evolve2/tasks, harder)
   --attempts <n>      runs per task, to see how much results vary (default: 1)
   --concurrency <n>   attempts running at the same time (default: 3)
-  --max-steps <n>     jig's step limit per task (default: 40)
+  --max-steps <n>     jig's step limit per task (default: the suite's, from bench/<suite>/suite.json, or 40)
   --timeout <s>       seconds before an attempt is stopped (default: 900)
   --jig-args="<args>" extra arguments for jig, e.g. --jig-args="--effort low" (with the =, since they start
                       with a dash; the jig version must support them)
@@ -87,7 +89,7 @@ async function main(): Promise<void> {
       suite: { type: "string", default: "tasks" },
       attempts: { type: "string", default: "1" },
       concurrency: { type: "string", default: "3" },
-      "max-steps": { type: "string", default: "40" },
+      "max-steps": { type: "string" },
       timeout: { type: "string", default: "900" },
       "jig-args": { type: "string", default: "" },
       keep: { type: "boolean", default: false },
@@ -100,23 +102,30 @@ async function main(): Promise<void> {
   }
   const agent = values.agent;
   if (!["jig", "oracle", "noop"].includes(agent)) throw new Error("--agent must be jig, oracle or noop");
-  if (!["tasks", "evolve"].includes(values.suite)) throw new Error("--suite must be tasks or evolve");
-  if (values.suite === "evolve") {
-    TASKS = join(BENCH, "evolve", "tasks");
-    RESULTS = join(BENCH, "results", "evolve");
+  if (values.suite !== "tasks") {
+    if (!/^[\w-]+$/.test(values.suite) || !existsSync(join(BENCH, values.suite, "tasks"))) {
+      throw new Error("--suite must be tasks, or a suite with its tasks in bench/<name>/tasks, like evolve or evolve2");
+    }
+    TASKS = join(BENCH, values.suite, "tasks");
+    RESULTS = join(BENCH, "results", values.suite);
   }
+  // A suite may set its own step limit: evolve2's is 4, so that what it measures is how much jig gets
+  // right in a few model calls, which a change can improve (see bench/evolve2/suite.json).
+  const suiteConfig = values.suite !== "tasks" && existsSync(join(BENCH, values.suite, "suite.json")) ? JSON.parse(readFileSync(join(BENCH, values.suite, "suite.json"), "utf8")) : {};
+  const maxSteps = values["max-steps"] ?? String(suiteConfig.max_steps ?? 40);
 
   if (agent === "jig" && values.model.startsWith("deepseek") && !process.env.DEEPSEEK_API_KEY) {
     throw new Error("DEEPSEEK_API_KEY is not set, so every attempt would fail. Export it and run again.");
   }
   const tasks = await loadTasks(values.tasks?.split(","));
   const jig = agent === "jig" ? await prepareJig(values.ref) : undefined;
+  const suiteAtStart = jig && suiteFingerprint(tasks);
   const label = values.label ?? values.ref ?? (agent === "jig" ? "working-tree" : agent);
   const runId = `${new Date().toLocaleString("sv-SE").replace(" ", "T").replace(/:/g, "-")}_${label}`; // local time
   const logDir = join(BENCH, "logs", runId);
   await mkdir(logDir, { recursive: true });
   const jigArgs = values["jig-args"].split(/\s+/).filter(Boolean);
-  const settings = { attempts: Number(values.attempts), maxSteps: Number(values["max-steps"]), timeout: Number(values.timeout), jigArgs };
+  const settings = { attempts: Number(values.attempts), maxSteps: Number(maxSteps), timeout: Number(values.timeout), jigArgs };
   const run: RunContext = { agent, jigDir: jig?.dir, model: values.model, logDir, keep: values.keep, ...settings };
 
   const who = jig ? `jig ${jig.version} with ${values.model}` : `the ${agent} agent`;
@@ -149,8 +158,11 @@ async function main(): Promise<void> {
   }
   const file = join(RESULTS, `${runId}.json`);
   await mkdir(dirname(file), { recursive: true });
-  const suite = suiteFingerprint(tasks);
-  const record = { id: runId, label, version: jig!.version, model: values.model, suite, date: new Date().toISOString(), settings, summary, attempts };
+  // Fingerprinted at the start and again at the end: a task changed while the run was going means its
+  // attempts didn't all see the same tasks, and the run describes no one version of the suite.
+  const suiteAtEnd = suiteFingerprint(tasks);
+  if (suiteAtEnd !== suiteAtStart) console.log(`The tasks changed during the run (${suiteAtStart}, then ${suiteAtEnd}): its attempts didn't all see the same tasks.`);
+  const record = { id: runId, label, version: jig!.version, model: values.model, suite: suiteAtStart, ...(suiteAtEnd !== suiteAtStart && { suiteAtEnd }), date: new Date().toISOString(), settings, summary, attempts };
   await mkdir(RESULTS, { recursive: true });
   await writeFile(file, `${JSON.stringify(record, null, 2)}\n`);
   console.log(`Saved ${file}\nCompare runs with: npm run bench:report`);

@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement loads in toml_lite.py so that it follows SPEC.md exactly, without tomllib or any other TOML library.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "parsing"
+  ]
+}

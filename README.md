@@ -226,13 +226,13 @@ What jig can change about itself, and who decides whether it does:
 | its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests | whoever trains a model: jig doesn't |
 
 ```bash
-node bench/run.ts --suite evolve --attempts 3 --label baseline   # the baseline: 10 tasks, 3 attempts each
+node bench/run.ts --suite evolve2 --attempts 3 --label baseline   # the baseline: 21 tasks, 3 attempts each
 npm run evolve -- split       # training and held-out halves, and how often the referee would be fooled
-npm run evolve -- analyze     # the model's diagnosis of the training attempts (bench/evolve/analysis.md)
-node bench/run.ts --suite evolve --attempts 3 --label baseline-2 # the baseline again, to compare with
+npm run evolve -- analyze     # the model's diagnosis of the training attempts (bench/evolve2/analysis.md)
+node bench/run.ts --suite evolve2 --attempts 3 --label baseline-2 # the baseline again, to compare with
 npm run evolve -- calibrate   # how often the referee would be fooled, from both runs
 npm run evolve -- run         # a candidate for each cause found: jig changes itself, the referee judges
-npm run evolve -- list        # every candidate, its change and the verdict
+npm run evolve -- list        # every candidate, its change and the verdict (--suite evolve: milestone 14's)
 
 jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
 node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # attempts that passed, only
@@ -240,7 +240,8 @@ node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # atte
 
 A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
 change only `src/` and `skills/`; the referee runs from the main checkout, so nothing a candidate
-changes can change how it is judged. Milestone 14 describes the loop and what it found.
+changes can change how it is judged. Milestone 14 describes the loop and what it found, and milestone
+15 the suite it runs on now, whose tasks are judged at a budget of 4 steps.
 
 ## How it works
 
@@ -409,6 +410,11 @@ Ctrl+C, and when a safety classifier declines the request.
   run of the baseline showed what it missed: the run the analysis comes from is a sample too, and its
   bad luck becomes every candidate's gain (4% against that run). So the simulation draws the baseline as
   well, and candidates are compared with a baseline run the analysis didn't see.
+- **A suite's difficulty is measured, not designed.** Tasks that look hard (denser specs, a time limit,
+  a hang to find, conventions only the code shows) were solved at 88 to 100%, and a referee can only
+  reward what a suite leaves to gain. What made the evolve suite hard enough was a limit jig works
+  under, four steps, chosen by measuring 10, 8, 6 and 4: it belongs to the suite (`suite.json`), every
+  run records it, and the referee won't compare runs made under different limits.
 - **Training data is checked by something other than the model.** jig doesn't train models, but its
   sessions are what one would be trained on, and the benchmark knows which of them succeeded:
   `bench/export.ts` keeps only attempts that passed hidden tests the model never saw, as in rejection-
@@ -471,9 +477,13 @@ npm run bench:report                                # compare the saved runs (Ma
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
+The fingerprint is taken as a run starts and again as it ends, and a run whose tasks changed in between
+records both (`suiteAtEnd`).
 Since milestone 14 each attempt also records its session, the conversation jig saved, for
-`bench/export.ts`. A second suite, `--suite evolve` (`bench/evolve/tasks`, results in
-`bench/results/evolve/`), is the one jig evolves on.
+`bench/export.ts`. Two more suites are the ones jig evolves on: `--suite evolve` (`bench/evolve/tasks`,
+milestone 14's) and `--suite evolve2` (`bench/evolve2/tasks`, milestone 15's), each with its results in
+`bench/results/<suite>/`. A suite may set its own step limit in `bench/<suite>/suite.json`; evolve2's
+is 4.
 Runs on earlier versions of the suite are in `suite-12/`, `suite-15/`, `suite-17/` and `suite-20/`, one-off experiments in
 `experiments/`; `npm run bench:report -- bench/results/experiments` reports a folder.
 Logs of every attempt (the transcript, the diff the agent made, the check's output and jig's session file)
@@ -1078,6 +1088,158 @@ trainer would reject left out too). `bench/export.ts` writes only attempts that 
 examples, all valid, 23 messages on average. Training a model on them, and routing between models by
 task, are left for later.
 
+### Milestone 15: a suite that can tell a fix from luck
+
+Milestone 14's suite could reward a cheaper jig but not a better one: jig solved 93 to 97% of it, and
+the referee would have accepted a change that fixed every failure 0.7% of the time, about as often as
+one that changed nothing (0.4%). Evolving needs tasks jig fails about half the time.
+[`bench/evolve2/`](bench/evolve2) is that suite, 21 tasks, and `npm run evolve` uses it by default
+(`--suite evolve` for the first).
+
+**Harder tasks didn't make jig fail.** The suite was built in three rounds, each calibrated before the
+next, with the benchmark's usual 40 steps:
+
+| round | tasks | solved |
+|-------|-------|--------|
+| 1 | 16 tasks, denser than the first suite's: 14 specs to implement exactly (which paths a set of `.gitignore` rules ignores, a TOML subset, iCalendar recurrence rules, league standings with head-to-head ties, shift pay, JSON Patch, numbers in words, an expression evaluator, a cache with expiry, business days, a ledger, a text table, unit conversion, and the first suite's semver ranges), and two changes to a small package (six reported problems; money in whole cents, with new rules) | 14 of 16 (88%) |
+| 2 | the same, with a second layer of rules in 13 of them: nested `.gitignore` files, TOML's multi-line strings and dates, Python's `and`, `or` and `if` in the evaluator, British number words and cheques, JSON Patch's `diff`, points deductions and shared positions, holidays and call-in pay, and smaller additions to six more | 30 of 32 (94%) |
+| 3 | five new kinds: an order to build 200,000 targets in, within a time limit; an upload server that hangs for minutes (a regular expression that backtracks exponentially on long names, and a listing that is quadratic in the number of uploads); three problems a shop reported only by their symptoms; reminders an hour late since the clocks changed, and on the wrong days; and a new command for a bank's command line that must work like the others in every way the code shows | 10 of 10 |
+
+Of the four failures, three were rules the spec stated and jig missed: a holiday rule that isn't a
+string must raise `ValueError`, not `TypeError`; `BYDAY=+3WE` has a signed ordinal; `·` multiplies, as
+`*` does. The fourth was the spec's fault: "at least two postings, unless they are all virtual" holds
+for a transaction with no postings at all, which jig read literally and the hidden tests didn't. It was
+reworded during the second calibration, which that run's fingerprint of the tasks, taken as it ended,
+couldn't show; `bench/run.ts` now takes one as a run starts too, and records both if they differ.
+
+More rules only made attempts longer (a median of 11.5 steps and $0.028 an attempt in round 2, twice
+the first suite's): with 40 steps, this model reads a spec closely and tests its work until it passes.
+It solves self-contained tasks of this size almost always, as the main benchmark had shown (60 of 60 in
+every run since milestone 7).
+
+**A step budget did.** The tasks stay as they are, and the suite limits jig's steps instead
+(`bench/evolve2/suite.json`, which `bench/run.ts` reads; `--max-steps` overrides it, every run records
+its limit, and the referee won't compare runs made with different ones):
+
+| steps | solved | an attempt |
+|-------|--------|------------|
+| 40 | 40 of 42 (95%) | $0.024 |
+| 10 | 19 of 21 (90%) | $0.021 |
+| 8 | 15 of 21 (71%) | $0.017 |
+| 6 | 32 of 42 (76%) | $0.017 |
+| 4 | 22 of 42 (52%) | $0.014 |
+
+The 40-step row is rounds 2 and 3, on the tasks the budgets ran on (the ledger's reworded rule aside);
+8 steps solving fewer than 6 is noise, at one attempt a task. At 4 steps no attempt finishes on its
+own: each is stopped after its fourth model call (whose tool calls still run) and graded on the files
+as they are then. So what the suite measures is how much jig gets right in four model calls: whether
+it finds the rules on its first reading, whether its first draft is right, and how few calls go on
+looking around. That is narrower than solving the task, and a change could do better here by rushing
+(writing before it has read) and worse with 40 steps. The referee only sees the budget, so a candidate it
+accepts should be run with 40 steps before it is merged.
+
+**The baseline**, run twice, as milestone 14 learned to: 36 of 63 attempts (57%), $0.014 each, and 28
+of 63 (44%), $0.012. Of the 62 failed attempts, 32 hadn't changed a file when their four calls ran out:
+they were still reading, checking `git log` or the Python version, or looking for a reference
+implementation (npm's `semver`, the source of `tomllib`). The other 30 wrote code that failed hidden
+tests. Per task, from both runs, in the halves the split made:
+
+| task | kind | half | 40 steps | 4 steps |
+|------|------|------|----------|---------|
+| bank-statement | a command that works like the others | training | 2 of 2 | 0 of 6 |
+| gitignore-match | spec | training | 2 of 2 | 4 of 6 |
+| json-patch | spec | training | 2 of 2 | 6 of 6 |
+| library-issues | bugs | training | 2 of 2 | 2 of 6 |
+| number-words | spec | training | 2 of 2 | 2 of 6 |
+| shift-pay | spec | training | 2 of 2 | 2 of 6 |
+| shop-cents | refactor | training | 2 of 2 | 2 of 6 |
+| text-table | spec | training | 2 of 2 | 6 of 6 |
+| toml-subset | spec | training | 2 of 2 | 1 of 6 |
+| unit-convert | spec | training | 1 of 2 | 4 of 6 |
+| build-order | spec, performance | held out | 2 of 2 | 5 of 6 |
+| business-days | spec | held out | 2 of 2 | 4 of 6 |
+| expression-eval | spec | held out | 2 of 2 | 2 of 6 |
+| inventory-bugs | bugs | held out | 2 of 2 | 2 of 6 |
+| league-standings | spec | held out | 2 of 2 | 5 of 6 |
+| ledger-balances | spec | held out | 1 of 2 | 2 of 6 |
+| reminder-times | bugs | held out | 2 of 2 | 4 of 6 |
+| rrule-dates | spec | held out | 2 of 2 | 3 of 6 |
+| semver-range | spec | held out | 2 of 2 | 3 of 6 |
+| ttl-cache | spec | held out | 2 of 2 | 5 of 6 |
+| upload-hang | bugs, performance | held out | 2 of 2 | 0 of 6 |
+
+Seventeen of the 21 tasks were solved at least once and failed at least once. The two never solved
+are the two where getting started costs most: bank-statement has ten files to read, and in upload-hang
+the calls went on reproducing the hang; in 11 of their 12 attempts no file had changed. The same jig
+solved the training half 18 and then 11 times out of 30, and the held-out half 18 and 17 times out of
+33: one run is not enough to judge by, which is why the referee resamples, and draws the baseline too.
+
+**What a verdict is worth now.** Simulated as in milestone 14, from both baseline runs, drawing the
+baseline as well as the candidate. A candidate that fixes a share of the failures turns each task's
+pass rate p into p + share × (1 − p):
+
+| a candidate that | first suite | this suite |
+|------------------|-------------|------------|
+| changes nothing | 0.4% | 2.0% |
+| fixes a tenth of the failures | 0.3% | 8.1% |
+| fixes a fifth | 0.3% | 22.5% |
+| fixes a third | 0.4% | 44.8% |
+| fixes half | 0.4% | 75.0% |
+| fixes all of them | 0.7% | 100% |
+| costs 25% less | 34.1% | 20.4% |
+
+The referee is the same; what changed is that it has something to see. On the first suite nothing a
+candidate did to the pass rate could be told from luck; on this one a change that fixes a third of
+jig's failures is accepted almost half the time. A change that does nothing gets through more often
+(2.0%), since pass rates near a half vary the most, and so a cheaper change that solves no more is
+accepted less often (20%): it now solves fewer tasks than the baseline, by chance, about as often as
+more.
+
+**Checking the tasks.** Each task is written by a script in
+[`bench/evolve2/make/`](bench/evolve2/make), which then checks it four ways: the starting code parses,
+the hidden tests fail on it, they pass with the reference solution, and the project's own tests agree
+with that solution. The first and the last checks were added after a starting file that didn't parse,
+and a visible test that expected what only the buggy code produced, had got past the other two. Where
+a real tool knows the answer, the hidden tests' expectations come from it:
+
+| task | answers from | the reference solution agrees on |
+|------|--------------|----------------------------------|
+| gitignore-match | git itself (`git check-ignore`) | the tests' 135 cases, and 885 random layouts |
+| toml-subset | Python's `tomllib` (blocked inside the tests, so a solution can't use it) | the tests' 98 documents, 64 of them invalid |
+| rrule-dates | python-dateutil's `rrule` | the tests' rules, and 2,939 random ones |
+| expression-eval | Python's `eval` | 17,498 random expressions |
+| reminder-times | Python's `zoneinfo` | the tests' cases |
+
+A tool can mislead as a reference, too. On macOS git matches without regard to case unless told
+otherwise, and `git check-ignore abc/` says `abc/**` ignores the directory, which git itself, walking
+a project, never does: the cases were made with case-sensitive matching and directories named without
+the slash. dateutil counts a weekly rule's first week only from the rule's start, which decides what
+`BYSETPOS` picks in it, so the spec allows `BYSETPOS` only in monthly and yearly rules. And the
+random expressions differ from Python's only where the spec chose to (a function's arity is checked
+before its arguments are evaluated). The time limits make a slow solution fail rather than hang:
+`signal.alarm` for pure Python, and a subprocess with a timeout for the regular expression and the
+listing, since a regular expression in C doesn't stop for an alarm. The original pattern took 8.2
+seconds on a name of 31 characters and 131 seconds on 35; the reference rewrite accepts the same names
+(`fuzz_names.py`: 100,000 random ones). The reference build order takes 0.13 to 0.3 seconds on 200,000
+targets; the obvious recursive depth-first search fails 4 of the 8 hidden tests. Rerunning the 20
+scripts wrote the same tasks, byte for byte (the 21st, semver-range, is the first suite's, copied).
+
+**Cost.** $5.05 in all: $1.29 for the three calibrations, $2.09 for the four budgets and $1.67 for the
+two baselines. Scoring a candidate's training run now costs $0.40 to $0.44, against milestone 14's
+$0.23.
+
+- **Difficulty had to be measured.** Every round was designed to be hard (rules that are easy to
+  overlook, a performance target, a hang to find, conventions only the code shows), and each one was
+  solved at 88 to 100%. What jig finds hard is not what looks hard: the failures were single overlooked
+  rules, never a task it couldn't do.
+- **The budget changes the question.** With 4 steps the suite asks how well jig works in few calls,
+  which is worth asking, since every call costs time and money, but it isn't "can it solve the task".
+  The analysis will see what the counts above show, that half the failures are still exploring when
+  the budget ends, and the obvious candidate, "write the first draft sooner", is the change the budget
+  rewards most and 40 steps might not.
+- **Next: candidates.** `npm run evolve -- analyze` on the training half, then `run`, and anything the
+  referee accepts run again with 40 steps.
+
 ## Tests
 
 ```bash
@@ -1118,6 +1280,7 @@ installs and runs the tarball on every push.
 - [x] **12. Skills to install, write and measure:** `jig skills add/list/update/remove` from folders and git repositories, with a lockfile; the bundled `skill-writer`, `jig skills new` and `/skills new`, `jig skills learn` and `/learn`, all through `propose_skill`, which shows you the skill and saves it only where you say; `jig skills test`, each eval with and without the skill; a skill learned from one session passed 9 of 9 eval runs with it, against 0 of 9 without
 - [x] **13. Memory and context:** user and project memories under `~/.jig/memory/`, indexed in the system prompt and read with the `memory` tool; `propose_memory` and `propose_instructions` (AGENTS.md edits as diffs), approved one at a time, secrets refused; `/remember`, `/reflect`, `/memory` and `jig memory list|show|remove|reflect`; `--no-memory`; the memory benchmark: a convention or preference said once, in an earlier session, was followed in 9 of 9 later runs with what reflection kept and 0 of 9 without
 - [x] **14. jig changes itself, under a referee:** `bench/evolve.ts`: an analysis of jig's own attempts on a new ten-task suite, candidate changes jig makes to a copy of itself (no benchmarks, no history, its own sandbox and home), and a referee in the main checkout (changed files, task words, jig's tests, training then held-out tasks, a bootstrap over tasks and their attempts) whose false acceptance was measured before any candidate ran (0.2%); four candidates for the four causes found, all rejected on the training tasks, the best solving 15 of 15 for 8% less; a second run of the unchanged baseline, which the referee as it was would nearly have accepted, showed that saving to be the first run's bad luck and the 0.2% to be 4% against that run, so the held-out tasks now need what the training ones do, candidates are compared with a run the analysis didn't see, and the simulation draws the baseline too (0.4%); sessions record their system prompt and tools, and `jig sessions export` and `bench/export.ts` write them as fine-tuning data, the latter only attempts that passed their hidden tests
+- [x] **15. A suite that can tell a fix from luck:** `bench/evolve2`, 21 tasks written by scripts that check each one four ways (it parses, fails as given, passes with the reference solution, and its visible tests agree with that solution), with the hidden tests' answers from git, `tomllib`, dateutil, Python's `eval` and `zoneinfo` where a tool knows them; denser specs (88%, then 94%) and five new kinds of task (10 of 10) didn't make jig fail with 40 steps, and a budget of 4 steps did (57% and 44% in two baseline runs), set per suite in `suite.json` and recorded with every run; against it, the referee accepts a change that fixes a third of jig's failures 45% of the time, where on the first suite it couldn't tell such a change from luck (0.4%), and a change that does nothing 2.0%
 
 ## License
 

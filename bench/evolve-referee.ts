@@ -132,10 +132,13 @@ function cheaper(comparison: Comparison): boolean {
  * a baseline's from what the baseline runs given show of each task: its pass rate (shrunk toward the
  * overall rate, as 3/3 doesn't mean always) and its costs, the candidate's times costScale. At costScale 1
  * the candidate changes nothing, and the share is the referee's false acceptance rate: what an "accepted"
- * is worth. Both runs have `attempts` attempts a task, as a candidate and a baseline run do. The baseline is drawn too because it is a sample as well: milestone 14 first held it fixed,
- * which made the rate look ten times smaller than a second run of the baseline showed it to be.
+ * is worth. With fixShare, the candidate also turns that share of the baseline's failures into passes
+ * (each task's pass rate p becomes p + fixShare × (1 − p)): how often a real improvement is accepted.
+ * Both runs have `attempts` attempts a task, as a candidate and a baseline run do. The baseline is drawn
+ * too because it is a sample as well: milestone 14 first held it fixed, which made the rate look ten
+ * times smaller than a second run of the baseline showed it to be.
  */
-export function simulateReferee(baselines: Attempt[], train: string[], heldOut: string[], { costScale = 1, attempts = 3, trials = 1000, seed = 1 } = {}): number {
+export function simulateReferee(baselines: Attempt[], train: string[], heldOut: string[], { costScale = 1, fixShare = 0, attempts = 3, trials = 1000, seed = 1 } = {}): number {
   const overall = rate(baselines.map((attempt) => attempt.passed));
   let state = seed;
   const random = () => ((state = (state * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
@@ -146,12 +149,13 @@ export function simulateReferee(baselines: Attempt[], train: string[], heldOut: 
       return [task, { p: (mine.filter((attempt) => attempt.passed).length + overall) / (mine.length + 1), costs }];
     }),
   );
-  const draw = (tasks: string[], scale: number, count: number): Attempt[] =>
+  const draw = (tasks: string[], scale: number, fix: number, count: number): Attempt[] =>
     tasks.flatMap((task) => {
       const { p, costs } = truth.get(task) ?? { p: overall, costs: [] };
-      return Array.from({ length: count }, () => ({ task, passed: random() < p, cost: costs.length ? costs[Math.floor(random() * costs.length)] * scale : null }));
+      const rate = p + fix * (1 - p);
+      return Array.from({ length: count }, () => ({ task, passed: random() < rate, cost: costs.length ? costs[Math.floor(random() * costs.length)] * scale : null }));
     });
-  const stage = (tasks: string[]) => compare(draw(tasks, costScale, attempts), draw(tasks, 1, attempts), 400, state);
+  const stage = (tasks: string[]) => compare(draw(tasks, costScale, fixShare, attempts), draw(tasks, 1, 0, attempts), 400, state);
   let accepted = 0;
   for (let trial = 1; trial <= trials; trial++) {
     if (judgeTrain(stage(train)).stage === "rejected") continue;

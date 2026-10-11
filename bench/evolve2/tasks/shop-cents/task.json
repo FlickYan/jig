@@ -1,0 +1,10 @@
+{
+  "instruction": "Do what ISSUE.md asks of the shop package: keep money in whole cents, as it describes, and make the changes it lists under Also needed, without changing anything else about how the shop behaves.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "refactor",
+    "money",
+    "many files"
+  ]
+}

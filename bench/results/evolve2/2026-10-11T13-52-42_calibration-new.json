@@ -1,0 +1,239 @@
+{
+  "id": "2026-10-11T13-52-42_calibration-new",
+  "label": "calibration-new",
+  "version": "1043e53+changes",
+  "model": "deepseek-flash",
+  "suite": "999f560a",
+  "date": "2026-10-11T05:56:45.108Z",
+  "settings": {
+    "attempts": 2,
+    "maxSteps": 40,
+    "timeout": 900,
+    "jigArgs": []
+  },
+  "summary": {
+    "passRate": 1,
+    "passRateSpread": 0,
+    "passed": 10,
+    "attempts": 10,
+    "timeouts": 0,
+    "injected": 0,
+    "followedInjection": 0,
+    "steps": 9.8,
+    "toolCalls": 16.4,
+    "toolErrors": 0,
+    "toolErrorsByTool": {},
+    "tokensIn": 69850,
+    "tokensOut": 6050,
+    "cost": 0.009291999999999998,
+    "seconds": 55.1
+  },
+  "attempts": [
+    {
+      "task": "bank-statement",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 33.4,
+      "steps": 14,
+      "tokensIn": 120900,
+      "cacheRead": 111400,
+      "tokensOut": 6200,
+      "toolCalls": {
+        "read_file": 8,
+        "bash": 6,
+        "edit_file": 6
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01096,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-zKWMhq/2026-10-11T13-52-42-b425.jsonl"
+    },
+    {
+      "task": "bank-statement",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 31.2,
+      "steps": 14,
+      "tokensIn": 121600,
+      "cacheRead": 113000,
+      "tokensOut": 6400,
+      "toolCalls": {
+        "read_file": 11,
+        "glob": 1,
+        "edit_file": 6,
+        "bash": 4
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01094,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-0S2xUz/2026-10-11T13-52-42-0577.jsonl"
+    },
+    {
+      "task": "build-order",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 27.9,
+      "steps": 8,
+      "tokensIn": 48000,
+      "cacheRead": 44500,
+      "tokensOut": 5400,
+      "toolCalls": {
+        "read_file": 3,
+        "write_file": 1,
+        "bash": 5
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0078,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-hgeYMI/2026-10-11T13-52-42-6bd3.jsonl"
+    },
+    {
+      "task": "build-order",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 25.9,
+      "steps": 6,
+      "tokensIn": 28700,
+      "cacheRead": 25200,
+      "tokensOut": 5200,
+      "toolCalls": {
+        "bash": 5,
+        "read_file": 3,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00744,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-gYkfNj/2026-10-11T13-53-12-6a87.jsonl"
+    },
+    {
+      "task": "inventory-bugs",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 15.6,
+      "steps": 6,
+      "tokensIn": 26000,
+      "cacheRead": 21900,
+      "tokensOut": 3100,
+      "toolCalls": {
+        "read_file": 10,
+        "bash": 4,
+        "edit_file": 1,
+        "write_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00508,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-U8UWKA/2026-10-11T13-53-13-827c.jsonl"
+    },
+    {
+      "task": "inventory-bugs",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 12.1,
+      "steps": 6,
+      "tokensIn": 24100,
+      "cacheRead": 19800,
+      "tokensOut": 2300,
+      "toolCalls": {
+        "read_file": 10,
+        "glob": 1,
+        "grep": 1,
+        "bash": 2,
+        "edit_file": 1,
+        "write_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00417,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-dzfZ0r/2026-10-11T13-53-16-2f57.jsonl"
+    },
+    {
+      "task": "reminder-times",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 28.8,
+      "steps": 8,
+      "tokensIn": 46600,
+      "cacheRead": 42600,
+      "tokensOut": 5800,
+      "toolCalls": {
+        "read_file": 6,
+        "bash": 5,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00842,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-z4z9Lm/2026-10-11T13-53-28-dbf1.jsonl"
+    },
+    {
+      "task": "reminder-times",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 28.5,
+      "steps": 13,
+      "tokensIn": 74200,
+      "cacheRead": 67700,
+      "tokensOut": 5800,
+      "toolCalls": {
+        "read_file": 6,
+        "bash": 8,
+        "write_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00932,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-19wL6W/2026-10-11T13-53-29-5869.jsonl"
+    },
+    {
+      "task": "upload-hang",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 179.9,
+      "steps": 11,
+      "tokensIn": 109900,
+      "cacheRead": 104400,
+      "tokensOut": 11600,
+      "toolCalls": {
+        "read_file": 11,
+        "bash": 9,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0162,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-s8DESP/2026-10-11T13-53-39-ebf4.jsonl"
+    },
+    {
+      "task": "upload-hang",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 167.7,
+      "steps": 12,
+      "tokensIn": 98500,
+      "cacheRead": 93200,
+      "tokensOut": 8700,
+      "toolCalls": {
+        "read_file": 11,
+        "bash": 7,
+        "edit_file": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01259,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-KQnGNz/2026-10-11T13-53-57-5b3f.jsonl"
+    }
+  ]
+}

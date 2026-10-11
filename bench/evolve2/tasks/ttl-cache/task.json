@@ -1,0 +1,9 @@
+{
+  "instruction": "Implement the Cache class in ttlcache.py so that it follows SPEC.md exactly.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "state"
+  ]
+}

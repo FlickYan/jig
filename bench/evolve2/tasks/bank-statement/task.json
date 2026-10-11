@@ -1,0 +1,10 @@
+{
+  "instruction": "Add the statement command that TASK.md describes to the bank command-line tool.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "conventions",
+    "many files"
+  ]
+}

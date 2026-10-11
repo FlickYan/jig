@@ -1,0 +1,33 @@
+['*.log'] {'debug.log': True, 'logs/debug.log': True, 'debug.log.txt': False, 'a/b/c.log': True}
+['/todo'] {'todo': True, 'src/todo': False}
+['doc/frotz'] {'doc/frotz': True, 'a/doc/frotz': False}
+['frotz'] {'frotz': True, 'a/b/frotz': True, 'frotz2': False, 'frotz/x.txt': True}
+['build/'] {'build/': True, 'build': False, 'build/out.o': True, 'src/build/x.o': True, 'src/build': False}
+['/build/'] {'build/': True, 'sub/build/': False, 'build/x': True, 'sub/build/x': False}
+['*.log', '!keep.log'] {'keep.log': False, 'a/keep.log': False, 'x.log': True}
+['!keep.log', '*.log'] {'keep.log': True}
+['logs/', '!logs/keep.txt'] {'logs/keep.txt': True, 'logs/x.txt': True}
+['logs/*', '!logs/keep.txt'] {'logs/keep.txt': False, 'logs/x.txt': True, 'logs/': False}
+['*', '!*/', '!*.py'] {'src/a.py': False, 'src/a.txt': True, 'a.py': False, 'README': True, 'src/': False}
+['**/foo'] {'foo': True, 'a/b/foo': True, 'a/foo/bar': True}
+['abc/**'] {'abc/x': True, 'abc/x/y': True, 'abc/': False, 'xabc/x': False}
+['a/**/b'] {'a/b': True, 'a/x/b': True, 'a/x/y/b': True, 'x/a/b': False, 'a/b/c': True}
+['logs/**', '!logs/keep/'] {'logs/keep/': False, 'logs/keep/a.txt': True, 'logs/other.txt': True}
+['file?.txt'] {'file1.txt': True, 'file10.txt': False, 'file.txt': False, 'd/fileA.txt': True}
+['[abc]*.txt'] {'a1.txt': True, 'd1.txt': False, 'c.txt': True}
+['[!0-9]*.csv'] {'x.csv': True, '9x.csv': False}
+['data[0-9][0-9]'] {'data07': True, 'data7': False, 'data7x': False}
+['\\#notes', '#comment'] {'#notes': True, '#comment': False}
+['\\!important'] {'!important': True, 'important': False}
+['name\\ '] {'name ': True, 'name': False}
+['spaced   '] {'spaced': True, 'spaced   ': False}
+['\\*.md'] {'*.md': True, 'a.md': False}
+['*.LOG'] {'x.log': False, 'X.LOG': True}
+['a**b'] {'axxb': True, 'a/b': False, 'ab': True}
+['', '# just a comment', '   ', '*.tmp'] {'x.tmp': True, 'x.tmpl': False}
+['build/', '!build/'] {'build/x': False, 'build/': False}
+['vendor/', '!vendor/keep/', '!vendor/keep/*'] {'vendor/keep/a.go': True, 'vendor/b.go': True}
+['out', '!out/keep'] {'out/keep': True, 'out/': True}
+['docs/*.txt'] {'docs/a.txt': True, 'docs/sub/a.txt': False, 'x/docs/a.txt': False}
+['**/cache/', '!**/cache/README'] {'a/cache/README': True, 'cache/': True, 'a/b/cache/data': True}
+['*.o', '!lib/*.o', 'lib/bad.o'] {'lib/good.o': False, 'lib/bad.o': True, 'main.o': True, 'lib/sub/x.o': True}

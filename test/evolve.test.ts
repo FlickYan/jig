@@ -98,6 +98,14 @@ describe("the evolve referee", () => {
     assert.equal(simulateReferee(baseline, train, heldOut, { costScale: 0.7, trials: 300 }), cheaper);
   });
 
+  it("accepts a change that fixes failures more often the more it fixes", () => {
+    const halfway = runOf({ a: 1, b: 2, c: 1, d: 2, e: 1, f: 2, g: 1, h: 2, i: 1, j: 2 });
+    const train = ["a", "b", "c", "d", "e"];
+    const heldOut = ["f", "g", "h", "i", "j"];
+    const rates = [0, 1 / 3, 2 / 3].map((fixShare) => simulateReferee(halfway, train, heldOut, { fixShare, trials: 300 }));
+    assert.ok(rates[0] < 0.05 && rates[0] < rates[1] && rates[1] < rates[2], rates.join(", "));
+  });
+
   it("gives each task its share of passed attempts", () => {
     assert.deepEqual(passRates(runOf({ a: 3, b: 1 })), new Map([["a", 1], ["b", 1 / 3]]));
   });

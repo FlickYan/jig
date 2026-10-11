@@ -1,0 +1,10 @@
+{
+  "instruction": "Fix the problems reported in ISSUE.md, without changing anything else about how the uploads package behaves.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bugs",
+    "performance",
+    "many files"
+  ]
+}

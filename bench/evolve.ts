@@ -20,11 +20,11 @@ const HELP = `Usage: node bench/evolve.ts <command> [options]
 
 Commands:
   split        split the suite into training and held-out tasks, from the latest baseline run
-               (node bench/run.ts --suite evolve --attempts 3 --label baseline)
+               (node bench/run.ts --suite evolve2 --attempts 3 --label baseline)
   calibrate    how often the referee would be fooled, from every baseline run so far (more runs:
                --label baseline-<name>), saved with the split
   analyze      diagnose the baseline's training attempts: what failed, where steps went
-  propose      jig changes a copy of itself; the change goes on a new branch, evolve/<n>
+  propose      jig changes a copy of itself; the change goes on a new branch, <suite>/<n>
   score <n>    the referee: changed files, task words, jig's tests, the training tasks, the held-out tasks,
                compared with the latest baseline run the analysis didn't see (run the baseline again
                with --label baseline-<name> before scoring; without one, the first run is used)
@@ -32,6 +32,7 @@ Commands:
   list         every candidate so far and its verdict
 
 Options:
+  --suite <name>      evolve2 (default: bench/evolve2, the harder suite) or evolve (milestone 14's)
   --model <id>        model for the analysis, the candidates and the runs (default: deepseek-flash)
   --attempts <n>      attempts per task when scoring (default: 3, as in the baseline)
   --candidates <n>    candidates for run (default: 3)
@@ -41,19 +42,10 @@ Options:
 Candidates branch from HEAD and are judged by the main checkout: its tests, tasks and runner, never the
 candidate's. Nothing here merges one: an accepted candidate waits on its branch for a person.`;
 
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
-const EVOLVE = join(ROOT, "bench", "evolve");
-const TASKS = join(EVOLVE, "tasks");
-const ARCHIVE = join(EVOLVE, "archive");
-const RESULTS = join(ROOT, "bench", "results", "evolve");
-const LOGS = join(ROOT, "bench", "logs", "evolve");
-const CLI = join(ROOT, "src", "cli.ts");
-/** jig's tests, made to fail rather than hang where something they need is missing. */
-const TESTS = "node --test --test-timeout=30000 --test-force-exit --test-reporter=spec test/*.test.ts";
-
 const { values, positionals } = parseArgs({
   allowPositionals: true,
   options: {
+    suite: { type: "string", default: "evolve2" },
     model: { type: "string", default: "deepseek-flash" },
     attempts: { type: "string", default: "3" },
     candidates: { type: "string", default: "3" },
@@ -63,6 +55,19 @@ const { values, positionals } = parseArgs({
   },
 });
 const model = values.model;
+const suite = values.suite;
+
+const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+// Each suite keeps its own tasks, split, analysis and archive, its results and its logs.
+const EVOLVE = join(ROOT, "bench", suite);
+const TASKS = join(EVOLVE, "tasks");
+const ARCHIVE = join(EVOLVE, "archive");
+const RESULTS = join(ROOT, "bench", "results", suite);
+const LOGS = join(ROOT, "bench", "logs", suite);
+const CLI = join(ROOT, "src", "cli.ts");
+/** jig's tests, made to fail rather than hang where something they need is missing. */
+const TESTS = "node --test --test-timeout=30000 --test-force-exit --test-reporter=spec test/*.test.ts";
+if (!/^[\w-]+$/.test(suite) || !existsSync(TASKS)) throw new Error(`No suite ${suite}: bench/${suite}/tasks doesn't exist.`);
 
 interface Split {
   seed: number;
@@ -70,9 +75,9 @@ interface Split {
   baseline: string;
   train: string[];
   heldOut: string[];
-  /** How often the referee would accept a change that does nothing, or one that cuts cost by 25%, judged
-   * against the baseline runs named (see calibrate). */
-  acceptance: { baselines: string[]; nothing: number; cheaper25: number };
+  /** How often the referee would accept a change that does nothing, one that cuts cost by 25%, or one that
+   * fixes a third of the failures, judged against the baseline runs named (see calibrate). */
+  acceptance: { baselines: string[]; nothing: number; cheaper25: number; fixesThird?: number };
   /** What it said before milestone 14's candidates ran: the first baseline held fixed, and any more solved
    * on the held-out tasks enough to be accepted. */
   acceptanceBefore?: { nothing: number; cheaper25: number };
@@ -136,10 +141,10 @@ function makeSplit(): Split {
 function calibrate(current = loadSplit()): Split {
   const runs = baselineRuns(current);
   const pooled = runs.flatMap((run) => run.attempts);
-  const simulate = (costScale: number) => simulateReferee(pooled, current.train, current.heldOut, { attempts: Number(values.attempts), costScale });
-  const result: Split = { ...current, acceptance: { baselines: runs.map((run) => relative(ROOT, run.file)), nothing: simulate(1), cheaper25: simulate(0.75) } };
+  const simulate = (costScale: number, fixShare = 0) => simulateReferee(pooled, current.train, current.heldOut, { attempts: Number(values.attempts), costScale, fixShare });
+  const result: Split = { ...current, acceptance: { baselines: runs.map((run) => relative(ROOT, run.file)), nothing: simulate(1), cheaper25: simulate(0.75), fixesThird: simulate(1, 1 / 3) } };
   writeFileSync(join(EVOLVE, "split.json"), `${JSON.stringify(result, null, 2)}\n`);
-  console.log(`Against ${runs.length === 1 ? "the baseline run" : `the ${runs.length} baseline runs`}, the referee would accept a change that does nothing ${pct(result.acceptance.nothing, 1)} of the time, and one that cuts cost by 25% ${pct(result.acceptance.cheaper25)} of the time.`);
+  console.log(`Against ${runs.length === 1 ? "the baseline run" : `the ${runs.length} baseline runs`}, the referee would accept a change that does nothing ${pct(result.acceptance.nothing, 1)} of the time, one that cuts cost by 25% ${pct(result.acceptance.cheaper25)}, and one that fixes a third of the failures ${pct(result.acceptance.fixesThird ?? 0)}.`);
   return result;
 }
 
@@ -180,7 +185,7 @@ function readRun(file: string): Run {
 
 function latestRun(label: string): Run {
   const files = existsSync(RESULTS) ? readdirSync(RESULTS).filter((file) => file.endsWith(`_${label}.json`)).sort() : [];
-  if (!files.length) throw new Error(`No ${label} run yet. Make one with: node bench/run.ts --suite evolve --attempts ${values.attempts} --label ${label}`);
+  if (!files.length) throw new Error(`No ${label} run yet. Make one with: node bench/run.ts --suite ${suite} --attempts ${values.attempts} --label ${label}`);
   return readRun(join(RESULTS, files.at(-1)!));
 }
 
@@ -211,7 +216,8 @@ async function analysis(fresh = false): Promise<string> {
       `The agent's last message:\n${log.finalMessage}`,
     ].join("\n\n");
   });
-  const prompt = `These are attempts by jig at tasks of one kind: implement or change code in a small project so that it follows a written specification, which hidden tests then check. jig solves ${pct(mine.filter((a) => a.passed).length / mine.length)} of them, at $${mean(mine.map((a) => a.cost ?? 0)).toFixed(4)} an attempt.
+  const limit = JSON.parse(readFileSync(run.file, "utf8")).settings.maxSteps;
+  const prompt = `These are attempts by jig at small programming tasks: implementing a written specification, or fixing or changing a small project as an issue asks, after which hidden tests check the work. Each attempt may use at most ${limit} steps (model calls): one that runs out is stopped, and whatever it has written by then is tested. jig solves ${pct(mine.filter((a) => a.passed).length / mine.length)} of them, at $${mean(mine.map((a) => a.cost ?? 0)).toFixed(4)} an attempt.
 
 ${evidence.join("\n\n")}
 
@@ -235,7 +241,7 @@ async function causes(): Promise<string[]> {
   return found;
 }
 
-const IMPROVE = (cause: string, earlier: string, failing: string[]) => `You are improving jig, the coding agent whose source code is in this repository (src/). On a benchmark of small tasks, each a written specification to implement with hidden tests to check it, an analysis of jig's attempts found this:
+const IMPROVE = (cause: string, earlier: string, failing: string[], limit: number) => `You are improving jig, the coding agent whose source code is in this repository (src/). On a benchmark of small programming tasks (specifications to implement, issues to fix), checked by hidden tests, with at most ${limit} steps (model calls) for each task, an analysis of jig's attempts found this:
 
 ${cause}
 
@@ -256,7 +262,7 @@ Make one change to jig that addresses it: most likely in its system prompt (src/
  */
 async function propose(cause: string): Promise<Candidate> {
   const n = nextNumber();
-  const branch = `evolve/${n}`;
+  const branch = `${suite}/${n}`;
   const base = git("rev-parse", "--short", "HEAD");
   const logs = join(LOGS, String(n));
   const home = join(logs, "home");
@@ -267,7 +273,8 @@ async function propose(cause: string): Promise<Candidate> {
     console.log(`\ncandidate ${n}: ${cause}`);
     const stats = join(logs, "stats.json");
     const args = ["--yes", "--model", model, "--max-steps", "60", "--stats", stats, "--add-dir", home, "-"];
-    const transcript = await jig(args, { cwd: tree, home, stdin: IMPROVE(cause, earlier(), failing), timeout: 1500 });
+    const limit = JSON.parse(readFileSync(join(ROOT, loadSplit().baseline), "utf8")).settings.maxSteps;
+    const transcript = await jig(args, { cwd: tree, home, stdin: IMPROVE(cause, earlier(), failing, limit), timeout: 1500 });
     writeFileSync(join(logs, "propose.log"), transcript);
     const usage = existsSync(stats) ? (JSON.parse(readFileSync(stats, "utf8")).usage as Usage) : undefined;
     const { subject, description } = replySummary(transcript);
@@ -307,6 +314,8 @@ async function score(n: number): Promise<Candidate> {
   const { train, heldOut } = current;
   const base = comparisonBaseline(current);
   console.log(`candidate ${n}: compared with ${relative(ROOT, base.file)}`);
+  const limit = (run: Run) => JSON.parse(readFileSync(run.file, "utf8")).settings.maxSteps;
+  if (suiteLimit() !== limit(base)) throw new Error(`The baseline ran with a step limit of ${limit(base)}, and the suite's is now ${suiteLimit()}: run the baseline again first.`);
   const decide = (verdict: Verdict) => {
     candidate.verdict = verdict;
     save(candidate);
@@ -323,6 +332,7 @@ async function score(n: number): Promise<Candidate> {
   if (!testsPass(candidate)) return decide({ stage: "rejected", reason: "jig's tests fail with it" });
 
   const trainRun = await bench(candidate, train, "train");
+  if (limit(trainRun) !== limit(base)) throw new Error(`The baseline ran with a step limit of ${limit(base)} and the candidate with ${limit(trainRun)}: they can't be compared.`);
   candidate.runs.train = relative(ROOT, trainRun.file);
   candidate.train = compare(trainRun.attempts, base.attempts.filter((a) => train.includes(a.task)));
   candidate.spent += sum(trainRun.attempts);
@@ -352,10 +362,16 @@ function testsPass(candidate: Candidate): boolean {
   }
 }
 
+/** The step limit bench/run.ts gives this suite's attempts: its suite.json's, or the runner's default. */
+function suiteLimit(): number {
+  const config = join(EVOLVE, "suite.json");
+  return existsSync(config) ? (JSON.parse(readFileSync(config, "utf8")).max_steps ?? 40) : 40;
+}
+
 /** The candidate's branch on some of the tasks, run by the main checkout's runner. */
 async function bench(candidate: Candidate, tasks: string[], stage: string): Promise<Run> {
   const label = `evolve-${candidate.n}-${stage}`;
-  const args = [join(ROOT, "bench", "run.ts"), "--suite", "evolve", "--ref", candidate.branch, "--tasks", tasks.join(","), "--attempts", values.attempts, "--model", model, "--label", label];
+  const args = [join(ROOT, "bench", "run.ts"), "--suite", suite, "--ref", candidate.branch, "--tasks", tasks.join(","), "--attempts", values.attempts, "--model", model, "--label", label];
   await new Promise<void>((resolve, reject) => {
     const child = spawn(process.execPath, args, { cwd: ROOT, stdio: "inherit" });
     child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(`bench/run.ts exited with ${code}`))));
@@ -383,6 +399,7 @@ async function run(count: number, budget: number): Promise<void> {
 
 function list(): void {
   const share = (comparison?: Comparison) => (comparison ? `${pct(comparison.candidate)} vs ${pct(comparison.baseline)}, cost ×${comparison.costRatio?.toFixed(2) ?? "?"}` : "-");
+  if (!archived().length) console.log(`No candidates on ${suite} yet: npm run evolve -- run --suite ${suite} makes them.`);
   for (const c of archived()) {
     console.log(`\n#${c.n} ${c.verdict?.stage ?? "not scored"}  ($${c.spent.toFixed(3)})  ${c.branch}${c.verdict?.stage === "rejected" ? " (deleted)" : ""}`);
     console.log(`  cause:    ${c.cause.slice(0, 160)}`);
@@ -409,8 +426,8 @@ function archived(): Candidate[] {
 
 /** One more than any candidate archived or branched, so a run that broke off never reuses a number. */
 function nextNumber(): number {
-  const branches = git("branch", "--list", "evolve/*", "--format=%(refname:short)").split("\n").filter(Boolean);
-  const used = [...archived().map((c) => c.n), ...branches.map((branch) => Number(branch.slice("evolve/".length)))];
+  const branches = git("branch", "--list", `${suite}/*`, "--format=%(refname:short)").split("\n").filter(Boolean);
+  const used = [...archived().map((c) => c.n), ...branches.map((branch) => Number(branch.slice(suite.length + 1)))];
   return Math.max(0, ...used.filter(Number.isInteger)) + 1;
 }
 

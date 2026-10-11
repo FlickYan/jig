@@ -1,0 +1,9 @@
+{
+  "instruction": "The librarians reported the problems in ISSUE.md. Fix them in the library package, without changing anything else about how it behaves.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bugs",
+    "many files"
+  ]
+}
