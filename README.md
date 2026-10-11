@@ -241,8 +241,8 @@ node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # atte
 A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
 change only `src/` and `skills/`; the referee runs from the main checkout, so nothing a candidate
 changes can change how it is judged. Milestone 14 describes the loop and what it found, milestone 15
-the suite it runs on now, whose tasks are judged at a budget of 4 steps, and milestone 16 the first
-change it accepted, which waits on its branch.
+the suite it runs on now, whose tasks are judged at a budget of 4 steps, milestone 16 the first
+change it accepted, and milestone 17 why that change wasn't merged: it cost Terminal-Bench 15 points.
 
 ## How it works
 
@@ -414,6 +414,10 @@ Ctrl+C, and when a safety classifier declines the request.
   made, their luck is part of every verdict: against one unlucky run, a change that does nothing would
   have been accepted 9% of the time, so candidates meet every unseen run, pooled, and `calibrate`
   reports the rate against them as they came out.
+- **An accepted change is checked where jig is used.** The evolve suite is a proxy, small tasks at 4
+  steps, and the referee measures only the proxy: milestone 16's accepted change solved more of it and
+  15 points less of Terminal-Bench. So before a candidate is merged, it runs on Terminal-Bench against
+  jig as it is, in alternating rounds.
 - **A suite's difficulty is measured, not designed.** Tasks that look hard (denser specs, a time limit,
   a hang to find, conventions only the code shows) were solved at 88 to 100%, and a referee can only
   reward what a suite leaves to gain. What made the evolve suite hard enough was a limit jig works
@@ -1303,7 +1307,7 @@ failure in the code that reports a cycle) and on a change across files (shop-cen
 **It stays on its branch**, `evolve2/1`. The gain that survived the rerun is small, its interval
 crosses zero, and the line most likely to cost something wasn't measured where it would: "don't
 survey … its environment" on Terminal-Bench, where jig works on machines it has never seen. Merging
-it waits for that check.
+it waited for that check, which it failed (milestone 17).
 
 **Cost.** $5.85 by jig's estimates: $0.88 for the third baseline, $1.83 for the three candidates ($0.13
 of it proposing them), and $3.13 for the checks (the rerun and its baseline $1.71, 40 steps $0.91, the
@@ -1321,6 +1325,47 @@ main benchmark $0.51). DeepSeek billed 19.5 CNY for all of it, about $2.70.
   combination.
 - **Next:** candidate 1 against jig as it is on Terminal-Bench, before merging it; and if it is merged,
   new baselines, since every run so far is of jig without it.
+
+### Milestone 17: the accepted change, on Terminal-Bench
+
+Milestone 16's referee accepted candidate 1 on small Python tasks at a budget of 4 steps, and its line
+most likely to cost something, "don't survey … its environment", hadn't been measured where jig works
+on machines it has never seen. So candidate 1 and jig as it is ran on the original 20 Terminal-Bench
+tasks, two attempts each, in alternating rounds (jig, candidate, candidate, jig: about 2.3 hours a
+round), as in milestone 11:
+
+```bash
+eval/run.sh tb-m16 jig --ak ref=m16        # then tb-c1 and tb-c1-r2 (--ak ref=evolve2/1), and tb-m16-r2
+python3 eval/report.py eval/jobs/tb-m16+tb-m16-r2 eval/jobs/tb-c1+tb-c1-r2
+```
+
+| original 20, 2 attempts | passed | looked up | against jig as it is | timed out | turns | cost | agent time |
+|-------------------------|--------|-----------|----------------------|-----------|-------|------|------------|
+| jig as it is (m16) | 78% (31/40) | 1 (passed) | | 3 | 24.9 | $0.055 | 5.5 min |
+| candidate 1 (evolve2/1) | 62% (25/40) | 1 (passed) | −15 points (−28 to −5) | 3 | 21.9 | $0.050 | 5.0 min |
+
+- **It cost Terminal-Bench 15 points, so it isn't merged.** Both rounds agreed: 16 and 15 passes for
+  jig as it is, 13 and 12 for the candidate. It lost model-extraction-relu-logits (2 of 2 against 0 of
+  2), dna-assembly, adaptive-rejection-sampler and chess-best-move, and gained on no task. It took
+  fewer turns and tokens and cost 9% less, but solved less. Its branch is deleted; the change stays in
+  the archive, `bench/evolve2/archive/1`, with the decision, which `npm run evolve -- list` shows.
+- **What the evolve suite measures and what Terminal-Bench needs pull apart.** At 4 steps the suite
+  rewards getting it right with little looking; on an unfamiliar machine, with a task to work out,
+  looking is the work. A referee that measures only the first accepts changes that cost the second.
+  The next evolve suite needs tasks where exploring pays, or a candidate must also pass Terminal-Bench
+  before it is accepted.
+- **Neither prompt stops look-ups.** Each agent fetched the benchmark's files once, both times on
+  mteb-retrieve, and both times the attempt passed and counts as failed. In jig's, it first searched
+  its own source for an expected answer, then GitHub's code search, then downloaded the benchmark's
+  repositories.
+- **jig as it is did better than milestone 11's jig**: 78% against 68% two days before (+9 points, +1
+  to +18, paired by task), with more turns and tokens an attempt. jig has gained skills, memory and
+  session records since, and DeepSeek's service may have changed as well; these runs can't say which,
+  which is why the comparison above is paired and in alternating rounds.
+- A network outage of about five minutes during the last round left one trace, a reply that broke off
+  and that jig retried (chess-best-move, which passed).
+
+The four rounds cost $4.20 by jig's estimates, in 9 hours 20 minutes.
 
 ## Tests
 
@@ -1364,6 +1409,7 @@ installs and runs the tarball on every push.
 - [x] **14. jig changes itself, under a referee:** `bench/evolve.ts`: an analysis of jig's own attempts on a new ten-task suite, candidate changes jig makes to a copy of itself (no benchmarks, no history, its own sandbox and home), and a referee in the main checkout (changed files, task words, jig's tests, training then held-out tasks, a bootstrap over tasks and their attempts) whose false acceptance was measured before any candidate ran (0.2%); four candidates for the four causes found, all rejected on the training tasks, the best solving 15 of 15 for 8% less; a second run of the unchanged baseline, which the referee as it was would nearly have accepted, showed that saving to be the first run's bad luck and the 0.2% to be 4% against that run, so the held-out tasks now need what the training ones do, candidates are compared with a run the analysis didn't see, and the simulation draws the baseline too (0.4%); sessions record their system prompt and tools, and `jig sessions export` and `bench/export.ts` write them as fine-tuning data, the latter only attempts that passed their hidden tests
 - [x] **15. A suite that can tell a fix from luck:** `bench/evolve2`, 21 tasks written by scripts that check each one four ways (it parses, fails as given, passes with the reference solution, and its visible tests agree with that solution), with the hidden tests' answers from git, `tomllib`, dateutil, Python's `eval` and `zoneinfo` where a tool knows them; denser specs (88%, then 94%) and five new kinds of task (10 of 10) didn't make jig fail with 40 steps, and a budget of 4 steps did (57% and 44% in two baseline runs), set per suite in `suite.json` and recorded with every run; against it, the referee accepts a change that fixes a third of jig's failures 45% of the time, where on the first suite it couldn't tell such a change from luck (0.4%), and a change that does nothing 2.0%
 - [x] **16. The first change the referee accepted:** before any candidate ran, the false acceptance against the one baseline run candidates would meet turned out to be 9%, not the 2% averaged over runs, so candidates are compared with every run the analysis didn't see, pooled, and `calibrate` reports the rate against those runs (3.7% with four baselines); the analysis found jig reading until its 4 steps ran out, and of three prompt changes the referee accepted one (+15 and +17 points); run again beside a fourth baseline it was +6 (−11 to +24), harmless with 40 steps (41 of 42) and one attempt short on the main benchmark (59 of 60), so it waits on its branch for a Terminal-Bench check
+- [x] **17. The accepted change, on Terminal-Bench:** candidate 1 against jig as it is on the original 20 tasks, two attempts each in alternating rounds: 62% against 78%, −15 points (−28 to −5), both rounds alike, so it isn't merged; the evolve suite rewards getting it right with little looking, which Terminal-Bench doesn't; each prompt looked the benchmark up once; jig as it is solved 9 points more than milestone 11's jig (+1 to +18)
 
 ## License
 

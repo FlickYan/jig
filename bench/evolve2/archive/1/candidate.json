@@ -36,5 +36,6 @@
   "verdict": {
     "stage": "accepted",
     "reason": "solved more held-out tasks too (+17 points, ahead in 90% of resamples)"
-  }
+  },
+  "decision": "not merged: on Terminal-Bench it solved 15 points less than jig as it is (milestone 17), so its branch was deleted"
 }

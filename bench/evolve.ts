@@ -109,6 +109,8 @@ interface Candidate {
   train?: Comparison;
   heldOut?: Comparison;
   verdict?: Verdict;
+  /** What a person decided about it once the referee had accepted it, and why. */
+  decision?: string;
 }
 
 async function main(): Promise<void> {
@@ -422,11 +424,12 @@ function list(): void {
   const share = (comparison?: Comparison) => (comparison ? `${pct(comparison.candidate)} vs ${pct(comparison.baseline)}, cost ×${comparison.costRatio?.toFixed(2) ?? "?"}` : "-");
   if (!archived().length) console.log(`No candidates on ${suite} yet: npm run evolve -- run --suite ${suite} makes them.`);
   for (const c of archived()) {
-    console.log(`\n#${c.n} ${c.verdict?.stage ?? "not scored"}  ($${c.spent.toFixed(3)})  ${c.branch}${c.verdict?.stage === "rejected" ? " (deleted)" : ""}`);
+    console.log(`\n#${c.n} ${c.verdict?.stage ?? "not scored"}  ($${c.spent.toFixed(3)})  ${c.branch}${branchExists(c.branch) ? "" : " (deleted)"}`);
     console.log(`  cause:    ${c.cause.slice(0, 160)}`);
     console.log(`  change:   ${c.subject}`);
     console.log(`  training: ${share(c.train)}   held out: ${share(c.heldOut)}`);
     if (c.verdict) console.log(`  verdict:  ${c.verdict.reason}`);
+    if (c.decision) console.log(`  decision: ${c.decision}`);
   }
 }
 
