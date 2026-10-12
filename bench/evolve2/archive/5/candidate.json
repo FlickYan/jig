@@ -1,0 +1,41 @@
+{
+  "n": 5,
+  "branch": "evolve2/5",
+  "base": "1ad854b",
+  "cause": "Reconnaissance crowds out the work. jig begins by enumerating everything — directory trees, every module, every test file, git history, interpreter and library availability — and frequently exhausts the step budget before reaching an edit, or reaches it only for one fragment of the change. It should read the spec and only the files the change actually touches, land a first complete implementation early, and use the remaining steps to verify.",
+  "subject": "Tell jig to skip surveying when steps are few",
+  "description": "Paragraph explaining what and why.\nSummary: Tell jig to skip surveying when steps are few",
+  "files": [
+    "src/cli.ts",
+    "src/prompt.ts"
+  ],
+  "spent": 0.859398716,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T18-34-17_evolve-5-train.json",
+    "heldOut": "bench/results/evolve2/2026-10-12T18-43-50_evolve-5-heldout.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.5333333333333333,
+    "baseline": 0.3666666666666667,
+    "difference": 0.1666666666666666,
+    "low": -0.08333333333333336,
+    "high": 0.41666666666666663,
+    "ahead": 0.8911,
+    "costRatio": 1.1614493877777161
+  },
+  "heldOut": {
+    "tasks": 11,
+    "candidate": 0.5454545454545454,
+    "baseline": 0.49999999999999994,
+    "difference": 0.04545454545454544,
+    "low": -0.21212121212121213,
+    "high": 0.3181818181818182,
+    "ahead": 0.6368,
+    "costRatio": 1.0387310955367022
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "didn't carry over to the held-out tasks (+5 points, ahead in 64% of resamples, cost ×1.04)"
+  }
+}

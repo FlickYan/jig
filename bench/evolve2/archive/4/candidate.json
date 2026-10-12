@@ -1,0 +1,29 @@
+{
+  "n": 4,
+  "branch": "evolve2/4",
+  "base": "1ad854b",
+  "cause": "Steps are burned on non-informative probes and duplicated navigation — both `glob` and `find`, repeated `git log`, interpreter-version checks, invoking an uninstalled runner — and on private deliberation about edge cases in prose instead of settling them by running code.",
+  "subject": "Added one prompt bullet: probe once, act on answers, settle empirically.",
+  "description": "What I changed: in `src/prompt.ts`'s \"How to work\" list I added a single bullet — \"Look once per question: skip a check whose answer wouldn't change what you do next, and settle how code behaves by running it, not by reasoning about it.\" It targets the analysis directly: \"look once per question\" discourages the duplicated navigation (glob *and* find, a second tool for the same lookup) and repeated probes like `git log`; \"skip a check whose answer wouldn't change what you do next\" covers the non-informative environment probes (interpreter versions, invoking an absent runner); and \"settle how code behaves by running it, not by reasoning about it\" replaces prose deliberation about edge cases with a quick run or a read of the source. Unlike the earlier rejected candidate, it never tells jig not to explore — a probe that informs the next move is still allowed — so it should not cost anything where exploring is the work (Terminal-Bench). It is 27 words added to every request (cached), and by cutting redundant calls it should free steps and tokens on the 4-step suite.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.41852146799999995,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T18-23-01_evolve-4-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.36666666666666664,
+    "baseline": 0.3666666666666667,
+    "difference": -1.1102230246251566e-17,
+    "low": -0.2166666666666667,
+    "high": 0.2333333333333333,
+    "ahead": 0.4748,
+    "costRatio": 1.0284503296581524
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (0 points, ahead in 47% of resamples, cost ×1.03)"
+  }
+}

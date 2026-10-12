@@ -1,0 +1,40 @@
+{
+  "n": 6,
+  "branch": "evolve2/6",
+  "base": "1ad854b",
+  "cause": "No run-and-repair step. When it does implement, it emits one large whole-file rewrite and stops, so defects in what it wrote (bad arithmetic, off-by-one indexing, an attribute that is never set) are never observed or corrected before the hidden tests. It should reserve a step to execute the tests or a probe and iterate on what fails.",
+  "subject": "Remind the model to run and fix after every edit.",
+  "description": "I changed `src/agent.ts` so that the result of every successful edit (`write_file`/`edit_file`, `tool.kind === \"edit\"`) carries one extra sentence to the model: \"Before you finish, run the tests or a short probe that exercises this change, and fix what fails.\" It is appended to the tool-result content only (the terminal still shows the tool's own output), so it does not change the tools' unit-tested return strings, the step count, or the message structure. The point is timing: the analysis found jig writes its whole change in one draft and then stops, so defects go unobserved. The existing \"Verify your work\" guidance is in the system prompt, far from the decision, and bare prompt bullets that asked for this were rejected before; this reminder arrives at the write itself, at the exact step where the model chooses what to do next, so it can keep the remaining calls for running the change and fixing what the run shows. Because it rides on the edit result rather than forcing an extra turn, it also fits the 4-step budget (a loop-level nudge could only fire once the model had already stopped, leaving no step to act on a failure).",
+  "files": [
+    "src/agent.ts"
+  ],
+  "spent": 0.8976689559999999,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T18-58-09_evolve-6-train.json",
+    "heldOut": "bench/results/evolve2/2026-10-12T19-07-12_evolve-6-heldout.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.5,
+    "baseline": 0.3666666666666667,
+    "difference": 0.1333333333333333,
+    "low": -0.13333333333333333,
+    "high": 0.39999999999999997,
+    "ahead": 0.8252,
+    "costRatio": 1.1114466175411377
+  },
+  "heldOut": {
+    "tasks": 11,
+    "candidate": 0.42424242424242425,
+    "baseline": 0.49999999999999994,
+    "difference": -0.07575757575757579,
+    "low": -0.2727272727272727,
+    "high": 0.12121212121212119,
+    "ahead": 0.2139,
+    "costRatio": 1.079780787268799
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "didn't carry over to the held-out tasks (-8 points, ahead in 21% of resamples, cost ×1.08)"
+  }
+}

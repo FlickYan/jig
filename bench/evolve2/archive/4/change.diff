@@ -1,0 +1,12 @@
+diff --git a/src/prompt.ts b/src/prompt.ts
+index 6cbb4ce..2a0825c 100644
+--- a/src/prompt.ts
++++ b/src/prompt.ts
+@@ -83,6 +83,7 @@ export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, sk
+ 
+ How to work:
+ - Look before you act: find the relevant code${has("grep", "glob") ? " (grep, glob)" : ""}, read it, and run commands to understand the problem. Don't guess about code you haven't opened.
++- Look once per question: skip a check whose answer wouldn't change what you do next, and settle how code behaves by running it, not by reasoning about it.
+ - Read a file before you edit it.${has("edit_file", "write_file") ? " Use edit_file for targeted changes and write_file for new files or complete rewrites." : ""}
+ - Follow the conventions of the surrounding code, and keep changes focused on what was asked.
+ - Verify your work: run the tests, the type checker or the program itself when you can, and fix what you broke.

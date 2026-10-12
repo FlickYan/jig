@@ -1,0 +1,29 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index ed6272e..b741c32 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -147,6 +147,13 @@ async function compactConversation(conversation: Conversation, opts: AgentOption
+   return compacted.usage;
+ }
+ 
++/**
++ * Appended to a successful edit's result. jig tends to write the whole change in one draft and then stop,
++ * so a defect in it is never run and never fixed; the reminder arrives where the model chooses its next
++ * step, and asks it to keep a step for running the change while there is still time to act on what it shows.
++ */
++const AFTER_EDIT = "Before you finish, run the tests or a short probe that exercises this change, and fix what fails.";
++
+ /**
+  * One tool call, through each check in turn: the tool exists, the run wasn't interrupted, the call wasn't
+  * cut off mid-input, the input is valid, the hooks and then the permission policy allow it. Then it runs,
+@@ -204,7 +211,9 @@ async function handleToolCall(
+   const feedback = await opts.hooks?.after(call.name, input, output);
+   if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+   opts.ui.toolResult(output, false, call.id);
+-  return { type: "tool_result", tool_use_id: call.id, content: output };
++  // The reminder goes only to the model (the terminal shows the tool's own output): see AFTER_EDIT.
++  const content = tool.kind === "edit" ? `${output.trimEnd()}\n\n${AFTER_EDIT}` : output;
++  return { type: "tool_result", tool_use_id: call.id, content };
+ }
+ 
+ function replyText(reply: Message): string {

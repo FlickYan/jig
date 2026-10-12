@@ -1,0 +1,55 @@
+diff --git a/src/cli.ts b/src/cli.ts
+index 68bc6f3..c562b0a 100755
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -307,6 +307,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
+       dirs,
+       oneShot,
+       tools: named(tools),
++      maxSteps,
+       custom: values["system-prompt"],
+     };
+     const system = systemPrompt(cwd, prompt);
+diff --git a/src/prompt.ts b/src/prompt.ts
+index 6cbb4ce..bd23b10 100644
+--- a/src/prompt.ts
++++ b/src/prompt.ts
+@@ -7,6 +7,8 @@ import os from "node:os";
+ import { dirname, join, relative } from "node:path";
+ 
+ const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
++/** At most this many model calls is a tight budget: no room to survey, so the prompt says so. */
++const TIGHT_STEPS = 8;
+ const FILE_TOOLS = ["read_file", "grep", "glob", "write_file", "edit_file"];
+ 
+ /** One instructions file: its path, relative to the working directory, and its text. */
+@@ -50,6 +52,8 @@ export interface PromptOptions {
+   oneShot?: boolean;
+   /** The names of the tools the model has, when not all of jig's (--tools): the prompt names no others. */
+   tools?: string[];
++  /** The most model calls the task may take (--max-steps). A tight budget changes what the prompt asks for. */
++  maxSteps?: number;
+   /** A system prompt to use instead of jig's own (--system-prompt). The sections that follow it stay. */
+   custom?: string;
+   /** The memory section: what memory is for, and the index of what is remembered (see memory.ts). */
+@@ -76,13 +80,18 @@ export const REVIEW = `Before you finish, check your work against the task. Go t
+  * --system-prompt's) and the environment, the rules for a one-shot run with --check, the skill catalog,
+  * memory, and the project's instructions last, which win where they conflict with what comes before.
+  */
+-export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false, tools, custom, memory = "" }: PromptOptions = {}): string {
++export function systemPrompt(cwd: string, { instructions = [], sandboxLimits, skills = "", dirs = [], oneShot = false, tools, maxSteps, custom, memory = "" }: PromptOptions = {}): string {
+   const has = (...names: string[]) => !tools || names.every((name) => tools.includes(name));
+   const fileTools = !tools || tools.some((name) => FILE_TOOLS.includes(name));
++  // With steps to spare, looking around is how an unfamiliar project is understood; with a handful, it is
++  // the work that has to be spent, so the prompt asks for a complete change before any survey.
++  const start = maxSteps !== undefined && maxSteps <= TIGHT_STEPS
++    ? `- You have at most ${maxSteps} steps: read the task, then the files the change touches${has("grep", "glob") ? " (grep, glob)" : ""}. Don't survey the project, its history or its environment. Land the whole change in your first draft, then check and fix it.`
++    : `- Look before you act: find the relevant code${has("grep", "glob") ? " (grep, glob)" : ""}, read it, and run commands to understand the problem. Don't guess about code you haven't opened.`;
+   const prompt = custom?.trim() || `You are a coding agent running in the user's terminal. You help with software engineering tasks, like fixing bugs, adding features, refactoring and explaining code, by reading and editing files and running commands in the user's project.
+ 
+ How to work:
+-- Look before you act: find the relevant code${has("grep", "glob") ? " (grep, glob)" : ""}, read it, and run commands to understand the problem. Don't guess about code you haven't opened.
++${start}
+ - Read a file before you edit it.${has("edit_file", "write_file") ? " Use edit_file for targeted changes and write_file for new files or complete rewrites." : ""}
+ - Follow the conventions of the surrounding code, and keep changes focused on what was asked.
+ - Verify your work: run the tests, the type checker or the program itself when you can, and fix what you broke.

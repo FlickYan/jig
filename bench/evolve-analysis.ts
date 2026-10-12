@@ -32,7 +32,9 @@ export function readAttemptLog(text: string): AttemptLog {
 /** The line after "Summary:" in an agent's reply, and the paragraph after it (else its last paragraph). */
 export function replySummary(transcript: string): { subject: string; description: string } {
   const text = readAttemptLog(transcript).finalMessage;
-  const line = text.match(/^\W*Summary\W*\s*(.+)$/im);
+  // The last such line: thinking printed before the reply can draft one (milestone 20's fifth candidate
+  // counted the words of its summary there, and that became its subject).
+  const line = [...text.matchAll(/^\W*Summary\W*\s*(.+)$/gim)].at(-1);
   const rest = line ? text.slice(line.index! + line[0].length) : text;
   const paragraphs = rest.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
   const description = (line ? paragraphs[0] : paragraphs.at(-1)) ?? "";

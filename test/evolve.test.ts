@@ -238,6 +238,8 @@ describe("a candidate's workspace", () => {
     assert.deepEqual(replySummary(reply("Done.\n\n**Summary:** Check every stated rule\n\nI added a sentence. It helps.")), { subject: "Check every stated rule", description: "I added a sentence. It helps." });
     assert.deepEqual(replySummary(reply("Summary: Shorter prompt\nI cut two lines.")), { subject: "Shorter prompt", description: "I cut two lines." });
     assert.deepEqual(replySummary(reply("Some notes.\n\nI changed the loop. It now stops sooner.")), { subject: "I changed the loop.", description: "I changed the loop. It now stops sooner." });
+    const drafted = 'Final reply needs a "Summary:" line.\nSummary: "Skip the survey" (3 words? let me count)\n\nSummary: Skip the survey\n\nI changed the prompt.';
+    assert.deepEqual(replySummary(reply(drafted)), { subject: "Skip the survey", description: "I changed the prompt." });
   });
 
   it("lists the failed tests of a run", () => {

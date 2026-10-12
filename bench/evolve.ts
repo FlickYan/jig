@@ -24,7 +24,8 @@ Commands:
   split        split the suite into training and held-out tasks, from the latest baseline run
                (node bench/run.ts --suite evolve2 --attempts 3 --label baseline)
   calibrate    how often the referee would be fooled, from every baseline run so far (more runs:
-               --label baseline-<name>), saved with the split
+               --label baseline-<name>), saved with the split; --compare-with names the runs
+               candidates are compared with from then on (after jig itself changed, say)
   analyze      diagnose the baseline's training attempts: what failed, where steps went
   propose      jig changes a copy of itself; the change goes on a new branch, <suite>/<n>
   score <n>    the referee: changed files, task words, jig's tests, the training tasks, the held-out tasks,
@@ -43,6 +44,8 @@ Options:
   --candidates <n>    candidates for run (default: 3)
   --budget <usd>      run stops once candidates have cost this much (default: 1.50)
   --seed <n>          for the split (default: 14)
+  --compare-with <labels>  for calibrate: the baseline runs candidates are compared with, by label
+                      (baseline-a,baseline-b); without it, every run the analysis didn't see
   --rounds <n>        Terminal-Bench rounds for tbcheck, each side once a round (default: 2)
   --tb-tasks <a,b>    tbcheck on these tasks only: a smoke test, whose verdict isn't recorded
 
@@ -58,6 +61,7 @@ const { values, positionals } = parseArgs({
     candidates: { type: "string", default: "3" },
     budget: { type: "string", default: "1.50" },
     rounds: { type: "string", default: "2" },
+    "compare-with": { type: "string" },
     "tb-tasks": { type: "string" },
     seed: { type: "string", default: "14" },
     help: { type: "boolean", short: "h", default: false },
@@ -91,6 +95,9 @@ interface Split {
   /** What it said before milestone 14's candidates ran: the first baseline held fixed, and any more solved
    * on the held-out tasks enough to be accepted. */
   acceptanceBefore?: { nothing: number; cheaper25: number };
+  /** The labels of the runs candidates are compared with, set by calibrate --compare-with: runs of the jig
+   * they branch from. Without it, every baseline run the analysis didn't see. */
+  compareWith?: string[];
 }
 
 type RunAttempt = Attempt & { attempt: number; steps: number | null };
@@ -153,7 +160,10 @@ function makeSplit(): Split {
  * the split. Another run of the baseline makes the estimate better: run one, label it baseline-<name>,
  * and calibrate again.
  */
-function calibrate(current = loadSplit()): Split {
+function calibrate(loaded = loadSplit()): Split {
+  const named = values["compare-with"]?.split(",").map((label) => label.trim()).filter(Boolean);
+  if (named) for (const label of named) latestRun(label); // fails, saying how to make it, if there is none
+  const current: Split = named ? { ...loaded, compareWith: named } : loaded;
   const runs = baselineRuns(current);
   const pooled = runs.flatMap((run) => run.attempts);
   const comparison = comparisonRuns(current);
@@ -198,9 +208,11 @@ function baselineRuns(current: Split): Run[] {
  * there is no other. The analysis works from the first run's failures and slow attempts, which another
  * run of the same jig mostly doesn't repeat, so against that run, any change looks better (milestone 14:
  * unchanged jig would have been accepted). Until milestone 16 it was only the latest run, whose luck then
- * became every candidate's: pooling more runs leaves less of it.
+ * became every candidate's: pooling more runs leaves less of it. Once jig itself has changed, its older
+ * runs are no longer the jig a candidate branches from, so calibrate --compare-with names the fresh ones.
  */
 function comparisonRuns(current: Split): Run[] {
+  if (current.compareWith) return current.compareWith.map((label) => latestRun(label));
   const runs = baselineRuns(current);
   return runs.length > 1 ? runs.slice(1) : runs;
 }
@@ -550,8 +562,12 @@ function terminalBenchJob(job: string, ref: string, tasks: string[]): Promise<vo
 
 /** Earlier candidates and their verdicts, for the next one to learn from. */
 function earlier(): string {
+  // What happened after the referee too: an accepted change that Terminal-Bench or a person turned down
+  // isn't one to repeat (milestone 16's was copied by the two candidates after it).
+  const after = (c: Candidate) =>
+    [c.terminalBench && ` Then on Terminal-Bench: ${c.terminalBench.reason}.`, c.decision && ` Decision: ${c.decision}.`].filter(Boolean).join("");
   return archived()
-    .map((c) => `- ${c.subject || "(no summary)"}. ${c.verdict ? `Verdict: ${c.verdict.stage}, ${c.verdict.reason}.` : "Not scored."}`)
+    .map((c) => `- ${(c.subject || "(no summary)").replace(/\.$/, "")}. ${c.verdict ? `Verdict: ${c.verdict.stage}, ${c.verdict.reason}.` : "Not scored."}${after(c)}`)
     .join("\n");
 }
 

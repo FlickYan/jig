@@ -233,6 +233,7 @@ npm run evolve -- split       # training and held-out halves, and how often the 
 npm run evolve -- analyze     # the model's diagnosis of the training attempts (bench/evolve2/analysis.md)
 node bench/run.ts --suite evolve2 --attempts 3 --label baseline-2 # the baseline again, to compare with
 npm run evolve -- calibrate   # how often the referee would be fooled, from both runs
+                              # (--compare-with baseline-a,baseline-b: once jig has changed, the fresh runs)
 npm run evolve -- run         # a candidate for each cause found: jig changes itself, the referee judges
 npm run evolve -- tbcheck <n> # an accepted candidate on Terminal-Bench, outside DeepSeek's peak hours
 npm run evolve -- list        # every candidate, its change and the verdict (--suite evolve: milestone 14's)
@@ -1485,6 +1486,43 @@ alternating rounds (two by default: 80 trials), and records the verdict with the
 
 A full check costs about $4.20, as milestone 17's did. So far 1 of 7 candidates got this far.
 
+### Milestone 20: a second round, against fresh baselines
+
+Milestone 18 changed what the model sees in a benchmark run (one sentence: some paths are hidden), so
+the baselines of milestones 15 and 16 were no longer runs of the jig a candidate branches from. A new
+option names the runs candidates are compared with, `calibrate --compare-with`, and two fresh baselines
+of today's jig became them. The proposer now also hears what happened to an earlier candidate after the
+referee: candidate 1's result on Terminal-Bench, and the decision not to merge it. The round ran from
+18:00, started by a script that waited for DeepSeek's peak hours to end.
+
+**The fresh baselines came out low:** 28 and 27 of 63 (44% and 43%), against 44% to 57% for the four
+before. No attempt touched a hidden path, and the failures look like the usual ones (text-table, solved
+12 times in 12 before, lost one attempt to a bug in its totals and two that spent their four calls
+reading and never wrote the table); whether that sentence costs anything at 4 steps, or this is the
+runs' spread, two runs can't say. Against them as they came out, a
+change that does nothing would be accepted 7.6% of the time, and one that fixes a third of the failures
+77%: the first higher than before, because on the training half they solved only 37%.
+
+**The candidates**, one for the cause no candidate had taken and two for causes taken before:
+
+| # | the change | training tasks | held-out tasks | verdict |
+|---|------------|----------------|----------------|---------|
+| 4 | "Look once per question: skip a check whose answer wouldn't change what you do next, and settle how code behaves by running it, not by reasoning about it." | 37% against 37% | | rejected |
+| 5 | candidate 1's advice ("read the task, then the files the change touches … land the whole change in your first draft"), but only when the step limit is 8 or less, with the limit stated | 53% against 37% | 55% against 50% | rejected: ahead in 64% of resamples |
+| 6 | after every edit, the tool's result adds "Before you finish, run the tests or a short probe that exercises this change, and fix what fails." | 50% against 37% | 42% against 50% | rejected |
+
+- **The held-out tasks did their job.** Two candidates beat the training half's low 37% by 13 and 16
+  points, and neither carried over: the comparison runs' bad luck on the training half was their gain,
+  and the held-out half, which the analysis never saw, didn't share it.
+- **The proposer learned from the decision.** Told that candidate 1 was accepted but solved 15 points
+  fewer Terminal-Bench tasks, candidate 5 kept that advice for tight step budgets only, so that runs with
+  steps to spare (on Terminal-Bench, jig gets 300) would get jig's prompt as it is. Accepted, it would
+  still have needed Terminal-Bench, and then a person: it fits jig to the benchmark's own setting.
+- No candidate was accepted, so `tbcheck` had nothing to do. One candidate's summary had come out as
+  its thinking about the summary (it counted the words), so the summary is now the reply's last such line.
+
+**Cost.** $3.66: $1.48 for the two baselines, $2.18 for the three candidates.
+
 ## Tests
 
 ```bash
@@ -1530,6 +1568,7 @@ installs and runs the tarball on every push.
 - [x] **17. The accepted change, on Terminal-Bench:** candidate 1 against jig as it is on the original 20 tasks, two attempts each in alternating rounds: 62% against 78%, −15 points (−28 to −5), both rounds alike, so it isn't merged; the evolve suite rewards getting it right with little looking, which Terminal-Bench doesn't; each prompt looked the benchmark up once; jig as it is solved 9 points more than milestone 11's jig (+1 to +18)
 - [x] **18. The answers out of reach:** an attempt in milestone 14 had found its task's folder on the disk and run the hidden tests (that baseline is 27 of 30, not 28; no verdict changes), so jig gets `hiddenPaths`, which its sandbox hides from commands, every benchmark run hides the tasks, logs, `eval/` and the history with it (`bench/hidden.ts`), and TASK_DIR no longer reaches jig; `bench/explore`, 14 generated tasks where exploring pays (information to find, or a visible check that is a special case), which didn't reproduce Terminal-Bench's verdict on milestone 16's candidate (20/20 against 20/20, then 8/12 against 12/12, the candidate ahead), so it isn't a gate in the referee
 - [x] **19. Terminal-Bench as the referee's last stage:** `npm run evolve -- tbcheck <n>` runs an accepted candidate and jig where it branched on the 20 Terminal-Bench tasks in alternating rounds, starts each round only when it can finish outside DeepSeek's peak hours, picks up after a break, and records the verdict (rejected when behind in 80% of resamples: milestone 17's runs give -15 points, rejected); a smoke test on one task ran end to end
+- [x] **20. A second round, against fresh baselines:** `calibrate --compare-with` names the runs candidates are compared with, and two fresh baselines of milestone 19's jig became them (44% and 43%, against 44 to 57% before); the proposer hears what Terminal-Bench and the person decided about earlier candidates; three candidates, all rejected, two of them after beating the training half by 13 and 16 points, on the held-out tasks (one was candidate 1's advice, kept for tight step budgets only)
 
 ## License
 
