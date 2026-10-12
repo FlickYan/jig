@@ -1,0 +1,21 @@
+{
+ "name": "tb-evolve2-1-baseline-r1-smoke",
+ "agent": "jig (ref=ae5d61a)",
+ "trials": [
+  {
+   "task": "log-summary-date-ranges",
+   "job": "tb-evolve2-1-baseline-r1-smoke",
+   "version": "ae5d61a (ae5d61a)",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 40699,
+   "cached": 31488,
+   "output": 1629,
+   "model": "deepseek-flash",
+   "seconds": 16.071345,
+   "trial": "log-summary-date-ranges__KCVp37b",
+   "looked_up": false
+  }
+ ]
+}

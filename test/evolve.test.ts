@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "../bench/evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "../bench/evolve-workspace.ts";
 import { type Attempt, compare, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split } from "../bench/evolve-referee.ts";
+import { attemptsOf, nextStart, runOrder, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
 
 /** Attempts with the given passes out of three per task, each costing `cost`. */
 function runOf(passes: Record<string, number>, cost = 0.01): Attempt[] {
@@ -243,5 +244,46 @@ describe("a candidate's workspace", () => {
     const output = "▶ sandbox\n  ✖ keeps commands off the network (55.8ms)\n✖ sandbox (180.9ms)\nℹ fail 2\n\n✖ failing tests:\n\ntest at test/safety.test.ts:48:3\n✖ keeps commands off the network (55.8ms)\n  Error: denied\n\ntest at test/headless.test.ts:90:3\n✖ reads the task from stdin when it is - (319.7ms)\n";
     assert.deepEqual(failingTests(output), ["keeps commands off the network", "reads the task from stdin when it is -"]);
     assert.deepEqual(failingTests("ℹ pass 3\nℹ fail 0\n"), []);
+  });
+});
+
+describe("the Terminal-Bench check", () => {
+  it("turns a candidate down only when it is behind in 80% of resamples", () => {
+    const tasks = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`t${i}`, i < 16 ? 3 : 1]));
+    const baseline = runOf(tasks);
+    const worse = runOf({ ...tasks, t0: 0, t1: 0, t2: 1, t3: 1, t4: 1 });
+    const better = runOf({ ...tasks, t16: 3, t17: 2 });
+    assert.equal(terminalBenchVerdict(worse, baseline).rejected, true);
+    assert.equal(terminalBenchVerdict(baseline, baseline).rejected, false);
+    assert.equal(terminalBenchVerdict(better, baseline).rejected, false);
+    assert.equal(terminalBenchVerdict(runOf({ ...tasks, t0: 2 }), baseline).rejected, false, "one attempt lost is noise");
+  });
+
+  it("gives milestone 17's verdict on milestone 17's runs", () => {
+    const load = (name: string) => attemptsOf(JSON.parse(readFileSync(join(import.meta.dirname, "..", "eval", "results", `${name}.json`), "utf8")).trials);
+    const verdict = terminalBenchVerdict(load("tb-c1"), load("tb-m16"));
+    assert.equal(verdict.rejected, true);
+    assert.match(verdict.reason, /-15 points/);
+  });
+
+  it("counts a look-up of the benchmark's answers as a failure", () => {
+    assert.deepEqual(
+      attemptsOf([{ task: "a", passed: true, looked_up: true, input: 1_000_000, cached: 0, output: 0 }, { task: "b", passed: true }]),
+      [{ task: "a", passed: false, cost: 0.3 }, { task: "b", passed: true, cost: null }],
+    );
+  });
+
+  it("starts a round only when it can finish outside the peak hours", () => {
+    const at = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute); // Monday 12 October 2026
+    assert.deepEqual(nextStart(at(12, 7), 3.5), at(12, 18), "before nine, a round would run into the morning");
+    assert.deepEqual(nextStart(at(12, 12, 30), 1), at(12, 12, 30), "an hour fits in the gap at noon");
+    assert.deepEqual(nextStart(at(12, 13), 3.5), at(12, 18));
+    assert.deepEqual(nextStart(at(12, 23, 30), 3.5), at(12, 23, 30), "the night is free");
+    assert.deepEqual(nextStart(at(16, 17), 3.5), at(16, 18), "Friday evening");
+    assert.deepEqual(nextStart(at(17, 10), 3.5), at(17, 10), "Saturday");
+  });
+
+  it("alternates the sides, so that the service's changes fall on both", () => {
+    assert.deepEqual(runOrder(2).map(({ side, round }) => `${side} ${round}`), ["baseline 1", "candidate 1", "candidate 2", "baseline 2"]);
   });
 });

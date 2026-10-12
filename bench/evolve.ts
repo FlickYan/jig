@@ -3,7 +3,7 @@
 // milestone 14 in the README.
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import { costOf } from "../src/prices.ts";
 import { createSandbox } from "../src/sandbox.ts";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "./evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "./evolve-workspace.ts";
+import { attemptsOf, nextStart, runOrder, type TerminalBenchVerdict, terminalBenchVerdict } from "./evolve-terminal-bench.ts";
 import { HOMES, hideAnswers } from "./hidden.ts";
 import { type Attempt, compare, type Comparison, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split, type Verdict } from "./evolve-referee.ts";
 
@@ -30,6 +31,9 @@ Commands:
                compared with the latest baseline run the analysis didn't see (run the baseline again
                with --label baseline-<name> before scoring; without one, the first run is used)
   run          propose and score candidates, each for a cause the analysis found that no earlier one took
+  tbcheck <n>  Terminal-Bench for a candidate the referee accepted: it and jig where it branched, on the
+               tasks in eval/subset.txt, in alternating rounds, each started only when it can finish
+               outside DeepSeek's peak hours (weekdays 9-12 and 14-18); needs Docker, about 9 hours
   list         every candidate so far and its verdict
 
 Options:
@@ -39,6 +43,8 @@ Options:
   --candidates <n>    candidates for run (default: 3)
   --budget <usd>      run stops once candidates have cost this much (default: 1.50)
   --seed <n>          for the split (default: 14)
+  --rounds <n>        Terminal-Bench rounds for tbcheck, each side once a round (default: 2)
+  --tb-tasks <a,b>    tbcheck on these tasks only: a smoke test, whose verdict isn't recorded
 
 Candidates branch from HEAD and are judged by the main checkout: its tests, tasks and runner, never the
 candidate's. Nothing here merges one: an accepted candidate waits on its branch for a person.`;
@@ -51,6 +57,8 @@ const { values, positionals } = parseArgs({
     attempts: { type: "string", default: "3" },
     candidates: { type: "string", default: "3" },
     budget: { type: "string", default: "1.50" },
+    rounds: { type: "string", default: "2" },
+    "tb-tasks": { type: "string" },
     seed: { type: "string", default: "14" },
     help: { type: "boolean", short: "h", default: false },
   },
@@ -112,6 +120,8 @@ interface Candidate {
   verdict?: Verdict;
   /** What a person decided about it once the referee had accepted it, and why. */
   decision?: string;
+  /** Terminal-Bench against jig where it branched (tbcheck): the jobs, the comparison and the verdict. */
+  terminalBench?: { jobs: { baseline: string[]; candidate: string[] } } & TerminalBenchVerdict;
 }
 
 async function main(): Promise<void> {
@@ -123,6 +133,7 @@ async function main(): Promise<void> {
   else if (command === "propose") await propose(await nextCause());
   else if (command === "score") await score(Number(arg));
   else if (command === "run") await run(Number(values.candidates), Number(values.budget));
+  else if (command === "tbcheck") await terminalBench(Number(arg));
   else if (command === "list") list();
   else throw new Error(`Unknown command ${command}.\n\n${HELP}`);
 }
@@ -348,6 +359,7 @@ async function score(n: number): Promise<Candidate> {
     save(candidate);
     console.log(`candidate ${n}: ${verdict.stage}: ${verdict.reason}`);
     if (verdict.stage === "rejected" && branchExists(candidate.branch)) git("branch", "-D", "-q", candidate.branch);
+    if (verdict.stage === "accepted") console.log(`candidate ${n}: next, Terminal-Bench: npm run evolve -- tbcheck ${n}`);
     return candidate;
   };
   if (!candidate.files.length) return decide({ stage: "rejected", reason: "it changed nothing" });
@@ -433,8 +445,107 @@ function list(): void {
     console.log(`  change:   ${c.subject}`);
     console.log(`  training: ${share(c.train)}   held out: ${share(c.heldOut)}`);
     if (c.verdict) console.log(`  verdict:  ${c.verdict.reason}`);
+    if (c.terminalBench) console.log(`  terminal-bench: ${c.terminalBench.rejected ? "rejected" : "passed"}: ${c.terminalBench.reason}`);
     if (c.decision) console.log(`  decision: ${c.decision}`);
   }
+}
+
+/** Minutes a Terminal-Bench round may take per task: milestone 17's longest was under 8; peak hours wait. */
+const TB_MINUTES_PER_TASK = 10.5;
+
+/**
+ * Terminal-Bench for a candidate the referee accepted: it and jig where it branched, on the tasks in
+ * eval/subset.txt (or --tb-tasks), alternating as milestone 17 did by hand, so that whatever DeepSeek's
+ * service does over the hours falls on both. Each round starts only when it can finish outside the peak
+ * hours. Rounds already run are kept, so after a break the command picks up where it stopped.
+ */
+async function terminalBench(n: number): Promise<void> {
+  const candidate = archived().find((c) => c.n === n);
+  if (!candidate) throw new Error(`No candidate ${n} in ${relative(ROOT, ARCHIVE)}.`);
+  if (candidate.verdict?.stage !== "accepted") throw new Error(`Candidate ${n} wasn't accepted by the referee: only accepted candidates go to Terminal-Bench.`);
+  // A person's decision can delete the branch; the archive keeps the change, and the branch goes again after.
+  const rebuilt = !branchExists(candidate.branch);
+  if (rebuilt) {
+    const diff = readFileSync(join(ARCHIVE, String(n), "change.diff"), "utf8");
+    commitPatch(ROOT, candidate.branch, candidate.base, diff.endsWith("\n") ? diff : `${diff}\n`, [`evolve ${n}: ${candidate.subject}`, "Rebuilt from the archive for Terminal-Bench."]);
+    console.log(`candidate ${n}: rebuilt ${candidate.branch} from its archived change`);
+  }
+  try {
+    await checkOnTerminalBench(candidate);
+  } finally {
+    if (rebuilt) git("branch", "-D", "-q", candidate.branch);
+  }
+}
+
+async function checkOnTerminalBench(candidate: Candidate): Promise<void> {
+  const { n } = candidate;
+  const smoke = values["tb-tasks"] !== undefined;
+  const tasks = smoke ? values["tb-tasks"]!.split(",") : readFileSync(join(ROOT, "eval", "subset.txt"), "utf8").split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
+  pullImages(tasks);
+  const jobs: { baseline: string[]; candidate: string[] } = { baseline: [], candidate: [] };
+  for (const { side, round } of runOrder(Number(values.rounds))) {
+    const job = `tb-${suite}-${n}-${side}-r${round}${smoke ? "-smoke" : ""}`;
+    jobs[side].push(job);
+    if (trialsDone(job) >= tasks.length) {
+      console.log(`${job}: already run`);
+      continue;
+    }
+    const start = nextStart(new Date(), (tasks.length * TB_MINUTES_PER_TASK) / 60);
+    if (start.getTime() > Date.now()) {
+      console.log(`${job}: waiting until ${start.toLocaleString()}, to stay out of DeepSeek's peak hours`);
+      await new Promise((done) => setTimeout(done, start.getTime() - Date.now()));
+    }
+    console.log(`${job}: running jig at ${side === "baseline" ? candidate.base : candidate.branch} on ${tasks.length} task${tasks.length === 1 ? "" : "s"}`);
+    await terminalBenchJob(job, side === "baseline" ? candidate.base : candidate.branch, tasks);
+  }
+  // Every trial, as eval/report.py counts them (a look-up of the benchmark's answers fails), kept with the candidate.
+  const out = join(ARCHIVE, String(n), smoke ? "terminal-bench-smoke" : "terminal-bench");
+  const runs = (["baseline", "candidate"] as const).map((side) => join("eval", "jobs", jobs[side].join("+")));
+  execFileSync("python3", ["eval/report.py", "--save", out, ...runs], { cwd: ROOT, stdio: "inherit" });
+  const load = (side: "baseline" | "candidate") => attemptsOf(JSON.parse(readFileSync(join(out, `${jobs[side][0]}.json`), "utf8")).trials);
+  const verdict = terminalBenchVerdict(load("candidate"), load("baseline"));
+  console.log(`candidate ${n}: ${verdict.reason}`);
+  if (smoke) {
+    console.log("A smoke test on some of the tasks: its verdict isn't recorded.");
+    return;
+  }
+  candidate.terminalBench = { jobs, ...verdict };
+  save(candidate);
+  console.log(`The task images stay in Docker (about 28 GB for all twenty tasks).`);
+}
+
+/** The task images, pulled before a round rather than during it, where a slow download fails the setup. */
+function pullImages(tasks: string[]): void {
+  for (const task of tasks) {
+    const image = `alexgshaw/${task}:20251031`;
+    if (spawnSync("docker", ["image", "inspect", image], { stdio: "ignore" }).status === 0) continue;
+    console.log(`pulling ${image}`);
+    for (let attempt = 1; spawnSync("docker", ["pull", "-q", "--platform", "linux/amd64", image], { stdio: "ignore" }).status !== 0; attempt++) {
+      if (attempt === 3) throw new Error(`Couldn't pull ${image}: is Docker running?`);
+    }
+  }
+}
+
+function trialsDone(job: string): number {
+  const dir = join(ROOT, "eval", "jobs", job);
+  return existsSync(dir) ? readdirSync(dir).filter((trial) => existsSync(join(dir, trial, "result.json"))).length : 0;
+}
+
+/** One round, through eval/run.sh, or Harbor's resume for a round a break cut short. */
+function terminalBenchJob(job: string, ref: string, tasks: string[]): Promise<void> {
+  mkdirSync(LOGS, { recursive: true });
+  const log = join(LOGS, `terminal-bench-${job}.log`);
+  const resume = existsSync(join(ROOT, "eval", "jobs", job, "config.json"));
+  const [program, args] = resume ? [join(ROOT, "eval", ".venv", "bin", "harbor"), ["job", "resume", "-p", join("eval", "jobs", job)]] : [join(ROOT, "eval", "run.sh"), [job, "jig", "--ak", `ref=${ref}`]];
+  return new Promise((resolve, reject) => {
+    const out = openSync(log, "a");
+    const child = spawn(program, args, { cwd: ROOT, env: { ...process.env, TASKS: tasks.join(" "), PYTHONPATH: join(ROOT, "eval") }, stdio: ["ignore", out, out] });
+    child.on("close", (code) => {
+      closeSync(out);
+      if (trialsDone(job) >= tasks.length) resolve();
+      else reject(new Error(`${job} stopped after ${trialsDone(job)} of ${tasks.length} trials (exit ${code}); see ${relative(ROOT, log)}, and run tbcheck again to go on.`));
+    });
+  });
 }
 
 /** Earlier candidates and their verdicts, for the next one to learn from. */

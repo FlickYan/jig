@@ -234,6 +234,7 @@ npm run evolve -- analyze     # the model's diagnosis of the training attempts (
 node bench/run.ts --suite evolve2 --attempts 3 --label baseline-2 # the baseline again, to compare with
 npm run evolve -- calibrate   # how often the referee would be fooled, from both runs
 npm run evolve -- run         # a candidate for each cause found: jig changes itself, the referee judges
+npm run evolve -- tbcheck <n> # an accepted candidate on Terminal-Bench, outside DeepSeek's peak hours
 npm run evolve -- list        # every candidate, its change and the verdict (--suite evolve: milestone 14's)
 
 jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
@@ -420,8 +421,9 @@ Ctrl+C, and when a safety classifier declines the request.
 - **An accepted change is checked where jig is used.** The evolve suite is a proxy, small tasks at 4
   steps, and the referee measures only the proxy: milestone 16's accepted change solved more of it and
   15 points less of Terminal-Bench. So before a candidate is merged, it runs on Terminal-Bench against
-  jig as it is, in alternating rounds. A cheaper stand-in for that check would have to agree with it
-  first: milestone 18's exploration suite didn't, and preferred the change Terminal-Bench turned down.
+  jig where it branched, in alternating rounds (`tbcheck`, milestone 19). A cheaper stand-in for that
+  check would have to agree with it first: milestone 18's exploration suite didn't, and preferred the
+  change Terminal-Bench turned down.
 - **The answers are out of the agent's reach.** A sandbox that lets commands read anything lets them read
   a benchmark's hidden tests too, and one attempt did. Benchmark runs hide them (`hiddenPaths`), and the
   scripts that set a task up get its folder; jig doesn't.
@@ -1458,6 +1460,31 @@ Terminal-Bench's time limits.
   tasks and runs out the clock on others; a change that trims it could do better or worse depending on
   the time budget alone.
 
+### Milestone 19: Terminal-Bench as the referee's last stage
+
+Milestone 17 checked an accepted candidate on Terminal-Bench by hand, and milestone 18 found no cheaper
+check that agreed with it, so that check is now part of the loop. `npm run evolve -- tbcheck <n>` runs a
+candidate the referee accepted, and jig where it branched, on the 20 tasks in `eval/subset.txt`, in
+alternating rounds (two by default: 80 trials), and records the verdict with the candidate
+([`bench/evolve-terminal-bench.ts`](bench/evolve-terminal-bench.ts)).
+
+- **The bar is the referee's, turned around.** On the evolve suite a candidate must be ahead in 80% of
+  resamples to pass; on Terminal-Bench it fails if it is behind in 80% of them. Two attempts at twenty
+  tasks can't confirm a gain, but they showed milestone 16's loss: on milestone 17's runs the check
+  says "solved fewer Terminal-Bench tasks (63% against 78%, -15 points, behind in 99% of resamples)",
+  and two identical runs pass. Look-ups of the benchmark's answers count as failures, as in the report.
+- **Out of the peak hours.** Each round starts only when it can finish outside DeepSeek's expensive hours
+  (weekdays 9 to 12 and 14 to 18), allowing 10.5 minutes a task (milestone 17's longest round took under
+  8), so a full check runs over an evening and a night, or a weekend.
+- **Breaks don't lose work.** Rounds already run are kept, and one cut short is resumed with Harbor's
+  `job resume` (that path hasn't been needed yet): after a break, the command picks up where it stopped.
+- **The branch comes back for it.** A candidate whose branch a person deleted is rebuilt from the archive
+  for the check, and deleted again after.
+- **A smoke test** (`--tb-tasks`, one round, on one task) ran end to end in three minutes for $0.009: both
+  sides passed, and the verdict of a run on some of the tasks isn't recorded.
+
+A full check costs about $4.20, as milestone 17's did. So far 1 of 7 candidates got this far.
+
 ## Tests
 
 ```bash
@@ -1502,6 +1529,7 @@ installs and runs the tarball on every push.
 - [x] **16. The first change the referee accepted:** before any candidate ran, the false acceptance against the one baseline run candidates would meet turned out to be 9%, not the 2% averaged over runs, so candidates are compared with every run the analysis didn't see, pooled, and `calibrate` reports the rate against those runs (3.7% with four baselines); the analysis found jig reading until its 4 steps ran out, and of three prompt changes the referee accepted one (+15 and +17 points); run again beside a fourth baseline it was +6 (−11 to +24), harmless with 40 steps (41 of 42) and one attempt short on the main benchmark (59 of 60), so it waits on its branch for a Terminal-Bench check
 - [x] **17. The accepted change, on Terminal-Bench:** candidate 1 against jig as it is on the original 20 tasks, two attempts each in alternating rounds: 62% against 78%, −15 points (−28 to −5), both rounds alike, so it isn't merged; the evolve suite rewards getting it right with little looking, which Terminal-Bench doesn't; each prompt looked the benchmark up once; jig as it is solved 9 points more than milestone 11's jig (+1 to +18)
 - [x] **18. The answers out of reach:** an attempt in milestone 14 had found its task's folder on the disk and run the hidden tests (that baseline is 27 of 30, not 28; no verdict changes), so jig gets `hiddenPaths`, which its sandbox hides from commands, every benchmark run hides the tasks, logs, `eval/` and the history with it (`bench/hidden.ts`), and TASK_DIR no longer reaches jig; `bench/explore`, 14 generated tasks where exploring pays (information to find, or a visible check that is a special case), which didn't reproduce Terminal-Bench's verdict on milestone 16's candidate (20/20 against 20/20, then 8/12 against 12/12, the candidate ahead), so it isn't a gate in the referee
+- [x] **19. Terminal-Bench as the referee's last stage:** `npm run evolve -- tbcheck <n>` runs an accepted candidate and jig where it branched on the 20 Terminal-Bench tasks in alternating rounds, starts each round only when it can finish outside DeepSeek's peak hours, picks up after a break, and records the verdict (rejected when behind in 80% of resamples: milestone 17's runs give -15 points, rejected); a smoke test on one task ran end to end
 
 ## License
 

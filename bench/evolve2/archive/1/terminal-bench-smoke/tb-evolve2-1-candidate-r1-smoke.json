@@ -1,0 +1,21 @@
+{
+ "name": "tb-evolve2-1-candidate-r1-smoke",
+ "agent": "jig (ref=evolve2/1)",
+ "trials": [
+  {
+   "task": "log-summary-date-ranges",
+   "job": "tb-evolve2-1-candidate-r1-smoke",
+   "version": "evolve2/1 (4432ef7)",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 20540,
+   "cached": 16384,
+   "output": 1855,
+   "model": "deepseek-flash",
+   "seconds": 29.472776,
+   "trial": "log-summary-date-ranges__2VLoKC9",
+   "looked_up": false
+  }
+ ]
+}
