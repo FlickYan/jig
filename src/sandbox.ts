@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { isInside } from "./tools/util.ts";
@@ -21,19 +21,20 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
  * Seatbelt on macOS, bubblewrap on Linux. Either way they can read anything, but write only inside the
  * project, its git directory, the directories added with --add-dir and the temp directories, and without
  * `network` they can't reach the network. Unlike a container, this keeps the user's own toolchain
- * (python, node, compilers) working with no setup.
+ * (python, node, compilers) working with no setup. The `hidden` paths they can't read at all.
  * Returns undefined where there is no sandbox; sandboxProblem says why.
  */
-export function createSandbox(root: string, { network, dirs = [] }: { network: boolean; dirs?: string[] }): Sandbox | undefined {
+export function createSandbox(root: string, { network, dirs = [], hidden = [] }: { network: boolean; dirs?: string[]; hidden?: string[] }): Sandbox | undefined {
   if (sandboxProblem()) return undefined;
   const project = realpathSync(root); // Seatbelt sees real paths: /var is /private/var
+  const unreadable = hidden.filter((path) => existsSync(path)).map((path) => realpathSync(path));
   const added = dirs.map((dir) => realpathSync(dir));
   const temp = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"].filter((dir) => existsSync(dir));
   const writable = [project, gitDir(project), ...added, realpathSync(tmpdir()), ...temp].filter(
     (dir, i, all): dir is string => !!dir && !all.slice(0, i).some((other) => other && isInside(other, dir)),
   );
   const where = `inside the project${added.length ? `, ${added.join(", ")}` : ""} and the temp directories`;
-  return process.platform === "darwin" ? seatbelt(writable, network, where) : bubblewrap(writable, network, where);
+  return process.platform === "darwin" ? seatbelt(writable, network, where, unreadable) : bubblewrap(writable, network, where, unreadable);
 }
 
 /** Why there is no sandbox on this machine, or undefined if there is one. */
@@ -43,7 +44,7 @@ export function sandboxProblem(): string | undefined {
   return `jig has no sandbox for ${process.platform} yet`;
 }
 
-function seatbelt(writable: string[], network: boolean, where: string): Sandbox {
+function seatbelt(writable: string[], network: boolean, where: string, hidden: string[]): Sandbox {
   const profile = [
     "(version 1)",
     "(allow default)",
@@ -51,10 +52,12 @@ function seatbelt(writable: string[], network: boolean, where: string): Sandbox 
     `(allow file-write* ${writable.map((dir) => `(subpath ${quote(dir)})`).join(" ")}`,
     '  (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/tty") (regex #"^/dev/fd/"))',
     ...(network ? [] : ["(deny network-outbound (remote ip))", '(allow network-outbound (remote ip "localhost:*"))']),
+    // Last, so that it wins over the rules before it: reading and writing alike.
+    ...hidden.map((path) => `(deny file-read* file-write* (subpath ${quote(path)}))`),
   ].join("\n");
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}.`,
+    limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}${hiddenNote(hidden)}.`,
     wrap: (command) => ({ program: SANDBOX_EXEC, args: ["-p", profile, "/bin/bash", "-c", command] }),
   };
 }
@@ -65,12 +68,14 @@ function seatbelt(writable: string[], network: boolean, where: string): Sandbox 
  * machine, though a command can still use its own loopback. A server started in one command is
  * therefore out of reach of the next, unlike on macOS, where localhost stays open.
  */
-function bubblewrap(writable: string[], network: boolean, where: string): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[]): Sandbox {
   const bwrap = findProgram("bwrap")!;
   const args = [
     "--ro-bind", "/", "/",
     "--dev", "/dev",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
+    // An empty directory over each hidden directory, and an empty file over each hidden file.
+    ...hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path])),
     ...(network ? [] : ["--unshare-net"]),
     "--die-with-parent", // if jig is killed, so are its commands
   ];
@@ -79,9 +84,14 @@ function bubblewrap(writable: string[], network: boolean, where: string): Sandbo
     "servers, or a server an earlier command started (start a server and use it in the same command)";
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : offline}.`,
+    limits: `Commands can write only ${where}${network ? "" : offline}${hiddenNote(hidden)}.`,
     wrap: (command) => ({ program: bwrap, args: [...args, "--", "/bin/bash", "-c", command] }),
   };
+}
+
+/** For the model: that some paths are hidden, so their denials make sense (not which: they may be answers). */
+function hiddenNote(hidden: string[]): string {
+  return hidden.length ? ". Some paths are hidden from commands by the user's settings" : "";
 }
 
 let bubblewrapProblem: string | undefined;

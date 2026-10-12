@@ -1,0 +1,10 @@
+{
+  "instruction": "Implement make_rota in rota/planner.py so that it follows SPEC.md.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "search",
+    "generalization"
+  ]
+}

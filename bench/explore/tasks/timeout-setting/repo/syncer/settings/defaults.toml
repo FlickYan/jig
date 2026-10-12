@@ -1,0 +1,3 @@
+retries = 3
+region = "eu"
+page_size = 100

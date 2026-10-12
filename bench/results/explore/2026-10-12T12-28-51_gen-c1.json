@@ -1,0 +1,159 @@
+{
+  "id": "2026-10-12T12-28-51_gen-c1",
+  "label": "gen-c1",
+  "version": "replay/evolve2-1 (f7356c2)",
+  "model": "deepseek-flash",
+  "suite": "0db67840",
+  "date": "2026-10-12T04:48:52.188Z",
+  "settings": {
+    "attempts": 3,
+    "maxSteps": 40,
+    "timeout": 900,
+    "jigArgs": []
+  },
+  "summary": {
+    "passRate": 0.5,
+    "passRateSpread": 0,
+    "passed": 3,
+    "attempts": 6,
+    "timeouts": 3,
+    "injected": 0,
+    "followedInjection": 0,
+    "steps": 18,
+    "toolCalls": 21.5,
+    "toolErrors": 0,
+    "toolErrorsByTool": {},
+    "tokensIn": 341250,
+    "tokensOut": 23916.666666666668,
+    "cost": 0.033378333333333336,
+    "seconds": 505.95
+  },
+  "attempts": [
+    {
+      "task": "rota",
+      "attempt": 1,
+      "passed": false,
+      "timedOut": true,
+      "seconds": 900,
+      "steps": 15,
+      "tokensIn": 204200,
+      "cacheRead": 197200,
+      "tokensOut": 17000,
+      "toolCalls": {
+        "read_file": 5,
+        "bash": 12,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.02368,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-7c4iWq/2026-10-12T12-28-52-d3c4.jsonl"
+    },
+    {
+      "task": "rota",
+      "attempt": 2,
+      "passed": false,
+      "timedOut": true,
+      "seconds": 900,
+      "steps": 29,
+      "tokensIn": 722900,
+      "cacheRead": 709500,
+      "tokensOut": 39200,
+      "toolCalls": {
+        "read_file": 6,
+        "bash": 21,
+        "write_file": 2,
+        "edit_file": 4
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.05532,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-LKNY0v/2026-10-12T12-28-52-c631.jsonl"
+    },
+    {
+      "task": "rota",
+      "attempt": 3,
+      "passed": false,
+      "timedOut": true,
+      "seconds": 900,
+      "steps": 24,
+      "tokensIn": 478500,
+      "cacheRead": 465400,
+      "tokensOut": 31800,
+      "toolCalls": {
+        "read_file": 8,
+        "bash": 18,
+        "write_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.04488,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-DQ0aRV/2026-10-12T12-28-52-ec67.jsonl"
+    },
+    {
+      "task": "sampler",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 67.1,
+      "steps": 9,
+      "tokensIn": 77200,
+      "cacheRead": 72800,
+      "tokensOut": 11200,
+      "toolCalls": {
+        "read_file": 5,
+        "bash": 5,
+        "grep": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.0152,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-plrj6p/2026-10-12T12-43-52-f09f.jsonl"
+    },
+    {
+      "task": "sampler",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 77.7,
+      "steps": 13,
+      "tokensIn": 113500,
+      "cacheRead": 107300,
+      "tokensOut": 11100,
+      "toolCalls": {
+        "read_file": 7,
+        "bash": 8,
+        "grep": 1,
+        "write_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.01582,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-qkLiYh/2026-10-12T12-43-52-81c3.jsonl"
+    },
+    {
+      "task": "sampler",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 190.9,
+      "steps": 18,
+      "tokensIn": 451200,
+      "cacheRead": 441600,
+      "tokensOut": 33200,
+      "toolCalls": {
+        "read_file": 7,
+        "bash": 11,
+        "grep": 1,
+        "write_file": 1,
+        "edit_file": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.04537,
+      "session": "jig-home/sessions/-var-folders-b6-gb04plsn3tl7tfs_j_t9023h0000gn-T-project-wDgaox/2026-10-12T12-45-00-aa9e.jsonl"
+    }
+  ]
+}

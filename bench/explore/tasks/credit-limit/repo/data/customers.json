@@ -1,0 +1,5 @@
+{
+  "c1": {"name": "Ada's Cafe", "limit": 500000, "trusted": false},
+  "c2": {"name": "Bob's Bakery", "limit": 200000, "trusted": false},
+  "c3": {"name": "City Hotel", "limit": 100000, "trusted": true}
+}

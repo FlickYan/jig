@@ -5,9 +5,10 @@ import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from "node:fs";
 import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { HOMES, hideAnswers } from "./hidden.ts";
 import { type Attempt, estimateCost, formatTable, money, num, parseTranscript, percent, summarize, triedForbidden } from "./metrics.ts";
 
 const BENCH = dirname(fileURLToPath(import.meta.url));
@@ -124,6 +125,7 @@ async function main(): Promise<void> {
   const runId = `${new Date().toLocaleString("sv-SE").replace(" ", "T").replace(/:/g, "-")}_${label}`; // local time
   const logDir = join(BENCH, "logs", runId);
   await mkdir(logDir, { recursive: true });
+  hideAnswers(join(logDir, "jig-home"));
   const jigArgs = values["jig-args"].split(/\s+/).filter(Boolean);
   const settings = { attempts: Number(values.attempts), maxSteps: Number(maxSteps), timeout: Number(values.timeout), jigArgs };
   const run: RunContext = { agent, jigDir: jig?.dir, model: values.model, logDir, keep: values.keep, ...settings };
@@ -210,13 +212,15 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
   const work = await mkdtemp(join(tmpdir(), "project-"));
   const log = createWriteStream(join(run.logDir, `${task.id}-${attempt}.log`));
   // A home directory of its own (outside the project and the temp directories, so the sandbox can't
-  // write there): injection tasks check that nothing landed in it. jig's sessions and snapshots go with
-  // the run's logs rather than in ~/.jig.
-  const home = join(run.logDir, "homes", `${task.id}-${attempt}`);
+  // write there): injection tasks check that nothing landed in it. It is outside bench/ too, which the
+  // sandbox hides (see hidden.ts). jig's sessions and snapshots go with the run's logs, not in ~/.jig.
+  const home = join(HOMES, basename(run.logDir), `${task.id}-${attempt}`);
   await mkdir(home, { recursive: true });
   // Programs a task expects on the user's machine, outside the project (like a linter its hooks run).
   if (existsSync(join(taskDir, "home"))) await cp(join(taskDir, "home"), home, { recursive: true });
+  // TASK_DIR is for the task's own scripts (setup.sh, solve.sh), not for jig: it leads to the answers.
   const env = { ...ENV, TASK_DIR: taskDir, HOME: home, JIG_HOME: join(run.logDir, "jig-home") };
+  const { TASK_DIR: _, ...jigEnv } = env;
   const opts = { cwd: work, env, log };
   try {
     await cp(join(taskDir, "repo"), work, { recursive: true });
@@ -231,7 +235,7 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
     if (run.agent === "jig") {
       const cli = join(run.jigDir!, "src/cli.ts");
       const args = [cli, "-C", work, "--yes", "--max-steps", String(run.maxSteps), "--model", run.model, ...run.jigArgs, task.instruction];
-      ({ output: transcript, timedOut } = await exec("node", args, { ...opts, timeout: run.timeout }));
+      ({ output: transcript, timedOut } = await exec("node", args, { ...opts, env: jigEnv, timeout: run.timeout }));
     } else if (run.agent === "oracle") {
       await exec("bash", [join(taskDir, "solve.sh")], { ...opts, timeout: 120 });
     }

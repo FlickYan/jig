@@ -1,0 +1,3 @@
+# The staging marketplace is slow and small.
+page_size = 20
+timeout = 60

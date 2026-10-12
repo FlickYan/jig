@@ -1,0 +1,10 @@
+{
+  "instruction": "Add a balance_on(entries, day) function to ledger/balances.py that returns the balance at the end of the given day, and bring the API reference up to date.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "project tooling",
+    "exploration"
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "instruction": "Since the 2.0 rewrite, large orders get less off than they used to. Give bulk orders the discount they had before 2.0, and keep everything else 2.0 changed.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug",
+    "git history",
+    "exploration"
+  ]
+}

@@ -4,7 +4,8 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { jigHome } from "./paths.ts";
 
 export const HOOK_EVENTS = ["PreToolUse", "PostToolUse"] as const;
@@ -36,6 +37,12 @@ export interface Settings {
   sandbox?: boolean;
   /** Let sandboxed commands use the network (default: off). */
   network?: boolean;
+  /**
+   * Paths sandboxed commands can't read: secrets (~/.ssh, ~/.aws), or answers a benchmark keeps on the
+   * same machine. Absolute, or starting with ~/. jig's own file tools only reach the project and --add-dir
+   * directories in any case.
+   */
+  hiddenPaths: string[];
   hooks: Hook[];
   mcpServers: Record<string, McpServerConfig>;
 }
@@ -48,7 +55,7 @@ export interface ProjectSettings {
   settings: Settings;
 }
 
-const empty = (): Settings => ({ allow: [], deny: [], hooks: [], mcpServers: {} });
+const empty = (): Settings => ({ allow: [], deny: [], hiddenPaths: [], hooks: [], mcpServers: {} });
 
 /** The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one. */
 export function readSettings(root: string): { user: Settings; project?: ProjectSettings } {
@@ -78,13 +85,16 @@ export function needsTrust(settings: Settings): string[] {
   return asks;
 }
 
-/** The settings in effect: the user's, plus the project's (only its deny rules, unless it is trusted). */
+/** The settings in effect: the user's, plus the project's (only its deny rules and hidden paths, unless it is trusted). */
 export function mergeSettings(user: Settings, project: Settings | undefined, trusted: boolean): Settings {
   if (!project) return user;
-  if (!trusted) return { ...user, deny: [...user.deny, ...project.deny] };
+  // Deny rules and hidden paths only take power away, so they apply whether the project is trusted or not.
+  const hiddenPaths = [...user.hiddenPaths, ...project.hiddenPaths];
+  if (!trusted) return { ...user, deny: [...user.deny, ...project.deny], hiddenPaths };
   return {
     allow: [...user.allow, ...project.allow],
     deny: [...user.deny, ...project.deny],
+    hiddenPaths,
     sandbox: project.sandbox ?? user.sandbox,
     network: project.network ?? user.network,
     hooks: [...user.hooks, ...project.hooks],
@@ -126,6 +136,11 @@ function parse(text: string, file: string): Settings {
     }
     settings[key] = (rules as string[]).map((rule) => rule.trim());
   }
+  const hidden = data.hiddenPaths ?? [];
+  if (!Array.isArray(hidden) || hidden.some((path) => typeof path !== "string" || !(isAbsolute(path) || path.startsWith("~/")))) {
+    fail(`"hiddenPaths" must be a list of absolute paths or paths starting with ~/, like ["~/.ssh"]`);
+  }
+  settings.hiddenPaths = (hidden as string[]).map((path) => (path.startsWith("~/") ? join(homedir(), path.slice(2)) : resolve(path)));
   for (const key of ["sandbox", "network"] as const) {
     if (data[key] === undefined) continue;
     if (typeof data[key] !== "boolean") fail(`"${key}" must be true or false`);

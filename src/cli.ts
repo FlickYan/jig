@@ -225,10 +225,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
   const wantSandbox = values.sandbox ?? settings.sandbox ?? true;
-  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs }) : undefined;
+  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths }) : undefined;
   if (values.sandbox && !sandbox) throw new Error(`No sandbox: ${sandboxProblem()}.`);
   // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
+  // Only the sandbox can hide paths: without it, commands can read everything the user can.
+  if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
   const contained = !!sandbox && !network;
   const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
   let snapshots: Snapshots | undefined = new Snapshots(cwd);

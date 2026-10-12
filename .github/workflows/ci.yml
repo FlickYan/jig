@@ -49,6 +49,8 @@ jobs:
       - run: node bench/run.ts --suite evolve --agent noop
       - run: node bench/run.ts --suite evolve2 --agent oracle
       - run: node bench/run.ts --suite evolve2 --agent noop
+      - run: node bench/run.ts --suite explore --agent oracle
+      - run: node bench/run.ts --suite explore --agent noop
 
   package:
     # The npm package runs JavaScript compiled from src/ (Node won't strip types under node_modules):

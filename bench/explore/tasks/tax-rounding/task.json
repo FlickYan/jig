@@ -1,0 +1,10 @@
+{
+  "instruction": "Fix the problem reported in ISSUE.md.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug",
+    "indirection",
+    "exploration"
+  ]
+}

@@ -1,0 +1,4 @@
+# region code -> plugin module in billing/regions/
+DE de
+FR fr
+UK uk

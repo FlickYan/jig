@@ -1,0 +1,10 @@
+{
+  "instruction": "Last night's price import failed. Fix the importer so that it handles what broke it, without changing how it imports anything else.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "bug",
+    "logs",
+    "exploration"
+  ]
+}

@@ -8,3 +8,4 @@ eval/.venv/
 eval/jobs/
 dist/
 *.tgz
+.bench-homes/

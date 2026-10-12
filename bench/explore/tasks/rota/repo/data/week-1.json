@@ -1,0 +1,162 @@
+{
+  "staff": [
+    {
+      "name": "Ada",
+      "max_shifts": 3,
+      "unavailable": [
+        "mon-early",
+        "mon-late",
+        "thu-night"
+      ],
+      "skills": []
+    },
+    {
+      "name": "Bo",
+      "max_shifts": 3,
+      "unavailable": [
+        "thu-late",
+        "thu-night"
+      ],
+      "skills": [
+        "first-aid"
+      ]
+    },
+    {
+      "name": "Cy",
+      "max_shifts": 4,
+      "unavailable": [
+        "thu-early"
+      ],
+      "skills": []
+    },
+    {
+      "name": "Dee",
+      "max_shifts": 4,
+      "unavailable": [
+        "wed-night"
+      ],
+      "skills": [
+        "first-aid"
+      ]
+    },
+    {
+      "name": "Eli",
+      "max_shifts": 4,
+      "unavailable": [
+        "tue-late",
+        "tue-night",
+        "wed-night"
+      ],
+      "skills": []
+    },
+    {
+      "name": "Fay",
+      "max_shifts": 4,
+      "unavailable": [
+        "tue-early",
+        "wed-late"
+      ],
+      "skills": []
+    },
+    {
+      "name": "Gus",
+      "max_shifts": 3,
+      "unavailable": [
+        "mon-early"
+      ],
+      "skills": [
+        "first-aid"
+      ]
+    },
+    {
+      "name": "Hal",
+      "max_shifts": 3,
+      "unavailable": [
+        "mon-night"
+      ],
+      "skills": []
+    },
+    {
+      "name": "Ivy",
+      "max_shifts": 3,
+      "unavailable": [],
+      "skills": []
+    }
+  ],
+  "shifts": [
+    {
+      "id": "mon-early",
+      "day": 0,
+      "slot": "early",
+      "needs": 2,
+      "skill": "first-aid"
+    },
+    {
+      "id": "mon-late",
+      "day": 0,
+      "slot": "late",
+      "needs": 1
+    },
+    {
+      "id": "mon-night",
+      "day": 0,
+      "slot": "night",
+      "needs": 2
+    },
+    {
+      "id": "tue-early",
+      "day": 1,
+      "slot": "early",
+      "needs": 2,
+      "skill": "first-aid"
+    },
+    {
+      "id": "tue-late",
+      "day": 1,
+      "slot": "late",
+      "needs": 1
+    },
+    {
+      "id": "tue-night",
+      "day": 1,
+      "slot": "night",
+      "needs": 1
+    },
+    {
+      "id": "wed-early",
+      "day": 2,
+      "slot": "early",
+      "needs": 2
+    },
+    {
+      "id": "wed-late",
+      "day": 2,
+      "slot": "late",
+      "needs": 1
+    },
+    {
+      "id": "wed-night",
+      "day": 2,
+      "slot": "night",
+      "needs": 2
+    },
+    {
+      "id": "thu-early",
+      "day": 3,
+      "slot": "early",
+      "needs": 2
+    },
+    {
+      "id": "thu-late",
+      "day": 3,
+      "slot": "late",
+      "needs": 1
+    },
+    {
+      "id": "thu-night",
+      "day": 3,
+      "slot": "night",
+      "needs": 2
+    }
+  ]
+}

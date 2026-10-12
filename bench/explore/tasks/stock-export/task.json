@@ -1,0 +1,10 @@
+{
+  "instruction": "Add an `export` command to the stock tool that writes every item in stock to a CSV file (SKU, name, quantity and unit price) and shows where it wrote it.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "conventions",
+    "exploration"
+  ]
+}

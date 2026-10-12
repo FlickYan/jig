@@ -1,0 +1,10 @@
+{
+  "instruction": "Make the HTTP timeout a setting like the others: 30 seconds unless it is configured otherwise, and 60 in staging.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "configuration",
+    "exploration"
+  ]
+}

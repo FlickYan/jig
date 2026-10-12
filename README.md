@@ -104,7 +104,9 @@ received (subagents included), and how many input tokens came from the prompt ca
   A deny rule is refused in every mode, even `auto`, and matches its words in order within one command, so
   `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. A deny rule can also name a
   tool, like `"mcp__github__merge_pull_request"`. The settings can also hold `"sandbox": false` or
-  `"network": true` for a project.
+  `"network": true` for a project, and `"hiddenPaths"`: files and folders sandboxed commands can't read at
+  all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which). A project's
+  hidden paths apply whether it is trusted or not, since they only restrict.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply after
   you say yes to a prompt listing exactly what they would do; the answer is remembered for that version of
@@ -242,7 +244,8 @@ A candidate works on a copy of jig without the benchmarks, in a repository with 
 change only `src/` and `skills/`; the referee runs from the main checkout, so nothing a candidate
 changes can change how it is judged. Milestone 14 describes the loop and what it found, milestone 15
 the suite it runs on now, whose tasks are judged at a budget of 4 steps, milestone 16 the first
-change it accepted, and milestone 17 why that change wasn't merged: it cost Terminal-Bench 15 points.
+change it accepted, milestone 17 why that change wasn't merged (it cost Terminal-Bench 15 points), and
+milestone 18 a cheaper check that would have let it through.
 
 ## How it works
 
@@ -417,7 +420,11 @@ Ctrl+C, and when a safety classifier declines the request.
 - **An accepted change is checked where jig is used.** The evolve suite is a proxy, small tasks at 4
   steps, and the referee measures only the proxy: milestone 16's accepted change solved more of it and
   15 points less of Terminal-Bench. So before a candidate is merged, it runs on Terminal-Bench against
-  jig as it is, in alternating rounds.
+  jig as it is, in alternating rounds. A cheaper stand-in for that check would have to agree with it
+  first: milestone 18's exploration suite didn't, and preferred the change Terminal-Bench turned down.
+- **The answers are out of the agent's reach.** A sandbox that lets commands read anything lets them read
+  a benchmark's hidden tests too, and one attempt did. Benchmark runs hide them (`hiddenPaths`), and the
+  scripts that set a task up get its folder; jig doesn't.
 - **A suite's difficulty is measured, not designed.** Tasks that look hard (denser specs, a time limit,
   a hang to find, conventions only the code shows) were solved at 88 to 100%, and a referee can only
   reward what a suite leaves to gain. What made the evolve suite hard enough was a limit jig works
@@ -485,6 +492,9 @@ npm run bench:report                                # compare the saved runs (Ma
 
 Each run is saved to `bench/results/` (commit these: they are the evidence), with a fingerprint of the
 task suite: the report warns when runs used different versions of the tasks, which are not comparable.
+The answers stay out of the attempts' reach: since milestone 18, the commands jig runs during a benchmark
+can't read the tasks' folders, the other attempts' logs and sessions, `eval/` or the repository's history
+(`bench/hidden.ts` writes them into the run's jig settings as `hiddenPaths`).
 The fingerprint is taken as a run starts and again as it ends, and a run whose tasks changed in between
 records both (`suiteAtEnd`).
 Since milestone 14 each attempt also records its session, the conversation jig saved, for
@@ -1027,7 +1037,10 @@ paths, semver ranges, templates) and two a change across a small project (add a 
 setting), each with visible tests and hidden ones. It is simple on purpose, a first version to build the
 loop on. A calibration run (26 of 30) found two checks at fault, a rule the spec didn't state and a test
 that read too much into a paragraph, and both were fixed before the baseline. The baseline, today's
-jig: 28 of 30 (93%), $0.0138 an attempt.
+jig: 28 of 30 (93%), $0.0138 an attempt. (A correction from milestone 18: one of those passes, on the
+held-out ini-config, came from an attempt that found the benchmark's own folder on the disk, read the
+task's solution and ran its hidden tests. Counted as failed, as look-ups are on Terminal-Bench, the
+baseline is 27 of 30. No verdict below changes: every candidate was rejected on the training tasks.)
 
 **What a verdict was worth, before any candidate ran.** The referee was run on simulated candidates,
 drawn from the baseline's own pass rates (shrunk toward its overall rate) and costs:
@@ -1367,6 +1380,84 @@ python3 eval/report.py eval/jobs/tb-m16+tb-m16-r2 eval/jobs/tb-c1+tb-c1-r2
 
 The four rounds cost $4.20 by jig's estimates, in 9 hours 20 minutes.
 
+### Milestone 18: the answers out of reach, and a cheaper check that didn't work
+
+Milestone 17 showed that the evolve suite rewards changes that cost jig on Terminal-Bench, so this
+milestone set out to build a suite where exploring pays, for the referee to check candidates on. Building
+it turned up a problem with the benchmarks first.
+
+**The answers were within reach.** jig's sandbox lets commands read anything on the machine, and the
+benchmarks keep their hidden tests and reference solutions on the same machine. Every attempt since
+milestone 1 was searched for commands that touched a task's folder or the repository: one did. In
+milestone 14's first baseline, an attempt at the held-out ini-config searched the disk for a library,
+found the benchmark's own folder, read the task's solution and ran its hidden tests, and passed (so that
+baseline is 27 of 30, not 28; no verdict changes, see milestone 14). The runner also gave jig the task's
+folder in an environment variable, TASK_DIR, meant for the task's own scripts. Now:
+
+- jig has a setting for it, `hiddenPaths`: files and folders sandboxed commands can't read at all
+  (Seatbelt refuses them; bubblewrap mounts an empty folder over each). It is useful outside benchmarks
+  too, for `~/.ssh` and the like; the model is told that some paths are hidden, not which.
+- Every benchmark run that starts jig writes the run's jig settings with the answers hidden
+  (`bench/hidden.ts`): the repository's history, `bench/` (every suite's tasks and generators, and the
+  other attempts' logs and sessions) and `eval/`. bench/run.ts, bench/memory.ts, and the proposer in
+  bench/evolve.ts, which until now could have read the suite it was being judged on.
+- TASK_DIR no longer reaches jig, and attempts' home directories moved out of `bench/` (to
+  `.bench-homes/`, still outside the sandbox's reach for writing, which the injection tasks check).
+- A test runs jig with a model that tries to read a task's hidden tests, and checks that it can't
+  (without the setting, it could: checked by hand).
+
+Versions of jig before this one ignore the setting, so a run of an older version (`--ref m12`, say) can
+still reach the answers.
+
+**The exploration suite.** [`bench/explore/`](bench/explore) has 14 tasks, written by scripts in
+`bench/explore/make/` that check each one four ways, as in milestone 15, of two kinds. In ten, what the
+agent needs isn't in the instruction but somewhere in the project: conventions spread over a registry, a
+helper and a document; a vendored retry helper; a rounding bug reached only through plugins loaded by
+name; three data formats that only the data files show; a failure only a log records; a discount that
+only the git history holds (the task's setup.sh writes the history); a generated reference; a settings
+system; a migration convention. In four, the project's own test is a special case and the spec asks for
+more: a sampler checked at one parameter value and asked for six (two with two peaks), a rota whose
+example week a fill in order manages, floors a few tiles long and a billion long, a diff of five lines and
+one of 50,000 lines with repeated lines, where difflib isn't the shortest. Where a task leaves room, the
+hidden tests were also run against a second, differently read solution.
+
+**Would it have caught the change Terminal-Bench turned down?** Candidate 1, rebuilt from its archive on
+a branch of its own, against jig as it is, at the benchmark's usual 40 steps:
+
+| | jig as it is | candidate 1 |
+|---|--------------|-------------|
+| the ten tasks with information to find, 2 attempts | 20 of 20, 9.9 steps, $0.0057 | 20 of 20, 9.1 steps, $0.0055 |
+| the four special cases, 3 attempts | 8 of 12, 434 s an attempt | 12 of 12, 227 s |
+| Terminal-Bench (milestone 17) | 78% | 62% |
+
+- **Information:** both found everything, the history and the log included. With tasks this size, the
+  model looks wherever it needs to, whatever the prompt says about looking.
+- **Special cases: the opposite of Terminal-Bench.** On the rota, jig as it is wrote reference solvers,
+  counting and timing scripts of its own, ran into the commands' time limits three to six times an
+  attempt, and ran out of the attempt's 15 minutes all three times; candidate 1 finished in about
+  three minutes each time. On Terminal-Bench the same thoroughness is what solved
+  model-extraction-relu-logits: jig as it is tried its method on four other random networks, while
+  candidate 1 checked it on the one it had, declared success, and failed on the hidden one. (A first,
+  larger rota ran both into the time limit, 1 of 3 against 0 of 3, so its weeks were made smaller.)
+
+**So the exploration suite isn't a gate in the referee.** It would have passed candidate 1, and preferred
+it. A cheaper stand-in for Terminal-Bench is only worth what its agreement with Terminal-Bench is, and
+these tasks don't agree with it on the one change there is to compare. An accepted candidate is checked
+on Terminal-Bench itself, as milestone 17 decided. The suite stays, checked in CI with the oracle and
+noop agents, as a record and as a start for a better stand-in, which would need harder tasks and
+Terminal-Bench's time limits.
+
+**Cost.** $1.34 for the exploration suite's runs.
+
+- **Check the harness before trusting a result.** The hole was found only because a new suite made me
+  look at what the runner gives jig. One attempt in about 2,000 went looking; a model that searches the
+  disk for a library will find whatever else is there.
+- **A proxy has to be measured against what it stands for.** Each kind of task looked like Terminal-Bench
+  in miniature, and neither reproduced its verdict: a check made cheap changes what it measures.
+- **Thoroughness costs time, and time is limited.** jig's habit of building its own checks solves hard
+  tasks and runs out the clock on others; a change that trims it could do better or worse depending on
+  the time budget alone.
+
 ## Tests
 
 ```bash
@@ -1410,6 +1501,7 @@ installs and runs the tarball on every push.
 - [x] **15. A suite that can tell a fix from luck:** `bench/evolve2`, 21 tasks written by scripts that check each one four ways (it parses, fails as given, passes with the reference solution, and its visible tests agree with that solution), with the hidden tests' answers from git, `tomllib`, dateutil, Python's `eval` and `zoneinfo` where a tool knows them; denser specs (88%, then 94%) and five new kinds of task (10 of 10) didn't make jig fail with 40 steps, and a budget of 4 steps did (57% and 44% in two baseline runs), set per suite in `suite.json` and recorded with every run; against it, the referee accepts a change that fixes a third of jig's failures 45% of the time, where on the first suite it couldn't tell such a change from luck (0.4%), and a change that does nothing 2.0%
 - [x] **16. The first change the referee accepted:** before any candidate ran, the false acceptance against the one baseline run candidates would meet turned out to be 9%, not the 2% averaged over runs, so candidates are compared with every run the analysis didn't see, pooled, and `calibrate` reports the rate against those runs (3.7% with four baselines); the analysis found jig reading until its 4 steps ran out, and of three prompt changes the referee accepted one (+15 and +17 points); run again beside a fourth baseline it was +6 (−11 to +24), harmless with 40 steps (41 of 42) and one attempt short on the main benchmark (59 of 60), so it waits on its branch for a Terminal-Bench check
 - [x] **17. The accepted change, on Terminal-Bench:** candidate 1 against jig as it is on the original 20 tasks, two attempts each in alternating rounds: 62% against 78%, −15 points (−28 to −5), both rounds alike, so it isn't merged; the evolve suite rewards getting it right with little looking, which Terminal-Bench doesn't; each prompt looked the benchmark up once; jig as it is solved 9 points more than milestone 11's jig (+1 to +18)
+- [x] **18. The answers out of reach:** an attempt in milestone 14 had found its task's folder on the disk and run the hidden tests (that baseline is 27 of 30, not 28; no verdict changes), so jig gets `hiddenPaths`, which its sandbox hides from commands, every benchmark run hides the tasks, logs, `eval/` and the history with it (`bench/hidden.ts`), and TASK_DIR no longer reaches jig; `bench/explore`, 14 generated tasks where exploring pays (information to find, or a visible check that is a special case), which didn't reproduce Terminal-Bench's verdict on milestone 16's candidate (20/20 against 20/20, then 8/12 against 12/12, the candidate ahead), so it isn't a gate in the referee
 
 ## License
 

@@ -1,0 +1,10 @@
+{
+  "instruction": "Customers can have a phone number now (it's optional). Store it with each customer.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "database",
+    "exploration"
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "c1": [{"invoice": "I-100", "cents": 120000, "paid": true}, {"invoice": "I-104", "cents": 80000, "paid": false}],
+  "c2": [{"invoice": "I-101", "cents": 30000, "paid": false}]
+}

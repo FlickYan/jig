@@ -1,0 +1,10 @@
+{
+  "instruction": "Implement load_readings in meters/load.py so that it reads the export files of all three sites into Reading objects.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "data",
+    "formats",
+    "exploration"
+  ]
+}

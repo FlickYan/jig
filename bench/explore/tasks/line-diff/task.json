@@ -1,0 +1,10 @@
+{
+  "instruction": "Implement diff in patcher/diff.py so that it follows SPEC.md.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "spec",
+    "algorithms",
+    "generalization"
+  ]
+}

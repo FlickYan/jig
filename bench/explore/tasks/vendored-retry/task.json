@@ -1,0 +1,10 @@
+{
+  "instruction": "The reporting service sometimes times out. Make fetch_report retry when it does, the way the rest of the project retries.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "vendored code",
+    "exploration"
+  ]
+}

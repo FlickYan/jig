@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { costOf } from "../src/prices.ts";
+import { hideAnswers } from "./hidden.ts";
 
 const ROOT = join(dirname(new URL(import.meta.url).pathname), "..");
 const SCENARIOS = join(ROOT, "bench", "memory");
@@ -62,6 +63,7 @@ const kept: Record<string, { memories: string[]; instructions: string }> = {};
 for (const scenario of scenarios) {
   const work = mkdtempSync(join(tmpdir(), `jig-memory-${scenario.name}-`));
   const home = join(work, "jig-home");
+  hideAnswers(home); // the scenarios, with what each follow-up is checked for, are under bench/
   const env = { ...process.env, JIG_HOME: home, NO_COLOR: "1" };
   console.log(`${scenario.name}: ${scenario.description}`);
 

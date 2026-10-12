@@ -1,0 +1,10 @@
+{
+  "instruction": "Orders that would take a customer over their credit limit must be refused, whether they come through the API or the command line.",
+  "check": "PYTHONPATH=. python3 -m unittest discover -s bench_tests",
+  "tags": [
+    "python",
+    "feature",
+    "architecture",
+    "exploration"
+  ]
+}

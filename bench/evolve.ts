@@ -14,6 +14,7 @@ import { costOf } from "../src/prices.ts";
 import { createSandbox } from "../src/sandbox.ts";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "./evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "./evolve-workspace.ts";
+import { HOMES, hideAnswers } from "./hidden.ts";
 import { type Attempt, compare, type Comparison, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split, type Verdict } from "./evolve-referee.ts";
 
 const HELP = `Usage: node bench/evolve.ts <command> [options]
@@ -286,8 +287,11 @@ async function propose(cause: string): Promise<Candidate> {
   const branch = `${suite}/${n}`;
   const base = git("rev-parse", "--short", "HEAD");
   const logs = join(LOGS, String(n));
-  const home = join(logs, "home");
+  mkdirSync(logs, { recursive: true });
+  // Outside bench/, which the candidate's sandbox hides from it, with the tasks and their answers.
+  const home = join(HOMES, `${suite}-${n}`);
   mkdirSync(home, { recursive: true });
+  hideAnswers(join(home, ".jig"));
   const tree = workspace(ROOT, base);
   try {
     const failing = sandboxedFailures(tree, home);

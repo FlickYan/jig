@@ -1,0 +1,7 @@
+# export from meter gateway C
+# site: depot
+# columns: meter, date time, energy (kWh)
+C-1     20260901 0000      7.20
+C-1     20260901 0100     10.05
+C-12    20260901 0000    123.40
+TOTAL                    140.65

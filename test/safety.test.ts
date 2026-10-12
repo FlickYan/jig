@@ -53,6 +53,26 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     assert.match(await run(loopback, sandbox), /^pong/);
   });
 
+  it("hides the paths it is given from commands, and only those", async () => {
+    const hidden = await mkdtemp(join(homedir(), ".jig-sandbox-hidden-"));
+    const shown = await mkdtemp(join(homedir(), ".jig-sandbox-shown-"));
+    try {
+      await writeFile(join(hidden, "answer.txt"), "the hidden answer");
+      await writeFile(join(shown, "notes.txt"), "the visible notes");
+      await writeFile(join(shown, "key.txt"), "a hidden key");
+      const sandbox = createSandbox(project, { network: false, hidden: [hidden, join(shown, "key.txt")] })!;
+      // Seatbelt refuses; bubblewrap shows an empty directory and an empty file in their place.
+      assert.doesNotMatch(await run(`cat ${join(hidden, "answer.txt")}`, sandbox), /the hidden answer/);
+      assert.doesNotMatch(await run(`ls ${hidden}`, sandbox), /answer\.txt/);
+      assert.doesNotMatch(await run(`cat ${join(shown, "key.txt")}`, sandbox), /a hidden key/);
+      assert.match(await run(`cat ${join(shown, "notes.txt")}`, sandbox), /^the visible notes/);
+      assert.match(sandbox.limits, /Some paths are hidden from commands/);
+    } finally {
+      await rm(hidden, { recursive: true, force: true });
+      await rm(shown, { recursive: true, force: true });
+    }
+  });
+
   it("can allow the network", () => {
     const flags = (network: boolean) => createSandbox(project, { network })!.wrap("x").args.join(" ");
     assert.match(flags(false), /deny network|--unshare-net/);
@@ -119,6 +139,7 @@ describe("settings", () => {
     assert.deepEqual(mergeSettings(user, project!.settings, true), {
       allow: ["npm test"],
       deny: ["git push", "rm"],
+      hiddenPaths: [],
       sandbox: undefined,
       network: true,
       hooks: [],
@@ -141,7 +162,15 @@ describe("settings", () => {
       "run these commands without asking: npm test",
       "run commands outside the sandbox",
     ]);
-    assert.deepEqual(mergeSettings(user, project!.settings, false), { allow: ["make"], deny: ["rm"], hooks: [], mcpServers: {} });
+    assert.deepEqual(mergeSettings(user, project!.settings, false), { allow: ["make"], deny: ["rm"], hiddenPaths: [], hooks: [], mcpServers: {} });
+  });
+
+  it("hides paths whoever's settings name them, trusted or not", async () => {
+    await writeSettings({ hiddenPaths: ["~/.ssh"] }, { hiddenPaths: ["/srv/answers"] });
+    const { user, project } = readSettings(dir);
+    assert.deepEqual(mergeSettings(user, project!.settings, false).hiddenPaths, [join(homedir(), ".ssh"), "/srv/answers"]);
+    await writeSettings({}, { hiddenPaths: ["answers"] });
+    assert.throws(() => readSettings(dir), /"hiddenPaths" must be a list of absolute paths/);
   });
 
   it("remembers trust in one version of the project's settings, not in later edits", async () => {
