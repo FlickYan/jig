@@ -1,0 +1,178 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index ed6272e..9008367 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -7,6 +7,7 @@ import { compact } from "./compact.ts";
+ import type { Conversation } from "./conversation.ts";
+ import type { CallModel } from "./model.ts";
+ import type { Sandbox } from "./sandbox.ts";
++import { runCommand } from "./tools/bash.ts";
+ import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
+ 
+ type Message = Anthropic.Beta.BetaMessage;
+@@ -43,6 +44,11 @@ export interface AgentOptions {
+    * runs, where nobody is there to look at the result and ask for more.
+    */
+   review?: string;
++  /**
++   * A command that runs the project's tests. Run with a file change's own result, so that with few steps
++   * the model learns whether the change works without spending one of its calls to find out.
++   */
++  verify?: string;
+   ui: AgentUI;
+ }
+ 
+@@ -119,10 +125,18 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+ 
+     // Every tool call gets a result, even ones that never run, or the next request is invalid.
+     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete
+-    const handle = (call: ToolUse) => handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, conversation, opts, usage, signal);
++    // A change is checked right away, while steps are left to repair it: the project's tests run with the
++    // change's own result, so what they report costs no step to find and the steps that remain are the
++    // budget for fixing it. Not on the last step, where nothing is left to act on, and not when the model
++    // ended its reply with a command of its own, which it may already have used to check.
++    const kindOf = (call: ToolUse) => opts.tools.find((t) => t.definition.name === call.name)?.kind;
++    const last = calls.at(-1)!;
++    const verifyId = opts.verify && step < opts.maxSteps && kindOf(last) === "edit" ? last.id : undefined;
++    const handle = (call: ToolUse) =>
++      handleToolCall(call, { cutOff, malformed: malformed.get(call.id), verify: call.id === verifyId }, conversation, opts, usage, signal);
+     // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
+     // run at the same time. Anything else runs in order, since one call may depend on another's effect.
+-    const readOnly = calls.every((call) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read");
++    const readOnly = calls.every((call) => kindOf(call) === "read");
+     const results: ToolResult[] = [];
+     if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
+     else for (const call of calls) results.push(await handle(call));
+@@ -155,7 +169,7 @@ async function compactConversation(conversation: Conversation, opts: AgentOption
+  */
+ async function handleToolCall(
+   call: ToolUse,
+-  state: { cutOff: boolean; malformed?: string },
++  state: { cutOff: boolean; malformed?: string; verify?: boolean },
+   conversation: Conversation,
+   opts: AgentOptions,
+   usage: Usage,
+@@ -203,10 +217,32 @@ async function handleToolCall(
+   }
+   const feedback = await opts.hooks?.after(call.name, input, output);
+   if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
++  if (state.verify && opts.verify) {
++    const checked = await verifyChange(opts.verify, opts, signal);
++    if (checked) output = `${output.trimEnd()}\n\n${checked}`;
++  }
+   opts.ui.toolResult(output, false, call.id);
+   return { type: "tool_result", tool_use_id: call.id, content: output };
+ }
+ 
++/** How long the project's tests may take here, and how much of their output the model sees. */
++const VERIFY_TIMEOUT_SECONDS = 60;
++const VERIFY_OUTPUT_CHARS = 4000;
++
++/**
++ * Runs the project's tests right after a change and describes what they printed, for the change's own tool
++ * result. It is advice, not part of the change: if the command can't start, the model simply doesn't hear
++ * from it, and the change is not reported as failing.
++ */
++async function verifyChange(command: string, opts: AgentOptions, signal?: AbortSignal): Promise<string> {
++  try {
++    const output = truncate(await runCommand(command, opts.cwd, VERIFY_TIMEOUT_SECONDS, signal, opts.sandbox), VERIFY_OUTPUT_CHARS);
++    return `The project's tests, run right after that change:\n${output}\n\nFix what they report before finishing.`;
++  } catch {
++    return "";
++  }
++}
++
+ function replyText(reply: Message): string {
+   return reply.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+ }
+diff --git a/src/cli.ts b/src/cli.ts
+index 68bc6f3..c36cfe9 100755
+--- a/src/cli.ts
++++ b/src/cli.ts
+@@ -33,6 +33,7 @@ import { Snapshots } from "./snapshots.ts";
+ import { Stats } from "./stats.ts";
+ import { VERSION } from "./version.ts";
+ import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
++import { testCommand } from "./tools/tests.ts";
+ import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
+ import * as ui from "./ui.ts";
+ 
+@@ -92,6 +93,10 @@ project and in your home directory.
+ Ctrl+C stops the current task (press it again to force quit).`;
+ 
+ const SUBAGENT_MAX_STEPS = 30;
++// With few calls to spare, one spent only to run the tests is a call not spent repairing them, so jig runs
++// the project's tests with each change's result (see AgentOptions.verify). With many calls the model runs
++// them itself, and running them again would only cost.
++const TIGHT_STEPS = 8;
+ 
+ const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks before a tool call
+   /undo                        put the files back the way they were before the last task
+@@ -262,6 +267,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
+   let instructions = loadInstructions(cwd);
+   // jig's own tools, unless --tools picks some. The prompts then name only the tools there are.
+   const own = selectTools(toolNames);
++  // A plain one-shot task with few steps: run the project's tests with each change's result, so the model
++  // sees pass or fail without spending one of those steps. Only where a test command may run without
++  // asking, so it never prompts the user or loosens the mode; and only if bash is there to run it.
++  const bash = own.find((tool) => tool.definition.name === "bash");
++  const testCmd = given && !skillsVerb && !memoryVerb && maxSteps <= TIGHT_STEPS ? await testCommand(cwd, dirs) : null;
++  const verify = bash && testCmd && permissions.decide(bash, { command: testCmd }) === "allow" ? testCmd : undefined;
+   const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
+   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
+   const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
+@@ -357,6 +368,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
+     sandbox,
+     hooks,
+     review: oneShot ? REVIEW : undefined,
++    verify,
+     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
+   };
+   conversation.describe(context);
+diff --git a/src/tools/tests.ts b/src/tools/tests.ts
+new file mode 100644
+index 0000000..6becf9b
+--- /dev/null
++++ b/src/tools/tests.ts
+@@ -0,0 +1,41 @@
++// The project's tests, so the loop can run them right after a file change: the model learns whether the
++// change works in the same step, and the steps left go to repairing it instead of finding out. A command is
++// only proposed when the project's layout says how to run tests, and a missing runner falls back to a
++// standard-library one, so the check still runs.
++
++import { existsSync, readFileSync } from "node:fs";
++import { join } from "node:path";
++import { listFiles } from "./files.ts";
++
++/** Python test files by name: test_x.py and x_test.py. */
++const PYTHON_TEST = /(^|\/)(test[^/]*|[^/]*_test)\.py$/;
++
++/** A command that runs this project's tests, or null if its layout doesn't say how. */
++export async function testCommand(cwd: string, dirs: string[] = []): Promise<string | null> {
++  let files: string[];
++  try {
++    files = await listFiles(cwd, ".", dirs);
++  } catch {
++    return null;
++  }
++  if (files.some((file) => PYTHON_TEST.test(file))) return PYTHON_TESTS;
++  const packageJson = join(cwd, "package.json");
++  if (existsSync(packageJson) && hasScript(packageJson, "test")) return "npm test --silent";
++  return null;
++}
++
++/**
++ * pytest runs unittest's tests too and is the common choice; where it isn't installed, unittest is always
++ * there. discover's pattern finds both test_x.py and x_test.py.
++ */
++const PYTHON_TESTS = 'if python -c "import pytest" >/dev/null 2>&1; then python -m pytest -q; else python -m unittest discover -q -p "*test*.py"; fi';
++
++/** Whether package.json declares a non-empty script of that name. */
++function hasScript(file: string, name: string): boolean {
++  try {
++    const { scripts } = JSON.parse(readFileSync(file, "utf8")) as { scripts?: Record<string, unknown> };
++    return typeof scripts?.[name] === "string" && scripts[name] !== "";
++  } catch {
++    return false;
++  }
++}

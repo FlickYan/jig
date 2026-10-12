@@ -240,6 +240,8 @@ describe("a candidate's workspace", () => {
     assert.deepEqual(replySummary(reply("Some notes.\n\nI changed the loop. It now stops sooner.")), { subject: "I changed the loop.", description: "I changed the loop. It now stops sooner." });
     const drafted = 'Final reply needs a "Summary:" line.\nSummary: "Skip the survey" (3 words? let me count)\n\nSummary: Skip the survey\n\nI changed the prompt.';
     assert.deepEqual(replySummary(reply(drafted)), { subject: "Skip the survey", description: "I changed the prompt." });
+    const cutOff = "● edit_file src/cli.ts\nLet me rename.\nStopped after 60 steps (raise the limit with --max-steps).\n60 steps · 0 tool errors · $0.3000\n";
+    assert.equal(replySummary(cutOff).subject, "(no summary: stopped after 60 steps)");
   });
 
   it("lists the failed tests of a run", () => {

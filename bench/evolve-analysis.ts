@@ -38,7 +38,9 @@ export function replySummary(transcript: string): { subject: string; description
   const rest = line ? text.slice(line.index! + line[0].length) : text;
   const paragraphs = rest.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
   const description = (line ? paragraphs[0] : paragraphs.at(-1)) ?? "";
-  const subject = line?.[1] ?? description.split(/(?<=\.)\s/)[0];
+  // Stopped by the step limit, the reply is wherever the work was: its last words aren't a summary.
+  const stopped = !line && /^Stopped after (\d+) steps/m.exec(transcript);
+  const subject = line?.[1] ?? (stopped ? `(no summary: stopped after ${stopped[1]} steps)` : description.split(/(?<=\.)\s/)[0]);
   return { subject: subject.replace(/[*`]/g, "").trim().slice(0, 72), description };
 }
 

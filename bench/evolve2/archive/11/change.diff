@@ -1,0 +1,70 @@
+diff --git a/src/tools/read.ts b/src/tools/read.ts
+index 6524c5c..ad16b85 100644
+--- a/src/tools/read.ts
++++ b/src/tools/read.ts
+@@ -2,12 +2,15 @@
+ // records the version of the file the model saw (FileVersions), which write_file checks before overwriting.
+ 
+ import { readFile } from "node:fs/promises";
++import { basename, dirname, resolve } from "node:path";
++import { listFiles } from "./files.ts";
+ import type { Tool } from "./index.ts";
+ import { assertFile, resolveInRoot } from "./util.ts";
+ 
+ const DEFAULT_LIMIT = 2000; // lines per call
+ const MAX_LINE_CHARS = 2000; // minified files have enormous lines
+ const MAX_CHARS = 30_000; // per call; longer files are read in pages with offset
++const MAX_IMPORTS = 8; // project files named by one file's imports, before a list is a dump itself
+ 
+ export const readTool: Tool = {
+   definition: {
+@@ -31,7 +34,7 @@ export const readTool: Tool = {
+   kind: "read",
+   describe: ({ path, offset }) => (offset ? `${path}:${offset}` : String(path)),
+ 
+-  async run(input, { cwd, versions, dirs }) {
++  async run(input, { cwd, versions, dirs = [] }) {
+     const { path, offset = 1, limit = DEFAULT_LIMIT } = input as { path: string; offset?: number; limit?: number };
+     const file = resolveInRoot(cwd, path, dirs);
+     const info = await assertFile(file, path); // taken before reading, so a change during the read shows up later
+@@ -61,6 +64,40 @@ export const readTool: Tool = {
+       out += `\n(Showed lines ${first}-${last} of ${lines.length}. Use offset=${last + 1} to continue.)`;
+     }
+     await versions.record(file, info);
++    // Reading the file the task comes with should point at the modules it names, so the model reads
++    // those instead of listing the package and opening every sibling.
++    const imported = await importedFiles(bytes.toString("utf8"), file, cwd, dirs);
++    if (imported.length) out += `\n\nProject files this imports: ${imported.join(", ")}`;
+     return out;
+   },
+ };
++
++/** A line that imports or includes another module, in the languages jig's tasks tend to use. */
++const IMPORTISH = /\b(?:import|from|require|include|use)\b/;
++const WORD = /[A-Za-z_][A-Za-z0-9_]*/g;
++/** A file that stands in for the directory that names it: importing a package reads its entry point. */
++const PACKAGE_ENTRY = new Set(["__init__", "index", "mod"]);
++
++/**
++ * The project files whose name a file names in its imports: for `from table import render`, `table.py`.
++ * Matching names rather than parsing each language keeps it small and covers the same ground: the file
++ * the task points at says which modules to read, and the model doesn't have to enumerate to find them.
++ */
++async function importedFiles(text: string, self: string, cwd: string, dirs: string[]): Promise<string[]> {
++  const named = new Set<string>();
++  for (const line of text.split("\n")) {
++    if (line.length > 400 || !IMPORTISH.test(line)) continue;
++    for (const word of line.match(WORD) ?? []) if (word.length > 2) named.add(word.toLowerCase());
++  }
++  if (named.size === 0) return [];
++  const myself = resolve(cwd, self);
++  const found: string[] = [];
++  for (const file of await listFiles(cwd, ".", dirs).catch(() => [])) {
++    if (resolve(cwd, file) === myself) continue;
++    const name = basename(file).replace(/\.[^.]+$/, "").toLowerCase();
++    // A name matches its own file (`from table import render`), and a named directory its entry point
++    // (`from pkg import render` with pkg/__init__.py or pkg/index.js).
++    if (named.has(name) || (PACKAGE_ENTRY.has(name) && named.has(basename(dirname(file)).toLowerCase()))) found.push(file);
++  }
++  return found.slice(0, MAX_IMPORTS);
++}

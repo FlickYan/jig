@@ -1558,6 +1558,32 @@ first three:
 
 **Cost.** $2.22: $0.78 for the third baseline, $1.43 for the three candidates.
 
+### Milestone 22: the loop and the tools, not the prompt
+
+After nine prompt changes, a round in which candidates may change only jig's loop and tools:
+`npm run evolve -- run --target loop` tells the proposer so (the prompt was measured nine times, and
+nothing held up), the referee rejects such a candidate if it touches `src/prompt.ts`, and a cause tried
+in the prompt counts as new for it. Compared, as in milestone 21, with `baseline-m19b` and `-m19c`:
+
+| # | the change | training tasks | verdict |
+|---|------------|----------------|---------|
+| 10 | on the last step, if nothing has been changed yet, the model gets only the tools that change files (`src/agent.ts`, and the model calls, which can now take a step's own tools) | 50% against 42%, cost ×1.15 | rejected: ahead in 74% of resamples |
+| 11 | `read_file` lists the project files a file it reads imports | | rejected unread: its comment's example, `from table import render`, names a task's file |
+| 12 | with a tight step limit, after an edit the loop runs the project's tests itself and adds what they print to the edit's result (a new `src/tools/tests.ts` finds the command) | 47% against 42%, cost ×1.10 | rejected: ahead in 67% |
+
+- **Closer than the prompt, and still short.** The loop's two candidates came out 8 and 5 points ahead,
+  where the last round's prompt lines were within 5 of nothing either way, but neither reached the bar:
+  ahead in 74% and 67% of resamples, against the 80% needed, at 10 to 15% more cost. Candidate 10 is
+  the kind of change that can only matter under a budget: a run with steps to spare almost never gets
+  to its last step without having changed anything.
+- **The word check is strict by design.** Candidate 11's example used the very names of a task's file
+  and function, which the proposer can't have seen (its copy of jig has no benchmarks, and the sandbox
+  hides them); it was rejected unread all the same, since the check can't tell a coincidence from a leak.
+- **A proposal that ran out of steps** (candidate 12 used all 60 of its own) had no summary, and its
+  last words, "Let me rename.", had become one: such a candidate's summary now says it was cut off.
+
+**Cost.** $1.19 for the three candidates.
+
 ## Tests
 
 ```bash
@@ -1605,6 +1631,7 @@ installs and runs the tarball on every push.
 - [x] **19. Terminal-Bench as the referee's last stage:** `npm run evolve -- tbcheck <n>` runs an accepted candidate and jig where it branched on the 20 Terminal-Bench tasks in alternating rounds, starts each round only when it can finish outside DeepSeek's peak hours, picks up after a break, and records the verdict (rejected when behind in 80% of resamples: milestone 17's runs give -15 points, rejected); a smoke test on one task ran end to end
 - [x] **20. A second round, against fresh baselines:** `calibrate --compare-with` names the runs candidates are compared with, and two fresh baselines of milestone 19's jig became them (44% and 43%, against 44 to 57% before); the proposer hears what Terminal-Bench and the person decided about earlier candidates; three candidates, all rejected, two of them after beating the training half by 13 and 16 points, on the held-out tasks (one was candidate 1's advice, kept for tight step budgets only)
 - [x] **21. New causes, from today's jig:** `analyze --from <label>` diagnoses another baseline run, and the split records it so that candidates are never compared with the run the analysis saw; a third fresh baseline (52%); the new analysis named the same failures in other words, and its three candidates came out within 5 points of nothing against a fair comparison: across nine candidates, a line of advice in the prompt hasn't moved what jig gets right in four calls
+- [x] **22. The loop and the tools, not the prompt:** `run --target loop` lets candidates change only the loop and tools (the referee rejects one that touches the prompt); three candidates: forcing a change on the last step if there is none (+8 points, ahead in 74% of resamples), running the tests after each edit under a tight limit (+5, 67%), and one rejected unread by the word check; closer than the prompt's, short of the 80% bar
 
 ## License
 

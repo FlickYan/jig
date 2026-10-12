@@ -1,0 +1,118 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index ed6272e..829c3dc 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -84,15 +84,20 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+   const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage });
+   let reviewed = false;
++  let changed = false; // whether any tool call has changed a file yet
+ 
+   for (let step = 1; step <= opts.maxSteps; step++) {
+     let reply: Message;
+     let malformed: Map<string, string>;
++    // On the last step, if nothing has been changed yet, the model may only reach for a tool that changes
++    // something: reconnaissance is over, and this step has to produce the work rather than look around.
++    const edits = opts.tools.filter((tool) => tool.kind === "edit");
++    const tools = !changed && edits.length > 0 && step === opts.maxSteps ? edits : undefined;
+     try {
+       if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
+         addUsage(usage, await compactConversation(conversation, opts, signal));
+       }
+-      ({ message: reply, malformed } = await opts.callModel(conversation.messages, signal));
++      ({ message: reply, malformed } = await opts.callModel(conversation.messages, signal, tools && { tools }));
+     } catch (err) {
+       if (signal?.aborted) return result("interrupted", step - 1);
+       throw err;
+@@ -106,6 +111,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+     conversation.push({ role: "assistant", content: reply.content });
+     conversation.tokens = contextSize(reply.usage); // measured: the whole request plus this reply
+     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
++    if (calls.some((call) => opts.tools.find((tool) => tool.definition.name === call.name)?.kind === "edit")) changed = true;
+     // A reply with no tool calls is the final answer, unless the work is still to be checked.
+     if (calls.length === 0) {
+       if (opts.review && !reviewed && reply.stop_reason === "end_turn") {
+diff --git a/src/model.ts b/src/model.ts
+index 8d45fbe..9162e04 100644
+--- a/src/model.ts
++++ b/src/model.ts
+@@ -38,9 +38,10 @@ export interface ModelTurn {
+ 
+ /**
+  * One model call: the conversation in, the model's next message out, streamed to the terminal on the way.
+- * With `summarize`, the model may not call tools and nothing is printed (used for compaction).
++ * With `summarize`, the model may not call tools and nothing is printed (used for compaction). `tools`
++ * replaces the request's tools for this call only (the loop reserves the last step for a change).
+  */
+-export type CallModel = (messages: MessageParam[], signal?: AbortSignal, options?: { summarize?: boolean }) => Promise<ModelTurn>;
++export type CallModel = (messages: MessageParam[], signal?: AbortSignal, options?: { summarize?: boolean; tools?: Tool[] }) => Promise<ModelTurn>;
+ 
+ /** The model and how to reach it, and the system prompt and tools that go with every request. */
+ export interface ModelOptions {
+@@ -101,7 +102,7 @@ export const retryNotices = {
+   error() {},
+ };
+ 
+-type Turn = (messages: MessageParam[], signal: AbortSignal | undefined, summarize: boolean) => Promise<ModelTurn>;
++type Turn = (messages: MessageParam[], signal: AbortSignal | undefined, summarize: boolean, tools?: Tool[]) => Promise<ModelTurn>;
+ 
+ /**
+  * The model, as a CallModel. A call is tried up to three times when the reply broke off or its tool input
+@@ -111,10 +112,10 @@ export function createModel(options: ModelOptions): CallModel {
+   const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
+   const turn = (options.api ?? defaultApi(options.model)) === "openai" ? chatCompletions(options, settings) : messagesApi(options, settings);
+ 
+-  return async (messages, signal, { summarize = false } = {}) => {
++  return async (messages, signal, { summarize = false, tools } = {}) => {
+     for (let attempt = 1; ; attempt++) {
+       try {
+-        return await turn(messages, signal, summarize);
++        return await turn(messages, signal, summarize, tools);
+       } catch (err) {
+         // API errors are mostly not retried here: the SDK already retries rate limits, overloads and
+         // requests that fail before a reply begins. What it can't retry is a reply that broke off partway,
+@@ -142,10 +143,17 @@ function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
+   // Anthropic() reads ANTHROPIC_API_KEY.
+   const client = deepseek ? deepseekClient({ ...settings, ...baseURL }) : new Anthropic({ ...settings, ...baseURL });
+   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
+-  return (messages, signal, summarize) => {
++  // The tools as this API wants them; a per-call list replaces the request's own.
++  const definitions = (tools: Tool[]) => (deepseek ? tools.map((tool) => tool.definition) : tools.map((tool) => ({ ...tool.definition, eager_input_streaming: true })));
++  return (messages, signal, summarize, tools) => {
+     const sent = deepseek ? withoutIsError(messages) : messages;
+     // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
+-    const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
++    const params: BetaMessageStreamParams = {
++      ...request,
++      messages: sent,
++      ...(tools && { tools: definitions(tools) }),
++      ...(summarize && { tool_choice: { type: "none" } }),
++    };
+     return streamTurn(client, params, signal, summarize || options.quiet);
+   };
+ }
+@@ -165,7 +173,7 @@ function chatCompletions(options: ModelOptions, settings: ClientSettings): Turn
+   // DeepSeek gets the output limit its Anthropic endpoint gets; elsewhere the server's default stands (OpenAI's
+   // reasoning models refuse max_tokens).
+   const chat = { ...options, maxTokens: deepseek ? 64_000 : undefined };
+-  return (messages, signal, summarize) => chatTurn(client, chat, messages, { signal, quiet: summarize || options.quiet, summarize });
++  return (messages, signal, summarize, tools) => chatTurn(client, chat, messages, { signal, quiet: summarize || options.quiet, summarize, tools });
+ }
+ 
+ function claudeRequest({ model, effort = "medium", system, tools }: ModelOptions): Request {
+diff --git a/src/openai.ts b/src/openai.ts
+index 070fa14..b12f0ce 100644
+--- a/src/openai.ts
++++ b/src/openai.ts
+@@ -84,9 +84,9 @@ export async function chatTurn(
+   client: OpenAI,
+   options: ChatOptions,
+   messages: MessageParam[],
+-  { signal, quiet = false, summarize = false }: { signal?: AbortSignal; quiet?: boolean; summarize?: boolean },
++  { signal, quiet = false, summarize = false, tools: override }: { signal?: AbortSignal; quiet?: boolean; summarize?: boolean; tools?: Tool[] },
+ ): Promise<ModelTurn> {
+-  const tools = toChatTools(options.tools);
++  const tools = toChatTools(override ?? options.tools);
+   if (!quiet) ui.status("thinking…");
+   const stream = await client.chat.completions.create(
+     {

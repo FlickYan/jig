@@ -1,0 +1,32 @@
+{
+  "n": 12,
+  "branch": "evolve2/12",
+  "base": "f58e14b",
+  "cause": "It writes one large whole-file rewrite and then has no steps left to verify or repair; when the test runner is missing or misinvoked it gives up instead of falling back to a direct script. It should run the visible tests immediately after writing and treat the remaining steps as repair budget.",
+  "subject": "(no summary: stopped after 60 steps)",
+  "description": "Let me rename.\n● edit_file src/cli.ts\n  -   const bash = own.find((tool) => tool.definition.name === \"bash\");\n  -   const tests = given && !skillsVerb && !memoryVerb && maxSteps <= TIGHT_STEPS ? await testCommand(cwd, dirs) : null;\n  -   const verify = bash && tests && permissions.decide(bash, { command: tests }) === \"allow\" ? tests : undefined;\n  +   const bash = own.find((tool) => tool.definition.name === \"bash\");\n  +   const testCmd = given && !skillsVerb && !memoryVerb && maxSteps <= TIGHT_STEPS ? await testCommand(cwd, dirs) : null;\n  +   const verify = bash && testCmd && permissions.decide(bash, { command: testCmd }) === \"allow\" ? testCmd : undefined;\n  Edited src/cli.ts: replaced 3 lines at line 273 with 3 lines.\nStopped after 60 steps (raise the limit with --max-steps).",
+  "files": [
+    "src/agent.ts",
+    "src/cli.ts",
+    "src/tools/tests.ts"
+  ],
+  "spent": 0.530742832,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T21-17-56_evolve-12-train.json"
+  },
+  "target": "loop",
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4666666666666666,
+    "baseline": 0.4166666666666667,
+    "difference": 0.04999999999999998,
+    "low": -0.18333333333333335,
+    "high": 0.2833333333333333,
+    "ahead": 0.668,
+    "costRatio": 1.1049004804392586
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+5 points, ahead in 67% of resamples, cost ×1.10)"
+  }
+}

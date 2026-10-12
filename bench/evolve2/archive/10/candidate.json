@@ -1,0 +1,32 @@
+{
+  "n": 10,
+  "branch": "evolve2/10",
+  "base": "f58e14b",
+  "cause": "It front-loads reconnaissance and treats \"understand everything\" as prerequisite to writing, so with a small step cap it exhausts all steps on reads and never produces an edit. It should spend at most ~3 calls (spec/issue, visible tests, the one target module) and then write, iterating afterwards.",
+  "subject": "Reserves the last step for a change when none exists",
+  "description": "I changed the agent loop (`src/agent.ts`) so that when a run reaches its final step without having asked for any file-changing tool, the model is offered only the tools that change files (`write_file`/`edit_file`), not the read, search, or command tools. The per-call tool list is threaded through `CallModel` (`src/model.ts`, `src/openai.ts`) as an optional override for that one request; the system prompt and normal requests are untouched. This targets the observed failure directly: with a four-call cap, jig spends every call surveying and never lands a change, and tests are graded on whatever files exist when the cap hits. Now steps one through three stay free (so the model can still read the spec, visible tests and the target module), but the last step must produce work instead of more reconnaissance. Because the restriction only applies when nothing has been changed yet, it never fires on runs that already edited, on read-only tool sets (subagents, `--tools` without edits), or on longer runs that write early, so plenty-of-steps behaviour (Terminal-Bench) is unchanged and the cost of the extra request is negated by sending fewer tool definitions. I verified typecheck passes, confirmed with a scripted model that step 4 gets only the edit tools when no change happened and full tools otherwise, and ran the suite: 173 pass, with exactly the 10 pre-existing sandbox failures and no new ones.",
+  "files": [
+    "src/agent.ts",
+    "src/model.ts",
+    "src/openai.ts"
+  ],
+  "spent": 0.5468998120000002,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T20-54-18_evolve-10-train.json"
+  },
+  "target": "loop",
+  "train": {
+    "tasks": 10,
+    "candidate": 0.5000000000000001,
+    "baseline": 0.4166666666666667,
+    "difference": 0.08333333333333333,
+    "low": -0.15000000000000002,
+    "high": 0.35,
+    "ahead": 0.7354,
+    "costRatio": 1.1533287577213454
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+8 points, ahead in 74% of resamples, cost ×1.15)"
+  }
+}

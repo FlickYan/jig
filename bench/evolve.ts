@@ -43,6 +43,7 @@ Options:
   --model <id>        model for the analysis, the candidates and the runs (default: deepseek-flash)
   --attempts <n>      attempts per task when scoring (default: 3, as in the baseline)
   --candidates <n>    candidates for run (default: 3)
+  --target <where>    for run and propose: any (the default), or loop: the loop and tools only, not the prompt
   --budget <usd>      run stops once candidates have cost this much (default: 1.50)
   --seed <n>          for the split (default: 14)
   --from <label>      for analyze: the baseline run to diagnose (default: the one the split came from)
@@ -64,6 +65,7 @@ const { values, positionals } = parseArgs({
     budget: { type: "string", default: "1.50" },
     rounds: { type: "string", default: "2" },
     "compare-with": { type: "string" },
+    target: { type: "string", default: "any" },
     from: { type: "string" },
     "tb-tasks": { type: "string" },
     seed: { type: "string", default: "14" },
@@ -132,6 +134,8 @@ interface Candidate {
   verdict?: Verdict;
   /** What a person decided about it once the referee had accepted it, and why. */
   decision?: string;
+  /** Where it was asked to change jig (run --target): only the loop and tools, if "loop". */
+  target?: Target;
   /** Terminal-Bench against jig where it branched (tbcheck): the jobs, the comparison and the verdict. */
   terminalBench?: { jobs: { baseline: string[]; candidate: string[] } } & TerminalBenchVerdict;
 }
@@ -308,11 +312,19 @@ async function causes(): Promise<string[]> {
   return found;
 }
 
-const IMPROVE = (cause: string, earlier: string, failing: string[], limit: number) => `You are improving jig, the coding agent whose source code is in this repository (src/). On a benchmark of small programming tasks (specifications to implement, issues to fix), checked by hidden tests, with at most ${limit} steps (model calls) for each task, an analysis of jig's attempts found this:
+/** Where a round's changes may go: anywhere in jig, or only its loop and tools, leaving the system prompt alone. */
+type Target = "any" | "loop";
+
+const WHERE: Record<Target, string> = {
+  any: "most likely in its system prompt (src/prompt.ts), but it could be in a tool's description or behaviour (src/tools/) or in its loop (src/agent.ts)",
+  loop: "in its loop (src/agent.ts) or its tools (src/tools/), not in its system prompt (src/prompt.ts): nine changes to the prompt were measured on these tasks, and none held up",
+};
+
+const IMPROVE = (cause: string, earlier: string, failing: string[], limit: number, target: Target) => `You are improving jig, the coding agent whose source code is in this repository (src/). On a benchmark of small programming tasks (specifications to implement, issues to fix), checked by hidden tests, with at most ${limit} steps (model calls) for each task, an analysis of jig's attempts found this:
 
 ${cause}
 
-Make one change to jig that addresses it: most likely in its system prompt (src/prompt.ts), but it could be in a tool's description or behaviour (src/tools/) or in its loop (src/agent.ts). The change will be measured on tasks you will never see, for the share solved and the cost: one that makes jig slower or more expensive without solving more will be rejected.
+Make one change to jig that addresses it: ${WHERE[target]}. The change will be measured on tasks you will never see, for the share solved and the cost: one that makes jig slower or more expensive without solving more will be rejected.
 - Change only files under src/ or skills/.
 - Keep the change general, so it would help with any task of this kind: don't name a particular task, function, file or test.
 - Keep it small and in the style of the code around it. In a prompt, fewer words are better: every word goes into every request.
@@ -344,7 +356,7 @@ async function propose(cause: string): Promise<Candidate> {
     const stats = join(logs, "stats.json");
     const args = ["--yes", "--model", model, "--max-steps", "60", "--stats", stats, "--add-dir", home, "-"];
     const limit = JSON.parse(readFileSync(join(ROOT, loadSplit().baseline), "utf8")).settings.maxSteps;
-    const transcript = await jig(args, { cwd: tree, home, stdin: IMPROVE(cause, earlier(), failing, limit), timeout: 1500 });
+    const transcript = await jig(args, { cwd: tree, home, stdin: IMPROVE(cause, earlier(), failing, limit, target()), timeout: 1500 });
     writeFileSync(join(logs, "propose.log"), transcript);
     const usage = existsSync(stats) ? (JSON.parse(readFileSync(stats, "utf8")).usage as Usage) : undefined;
     const { subject, description } = replySummary(transcript);
@@ -354,7 +366,7 @@ async function propose(cause: string): Promise<Candidate> {
       commitPatch(ROOT, branch, base, patchOf(tree), [`evolve ${n}: ${subject}`, description]);
       diff = git("diff", `${base}..${branch}`);
     }
-    const candidate: Candidate = { n, branch, base, cause, subject, description, files, spent: usage ? (costOf(model, usage) ?? 0) : 0, runs: {} };
+    const candidate: Candidate = { n, branch, base, cause, subject, description, files, spent: usage ? (costOf(model, usage) ?? 0) : 0, runs: {}, ...(target() !== "any" && { target: target() }) };
     save(candidate, diff);
     console.log(`candidate ${n}: ${subject || "(no summary)"}: changed ${files.join(", ") || "nothing"} ($${candidate.spent.toFixed(3)})`);
     return candidate;
@@ -402,6 +414,7 @@ async function score(n: number): Promise<Candidate> {
   if (!candidate.files.length) return decide({ stage: "rejected", reason: "it changed nothing" });
   const forbidden = forbiddenFiles(candidate.files);
   if (forbidden.length) return decide({ stage: "rejected", reason: `it changed files outside src/ and skills/: ${forbidden.join(", ")}` });
+  if (candidate.target === "loop" && candidate.files.includes("src/prompt.ts")) return decide({ stage: "rejected", reason: "it changed the system prompt, which its round left alone" });
   const leaked = leakedWords(readFileSync(join(ARCHIVE, String(n), "change.diff"), "utf8"), taskWords(TASKS));
   if (leaked.length) return decide({ stage: "rejected", reason: `it names the tasks: ${leaked.join(", ")}` });
   console.log(`candidate ${n}: running jig's tests`);
@@ -455,10 +468,13 @@ async function bench(candidate: Candidate, tasks: string[], stage: string): Prom
   return latestRun(label);
 }
 
-/** The first cause no candidate has worked on yet, or once every one has, the causes again in turn. */
+/**
+ * The first cause no candidate has worked on yet with this --target, or once every one has, the causes
+ * again in turn: a cause tried in the prompt is still new to a round that may only change the loop.
+ */
 async function nextCause(): Promise<string> {
   const found = await causes();
-  const tried = archived().map((c) => c.cause);
+  const tried = archived().filter((c) => (c.target ?? "any") === target()).map((c) => c.cause);
   return found.find((cause) => !tried.includes(cause)) ?? found[tried.length % found.length];
 }
 
@@ -485,6 +501,12 @@ function list(): void {
     if (c.terminalBench) console.log(`  terminal-bench: ${c.terminalBench.rejected ? "rejected" : "passed"}: ${c.terminalBench.reason}`);
     if (c.decision) console.log(`  decision: ${c.decision}`);
   }
+}
+
+/** The --target given, checked. */
+function target(): Target {
+  if (values.target !== "any" && values.target !== "loop") throw new Error("--target must be any or loop");
+  return values.target;
 }
 
 /** Minutes a Terminal-Bench round may take per task: milestone 17's longest was under 8; peak hours wait. */
