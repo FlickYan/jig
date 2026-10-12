@@ -63,6 +63,7 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
+      --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents      leave out the subagent tool
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
                           (from ${TOOL_NAMES.join(", ")}; default: all)
@@ -175,6 +176,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       cwd: { type: "string", short: "C", default: "." },
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
       tools: { type: "string" },
       stats: { type: "string" },
@@ -267,7 +269,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
   const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
   let researchTools = researchFrom(extensions);
-  const metered = (callModel: CallModel, subagent = false) => stats?.meter(callModel, { subagent }) ?? callModel;
+  const metered = (callModel: CallModel, subagent = false, escalation?: string) => stats?.meter(callModel, { subagent, escalation }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
@@ -298,6 +300,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   let tools = toolsFrom(extensions);
   // What the model is given besides the messages, for the session to record (see jig sessions export).
   let context: { system: string; tools: Tool["definition"][] } | undefined;
+  // With --escalate, the model that takes over: newModel makes it too, with the same system prompt and tools.
+  let escalation: AgentOptions["escalate"];
   const newModel = () => {
     const prompt = {
       instructions,
@@ -311,6 +315,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     };
     const system = systemPrompt(cwd, prompt);
     context = { system, tools: tools.map((tool) => tool.definition) };
+    // The same for the model that takes over, so the conversation carries over whole.
+    const stronger = values.escalate;
+    escalation = stronger
+      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, stronger) }
+      : undefined;
     return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
   // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
@@ -348,6 +357,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   const agent: AgentOptions = {
     callModel: newModel(),
+    escalate: escalation,
     tools,
     cwd,
     dirs,
@@ -464,6 +474,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       instructions = loadInstructions(cwd);
       refreshSkills();
       agent.callModel = newModel();
+      agent.escalate = escalation;
       subagents.callModel = newSubagentModel();
       conversation = new Conversation(SessionFile.create(cwd, model));
       conversation.describe(context);
@@ -635,7 +646,11 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
   if (note) ui.notice(note);
-  // The benchmark runner (bench/run.ts) reads this line, so keep its format.
+  // The benchmark runner (bench/run.ts) reads these lines, so keep their format.
+  if (result.escalated) {
+    const { model, step, usage } = result.escalated;
+    ui.println(ui.dim(`Escalated to ${model} at step ${step}: ${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`));
+  }
   const { input, cacheWrite, cacheRead, output } = result.usage;
   const tokensIn = input + cacheWrite + cacheRead;
   ui.println(

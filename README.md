@@ -65,6 +65,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
+      --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
       --tools <names>   give the model only some of jig's tools, e.g. --tools bash
       --hide-skill <name>  leave a skill out, as if it weren't installed (repeatable)
@@ -240,6 +241,7 @@ npm run evolve -- list        # every candidate, its change and the verdict (--s
 
 jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
 node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # attempts that passed, only
+node bench/escalation.ts bench/results/evolve2/<run>.json eval/jobs/<job>   # where --escalate would hand over
 ```
 
 A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
@@ -264,7 +266,7 @@ milestone 18 a cheaper check that would have let it through.
 
 | File | What it does |
 | --- | --- |
-| [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed |
+| [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed; with `--escalate`, hand over to a stronger model once a test run fails |
 | [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
@@ -501,7 +503,7 @@ can't read the tasks' folders, the other attempts' logs and sessions, `eval/` or
 The fingerprint is taken as a run starts and again as it ends, and a run whose tasks changed in between
 records both (`suiteAtEnd`).
 Since milestone 14 each attempt also records its session, the conversation jig saved, for
-`bench/export.ts`. Two more suites are the ones jig evolves on: `--suite evolve` (`bench/evolve/tasks`,
+`bench/export.ts`, and for `bench/escalation.ts`, which replays a routing trigger on it. Two more suites are the ones jig evolves on: `--suite evolve` (`bench/evolve/tasks`,
 milestone 14's) and `--suite evolve2` (`bench/evolve2/tasks`, milestone 15's), each with its results in
 `bench/results/<suite>/`. A suite may set its own step limit in `bench/<suite>/suite.json`; evolve2's
 is 4.
@@ -1584,6 +1586,73 @@ in the prompt counts as new for it. Compared, as in milestone 21, with `baseline
 
 **Cost.** $1.19 for the three candidates.
 
+### Milestone 23: routing to a stronger model
+
+After the prompt (milestones 20 and 21) and the loop (22), two levers were left: routing work between
+models, and training one. Routing first. `--escalate <model>` has jig work with its model until a test
+command it ran fails, and then hands the steps left to a stronger one, with the whole conversation: both
+are made with the same system prompt and tools, and DeepSeek's endpoint takes flash's thinking blocks in
+v4-pro's requests. A test run has failed when it exits non-zero or when the runner says so (`FAILED (`,
+`2 failed`, `--- FAIL` and the like), since models pipe most test runs into `| tail -20`, which leaves
+the exit code tail's. jig prints the stronger model's share of the tokens on a line of its own, the
+`--stats` file records it, and `bench/run.ts` bills it at that model's prices. On a project with two
+bugs, whose tests flash ran first, v4-pro took over at step 2 and fixed both.
+
+**The trigger, checked before it was paid for.** `node bench/escalation.ts <runs>` reads the sessions
+saved by runs already made, and applies the loop's own rule to every step:
+
+| runs of jig as it was | attempts | failed | would have handed over | of those, passed anyway | failures it would have reached |
+|-----------------------|----------|--------|------------------------|-------------------------|--------------------------------|
+| evolve2, 4 steps: milestone 19's three baselines and this milestone's | 252 | 137 | 0 | - | 0 |
+| evolve2, 6 steps (this milestone's) | 63 | 19 | 2 | 2 | 0 |
+| evolve2, 6 to 10 steps (milestone 15's budgets) | 84 | 18 | 5 | 5 | 0 |
+| evolve2, 40 steps (milestone 15's calibration) | 58 | 4 | 7 | 7 | 0 |
+| the main benchmark, 40 steps (milestone 15) | 60 | 0 | 6 | 6 | 0 |
+| Terminal-Bench: six jobs from milestones 9, 11 and 16 | 159 | 42 | 1 | 0 | 1 |
+
+flash's failures are silent. Where a test run fails, flash puts it right itself (20 of the 21
+attempts that would have handed over passed), and in 219 of the 220 failures no test run had
+failed before the last step: with few steps the calls ran out before jig ran the tests, and with many,
+as on Terminal-Bench, the test runs jig made passed, or it made none, and the hidden tests failed. A
+router can only act on a failure it sees, so the escalation itself wasn't run on evolve2: its attempts
+would have been flash's.
+
+**The stronger model alone**, which bounds what handing work to it could do: deepseek-v4-pro on evolve2
+at 4 steps, three attempts a task, beside a run of flash in the same hour:
+
+| | solved | an attempt | a solved task | time an attempt | failures with no file written |
+|-|--------|------------|---------------|-----------------|-------------------------------|
+| deepseek-flash, 4 steps (four runs) | 115 of 252 (46%: 44, 43, 52 and 43%) | $0.012 | $0.026 | 50 s | 86 of 137 |
+| deepseek-v4-pro, 4 steps | 33 of 63 (52%) | $0.059 | $0.113 | 167 s | 14 of 30 |
+| deepseek-flash, 6 steps | 44 of 63 (70%) | $0.016 | $0.022 | 67 s | 6 of 19 |
+
+- **A little better, for five times the cost.** v4-pro was 7 points ahead of the four flash runs (−8
+  to +22), ahead in 80% of resamples, and solved as many as the best of them. It writes sooner (47%
+  of its failures hadn't changed a file, against 63% of flash's), but isn't better at every task: it
+  solved semver-range 3 times in 3 (flash 5 in 12) and expression-eval never (flash 6 in 12), and
+  neither model has solved bank-statement or upload-hang, the two where getting started costs most.
+- **Judged as a candidate, the referee would reject it.** On the training half v4-pro is 14 points
+  ahead of the four flash runs (ahead in 90% of resamples), and on the held-out half level (0 points,
+  48%; against the referee's own comparison runs, +12 and −2): the pattern of milestone 20's two
+  rejected candidates. But v4-pro wasn't made from the training attempts, so a lead on one half and
+  none on the other needn't mean a change fitted to the tasks it came from: with ten tasks a half, it
+  is also what a small gain spread unevenly over the tasks looks like. Nor does the referee hold cost
+  against a change: it passed a fivefold cost on the training half.
+- **Two more steps are the cheaper lever.** With 6 steps flash solved 44 of 63 (70%): 17 points more
+  than v4-pro with 4 (−2 to +35, ahead in 96% of resamples) for a quarter of its cost an attempt, and
+  24 more than flash with 4 (+8 to +40), upload-hang included, which neither model had solved in four
+  calls. A solved task cost less than with 4 steps ($0.022 against $0.026), fewer attempts being wasted.
+
+Milestone 21 guessed that what jig gets right in four calls is set by the model more than by advice
+about it. A stronger model moves it a little, for five times the cost; two more calls of the same model
+move it three times as far, for a third more. Routing on a failure can only help where the cheap
+model's failures show, and here they don't: a trigger for silent ones needs a check the model doesn't
+make itself, such as a second model reviewing the change before jig finishes (milestone 9's `--check`
+asked the same model).
+
+**Cost.** $5.45: $3.72 for v4-pro, $0.74 and $0.98 for the two flash runs, and under a cent for the
+smoke test.
+
 ## Tests
 
 ```bash
@@ -1632,6 +1701,7 @@ installs and runs the tarball on every push.
 - [x] **20. A second round, against fresh baselines:** `calibrate --compare-with` names the runs candidates are compared with, and two fresh baselines of milestone 19's jig became them (44% and 43%, against 44 to 57% before); the proposer hears what Terminal-Bench and the person decided about earlier candidates; three candidates, all rejected, two of them after beating the training half by 13 and 16 points, on the held-out tasks (one was candidate 1's advice, kept for tight step budgets only)
 - [x] **21. New causes, from today's jig:** `analyze --from <label>` diagnoses another baseline run, and the split records it so that candidates are never compared with the run the analysis saw; a third fresh baseline (52%); the new analysis named the same failures in other words, and its three candidates came out within 5 points of nothing against a fair comparison: across nine candidates, a line of advice in the prompt hasn't moved what jig gets right in four calls
 - [x] **22. The loop and the tools, not the prompt:** `run --target loop` lets candidates change only the loop and tools (the referee rejects one that touches the prompt); three candidates: forcing a change on the last step if there is none (+8 points, ahead in 74% of resamples), running the tests after each edit under a tight limit (+5, 67%), and one rejected unread by the word check; closer than the prompt's, short of the 80% bar
+- [x] **23. Routing to a stronger model:** `--escalate <model>` hands the steps left to a stronger model once a test run fails (by the runner's report too, since `| tail` hides the exit code), its share of the tokens printed, kept in `--stats` and billed by `bench/run.ts`; `bench/escalation.ts` checks a trigger on saved sessions before it is paid for: in 676 attempts of jig as it was it would have reached 1 of 220 failures (flash's are silent) and handed over 21 times, all but one on attempts flash put right; deepseek-v4-pro alone at 4 steps: +7 points (−8 to +22) for five times the cost, ahead on the training half and level on the held-out one, so the referee would reject it; flash with 6 steps: 70%, 17 points more than v4-pro with 4 for a quarter of the cost
 
 ## License
 

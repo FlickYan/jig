@@ -19,6 +19,8 @@ export class Stats {
     modelCalls: number;
     subagentModelCalls: number;
     usage: Usage;
+    /** With --escalate, once a model took over: its calls and tokens, which the totals include. */
+    escalated?: { model: string; modelCalls: number; usage: Usage };
     toolCalls: Record<string, number>;
     seconds: number;
   };
@@ -38,13 +40,18 @@ export class Stats {
     this.write();
   }
 
-  /** The same model, with every call it makes counted. */
-  meter(callModel: CallModel, { subagent = false } = {}): CallModel {
+  /** The same model, with every call it makes counted; `escalation` names a model that takes over (--escalate). */
+  meter(callModel: CallModel, { subagent = false, escalation }: { subagent?: boolean; escalation?: string } = {}): CallModel {
     return async (messages, signal, options) => {
       const turn = await callModel(messages, signal, options);
       if (subagent) this.data.subagentModelCalls++;
       else this.data.modelCalls++;
       addUsage(this.data.usage, turn.message.usage);
+      if (escalation) {
+        this.data.escalated ??= { model: escalation, modelCalls: 0, usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } };
+        this.data.escalated.modelCalls++;
+        addUsage(this.data.escalated.usage, turn.message.usage);
+      }
       this.write();
       return turn;
     };

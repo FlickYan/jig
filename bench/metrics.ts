@@ -21,6 +21,16 @@ export interface Attempt {
   followedInjection?: boolean;
   /** The session jig saved, relative to the run's logs (recorded from milestone 14 on; see bench/export.ts). */
   session?: string;
+  /** With --escalate: the model that took over, from which step, and its share of the tokens. */
+  escalated?: Escalation;
+}
+
+export interface Escalation {
+  model: string;
+  step: number;
+  tokensIn: number;
+  cacheRead: number;
+  tokensOut: number;
 }
 
 export type Summary = ReturnType<typeof summarize>;
@@ -45,7 +55,10 @@ export function parseTranscript(text: string) {
   const summary = [...clean.matchAll(/(\d+) steps? · ([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/g)].at(-1);
   const tokens = (value?: string) =>
     value === undefined ? null : Math.round(parseFloat(value) * (value.endsWith("k") ? 1000 : 1));
+  const handover = [...clean.matchAll(/^Escalated to (\S+) at step (\d+): ([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/gm)].at(-1);
+  const escalated: Escalation | undefined = handover && { model: handover[1], step: Number(handover[2]), tokensIn: tokens(handover[3])!, cacheRead: tokens(handover[4])!, tokensOut: tokens(handover[5])! };
   return {
+    ...(escalated && { escalated }),
     steps: summary ? Number(summary[1]) : null,
     tokensIn: tokens(summary?.[2]),
     cacheRead: tokens(summary?.[3]),
@@ -68,11 +81,18 @@ export function triedForbidden(text: string, patterns: string[]): boolean {
 /** Approximate: cache writes are counted as ordinary input. */
 export function estimateCost(
   model: string,
-  { tokensIn, cacheRead, tokensOut }: { tokensIn: number | null; cacheRead: number | null; tokensOut: number | null },
+  { tokensIn, cacheRead, tokensOut, escalated }: { tokensIn: number | null; cacheRead: number | null; tokensOut: number | null; escalated?: Escalation },
 ): number | null {
   const price = PRICES[model];
   if (!price || tokensIn === null || cacheRead === null || tokensOut === null) return null;
-  const dollars = ((tokensIn - cacheRead) * price.input + cacheRead * price.cacheRead + tokensOut * price.output) / 1e6;
+  const cost = (p: (typeof PRICES)[string], input: number, cached: number, output: number) => ((input - cached) * p.input + cached * p.cacheRead + output * p.output) / 1e6;
+  let dollars = cost(price, tokensIn, cacheRead, tokensOut);
+  // After an escalation, the stronger model's share is billed at its own prices.
+  const stronger = escalated && PRICES[escalated.model];
+  if (escalated) {
+    if (!stronger) return null;
+    dollars = cost(price, tokensIn - escalated.tokensIn, cacheRead - escalated.cacheRead, tokensOut - escalated.tokensOut) + cost(stronger, escalated.tokensIn, escalated.cacheRead, escalated.tokensOut);
+  }
   return Math.round(dollars * 1e5) / 1e5;
 }
 

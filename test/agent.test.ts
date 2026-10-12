@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { runAgent, type AgentOptions } from "../src/agent.ts";
+import { failedTestRun, runAgent, type AgentOptions } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import type { ModelTurn } from "../src/model.ts";
 import { TOOLS } from "../src/tools/index.ts";
@@ -181,5 +181,50 @@ describe("runAgent", () => {
     const [slow, next] = resultsIn(messages[2]);
     assert.match(String(slow.content), /interrupted/);
     assert.match(String(next.content), /Not run/);
+  });
+});
+
+describe("escalating to a stronger model", () => {
+  /** The stronger model's replies, and how long the history was each time it was called. */
+  function stronger(replies: ModelTurn[]) {
+    const seen: number[] = [];
+    const callModel = async (messages: MessageParam[]) => {
+      seen.push(messages.length);
+      const next = replies.shift();
+      if (!next) throw new Error("the stronger model ran out of replies");
+      return next;
+    };
+    return { seen, escalate: { model: "strong", callModel } };
+  }
+
+  it("hands the steps left to it, with the whole conversation, once a test run fails", async () => {
+    const strong = stronger([reply([text("Fixed it.")])]);
+    const { options, conversation } = setup([reply([toolUse("t1", "bash", { command: "false && pytest" })])], { maxSteps: 4, escalate: strong.escalate });
+    const result = await runAgent(conversation, options);
+    assert.equal(result.text, "Fixed it.");
+    assert.deepEqual(strong.seen, [3]); // the task, the failed run and its result
+    assert.equal(result.escalated?.model, "strong");
+    assert.equal(result.escalated?.step, 2);
+    assert.deepEqual([result.escalated?.usage.input, result.usage.input], [100, 200]);
+  });
+
+  it("keeps its own model while the tests pass, and on the last step", async () => {
+    const strong = stronger([]);
+    const passing = setup([reply([toolUse("t1", "bash", { command: "true || pytest" })]), reply([text("Done.")])], { maxSteps: 4, escalate: strong.escalate });
+    assert.equal((await runAgent(passing.conversation, passing.options)).escalated, undefined);
+    const last = setup([reply([toolUse("t1", "bash", { command: "false && pytest" })])], { maxSteps: 1, escalate: strong.escalate });
+    assert.equal((await runAgent(last.conversation, last.options)).escalated, undefined, "no steps left to hand over");
+    assert.deepEqual(strong.seen, []);
+  });
+
+  it("reads a failure from the runner's report when a pipe hides the exit code", () => {
+    const run = (command: string, content: string) =>
+      failedTestRun({ type: "tool_use", id: "t1", name: "bash", input: { command } }, { type: "tool_result", tool_use_id: "t1", content });
+    const piped = "python -m unittest discover -s tests -v 2>&1 | tail -20";
+    assert.equal(run(piped, "Ran 4 tests in 0.002s\n\nFAILED (failures=1, errors=1)\n\nExit code: 0"), true);
+    assert.equal(run("pytest -q | tail -3", "2 failed, 7 passed in 0.31s\n\nExit code: 0"), true);
+    assert.equal(run(piped, "Ran 4 tests in 0.002s\n\nOK\n\nExit code: 0"), false);
+    assert.equal(run("pytest -q", "7 passed, 0 failed in 0.31s\n\nExit code: 0"), false);
+    assert.equal(run("python check.py", "Traceback (most recent call last):\n\nExit code: 1"), false, "not a test runner");
   });
 });

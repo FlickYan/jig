@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { firstFailedTestRun } from "../bench/escalation.ts";
 import { ANSWERS, hideAnswers } from "../bench/hidden.ts";
 import { type Attempt, estimateCost, parseTranscript, summarize, triedForbidden } from "../bench/metrics.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
-import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 
 const TRANSCRIPT = `I'll look at the pager first.
 ● read_file pager.py
@@ -102,5 +103,48 @@ describe("the benchmark's answers", { skip: sandboxProblem() }, () => {
     } finally {
       api.close();
     }
+  });
+});
+
+describe("an escalated attempt", () => {
+  it("is read from the transcript and billed at each model's prices", () => {
+    const transcript = "● bash pytest\nA test run failed: deepseek-v4-pro takes over from step 3.\nEscalated to deepseek-v4-pro at step 3: 10.0k tokens in (6.0k from cache) · 2.0k out\n4 steps · 30.0k tokens in (20.0k from cache) · 5.0k out · 40.0s\n";
+    const metrics = parseTranscript(transcript);
+    assert.deepEqual(metrics.escalated, { model: "deepseek-v4-pro", step: 3, tokensIn: 10000, cacheRead: 6000, tokensOut: 2000 });
+    // flash: 20k in (14k cached), 3k out; v4-pro: 10k in (6k cached), 2k out
+    const flash = (6000 * 0.3 + 14000 * 0.006 + 3000 * 1.2) / 1e6;
+    const pro = (4000 * 1.32 + 6000 * 0.044 + 2000 * 3.96) / 1e6;
+    assert.equal(estimateCost("deepseek-flash", metrics), Math.round((flash + pro) * 1e5) / 1e5);
+    assert.equal(parseTranscript("4 steps · 30.0k tokens in (20.0k from cache) · 5.0k out · 40.0s\n").escalated, undefined);
+  });
+
+  it("is what jig prints when its test run fails, and its stats file records", async () => {
+    // The first model runs the tests, which fail; the stronger one answers from then on.
+    const api = await fakeMessagesApi((request) => (request.model === "claude-sonnet-5-5" ? [{ text: "Fixed." }] : [{ tool: "bash", input: { command: "false && pytest" } }]));
+    try {
+      const project = await mkdtemp(join(tmpdir(), "jig-escalate-"));
+      const file = join(project, "stats.json");
+      const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--escalate", "claude-sonnet-5-5", "--stats", file, "Fix the tests."], { api, cwd: project });
+      assert.deepEqual(api.requests.map((request) => request.model), ["claude-haiku-4-5", "claude-sonnet-5-5"]);
+      assert.equal(systemText(api.requests[1] as { system?: string }), systemText(api.requests[0] as { system?: string }));
+      assert.deepEqual(parseTranscript(output).escalated, { model: "claude-sonnet-5-5", step: 2, tokensIn: 10, cacheRead: 0, tokensOut: 5 });
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.modelCalls, stats.escalated?.model, stats.escalated?.modelCalls], [2, "claude-sonnet-5-5", 1]);
+    } finally {
+      api.close();
+    }
+  });
+});
+
+describe("firstFailedTestRun", () => {
+  it("finds the step whose test run failed in a saved session", async () => {
+    const call = (id: string, command: string) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "bash", input: { command } }] });
+    const result = (id: string, content: string) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] });
+    const session = (...messages: object[]) => [{ type: "start" }, ...messages.map((message) => ({ type: "message", message }))].map((e) => JSON.stringify(e)).join("\n");
+    const dir = await mkdtemp(join(tmpdir(), "jig-escalation-"));
+    await writeFile(join(dir, "failed.jsonl"), session({ role: "user", content: "fix it" }, call("a", "ls"), result("a", "x.py\n\nExit code: 0"), call("b", "python -m unittest 2>&1 | tail -5"), result("b", "FAILED (failures=1)\n\nExit code: 0")));
+    await writeFile(join(dir, "passed.jsonl"), session({ role: "user", content: "fix it" }, call("a", "python -m unittest"), result("a", "OK\n\nExit code: 0")));
+    assert.equal(firstFailedTestRun(join(dir, "failed.jsonl")), 2);
+    assert.equal(firstFailedTestRun(join(dir, "passed.jsonl")), undefined);
   });
 });

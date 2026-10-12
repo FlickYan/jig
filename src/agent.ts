@@ -43,6 +43,8 @@ export interface AgentOptions {
    * runs, where nobody is there to look at the result and ask for more.
    */
   review?: string;
+  /** A stronger model that takes over the steps left once a test command the model ran fails (--escalate). */
+  escalate?: { model: string; callModel: CallModel };
   ui: AgentUI;
 }
 
@@ -69,7 +71,10 @@ export interface RunResult {
   /** Text of the final reply. */
   text: string;
   steps: number;
+  /** Every model call's tokens, the escalation's included. */
   usage: Usage;
+  /** Which model took over, at which step, and the tokens of its calls. */
+  escalated?: { model: string; step: number; usage: Usage };
 }
 
 /**
@@ -82,7 +87,8 @@ export interface RunResult {
  */
 export async function runAgent(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal): Promise<RunResult> {
   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
-  const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage });
+  let escalated: RunResult["escalated"];
+  const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage, ...(escalated && { escalated }) });
   let reviewed = false;
 
   for (let step = 1; step <= opts.maxSteps; step++) {
@@ -92,12 +98,14 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
         addUsage(usage, await compactConversation(conversation, opts, signal));
       }
-      ({ message: reply, malformed } = await opts.callModel(conversation.messages, signal));
+      const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
+      ({ message: reply, malformed } = await callModel(conversation.messages, signal));
     } catch (err) {
       if (signal?.aborted) return result("interrupted", step - 1);
       throw err;
     }
     addUsage(usage, reply.usage);
+    if (escalated) addUsage(escalated.usage, reply.usage);
 
     // A safety classifier declined, even after the fallback model. Whatever was streamed before the
     // decline is not a real answer, so it stays out of the history.
@@ -127,6 +135,13 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
     else for (const call of calls) results.push(await handle(call));
     conversation.push({ role: "user", content: results }); // all results for one reply go in one message
+
+    // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
+    // the steps left, with the whole conversation, so it starts where the first one stopped.
+    if (opts.escalate && !escalated && step < opts.maxSteps && calls.some((call, i) => failedTestRun(call, results[i]))) {
+      escalated = { model: opts.escalate.model, step: step + 1, usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } };
+      opts.ui.notice(`A test run failed: ${opts.escalate.model} takes over from step ${step + 1}.`);
+    }
 
     if (signal?.aborted) return result("interrupted", step);
   }
@@ -205,6 +220,22 @@ async function handleToolCall(
   if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
   opts.ui.toolResult(output, false, call.id);
   return { type: "tool_result", tool_use_id: call.id, content: output };
+}
+
+/** Commands that run a project's tests, by the usual runners' names. */
+const TEST_COMMAND = /\b(pytest|unittest|tox|npm (run )?test|yarn test|pnpm test|node --test|jest|vitest|mocha|go test|cargo test|make (check|test)|rspec|phpunit|dotnet test|ctest)\b/;
+
+/** What the runners print when tests fail: unittest, pytest, node --test, jest and vitest, go test, cargo test. */
+const TESTS_FAILED = /^FAILED \(|\b[1-9]\d* (failed|errors?)\b|^(#|ℹ) fail [1-9]|^--- FAIL|^FAIL\b|test result: FAILED/m;
+
+/**
+ * Whether a call ran the tests and they failed: a non-zero exit code, or the runner's own report, since
+ * a pipe like `| tail -20`, which models add to most test runs, leaves the exit code tail's.
+ */
+export function failedTestRun(call: ToolUse, result: ToolResult): boolean {
+  if (call.name !== "bash" || !TEST_COMMAND.test(String((call.input as ToolInput).command ?? ""))) return false;
+  const content = typeof result.content === "string" ? result.content : "";
+  return /Exit code: [1-9]\d*\s*$/.test(content) || TESTS_FAILED.test(content);
 }
 
 function replyText(reply: Message): string {
