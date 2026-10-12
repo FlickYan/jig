@@ -26,11 +26,12 @@ Commands:
   calibrate    how often the referee would be fooled, from every baseline run so far (more runs:
                --label baseline-<name>), saved with the split; --compare-with names the runs
                candidates are compared with from then on (after jig itself changed, say)
-  analyze      diagnose the baseline's training attempts: what failed, where steps went
+  analyze      diagnose the baseline's training attempts: what failed, where steps went (--from
+               <label>: another baseline run's, which candidates mustn't then be compared with)
   propose      jig changes a copy of itself; the change goes on a new branch, <suite>/<n>
   score <n>    the referee: changed files, task words, jig's tests, the training tasks, the held-out tasks,
-               compared with the latest baseline run the analysis didn't see (run the baseline again
-               with --label baseline-<name> before scoring; without one, the first run is used)
+               compared with the baseline runs the analysis didn't see (run the baseline again with
+               --label baseline-<name> before scoring; there is no comparing with the run it saw)
   run          propose and score candidates, each for a cause the analysis found that no earlier one took
   tbcheck <n>  Terminal-Bench for a candidate the referee accepted: it and jig where it branched, on the
                tasks in eval/subset.txt, in alternating rounds, each started only when it can finish
@@ -44,6 +45,7 @@ Options:
   --candidates <n>    candidates for run (default: 3)
   --budget <usd>      run stops once candidates have cost this much (default: 1.50)
   --seed <n>          for the split (default: 14)
+  --from <label>      for analyze: the baseline run to diagnose (default: the one the split came from)
   --compare-with <labels>  for calibrate: the baseline runs candidates are compared with, by label
                       (baseline-a,baseline-b); without it, every run the analysis didn't see
   --rounds <n>        Terminal-Bench rounds for tbcheck, each side once a round (default: 2)
@@ -62,6 +64,7 @@ const { values, positionals } = parseArgs({
     budget: { type: "string", default: "1.50" },
     rounds: { type: "string", default: "2" },
     "compare-with": { type: "string" },
+    from: { type: "string" },
     "tb-tasks": { type: "string" },
     seed: { type: "string", default: "14" },
     help: { type: "boolean", short: "h", default: false },
@@ -98,6 +101,8 @@ interface Split {
   /** The labels of the runs candidates are compared with, set by calibrate --compare-with: runs of the jig
    * they branch from. Without it, every baseline run the analysis didn't see. */
   compareWith?: string[];
+  /** The results file of the run the analysis diagnosed (analyze --from); the split's own baseline if unset. */
+  analyzed?: string;
 }
 
 type RunAttempt = Attempt & { attempt: number; steps: number | null };
@@ -162,7 +167,10 @@ function makeSplit(): Split {
  */
 function calibrate(loaded = loadSplit()): Split {
   const named = values["compare-with"]?.split(",").map((label) => label.trim()).filter(Boolean);
-  if (named) for (const label of named) latestRun(label); // fails, saying how to make it, if there is none
+  for (const label of named ?? []) {
+    // latestRun fails, saying how to make it, if there is none.
+    if (relative(ROOT, latestRun(label).file) === analyzedRun(loaded)) throw new Error(`${label} is the run the analysis diagnosed: candidates can't be compared with it.`);
+  }
   const current: Split = named ? { ...loaded, compareWith: named } : loaded;
   const runs = baselineRuns(current);
   const pooled = runs.flatMap((run) => run.attempts);
@@ -214,7 +222,13 @@ function baselineRuns(current: Split): Run[] {
 function comparisonRuns(current: Split): Run[] {
   if (current.compareWith) return current.compareWith.map((label) => latestRun(label));
   const runs = baselineRuns(current);
-  return runs.length > 1 ? runs.slice(1) : runs;
+  const unseen = runs.filter((run) => relative(ROOT, run.file) !== analyzedRun(current));
+  return unseen.length ? unseen : runs;
+}
+
+/** The run the analysis diagnosed, as a results file relative to the repository. */
+function analyzedRun(current: Split): string {
+  return current.analyzed ?? current.baseline;
 }
 
 function loadSplit(): Split {
@@ -245,8 +259,15 @@ const ANALYST = `You study the attempts of a coding agent, jig, at benchmark tas
 async function analysis(fresh = false): Promise<string> {
   const file = join(EVOLVE, "analysis.md");
   if (!fresh && existsSync(file)) return readFileSync(file, "utf8");
-  const { baseline, train } = loadSplit();
-  const run = readRun(join(ROOT, baseline));
+  const current = loadSplit();
+  const { train } = current;
+  // Another run's attempts can be diagnosed, of today's jig, say; the analysis then knows its failures, so
+  // candidates are compared with other runs (calibrate --compare-with), never with this one.
+  const run = values.from ? latestRun(values.from) : readRun(join(ROOT, current.baseline));
+  if (values.from && current.compareWith?.includes(values.from)) {
+    throw new Error(`${values.from} is one of the runs candidates are compared with: calibrate --compare-with others first.`);
+  }
+  const baseline = relative(ROOT, run.file);
   const mine = run.attempts.filter((attempt) => train.includes(attempt.task));
   const failed = mine.filter((attempt) => !attempt.passed);
   const longest = train.flatMap((task) => mine.filter((a) => a.task === task && a.passed).sort((a, b) => (b.steps ?? 0) - (a.steps ?? 0)).slice(0, 1));
@@ -274,6 +295,7 @@ First, one line per attempt: what went wrong, or which steps were wasted. Then a
   const text = message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
   const header = `<!-- The analysis of ${baseline}'s training attempts by ${model}, for $${(costOf(model, usage) ?? 0).toFixed(4)}. What it was shown: bench/${suite}/analysis-prompt.md -->`;
   writeFileSync(join(EVOLVE, "analysis-prompt.md"), `${prompt}\n`);
+  writeFileSync(join(EVOLVE, "split.json"), `${JSON.stringify({ ...current, analyzed: baseline }, null, 2)}\n`);
   writeFileSync(file, `${header}\n\n${text.trim()}\n`);
   return readFileSync(file, "utf8");
 }
@@ -361,6 +383,9 @@ async function score(n: number): Promise<Candidate> {
   const current = loadSplit();
   const { train, heldOut } = current;
   const bases = comparisonRuns(current);
+  if (bases.some((run) => relative(ROOT, run.file) === analyzedRun(current))) {
+    throw new Error(`Candidates would be compared with ${analyzedRun(current)}, the run the analysis diagnosed: calibrate --compare-with other runs first.`);
+  }
   const base = bases.flatMap((run) => run.attempts);
   console.log(`candidate ${n}: compared with ${bases.map((run) => relative(ROOT, run.file)).join(" and ")}`);
   const limit = (run: Run) => JSON.parse(readFileSync(run.file, "utf8")).settings.maxSteps;

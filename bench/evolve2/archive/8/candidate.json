@@ -1,0 +1,29 @@
+{
+  "n": 8,
+  "branch": "evolve2/8",
+  "base": "510226d",
+  "cause": "It explores by dumping the repo — `ls`/`find`/`glob`, then opening every sibling module — rather than reading only the files the spec and tests point at. It should let the spec and test file select the modules instead of enumerating the package.",
+  "subject": "Point exploration at the task's spec and tests, not the whole project.",
+  "description": "I changed the first \"How to work\" bullet in `src/prompt.ts`. It used to tell jig to \"find the relevant code (grep, glob), read it, and run commands to understand the problem\", which it reads as a licence to dump the repo and open every sibling module. It now says to read the spec or tests the task comes with first and let their names and imports select the files to change, rather than surveying the project, while keeping the existing \"don't guess about code you haven't opened\" guard and the `(grep, glob)` tool hint (which `test/tools.test.ts` pins, including the case where only bash is available). This is general — no task, file or function names — and cheaper than a survey because it spends the few available steps on the modules the task actually points at, so it should solve more for no extra cost. The suite still shows exactly the 10 known pre-existing failures (183 tests, 173 pass, 10 fail) and the diff is one line.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.4882314359999999,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T20-05-42_evolve-8-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4,
+    "baseline": 0.4166666666666667,
+    "difference": -0.016666666666666677,
+    "low": -0.21666666666666665,
+    "high": 0.2,
+    "ahead": 0.4375,
+    "costRatio": 1.2446396705559364
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (-2 points, ahead in 44% of resamples, cost ×1.24)"
+  }
+}

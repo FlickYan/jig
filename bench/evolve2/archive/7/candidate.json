@@ -1,0 +1,29 @@
+{
+  "n": 7,
+  "branch": "evolve2/7",
+  "base": "510226d",
+  "cause": "It front-loads reconnaissance and treats \"understand everything\" as prerequisite to writing, so with a small step cap it exhausts all steps on reads and never produces an edit. It should spend at most ~3 calls (spec/issue, visible tests, the one target module) and then write, iterating afterwards.",
+  "subject": "Bounds reconnaissance, then writes within a few calls.",
+  "description": "I rewrote the reconnaissance bullet in `src/prompt.ts`: instead of \"find the relevant code, read it, and run commands to understand the problem\", jig is now told to read the task, any tests that cover it and the files the change touches, **then write the change within its first few calls**, and keep reading/running/fixing from there. This targets the measured failure directly — with a 4-step cap the model burned every call surveying and never edited — by giving a concrete stopping point for looking and making the first edit the priority. Unlike the earlier change that was deleted for costing Terminal-Bench, it doesn't forbid surveying the project/history/environment; it only sequences looking before writing and explicitly invites more reading afterwards, so hard tasks that need exploration can still get it. It adds no model calls and should be cost-neutral or cheaper, since it trades reconnaissance calls for edit and check calls.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.4239467240000001,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T19-54-54_evolve-7-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4333333333333333,
+    "baseline": 0.4166666666666667,
+    "difference": 0.016666666666666656,
+    "low": -0.18333333333333335,
+    "high": 0.23333333333333334,
+    "ahead": 0.5643,
+    "costRatio": 0.9813040494166095
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+2 points, ahead in 56% of resamples, cost ×0.98)"
+  }
+}

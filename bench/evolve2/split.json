@@ -33,22 +33,24 @@
       "bench/results/evolve2/2026-10-11T18-56-02_baseline-3.json",
       "bench/results/evolve2/2026-10-11T20-16-36_baseline-4.json",
       "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19a.json",
-      "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19b.json"
+      "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19b.json",
+      "bench/results/evolve2/2026-10-12T19-27-54_baseline-m19c.json"
     ],
-    "nothing": 0.044,
-    "cheaper25": 0.21,
-    "fixesThird": 0.519,
+    "nothing": 0.025,
+    "cheaper25": 0.253,
+    "fixesThird": 0.531,
     "against": {
       "runs": [
-        "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19a.json",
-        "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19b.json"
+        "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19b.json",
+        "bench/results/evolve2/2026-10-12T19-27-54_baseline-m19c.json"
       ],
-      "nothing": 0.076,
-      "fixesThird": 0.768
+      "nothing": 0.018,
+      "fixesThird": 0.654
     }
   },
   "compareWith": [
-    "baseline-m19a",
-    "baseline-m19b"
-  ]
+    "baseline-m19b",
+    "baseline-m19c"
+  ],
+  "analyzed": "bench/results/evolve2/2026-10-12T18-00-05_baseline-m19a.json"
 }

@@ -1,0 +1,29 @@
+{
+  "n": 9,
+  "branch": "evolve2/9",
+  "base": "510226d",
+  "cause": "It writes one large whole-file rewrite and then has no steps left to verify or repair; when the test runner is missing or misinvoked it gives up instead of falling back to a direct script. It should run the visible tests immediately after writing and treat the remaining steps as repair budget.",
+  "subject": "Verify each change at once; repair with the rest.",
+  "description": "I changed one line in `src/prompt.ts`, the \"Verify your work\" bullet of the system prompt. It now says to run the tests/type checker/program right after changing something, notes that a single reply can change a file and run its check (the agent loop runs non-read calls sequentially, so the check really does see the change), directs the model to spend the remaining steps fixing what it reports, and says to fall back to running a test file or a short script directly when the project has no test runner. This targets the measured failure directly: at a 4-step budget no attempt finishes early, so the model must fit reading, writing, checking and repairing into four calls, and the old \"when you can, and fix what you broke\" never made checking immediate or made the check part of the change itself. Batching the change with its check frees a call for repair, and the fallback stops it giving up when the runner is missing. It adds no model calls (only cached prompt words), generalises to any task, and fits the existing bullet list; the full suite still shows the same 10 pre-existing sandbox/ps failures (173 pass), and `tsc` is clean.",
+  "files": [
+    "src/prompt.ts"
+  ],
+  "spent": 0.51527482,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-12T20-23-20_evolve-9-train.json"
+  },
+  "train": {
+    "tasks": 10,
+    "candidate": 0.3666666666666667,
+    "baseline": 0.4166666666666667,
+    "difference": -0.05000000000000001,
+    "low": -0.23333333333333334,
+    "high": 0.13333333333333336,
+    "ahead": 0.2963,
+    "costRatio": 1.1518462594371996
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (-5 points, ahead in 30% of resamples, cost ×1.15)"
+  }
+}

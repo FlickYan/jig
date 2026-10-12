@@ -1523,6 +1523,41 @@ change that does nothing would be accepted 7.6% of the time, and one that fixes 
 
 **Cost.** $3.66: $1.48 for the two baselines, $2.18 for the three candidates.
 
+### Milestone 21: new causes, from today's jig
+
+The analysis had come from milestone 15's first baseline, before milestone 18 changed what the model
+sees, and all four of its causes had been tried, two of them twice. So `analyze --from <label>`
+diagnoses another run, and the split records which one (`analyzed`): `calibrate` and `score` refuse to
+compare candidates with it, the bias milestone 14 found. The analysis read `baseline-m19a`, and
+candidates were compared with `baseline-m19b` and a third fresh run, `baseline-m19c`, which solved 52%,
+back in the usual range: milestone 20's 44% and 43% look like the runs' spread. Against those two runs
+as they came out, a change that does nothing would be accepted 1.8% of the time, and one that fixes a
+third of the failures 65%.
+
+The new analysis ($0.007) named the same failures in other words: reading until the four calls run
+out, listing the project instead of following the spec and tests, one large write with no steps left
+to check it, and a change across files that misses the file the tests use. A candidate for each of the
+first three:
+
+| # | the change, in the system prompt | training tasks | verdict |
+|---|-----------------------------------|----------------|---------|
+| 7 | "Look before you act, but no further than the change needs: read the task, any tests that cover it, and the files the change touches, then write the change within your first few calls …" | 43% against 42% | rejected |
+| 8 | "… read the spec or tests the task comes with first, and let their names and imports select the files to change, rather than surveying the project." | 40% against 42%, cost ×1.24 | rejected |
+| 9 | "Verify your work: run the tests, the type checker or the program right after you change something (one reply can change a file and run the check, in that order), and spend the steps left fixing what it reports. …" | 37% against 42%, cost ×1.15 | rejected |
+
+- **Against a fair comparison, a line of advice doesn't move the suite.** Of the nine candidates on
+  evolve2, eight changed the system prompt, most of them about how to spend the four calls. Against runs
+  that came out a little low on the training half (42%, where the seven baselines have averaged 47%,
+  from 33% to 60%), these three were within 5 points of nothing. The larger gains before were luck:
+  milestone 20's came against a pair that solved 37% of the training half, and milestone 16's candidate
+  1, run again, solved 57% of it, as many as the baseline beside it. What jig gets right in four calls
+  looks set by the model more than by advice about it.
+- **What is left is outside the prompt.** The loop (candidate 6's reminder after each edit was the only
+  change there, and it lost on the held-out tasks), the tools, or the model: routing between models, or
+  training one on the passed sessions jig already exports.
+
+**Cost.** $2.22: $0.78 for the third baseline, $1.43 for the three candidates.
+
 ## Tests
 
 ```bash
@@ -1569,6 +1604,7 @@ installs and runs the tarball on every push.
 - [x] **18. The answers out of reach:** an attempt in milestone 14 had found its task's folder on the disk and run the hidden tests (that baseline is 27 of 30, not 28; no verdict changes), so jig gets `hiddenPaths`, which its sandbox hides from commands, every benchmark run hides the tasks, logs, `eval/` and the history with it (`bench/hidden.ts`), and TASK_DIR no longer reaches jig; `bench/explore`, 14 generated tasks where exploring pays (information to find, or a visible check that is a special case), which didn't reproduce Terminal-Bench's verdict on milestone 16's candidate (20/20 against 20/20, then 8/12 against 12/12, the candidate ahead), so it isn't a gate in the referee
 - [x] **19. Terminal-Bench as the referee's last stage:** `npm run evolve -- tbcheck <n>` runs an accepted candidate and jig where it branched on the 20 Terminal-Bench tasks in alternating rounds, starts each round only when it can finish outside DeepSeek's peak hours, picks up after a break, and records the verdict (rejected when behind in 80% of resamples: milestone 17's runs give -15 points, rejected); a smoke test on one task ran end to end
 - [x] **20. A second round, against fresh baselines:** `calibrate --compare-with` names the runs candidates are compared with, and two fresh baselines of milestone 19's jig became them (44% and 43%, against 44 to 57% before); the proposer hears what Terminal-Bench and the person decided about earlier candidates; three candidates, all rejected, two of them after beating the training half by 13 and 16 points, on the held-out tasks (one was candidate 1's advice, kept for tight step budgets only)
+- [x] **21. New causes, from today's jig:** `analyze --from <label>` diagnoses another baseline run, and the split records it so that candidates are never compared with the run the analysis saw; a third fresh baseline (52%); the new analysis named the same failures in other words, and its three candidates came out within 5 points of nothing against a fair comparison: across nine candidates, a line of advice in the prompt hasn't moved what jig gets right in four calls
 
 ## License
 
