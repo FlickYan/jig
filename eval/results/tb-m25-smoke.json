@@ -1,0 +1,23 @@
+{
+ "name": "tb-m25-smoke",
+ "agent": "jig",
+ "trials": [
+  {
+   "task": "log-summary-date-ranges",
+   "job": "tb-m25-smoke",
+   "version": "2629816+changes",
+   "passed": true,
+   "error": null,
+   "turns": 6,
+   "input": 46200,
+   "cached": 39168,
+   "output": 1513,
+   "model": "deepseek-flash",
+   "seconds": 14.627924,
+   "trial": "log-summary-date-ranges__YCmrJcU",
+   "looked_up": false,
+   "shares": [],
+   "cost": 0.0041602079999999994
+  }
+ ]
+}

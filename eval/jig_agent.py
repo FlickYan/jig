@@ -4,8 +4,9 @@
     PYTHONPATH=eval eval/.venv/bin/harbor run -d terminal-bench@2.0 -a jig_agent:Jig -m deepseek/deepseek-flash
 
 jig comes from this checkout: the working tree, or a git ref given with --ak ref=m5. The API key is read
-from the environment harbor runs in and handed to jig's process only; it is never written into the
-container or the job's files.
+from the environment harbor runs in and stays on the host: jig's process in the container gets a token of
+this run instead, and its requests go through key_proxy.py, which puts the key in (milestone 25; with
+--ak key_proxy=false jig gets the key itself, as before). Either way it is never written into the job's files.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from harbor.agents.installed.node_install import nvm_node_install_snippet
 from harbor.agents.options import Cli, InstalledAgentOptions
 from harbor.environments.base import BaseEnvironment
 from harbor.models.agent.context import AgentContext
+from key_proxy import UPSTREAMS, proxy_for
 
 REPO = Path(__file__).resolve().parent.parent
 MINI_PROMPTS = Path(__file__).resolve().parent / "mini-swe-agent-prompts.json"
@@ -71,6 +73,11 @@ class JigOptions(InstalledAgentOptions):
     )
     escalate: Annotated[str | None, Cli("--escalate")] = Field(
         default=None, description="jig's --escalate: a model that takes over once a test run fails"
+    )
+    key_proxy: bool = Field(
+        default=True,
+        description="keep the API key on the host: the container gets a token of this run, and a proxy here "
+        "(key_proxy.py) puts the key in. Off: the key goes into the container, as before milestone 25",
     )
 
 
@@ -156,6 +163,17 @@ class Jig(BaseInstalledAgent):
         if not key:
             raise ValueError(f"Set {key_name} in the environment harbor runs in.")
         flags = self.build_cli_flags()
+        secret = key
+        upstream = next((origin for prefix, origin in UPSTREAMS.items() if model.startswith(prefix)), None)
+        if self.options.key_proxy and upstream:
+            others = [m for m in (self.options.reviewer, self.options.escalate) if m and not m.startswith(model.split("-")[0])]
+            if others:
+                raise ValueError(f"With the key proxy, jig's other models must be {model}'s provider's, not {others[0]}: or set key_proxy=false.")
+            proxy = proxy_for(upstream, key)
+            secret = proxy.token
+            # DeepSeek's Anthropic-compatible API is under /anthropic; its OpenAI-compatible one, and Anthropic's, at the root.
+            path = "/anthropic" if model.startswith("deepseek") and self.options.api != "openai" else ""
+            flags += f" --base-url {shlex.quote(f'http://host.docker.internal:{proxy.port}{path}')}"
         if self.options.prompts == "mini":
             system, instruction = await self._mini_prompts(instruction, environment)
             flags += f" --system-prompt {shlex.quote(system)}"
@@ -178,7 +196,7 @@ class Jig(BaseInstalledAgent):
                 f"{LOAD_NODE} && node {INSTALL_DIR}/src/cli.ts --yes --no-sandbox --add-dir / --model {shlex.quote(model)} "
                 f"--stats /logs/agent/jig-stats.json {flags} -- - < {TASK_FILE} 2>&1 | tee /logs/agent/jig.txt"
             ),
-            env={key_name: key, "NO_COLOR": "1", "JIG_HOME": "/logs/agent/jig-home"},
+            env={key_name: secret, "NO_COLOR": "1", "JIG_HOME": "/logs/agent/jig-home"},
         )
 
     async def _mini_prompts(self, instruction: str, environment: BaseEnvironment) -> tuple[str, str]:

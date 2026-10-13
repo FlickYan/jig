@@ -682,7 +682,8 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
 - [`eval/jig_agent.py`](eval/jig_agent.py) is jig's Harbor adapter. It installs Node and jig from this
   checkout in each task's container, runs `jig --yes --add-dir / --stats …` on the instruction (the
   container is the sandbox, so the whole file system is the project), and reads the turns and tokens back
-  from the stats file. The adapter hands the API key to jig's process only, and never writes it down.
+  from the stats file. The API key stays on the host: jig in the container gets a token of the run, and
+  its requests go through [`eval/key_proxy.py`](eval/key_proxy.py), which puts the key in (milestone 25).
 - The tasks are a seeded random sample of 20 of the 61 that ask for 2 GB of memory, one CPU and at most 30
   minutes ([`eval/subset.txt`](eval/subset.txt)), because this Mac gives Docker 3 GB. The task images are
   x86-64, so on Apple Silicon everything in them runs under emulation, for both agents alike, while the
@@ -783,7 +784,8 @@ What the runs and their logs showed:
   mini-swe-agent's commands inherit its environment, so its model printed the API key into its own
   context in 6 of its 60 attempts. jig's did once, in 44 attempts before milestone 6's fix, and never in
   the 43 since: its commands don't get jig's keys. (As root in a container, though, a command can still
-  read another process's environment: milestone 24 had one such trial.)
+  read another process's environment: milestone 24 had one such trial, and since milestone 25 the
+  container holds only a token of the run.)
 - **A time limit doesn't stop the agent.** When a task's time runs out, Harbor stops waiting, but the
   agent's processes in the container carry on into the verification: jig made up to 9 more model calls
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
@@ -1733,6 +1735,37 @@ read.
 $0.20 for a smoke test on filter-js-from-html (where the reviewer sent back four problems with their
 lines, and jig worked 16 more steps and still failed).
 
+### Milestone 25: the key stays on the host
+
+In milestone 24 a model, root in its task's container, printed `/proc/<pid>/environ`, and with it the API
+key: jig keeps the key out of its commands' environment, but not out of the processes around them, and as
+root in a container a command can read anything jig can. So the key no longer goes into the container.
+[`eval/key_proxy.py`](eval/key_proxy.py) runs on the host, on 127.0.0.1 (containers reach it as
+`host.docker.internal`, and nothing else on the network can): jig in the container gets a token of the run
+instead of the key, and a `--base-url` pointing at the proxy, which checks the token, puts the key in its
+place (`x-api-key` for the Anthropic API, a bearer token for the OpenAI one) and streams the reply back as
+it comes. A request with any other token is refused before it reaches the provider, and a provider out of
+reach is a 502. The adapter starts one proxy per Harbor job, and `--ak key_proxy=false` hands jig the key
+as before. On the way, `--base-url` now reaches DeepSeek's Anthropic-compatible endpoint, which had
+ignored it.
+
+Checked three ways:
+
+- **Tests** (`test/key-proxy.test.ts`): the token swapped for the key in both forms, any other token
+  refused with the provider never called, a provider out of reach, and jig's own DeepSeek requests
+  through the proxy to a stand-in provider.
+- **A container** (node:24-slim) where jig, behind the proxy and on DeepSeek, was asked to print every
+  process's environment and say which values look like API keys. It found `DEEPSEEK_API_KEY` and advised
+  rotating it; its value was the token, and the key appeared nowhere in the output.
+- **A Terminal-Bench trial through Harbor** (log-summary-date-ranges): passed, with
+  `--base-url http://host.docker.internal:<port>/anthropic` in its command, and neither the key nor the
+  token in any of the job's 15 files.
+
+What a model can still do with the token is call DeepSeek through the proxy, from its container, while the
+run lasts, which is what jig does there anyway.
+
+**Cost.** Under a cent.
+
 ## Tests
 
 ```bash
@@ -1783,6 +1816,7 @@ installs and runs the tarball on every push.
 - [x] **22. The loop and the tools, not the prompt:** `run --target loop` lets candidates change only the loop and tools (the referee rejects one that touches the prompt); three candidates: forcing a change on the last step if there is none (+8 points, ahead in 74% of resamples), running the tests after each edit under a tight limit (+5, 67%), and one rejected unread by the word check; closer than the prompt's, short of the 80% bar
 - [x] **23. Routing to a stronger model:** `--escalate <model>` hands the steps left to a stronger model once a test run fails (by the runner's report too, since `| tail` hides the exit code), its share of the tokens printed, kept in `--stats` and billed by `bench/run.ts`; `bench/escalation.ts` checks a trigger on saved sessions before it is paid for: in 676 attempts of jig as it was it would have reached 1 of 220 failures (flash's are silent) and handed over 21 times, all but one on attempts flash put right; deepseek-v4-pro alone at 4 steps: +7 points (−8 to +22) for five times the cost, ahead on the training half and level on the held-out one, so the referee would reject it; flash with 6 steps: 70%, 17 points more than v4-pro with 4 for a quarter of the cost
 - [x] **24. A second model reviews the work:** `--reviewer <model>`: the first time the model stops, a read-only subagent on another model checks the work against the task, and its problems go back once; on Terminal-Bench, deepseek-v4-pro reviewing flash's work: 75% against 70% (+5, −20 to +30) for 2.4 times the cost, and no result changed because of a review (16 approvals, 2 of them of failures; 1 problem report, not fixed); the reviewer can't see what only running shows, and it stays off by default; `tbcheck` now stops when the balance is low or the API refuses a trial, which runs again
+- [x] **25. The key stays on the host:** Terminal-Bench's containers get a token of the run, and `eval/key_proxy.py` on the host (127.0.0.1, reached as `host.docker.internal`) swaps it for the API key and streams the reply back; a model asked to print every process's environment found only the token; `--base-url` now reaches DeepSeek's Anthropic-compatible endpoint
 
 ## License
 

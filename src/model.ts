@@ -194,7 +194,9 @@ function deepseekClient(settings: ConstructorParameters<typeof Anthropic>[0]): A
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
   // Without authToken: null, the SDK would also send ANTHROPIC_AUTH_TOKEN from the environment to DeepSeek.
-  return new Anthropic({ ...settings, baseURL: DEEPSEEK_BASE_URL, apiKey, authToken: null });
+  // --base-url wins (Terminal-Bench's adapter points it at a proxy that holds the key), but
+  // ANTHROPIC_BASE_URL in the environment doesn't: that one is Anthropic's.
+  return new Anthropic({ ...settings, baseURL: settings?.baseURL ?? DEEPSEEK_BASE_URL, apiKey, authToken: null });
 }
 
 /**
