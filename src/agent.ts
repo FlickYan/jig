@@ -45,8 +45,23 @@ export interface AgentOptions {
   review?: string;
   /** A stronger model that takes over the steps left once a test command the model ran fails (--escalate). */
   escalate?: { model: string; callModel: CallModel };
+  /** A second model that checks the work against the task the first time the model stops (--reviewer). */
+  reviewer?: Reviewer;
   ui: AgentUI;
 }
+
+/** A model that reviews the work before the task ends (see review.ts). */
+export interface Reviewer {
+  model: string;
+  /**
+   * Resolves to its verdict, what the model is told about the problems it found (if it found any), and the
+   * tokens it took. It is given the task, the model's last message, and this run's messages from the task on.
+   */
+  review(work: { task: string; answer: string; messages: Anthropic.Beta.BetaMessageParam[] }, signal?: AbortSignal): Promise<{ verdict: ReviewVerdict; feedback?: string; text?: string; usage: Usage }>;
+}
+
+/** Approved, problems found (and sent back), or no verdict (out of steps, say): then the work stands. */
+export type ReviewVerdict = "approved" | "problems" | "none";
 
 /** The user's hooks, as the loop sees them (the CLI builds them from the settings). */
 export interface ToolHooks {
@@ -75,6 +90,8 @@ export interface RunResult {
   usage: Usage;
   /** Which model took over, at which step, and the tokens of its calls. */
   escalated?: { model: string; step: number; usage: Usage };
+  /** The review: by which model, after which step, its verdict, and its tokens. */
+  reviewed?: { model: string; step: number; verdict: ReviewVerdict; usage: Usage };
 }
 
 /**
@@ -88,8 +105,15 @@ export interface RunResult {
 export async function runAgent(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal): Promise<RunResult> {
   const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
   let escalated: RunResult["escalated"];
-  const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage, ...(escalated && { escalated }) });
+  let review: RunResult["reviewed"];
+  const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage, ...(escalated && { escalated }), ...(review && { reviewed: review }) });
+  // Whether the work was checked (by --check's request or a reviewer): it is, at most once a run.
   let reviewed = false;
+  // The task is the message the run starts from; a reviewer sees it and what the run did after it (all
+  // there is, if a compaction has replaced it with a summary).
+  const taskMessage = conversation.messages.at(-1);
+  const task = textOf(taskMessage);
+  const sinceTask = () => conversation.messages.slice(Math.max(0, conversation.messages.indexOf(taskMessage!)));
 
   for (let step = 1; step <= opts.maxSteps; step++) {
     let reply: Message;
@@ -116,7 +140,29 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
     // A reply with no tool calls is the final answer, unless the work is still to be checked.
     if (calls.length === 0) {
-      if (opts.review && !reviewed && reply.stop_reason === "end_turn") {
+      // By a second model, once, while there are steps left to act on what it finds.
+      if (opts.reviewer && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
+        reviewed = true;
+        const { model } = opts.reviewer;
+        opts.ui.notice(`${model} is reviewing the work.`);
+        try {
+          const found = await opts.reviewer.review({ task, answer: replyText(reply), messages: sinceTask() }, signal);
+          addUsages(usage, found.usage);
+          if (signal?.aborted) return result("interrupted", step);
+          review = { model, step, verdict: found.verdict, usage: found.usage };
+          if (found.feedback) {
+            opts.ui.notice(`${model} found problems; the model takes them up.`);
+            conversation.push({ role: "user", content: found.feedback });
+            continue;
+          }
+          const said = found.text?.trim() ? ` (it said: "${found.text.trim().replace(/\s+/g, " ").slice(0, 160)}…")` : "";
+          opts.ui.notice(found.verdict === "approved" ? `${model} found no problems.` : `${model} gave no verdict${said}, so the work stands as it is.`);
+        } catch (err) {
+          if (signal?.aborted) return result("interrupted", step);
+          // A review that failed leaves the work as it is: it was only a check.
+          opts.ui.notice(`The review failed (${err instanceof Error ? err.message : String(err)}), so the work stands as it is.`);
+        }
+      } else if (opts.review && !reviewed && reply.stop_reason === "end_turn") {
         reviewed = true;
         opts.ui.notice("Checking the work before finishing.");
         conversation.push({ role: "user", content: opts.review });
@@ -238,8 +284,23 @@ export function failedTestRun(call: ToolUse, result: ToolResult): boolean {
   return /Exit code: [1-9]\d*\s*$/.test(content) || TESTS_FAILED.test(content);
 }
 
+/** The text of a message: a string, or its text blocks joined. */
+function textOf(message?: Anthropic.Beta.BetaMessageParam): string {
+  if (!message) return "";
+  if (typeof message.content === "string") return message.content;
+  return message.content.map((block) => (block.type === "text" ? block.text : "")).join("\n");
+}
+
 function replyText(reply: Message): string {
   return reply.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+}
+
+/** Adds one run's token counts to another's (a review's to its task's). */
+export function addUsages(total: Usage, usage: Usage): void {
+  total.input += usage.input;
+  total.cacheWrite += usage.cacheWrite;
+  total.cacheRead += usage.cacheRead;
+  total.output += usage.output;
 }
 
 /** Adds one reply's token counts to a run's totals. */

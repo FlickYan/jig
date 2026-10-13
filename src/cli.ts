@@ -9,7 +9,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, runAgent, type RunResult, type ToolHooks } from "./agent.ts";
+import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks } from "./hooks.ts";
@@ -18,6 +18,7 @@ import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
+import { reviewer } from "./review.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { listSessions, sessionsCommand } from "./sessions-cli.ts";
@@ -30,7 +31,7 @@ import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
 import { Snapshots } from "./snapshots.ts";
-import { Stats } from "./stats.ts";
+import { type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
@@ -75,6 +76,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           skills are still added after it)
       --check             in a one-shot run, tell the model nobody can answer and ask it to check its
                           work against the task before it finishes (costs turns; see the README)
+      --reviewer <model>  before the task ends, this model checks the work against the task (it can only
+                          look) and sends the problems it finds back to the model
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -93,6 +96,9 @@ project and in your home directory.
 Ctrl+C stops the current task (press it again to force quit).`;
 
 const SUBAGENT_MAX_STEPS = 30;
+// A review reads what the task names and the work touched, not the whole project, and the task's clock runs.
+const REVIEW_MAX_STEPS = 12;
+const VERDICTS: Record<ReviewVerdict, string> = { approved: "approved", problems: "problems sent back", none: "no verdict" };
 
 const COMMANDS = `  /mode [plan|ask|edits|auto]  show or change when jig asks before a tool call
   /undo                        put the files back the way they were before the last task
@@ -184,6 +190,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "hide-skill": { type: "string", multiple: true, default: [] },
       memory: { type: "boolean", default: true },
       check: { type: "boolean", default: false },
+      reviewer: { type: "string" },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -205,6 +212,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // A task on the command line with --check: nobody to talk to, so the model checks its own work.
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
+  if (values.check && values.reviewer) throw new Error("--check and --reviewer both check the work before the task ends: use one.");
   const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
@@ -269,7 +277,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
   const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
   let researchTools = researchFrom(extensions);
-  const metered = (callModel: CallModel, subagent = false, escalation?: string) => stats?.meter(callModel, { subagent, escalation }) ?? callModel;
+  const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
@@ -288,6 +296,15 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     sandbox,
     hooks,
     ui: ui.subagentUI,
+  };
+  // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
+  const newReviewer = (): Reviewer | undefined => {
+    const reviewing = values.reviewer;
+    if (!reviewing) return undefined;
+    const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
+    const api = (values.api ?? defaultApi(reviewing)) as Api;
+    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools }), true, { kind: "reviewed", model: reviewing });
+    return reviewer(reviewing, { ...subagents, tools: researchTools, callModel, maxSteps: REVIEW_MAX_STEPS });
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
   const toolsFrom = (extra: Tool[]) => [
@@ -318,7 +335,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // The same for the model that takes over, so the conversation carries over whole.
     const stronger = values.escalate;
     escalation = stronger
-      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, stronger) }
+      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, { kind: "escalated", model: stronger }) }
       : undefined;
     return metered(createModel({ model, effort, api, baseURL, system, tools }));
   };
@@ -367,6 +384,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     sandbox,
     hooks,
     review: oneShot ? REVIEW : undefined,
+    reviewer: newReviewer(),
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
   conversation.describe(context);
@@ -439,6 +457,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     tools = toolsFrom(extensions);
     agent.tools = tools;
     subagents.tools = researchTools;
+    agent.reviewer = newReviewer();
   }
 
   function takeSnapshot(label: string): void {
@@ -647,9 +666,11 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
   if (note) ui.notice(note);
   // The benchmark runner (bench/run.ts) reads these lines, so keep their format.
-  if (result.escalated) {
-    const { model, step, usage } = result.escalated;
-    ui.println(ui.dim(`Escalated to ${model} at step ${step}: ${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`));
+  const tokens = (usage: Usage) => `${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`;
+  if (result.escalated) ui.println(ui.dim(`Escalated to ${result.escalated.model} at step ${result.escalated.step}: ${tokens(result.escalated.usage)}`));
+  if (result.reviewed) {
+    const { model, step, verdict, usage } = result.reviewed;
+    ui.println(ui.dim(`Reviewed by ${model} after step ${step}: ${VERDICTS[verdict]} · ${tokens(usage)}`));
   }
   const { input, cacheWrite, cacheRead, output } = result.usage;
   const tokensIn = input + cacheWrite + cacheRead;

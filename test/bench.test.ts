@@ -148,3 +148,45 @@ describe("firstFailedTestRun", () => {
     assert.equal(firstFailedTestRun(join(dir, "passed.jsonl")), undefined);
   });
 });
+
+describe("a reviewed attempt", () => {
+  it("is what jig prints when a reviewer sends problems back, billed at the reviewer's prices", async () => {
+    // The model says it is done, the reviewer (another model) finds a problem, and the model fixes it.
+    let calls = 0;
+    const api = await fakeMessagesApi((request) => {
+      if (request.model === "claude-opus-5-5") return [{ text: "PROBLEMS:\n- out.txt is missing." }];
+      return calls++ === 0 ? [{ text: "Done." }] : [{ text: "Fixed: out.txt written." }];
+    });
+    try {
+      const project = await mkdtemp(join(tmpdir(), "jig-review-"));
+      const file = join(project, "stats.json");
+      const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-sonnet-5-5", "--reviewer", "claude-opus-5-5", "--stats", file, "Write out.txt."], { api, cwd: project });
+      assert.deepEqual(api.requests.map((request) => request.model), ["claude-sonnet-5-5", "claude-opus-5-5", "claude-sonnet-5-5"]);
+      const asked = (request: Record<string, unknown>) => JSON.stringify((request.messages as { content: unknown }[]).at(-1)?.content);
+      assert.match(asked(api.requests[1]), /<task>\\nWrite out.txt.\\n<\/task>/);
+      assert.match(asked(api.requests[2]), /A reviewer, another model, checked your work/);
+      const metrics = parseTranscript(output);
+      assert.deepEqual(metrics.reviewed, { model: "claude-opus-5-5", step: 1, tokensIn: 10, cacheRead: 0, tokensOut: 5, verdict: "problems sent back" });
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.modelCalls, stats.subagentModelCalls, stats.reviewed?.model, stats.reviewed?.modelCalls], [2, 1, "claude-opus-5-5", 1]);
+      // sonnet's 20 tokens in and 10 out at its prices, opus's 10 and 5 at its own
+      const own = estimateCost("claude-sonnet-5-5", { tokensIn: 20, cacheRead: 0, tokensOut: 10 })!;
+      const reviewers = estimateCost("claude-opus-5-5", { tokensIn: 10, cacheRead: 0, tokensOut: 5 })!;
+      assert.ok(Math.abs(estimateCost("claude-sonnet-5-5", metrics)! - (own + reviewers)) < 2e-5);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("can't be asked for together with --check", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig(["--yes", "--check", "--reviewer", "claude-opus-5-5", "--model", "claude-sonnet-5-5", "Do it."], { api, cwd: await mkdtemp(join(tmpdir(), "jig-review-")) });
+      assert.notEqual(code, 0);
+      assert.match(output, /--check and --reviewer both check the work/);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
+  });
+});

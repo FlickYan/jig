@@ -15,6 +15,8 @@ export interface Trial {
   input?: number;
   cached?: number;
   output?: number;
+  /** What eval/report.py priced the trial at (saved from milestone 24 on: a reviewer's calls are at its prices). */
+  cost?: number | null;
 }
 
 /** Prices of deepseek-flash per token, as eval/report.py has them: uncached input, cached input, output. */
@@ -24,7 +26,7 @@ const PRICE = { input: 0.3e-6, cached: 0.006e-6, output: 1.2e-6 };
 export function attemptsOf(trials: Trial[]): Attempt[] {
   return trials.map((trial) => {
     const cached = trial.cached ?? 0;
-    const cost = trial.input === undefined ? null : (trial.input - cached) * PRICE.input + cached * PRICE.cached + (trial.output ?? 0) * PRICE.output;
+    const cost = trial.cost !== undefined ? trial.cost : trial.input === undefined ? null : (trial.input - cached) * PRICE.input + cached * PRICE.cached + (trial.output ?? 0) * PRICE.output;
     return { task: trial.task, passed: trial.passed && !trial.looked_up, cost };
   });
 }
@@ -52,6 +54,33 @@ export function terminalBenchVerdict(candidate: Attempt[], baseline: Attempt[]):
   return behind >= 0.8
     ? { comparison, behind, rejected: true, reason: `solved fewer Terminal-Bench tasks (${scores}, behind in ${rate(behind)} of resamples)` }
     : { comparison, behind, rejected: false, reason: `no worse on Terminal-Bench (${scores}, behind in ${rate(behind)} of resamples)` };
+}
+
+/**
+ * A trial the API refused, for want of balance or a valid key: not a result, so it is removed to run again.
+ * On 2026-10-13 the balance ran out in the night and a round went on through 18 tasks, each failing in a
+ * minute (milestone 24).
+ */
+export function refusedByApi(transcript: string, exceptionType?: string | null): boolean {
+  return /Insufficient Balance|API error 40[12]\b/.test(transcript) || exceptionType === "UnknownApiError";
+}
+
+/**
+ * Below this, a round doesn't start: one costs about 4 CNY with deepseek-flash, and about twice that with a
+ * reviewer. The balance is the account's, and other projects may be drawing on it too.
+ */
+export const MIN_BALANCE_CNY = 5;
+
+/** DeepSeek's balance in CNY (the endpoint is free), 0 if the account can't be used, or null if it can't be read. */
+export async function deepseekBalance(key = process.env.DEEPSEEK_API_KEY): Promise<number | null> {
+  if (!key) return null;
+  try {
+    const response = await fetch("https://api.deepseek.com/user/balance", { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(20_000) });
+    const body = (await response.json()) as { is_available?: boolean; balance_infos?: { total_balance: string }[] };
+    return body.is_available ? Number(body.balance_infos?.[0]?.total_balance ?? 0) : 0;
+  } catch {
+    return null;
+  }
 }
 
 /** DeepSeek's expensive hours, which the user asked runs to stay out of: weekdays 9 to 12 and 14 to 18. */

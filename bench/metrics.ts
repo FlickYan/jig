@@ -22,10 +22,13 @@ export interface Attempt {
   /** The session jig saved, relative to the run's logs (recorded from milestone 14 on; see bench/export.ts). */
   session?: string;
   /** With --escalate: the model that took over, from which step, and its share of the tokens. */
-  escalated?: Escalation;
+  escalated?: Share;
+  /** With --reviewer: the model that reviewed the work, after which step, its verdict and its share. */
+  reviewed?: Share & { verdict: "approved" | "problems sent back" | "no verdict" };
 }
 
-export interface Escalation {
+/** The tokens another model than the run's used, for its own prices. */
+export interface Share {
   model: string;
   step: number;
   tokensIn: number;
@@ -55,10 +58,16 @@ export function parseTranscript(text: string) {
   const summary = [...clean.matchAll(/(\d+) steps? · ([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/g)].at(-1);
   const tokens = (value?: string) =>
     value === undefined ? null : Math.round(parseFloat(value) * (value.endsWith("k") ? 1000 : 1));
-  const handover = [...clean.matchAll(/^Escalated to (\S+) at step (\d+): ([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/gm)].at(-1);
-  const escalated: Escalation | undefined = handover && { model: handover[1], step: Number(handover[2]), tokensIn: tokens(handover[3])!, cacheRead: tokens(handover[4])!, tokensOut: tokens(handover[5])! };
+  const usage = /([\d.]+k?) tokens in \(([\d.]+k?) from cache\) · ([\d.]+k?) out/.source;
+  const share = (match: RegExpMatchArray | undefined, at: number): Share | undefined =>
+    match && { model: match[1], step: Number(match[2]), tokensIn: tokens(match[at])!, cacheRead: tokens(match[at + 1])!, tokensOut: tokens(match[at + 2])! };
+  const handover = [...clean.matchAll(new RegExp(`^Escalated to (\\S+) at step (\\d+): ${usage}`, "gm"))].at(-1);
+  const escalated = share(handover, 3);
+  const review = [...clean.matchAll(new RegExp(`^Reviewed by (\\S+) after step (\\d+): (approved|problems sent back|no verdict) · ${usage}`, "gm"))].at(-1);
+  const reviewed = review && { ...share(review, 4)!, verdict: review[3] as NonNullable<Attempt["reviewed"]>["verdict"] };
   return {
     ...(escalated && { escalated }),
+    ...(reviewed && { reviewed }),
     steps: summary ? Number(summary[1]) : null,
     tokensIn: tokens(summary?.[2]),
     cacheRead: tokens(summary?.[3]),
@@ -78,22 +87,24 @@ export function triedForbidden(text: string, patterns: string[]): boolean {
   return patterns.some((pattern) => calls.some((line) => new RegExp(pattern).test(line)));
 }
 
-/** Approximate: cache writes are counted as ordinary input. */
+/**
+ * Approximate: cache writes are counted as ordinary input. The tokens another model used (one that took
+ * over, or the reviewer) are billed at that model's prices, and the rest at the run's.
+ */
 export function estimateCost(
   model: string,
-  { tokensIn, cacheRead, tokensOut, escalated }: { tokensIn: number | null; cacheRead: number | null; tokensOut: number | null; escalated?: Escalation },
+  { tokensIn, cacheRead, tokensOut, escalated, reviewed }: { tokensIn: number | null; cacheRead: number | null; tokensOut: number | null; escalated?: Share; reviewed?: Share },
 ): number | null {
-  const price = PRICES[model];
-  if (!price || tokensIn === null || cacheRead === null || tokensOut === null) return null;
-  const cost = (p: (typeof PRICES)[string], input: number, cached: number, output: number) => ((input - cached) * p.input + cached * p.cacheRead + output * p.output) / 1e6;
-  let dollars = cost(price, tokensIn, cacheRead, tokensOut);
-  // After an escalation, the stronger model's share is billed at its own prices.
-  const stronger = escalated && PRICES[escalated.model];
-  if (escalated) {
-    if (!stronger) return null;
-    dollars = cost(price, tokensIn - escalated.tokensIn, cacheRead - escalated.cacheRead, tokensOut - escalated.tokensOut) + cost(stronger, escalated.tokensIn, escalated.cacheRead, escalated.tokensOut);
-  }
-  return Math.round(dollars * 1e5) / 1e5;
+  if (tokensIn === null || cacheRead === null || tokensOut === null) return null;
+  const cost = (model: string, input: number, cached: number, output: number) => {
+    const p = PRICES[model];
+    return p ? ((input - cached) * p.input + cached * p.cacheRead + output * p.output) / 1e6 : null;
+  };
+  const shares = [escalated, reviewed].filter((share): share is Share => !!share);
+  const own = (field: "tokensIn" | "cacheRead" | "tokensOut", total: number) => shares.reduce((rest, share) => rest - share[field], total);
+  const parts = [cost(model, own("tokensIn", tokensIn), own("cacheRead", cacheRead), own("tokensOut", tokensOut)), ...shares.map((s) => cost(s.model, s.tokensIn, s.cacheRead, s.tokensOut))];
+  if (parts.includes(null)) return null;
+  return Math.round((parts as number[]).reduce((sum, part) => sum + part, 0) * 1e5) / 1e5;
 }
 
 export function summarize(attempts: Attempt[]) {

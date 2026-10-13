@@ -1,0 +1,191 @@
+{
+ "name": "tb-m24-reviewer-r1",
+ "agent": "jig (reviewer=deepseek-v4-pro)",
+ "trials": [
+  {
+   "task": "adaptive-rejection-sampler",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 5,
+   "input": 14578,
+   "cached": 13184,
+   "output": 64425,
+   "model": "deepseek-flash",
+   "seconds": 493.133706,
+   "trial": "adaptive-rejection-sampler__Lips5i7",
+   "looked_up": false,
+   "shares": [],
+   "cost": 0.07780730400000001
+  },
+  {
+   "task": "chess-best-move",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 50,
+   "input": 2044070,
+   "cached": 2010112,
+   "output": 74846,
+   "model": "deepseek-flash",
+   "seconds": 674.760035,
+   "trial": "chess-best-move__eyHxVb8",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 8,
+     "usage": {
+      "input": 7449,
+      "cacheWrite": 0,
+      "cacheRead": 124800,
+      "output": 22084
+     }
+    }
+   ],
+   "cost": 0.185355492
+  },
+  {
+   "task": "cobol-modernization",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 33,
+   "input": 1485619,
+   "cached": 1453696,
+   "output": 64086,
+   "model": "deepseek-flash",
+   "seconds": 670.148636,
+   "trial": "cobol-modernization__yiWxiAi",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 12,
+     "usage": {
+      "input": 11851,
+      "cacheWrite": 0,
+      "cacheRead": 139008,
+      "output": 6433
+     }
+    }
+   ],
+   "cost": 0.13032768
+  },
+  {
+   "task": "db-wal-recovery",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 12,
+   "input": 150994,
+   "cached": 141952,
+   "output": 8123,
+   "model": "deepseek-flash",
+   "seconds": 62.128429,
+   "trial": "db-wal-recovery__uzdEEUS",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 12,
+     "usage": {
+      "input": 3999,
+      "cacheWrite": 0,
+      "cacheRead": 59008,
+      "output": 2628
+     }
+    }
+   ],
+   "cost": 0.026886476
+  },
+  {
+   "task": "dna-assembly",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 40,
+   "input": 3326297,
+   "cached": 3279232,
+   "output": 140669,
+   "model": "deepseek-flash",
+   "seconds": 988.298395,
+   "trial": "dna-assembly__QVsDzHJ",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 12,
+     "usage": {
+      "input": 12241,
+      "cacheWrite": 0,
+      "cacheRead": 212608,
+      "output": 9878
+     }
+    }
+   ],
+   "cost": 0.250425896
+  },
+  {
+   "task": "filter-js-from-html",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 52,
+   "input": 2409743,
+   "cached": 2383488,
+   "output": 90690,
+   "model": "deepseek-flash",
+   "seconds": 622.815656,
+   "trial": "filter-js-from-html__QxSak6r",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 4,
+     "usage": {
+      "input": 8151,
+      "cacheWrite": 0,
+      "cacheRead": 35328,
+      "output": 30904
+     }
+    }
+   ],
+   "cost": 0.225956952
+  },
+  {
+   "task": "headless-terminal",
+   "job": "tb-m24-reviewer-r1",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": "CancelledError",
+   "turns": 21,
+   "input": 336918,
+   "cached": 327424,
+   "output": 22911,
+   "model": "deepseek-flash",
+   "seconds": 160.136504,
+   "trial": "headless-terminal__p43dJfP",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 2,
+     "usage": {
+      "input": 2662,
+      "cacheWrite": 0,
+      "cacheRead": 5504,
+      "output": 431
+     }
+    }
+   ],
+   "cost": 0.036419896
+  }
+ ]
+}

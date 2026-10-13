@@ -57,7 +57,7 @@ export function subagentTool(setup: SubagentSetup): Tool {
 const OUT_OF_STEPS = "You have run out of steps. Don't call any more tools: reply now with what you found so far, and what you didn't get to.";
 
 /** The messages with a request added to the last user turn (it holds tool results, and turns must alternate). */
-function withRequest(messages: Anthropic.Beta.BetaMessageParam[], request: string): Anthropic.Beta.BetaMessageParam[] {
+export function withRequest(messages: Anthropic.Beta.BetaMessageParam[], request: string): Anthropic.Beta.BetaMessageParam[] {
   const last = messages.at(-1)!;
   const content = typeof last.content === "string" ? [{ type: "text" as const, text: last.content }] : last.content;
   return [...messages.slice(0, -1), { role: "user", content: [...content, { type: "text", text: request }] }];

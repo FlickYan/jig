@@ -66,6 +66,12 @@ class JigOptions(InstalledAgentOptions):
     api: Annotated[str | None, Cli("--api")] = Field(
         default=None, description="jig's --api: anthropic or openai (DeepSeek serves both)"
     )
+    reviewer: Annotated[str | None, Cli("--reviewer")] = Field(
+        default=None, description="jig's --reviewer: a model that checks the work against the task before it ends"
+    )
+    escalate: Annotated[str | None, Cli("--escalate")] = Field(
+        default=None, description="jig's --escalate: a model that takes over once a test run fails"
+    )
 
 
 class Jig(BaseInstalledAgent):
@@ -195,9 +201,19 @@ class Jig(BaseInstalledAgent):
         context.n_input_tokens = usage["input"] + usage["cacheWrite"] + usage["cacheRead"]
         context.n_cache_tokens = usage["cacheRead"]
         context.n_output_tokens = usage["output"]
-        prices = PRICES.get(stats["model"])
-        if prices:
-            uncached = usage["input"] + usage["cacheWrite"]
-            context.cost_usd = (uncached * prices[0] + usage["cacheRead"] * prices[1] + usage["output"] * prices[2]) / 1e6
-        keys = ("stop", "steps", "modelCalls", "subagentModelCalls", "toolCalls", "seconds")
-        context.metadata = {key: stats.get(key) for key in keys}
+        # Calls another model made for jig (the reviewer, or one that took over) at that model's prices.
+        shares = [stats[key] for key in ("escalated", "reviewed") if stats.get(key)]
+        own = {key: usage[key] - sum(share["usage"][key] for share in shares) for key in usage}
+        parts = [dollars(stats["model"], own), *(dollars(share["model"], share["usage"]) for share in shares)]
+        if None not in parts:
+            context.cost_usd = sum(parts)
+        keys = ("stop", "steps", "modelCalls", "subagentModelCalls", "toolCalls", "seconds", "escalated", "reviewed")
+        context.metadata = {key: stats.get(key) for key in keys if key in stats}
+
+
+def dollars(model: str, usage: dict) -> float | None:
+    """What a model's tokens cost (jig's usage: input, cacheWrite, cacheRead, output), or None without a price."""
+    prices = PRICES.get(model)
+    if not prices:
+        return None
+    return ((usage["input"] + usage["cacheWrite"]) * prices[0] + usage["cacheRead"] * prices[1] + usage["output"] * prices[2]) / 1e6

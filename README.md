@@ -73,6 +73,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
       --check           in a one-shot run, ask the model to check its work before it finishes
+      --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
 ```
 
 In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
@@ -267,6 +268,7 @@ milestone 18 a cheaper check that would have let it through.
 | File | What it does |
 | --- | --- |
 | [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed; with `--escalate`, hand over to a stronger model once a test run fails |
+| [`src/review.ts`](src/review.ts) | `--reviewer`: a second model, as a read-only subagent, checks the work against the task before it ends |
 | [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
@@ -780,7 +782,8 @@ What the runs and their logs showed:
 - **jig keeps its API key away from the model; mini-swe-agent doesn't.** Models look around with `env`.
   mini-swe-agent's commands inherit its environment, so its model printed the API key into its own
   context in 6 of its 60 attempts. jig's did once, in 44 attempts before milestone 6's fix, and never in
-  the 43 since: its commands don't get jig's keys.
+  the 43 since: its commands don't get jig's keys. (As root in a container, though, a command can still
+  read another process's environment: milestone 24 had one such trial.)
 - **A time limit doesn't stop the agent.** When a task's time runs out, Harbor stops waiting, but the
   agent's processes in the container carry on into the verification: jig made up to 9 more model calls
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
@@ -1653,6 +1656,83 @@ asked the same model).
 **Cost.** $5.45: $3.72 for v4-pro, $0.74 and $0.98 for the two flash runs, and under a cent for the
 smoke test.
 
+### Milestone 24: a second model reviews the work
+
+Milestone 23 found deepseek-flash's failures silent: it finishes sure it is done, and only the hidden
+tests know otherwise. On Terminal-Bench that is most of them: of the 60 failed trials of jig as it was
+(nine jobs since milestone 9), 46 ended with jig saying it was done, and 14 at the time limit. And they
+repeat: filter-js-from-html failed `test_clean_html_unchanged` in all 10 of its failures, dna-assembly
+`test_primers` in all 5, the kind of requirement a second reading of the task might catch. A trigger at
+that moment reaches 46 failures, where milestone 23's reached 1.
+
+`--reviewer <model>`: the first time the model stops, with steps left, a second model checks the work
+against the task before the task ends. The reviewer is a subagent on its own model
+([`src/review.ts`](src/review.ts)), with the subagents' tools and rules (it reads files and runs commands
+that only print or list, so it can't change the work it judges, or fetch the benchmark's answers), 12
+steps, and a prompt of its own: the task, the model's last message, and a log of what the run did (each
+file change, and each command with its exit code and last line of output; reads left out). It starts its
+reply with APPROVED, or with PROBLEMS: and the problems, which go back to the model, once, with a note
+that the reviewer can be wrong. Out of steps, it is asked for its verdict on what it has checked; a reply
+with no verdict, or a review that fails, leaves the work as it is. jig prints the verdict and the
+review's share of the tokens on a line of its own, the `--stats` file records it, and `bench/run.ts`,
+Terminal-Bench's adapter (`--ak reviewer=<model>`) and its report bill that share at the reviewer's
+prices. `--check` (milestone 9: the same model asked to check its own work) and `--reviewer` don't go
+together.
+
+**The measurement**: jig against jig with deepseek-v4-pro as the reviewer, on the 20 tasks, one attempt
+each, alternating at each task (jig first on odd tasks, the reviewer first on even ones), each task its
+own Harbor job with its image pulled before and removed after, and every trial started only where it
+could finish outside DeepSeek's peak hours. It took two tries:
+
+- **The balance ran out** at 01:36 on the first night, and the driver went on through 18 tasks that
+  failed within a minute each. Those trials were deleted. The driver, and now `tbcheck`, check the
+  balance before a trial or a round, and stop when the API refuses one (`refusedByApi`); that trial
+  runs again.
+- **Three reviews in five gave no verdict**: the reviewer spent its 12 steps on commands plan mode
+  refuses (python3, awk, `command -v`), and stopped. Its prompt now says which commands run, and out of
+  steps it is asked for its verdict. The run started over with that reviewer; the first try's seven
+  tasks are kept apart (`eval/results/tb-m24-*-r1.json`: 3 of 7 each).
+
+| | passed | looked up | timed out | cost | agent time |
+|-|--------|-----------|-----------|------|------------|
+| jig | 14 of 20 (70%) | 1 (mteb-retrieve, counted as failed) | 2 | $0.051 | 5.0 min |
+| jig with the reviewer | 15 of 20 (75%) | 0 | 2 | $0.123 | 6.7 min |
+
+Five points ahead (−20 to +30), ahead in 59% of resamples and behind in 26%: no worse by `tbcheck`'s
+rule, and nowhere near the 80% the referee asks of an improvement. What the reviews did, on the reviewer's
+side: 18 trials got as far as a review (in two, the time ran out first); 16 were approved, and 14 of those
+passed; one review sent problems back (filter-js-from-html, which still failed); and one gave no verdict,
+even when asked (make-mips-interpreter).
+
+- **No result changed because of a review.** The sides differ on five tasks, three the reviewer's side
+  won (dna-assembly, headless-terminal, tune-mjcf) and two jig's (adaptive-rejection-sampler,
+  model-extraction-relu-logits), and on none of them did a review send anything back: it approved what
+  flash had done, or never ran. These are tasks jig solves only some of the time anyway (6, 7, 2, 5 and
+  6 times in 11 in the nine earlier jobs), so the five points are the two runs' own variance.
+- **The reviewer can't see these failures either.** Of the four failures it reviewed, it approved two
+  (model-extraction-relu-logits, whose extracted matrix doesn't match; mteb-retrieve, which ranks the
+  wrong document), gave no verdict on one, and caught one, whose fix didn't pass. What decides these tasks
+  shows only when something runs, and the reviewer can only read; the problems a reading can find, flash
+  had mostly not left. It raised no false alarm (all 14 trials that passed were approved), so it did no
+  harm either; its approval was right 14 times in 16, against 14 in 18 for the reviewed trials as a whole.
+- **It costs more than twice as much**, $0.123 a trial against $0.051 (a review $0.09, most of it v4-pro's
+  thinking), and 1.7 minutes more. So `--reviewer` is there, measured, and off by default.
+- **The API key reached the model once more.** In one trial of the first try (db-wal-recovery), the model
+  printed `/proc/<pid>/environ` for the processes in the container, one of them the shell that started
+  jig. jig keeps its key out of its commands' environment (milestone 6), but where everything runs as
+  root, a command can read any process's. The key went only to DeepSeek, its own provider, and into the
+  local log, since redacted. Keeping it out of reach needs a container that never holds it: a proxy
+  outside it that adds the key to jig's requests.
+
+A review that could run things would be another tool, and one that could change the work it judges.
+Together with milestone 23, the two ways of bringing in a second model, at a failure and before the end,
+found the same thing: on these tasks, what flash gets wrong mostly doesn't show in what either model can
+read.
+
+**Cost.** $5.08 at the table's prices: $3.48 for the two sides of the run, $1.40 for the first try, and
+$0.20 for a smoke test on filter-js-from-html (where the reviewer sent back four problems with their
+lines, and jig worked 16 more steps and still failed).
+
 ## Tests
 
 ```bash
@@ -1702,6 +1782,7 @@ installs and runs the tarball on every push.
 - [x] **21. New causes, from today's jig:** `analyze --from <label>` diagnoses another baseline run, and the split records it so that candidates are never compared with the run the analysis saw; a third fresh baseline (52%); the new analysis named the same failures in other words, and its three candidates came out within 5 points of nothing against a fair comparison: across nine candidates, a line of advice in the prompt hasn't moved what jig gets right in four calls
 - [x] **22. The loop and the tools, not the prompt:** `run --target loop` lets candidates change only the loop and tools (the referee rejects one that touches the prompt); three candidates: forcing a change on the last step if there is none (+8 points, ahead in 74% of resamples), running the tests after each edit under a tight limit (+5, 67%), and one rejected unread by the word check; closer than the prompt's, short of the 80% bar
 - [x] **23. Routing to a stronger model:** `--escalate <model>` hands the steps left to a stronger model once a test run fails (by the runner's report too, since `| tail` hides the exit code), its share of the tokens printed, kept in `--stats` and billed by `bench/run.ts`; `bench/escalation.ts` checks a trigger on saved sessions before it is paid for: in 676 attempts of jig as it was it would have reached 1 of 220 failures (flash's are silent) and handed over 21 times, all but one on attempts flash put right; deepseek-v4-pro alone at 4 steps: +7 points (−8 to +22) for five times the cost, ahead on the training half and level on the held-out one, so the referee would reject it; flash with 6 steps: 70%, 17 points more than v4-pro with 4 for a quarter of the cost
+- [x] **24. A second model reviews the work:** `--reviewer <model>`: the first time the model stops, a read-only subagent on another model checks the work against the task, and its problems go back once; on Terminal-Bench, deepseek-v4-pro reviewing flash's work: 75% against 70% (+5, −20 to +30) for 2.4 times the cost, and no result changed because of a review (16 approvals, 2 of them of failures; 1 problem report, not fixed); the reviewer can't see what only running shows, and it stays off by default; `tbcheck` now stops when the balance is low or the API refuses a trial, which runs again
 
 ## License
 

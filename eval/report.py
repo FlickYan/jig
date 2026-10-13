@@ -53,6 +53,8 @@ def trials(job: Path) -> list[dict]:
             "seconds": seconds(execution),
             "trial": path.parent.name,
             "looked_up": any(BENCHMARK_REPOSITORY.search(command) for command in commands(path.parent)),
+            # jig's calls on another model (its reviewer, or one that took over), priced apart.
+            "shares": [share for key in ("escalated", "reviewed") if (share := (agent.get("metadata") or {}).get(key))],
         })
     return found
 
@@ -105,11 +107,18 @@ def seconds(span: dict) -> float | None:
 
 
 def cost(trial: dict) -> float | None:
-    prices = PRICES.get(trial["model"])
-    if not prices:
-        return None
-    uncached = trial["input"] - trial["cached"]
-    return (uncached * prices[0] + trial["cached"] * prices[1] + trial["output"] * prices[2]) / 1e6
+    """At the model's prices, but for the tokens jig spent on another model (trial["shares"]), at its own."""
+    def dollars(model: str, uncached: int, cached: int, output: int) -> float | None:
+        prices = PRICES.get(model)
+        return None if not prices else (uncached * prices[0] + cached * prices[1] + output * prices[2]) / 1e6
+
+    shares = [share["usage"] | {"model": share["model"]} for share in trial.get("shares") or []]
+    uncached = trial["input"] - trial["cached"] - sum(s["input"] + s["cacheWrite"] for s in shares)
+    cached = trial["cached"] - sum(s["cacheRead"] for s in shares)
+    output = trial["output"] - sum(s["output"] for s in shares)
+    parts = [dollars(trial["model"], uncached, cached, output)]
+    parts += [dollars(s["model"], s["input"] + s["cacheWrite"], s["cacheRead"], s["output"]) for s in shares]
+    return None if None in parts else sum(parts)
 
 
 def label(job: Path) -> str:
@@ -179,7 +188,7 @@ def main(args: list[str]) -> None:
     if save:
         save.mkdir(parents=True, exist_ok=True)
         for name, agent, found in runs:
-            summary = {"name": name, "agent": agent, "trials": found}
+            summary = {"name": name, "agent": agent, "trials": [trial | {"cost": cost(trial)} for trial in found]}
             (save / f"{name}.json").write_text(json.dumps(summary, indent=1) + "\n")
     print("| job | agent | passed | 95% CI | looked up | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
     print("|-----|-------|--------|--------|-----------|-----------|--------------|-------|-----------|------------|------|------------|")

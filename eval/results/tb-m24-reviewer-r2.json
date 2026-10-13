@@ -1,0 +1,544 @@
+{
+ "name": "tb-m24-reviewer-r2",
+ "agent": "jig (reviewer=deepseek-v4-pro)",
+ "trials": [
+  {
+   "task": "adaptive-rejection-sampler",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": "AgentTimeoutError",
+   "turns": 17,
+   "input": 848393,
+   "cached": 843776,
+   "output": 72875,
+   "model": "deepseek-flash",
+   "seconds": 900.007656,
+   "trial": "adaptive-rejection-sampler__KcYyR2V",
+   "looked_up": false,
+   "shares": [],
+   "cost": 0.093897756
+  },
+  {
+   "task": "chess-best-move",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 37,
+   "input": 1516015,
+   "cached": 1453568,
+   "output": 74705,
+   "model": "deepseek-flash",
+   "seconds": 505.554658,
+   "trial": "chess-best-move__Qn8FBaS",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 8,
+     "usage": {
+      "input": 31916,
+      "cacheWrite": 0,
+      "cacheRead": 108800,
+      "output": 23015
+     }
+    }
+   ],
+   "cost": 0.21731162799999998
+  },
+  {
+   "task": "cobol-modernization",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 36,
+   "input": 1029507,
+   "cached": 1003648,
+   "output": 55094,
+   "model": "deepseek-flash",
+   "seconds": 606.562424,
+   "trial": "cobol-modernization__GRxHe3d",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 7,
+     "usage": {
+      "input": 10223,
+      "cacheWrite": 0,
+      "cacheRead": 98176,
+      "output": 17031
+     }
+    }
+   ],
+   "cost": 0.14105609600000002
+  },
+  {
+   "task": "db-wal-recovery",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 137391,
+   "cached": 123776,
+   "output": 11691,
+   "model": "deepseek-flash",
+   "seconds": 94.334468,
+   "trial": "db-wal-recovery__NuaZy4D",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 8026,
+      "cacheWrite": 0,
+      "cacheRead": 63232,
+      "output": 7396
+     }
+    }
+   ],
+   "cost": 0.04985865199999999
+  },
+  {
+   "task": "dna-assembly",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 29,
+   "input": 1667471,
+   "cached": 1624448,
+   "output": 149041,
+   "model": "deepseek-flash",
+   "seconds": 1008.724144,
+   "trial": "dna-assembly__dV8VNoi",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 8,
+     "usage": {
+      "input": 31122,
+      "cacheWrite": 0,
+      "cacheRead": 260992,
+      "output": 79492
+     }
+    }
+   ],
+   "cost": 0.46256284400000003
+  },
+  {
+   "task": "filter-js-from-html",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 24,
+   "input": 1188830,
+   "cached": 1170176,
+   "output": 92596,
+   "model": "deepseek-flash",
+   "seconds": 634.116612,
+   "trial": "filter-js-from-html__Xks9jTj",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 8,
+     "usage": {
+      "input": 10899,
+      "cacheWrite": 0,
+      "cacheRead": 182016,
+      "output": 41508
+     }
+    }
+   ],
+   "cost": 0.256328124
+  },
+  {
+   "task": "headless-terminal",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 10,
+   "input": 157544,
+   "cached": 147456,
+   "output": 21243,
+   "model": "deepseek-flash",
+   "seconds": 160.77954,
+   "trial": "headless-terminal__iCEUkos",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 7,
+     "usage": {
+      "input": 7447,
+      "cacheWrite": 0,
+      "cacheRead": 61824,
+      "output": 9746
+     }
+    }
+   ],
+   "cost": 0.066246948
+  },
+  {
+   "task": "kv-store-grpc",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 10,
+   "input": 138528,
+   "cached": 120704,
+   "output": 11046,
+   "model": "deepseek-flash",
+   "seconds": 93.729638,
+   "trial": "kv-store-grpc__RivY3pN",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 13106,
+      "cacheWrite": 0,
+      "cacheRead": 68352,
+      "output": 7474
+     }
+    }
+   ],
+   "cost": 0.05592036
+  },
+  {
+   "task": "llm-inference-batching-scheduler",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 32,
+   "input": 1584960,
+   "cached": 1526528,
+   "output": 65642,
+   "model": "deepseek-flash",
+   "seconds": 604.973826,
+   "trial": "llm-inference-batching-scheduler__EErVSDV",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 32254,
+      "cacheWrite": 0,
+      "cacheRead": 185856,
+      "output": 8203
+     }
+    }
+   ],
+   "cost": 0.168061056
+  },
+  {
+   "task": "log-summary-date-ranges",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 134209,
+   "cached": 112640,
+   "output": 8188,
+   "model": "deepseek-flash",
+   "seconds": 98.648287,
+   "trial": "log-summary-date-ranges__PwUmT4S",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 12795,
+      "cacheWrite": 0,
+      "cacheRead": 82688,
+      "output": 6669
+     }
+    }
+   ],
+   "cost": 0.051571623999999996
+  },
+  {
+   "task": "make-mips-interpreter",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 63,
+   "input": 5185370,
+   "cached": 5052544,
+   "output": 98860,
+   "model": "deepseek-flash",
+   "seconds": 775.911708,
+   "trial": "make-mips-interpreter__QQ7E3Ux",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 83407,
+      "cacheWrite": 0,
+      "cacheRead": 316672,
+      "output": 15860
+     }
+    }
+   ],
+   "cost": 0.32967734000000004
+  },
+  {
+   "task": "model-extraction-relu-logits",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 13,
+   "input": 243100,
+   "cached": 232960,
+   "output": 29031,
+   "model": "deepseek-flash",
+   "seconds": 277.65322,
+   "trial": "model-extraction-relu-logits__JgSyLHZ",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 8,
+     "usage": {
+      "input": 5620,
+      "cacheWrite": 0,
+      "cacheRead": 70528,
+      "output": 11318
+     }
+    }
+   ],
+   "cost": 0.078927104
+  },
+  {
+   "task": "modernize-scientific-stack",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 6,
+   "input": 42078,
+   "cached": 35072,
+   "output": 5487,
+   "model": "deepseek-flash",
+   "seconds": 49.762092,
+   "trial": "modernize-scientific-stack__bTCp3jY",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 3,
+     "usage": {
+      "input": 4400,
+      "cacheWrite": 0,
+      "cacheRead": 9344,
+      "output": 2783
+     }
+    }
+   ],
+   "cost": 0.021420784
+  },
+  {
+   "task": "mteb-retrieve",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": null,
+   "turns": 4,
+   "input": 88011,
+   "cached": 84096,
+   "output": 8673,
+   "model": "deepseek-flash",
+   "seconds": 147.771259,
+   "trial": "mteb-retrieve__6a2RskF",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 12,
+     "usage": {
+      "input": 2905,
+      "cacheWrite": 0,
+      "cacheRead": 75136,
+      "output": 7770
+     }
+    }
+   ],
+   "cost": 0.039350144000000004
+  },
+  {
+   "task": "multi-source-data-merger",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 163672,
+   "cached": 144512,
+   "output": 12630,
+   "model": "deepseek-flash",
+   "seconds": 168.187445,
+   "trial": "multi-source-data-merger__kYhm4BP",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 16374,
+      "cacheWrite": 0,
+      "cacheRead": 86144,
+      "output": 6387
+     }
+    }
+   ],
+   "cost": 0.059374144000000004
+  },
+  {
+   "task": "openssl-selfsigned-cert",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 102096,
+   "cached": 91648,
+   "output": 14130,
+   "model": "deepseek-flash",
+   "seconds": 186.151929,
+   "trial": "openssl-selfsigned-cert__fGyx9jR",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 7,
+     "usage": {
+      "input": 8187,
+      "cacheWrite": 0,
+      "cacheRead": 58368,
+      "output": 10259
+     }
+    }
+   ],
+   "cost": 0.059523852
+  },
+  {
+   "task": "polyglot-rust-c",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 5,
+   "input": 80667,
+   "cached": 74368,
+   "output": 21873,
+   "model": "deepseek-flash",
+   "seconds": 193.950686,
+   "trial": "polyglot-rust-c__aC4XpwM",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 4,
+     "usage": {
+      "input": 5430,
+      "cacheWrite": 0,
+      "cacheRead": 15232,
+      "output": 8845
+     }
+    }
+   ],
+   "cost": 0.05911312399999999
+  },
+  {
+   "task": "pytorch-model-recovery",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 18,
+   "input": 504439,
+   "cached": 484608,
+   "output": 46421,
+   "model": "deepseek-flash",
+   "seconds": 502.18924,
+   "trial": "pytorch-model-recovery__NcJZLM7",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 13,
+     "usage": {
+      "input": 11881,
+      "cacheWrite": 0,
+      "cacheRead": 141824,
+      "output": 21574
+     }
+    }
+   ],
+   "cost": 0.14161432
+  },
+  {
+   "task": "sparql-university",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": null,
+   "turns": 9,
+   "input": 149786,
+   "cached": 135424,
+   "output": 16314,
+   "model": "deepseek-flash",
+   "seconds": 161.587542,
+   "trial": "sparql-university__ybV3hKH",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 6,
+     "usage": {
+      "input": 8493,
+      "cacheWrite": 0,
+      "cacheRead": 55552,
+      "output": 9210
+     }
+    }
+   ],
+   "cost": 0.06089138
+  },
+  {
+   "task": "tune-mjcf",
+   "job": "tb-m24-reviewer-r2",
+   "version": "b2bfa42+changes",
+   "passed": true,
+   "error": "AgentTimeoutError",
+   "turns": 29,
+   "input": 611690,
+   "cached": 595968,
+   "output": 25283,
+   "model": "deepseek-flash",
+   "seconds": 900.006612,
+   "trial": "tune-mjcf__zPsrQ5e",
+   "looked_up": false,
+   "shares": [],
+   "cost": 0.038632008
+  }
+ ]
+}

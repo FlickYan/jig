@@ -2,6 +2,18 @@ import { writeFileSync } from "node:fs";
 import { addUsage, type RunResult, type Usage } from "./agent.ts";
 import type { CallModel } from "./model.ts";
 
+/** Calls made by another model than the session's: the one that took over (--escalate), or the reviewer. */
+export interface Share {
+  kind: "escalated" | "reviewed";
+  model: string;
+}
+
+interface ShareTotals {
+  model: string;
+  modelCalls: number;
+  usage: Usage;
+}
+
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,
  * tokens (subagents included) and tool calls. It is rewritten after every model call, so a run that
@@ -20,7 +32,9 @@ export class Stats {
     subagentModelCalls: number;
     usage: Usage;
     /** With --escalate, once a model took over: its calls and tokens, which the totals include. */
-    escalated?: { model: string; modelCalls: number; usage: Usage };
+    escalated?: ShareTotals;
+    /** With --reviewer: the reviewer's calls and tokens, which the totals include. */
+    reviewed?: ShareTotals;
     toolCalls: Record<string, number>;
     seconds: number;
   };
@@ -40,17 +54,17 @@ export class Stats {
     this.write();
   }
 
-  /** The same model, with every call it makes counted; `escalation` names a model that takes over (--escalate). */
-  meter(callModel: CallModel, { subagent = false, escalation }: { subagent?: boolean; escalation?: string } = {}): CallModel {
+  /** The same model, with every call it makes counted; `share` says whose calls they are, if not the model's. */
+  meter(callModel: CallModel, { subagent = false, share }: { subagent?: boolean; share?: Share } = {}): CallModel {
     return async (messages, signal, options) => {
       const turn = await callModel(messages, signal, options);
       if (subagent) this.data.subagentModelCalls++;
       else this.data.modelCalls++;
       addUsage(this.data.usage, turn.message.usage);
-      if (escalation) {
-        this.data.escalated ??= { model: escalation, modelCalls: 0, usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } };
-        this.data.escalated.modelCalls++;
-        addUsage(this.data.escalated.usage, turn.message.usage);
+      if (share) {
+        const totals = (this.data[share.kind] ??= { model: share.model, modelCalls: 0, usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } });
+        totals.modelCalls++;
+        addUsage(totals.usage, turn.message.usage);
       }
       this.write();
       return turn;

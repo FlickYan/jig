@@ -14,7 +14,7 @@ import { costOf } from "../src/prices.ts";
 import { createSandbox } from "../src/sandbox.ts";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "./evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "./evolve-workspace.ts";
-import { attemptsOf, nextStart, runOrder, type TerminalBenchVerdict, terminalBenchVerdict } from "./evolve-terminal-bench.ts";
+import { attemptsOf, deepseekBalance, MIN_BALANCE_CNY, nextStart, refusedByApi, runOrder, type TerminalBenchVerdict, terminalBenchVerdict } from "./evolve-terminal-bench.ts";
 import { HOMES, hideAnswers } from "./hidden.ts";
 import { type Attempt, compare, type Comparison, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split, type Verdict } from "./evolve-referee.ts";
 
@@ -554,8 +554,15 @@ async function checkOnTerminalBench(candidate: Candidate): Promise<void> {
       console.log(`${job}: waiting until ${start.toLocaleString()}, to stay out of DeepSeek's peak hours`);
       await new Promise((done) => setTimeout(done, start.getTime() - Date.now()));
     }
+    const balance = await deepseekBalance();
+    if (balance !== null && balance < MIN_BALANCE_CNY) throw new Error(`${job}: DeepSeek's balance is ${balance} CNY, under ${MIN_BALANCE_CNY}: top it up, then run tbcheck again to go on.`);
     console.log(`${job}: running jig at ${side === "baseline" ? candidate.base : candidate.branch} on ${tasks.length} task${tasks.length === 1 ? "" : "s"}`);
     await terminalBenchJob(job, side === "baseline" ? candidate.base : candidate.branch, tasks);
+    const refused = refusedTrials(job);
+    if (refused.length) {
+      for (const trial of refused) rmSync(join(ROOT, "eval", "jobs", job, trial), { recursive: true, force: true });
+      throw new Error(`${job}: the API refused ${refused.length} trial${refused.length === 1 ? "" : "s"} (out of balance?), removed to run again: fix that, then run tbcheck again to go on.`);
+    }
   }
   // Every trial, as eval/report.py counts them (a look-up of the benchmark's answers fails), kept with the candidate.
   const out = join(ARCHIVE, String(n), smoke ? "terminal-bench-smoke" : "terminal-bench");
@@ -583,6 +590,19 @@ function pullImages(tasks: string[]): void {
       if (attempt === 3) throw new Error(`Couldn't pull ${image}: is Docker running?`);
     }
   }
+}
+
+/** The trials of a job that the API refused (see refusedByApi). */
+function refusedTrials(job: string): string[] {
+  const dir = join(ROOT, "eval", "jobs", job);
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((trial) => {
+    const result = join(dir, trial, "result.json");
+    if (!existsSync(result)) return false;
+    const transcript = join(dir, trial, "agent", "jig.txt");
+    const exception = (JSON.parse(readFileSync(result, "utf8")).exception_info ?? {}).exception_type;
+    return refusedByApi(existsSync(transcript) ? readFileSync(transcript, "utf8") : "", exception);
+  });
 }
 
 function trialsDone(job: string): number {

@@ -1,0 +1,34 @@
+{
+ "name": "tb-m24-smoke-reviewer",
+ "agent": "jig (reviewer=deepseek-v4-pro)",
+ "trials": [
+  {
+   "task": "filter-js-from-html",
+   "job": "tb-m24-smoke-reviewer",
+   "version": "b2bfa42+changes",
+   "passed": false,
+   "error": "VerifierTimeoutError",
+   "turns": 28,
+   "input": 1289106,
+   "cached": 1272448,
+   "output": 82319,
+   "model": "deepseek-flash",
+   "seconds": 611.427922,
+   "trial": "filter-js-from-html__8xNZWUT",
+   "looked_up": false,
+   "shares": [
+    {
+     "model": "deepseek-v4-pro",
+     "modelCalls": 4,
+     "usage": {
+      "input": 7846,
+      "cacheWrite": 0,
+      "cacheRead": 43904,
+      "output": 28144
+     }
+    }
+   ],
+   "cost": 0.19876359999999998
+  }
+ ]
+}

@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "../bench/evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "../bench/evolve-workspace.ts";
 import { type Attempt, compare, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split } from "../bench/evolve-referee.ts";
-import { attemptsOf, nextStart, runOrder, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
+import { attemptsOf, nextStart, refusedByApi, runOrder, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
 
 /** Attempts with the given passes out of three per task, each costing `cost`. */
 function runOf(passes: Record<string, number>, cost = 0.01): Attempt[] {
@@ -275,6 +275,25 @@ describe("the Terminal-Bench check", () => {
       attemptsOf([{ task: "a", passed: true, looked_up: true, input: 1_000_000, cached: 0, output: 0 }, { task: "b", passed: true }]),
       [{ task: "a", passed: false, cost: 0.3 }, { task: "b", passed: true, cost: null }],
     );
+  });
+
+  it("prices a reviewer's calls at the reviewer's prices, as eval/report.py saves them", () => {
+    // 1M tokens in (half cached) and 100k out, of which the reviewer, deepseek-v4-pro, made 200k in (100k cached) and 20k out
+    const trial = { model: "deepseek-flash", input: 1_000_000, cached: 500_000, output: 100_000, shares: [{ model: "deepseek-v4-pro", modelCalls: 3, usage: { input: 100_000, cacheWrite: 0, cacheRead: 100_000, output: 20_000 } }] };
+    const script = `import json, sys; sys.path.insert(0, "eval"); import report; print(json.dumps(report.cost(json.loads(sys.argv[1]))))`;
+    const priced = JSON.parse(execFileSync("python3", ["-c", script, JSON.stringify(trial)], { cwd: join(import.meta.dirname, ".."), encoding: "utf8" }));
+    const flash = (400_000 * 0.3 + 400_000 * 0.006 + 80_000 * 1.2) / 1e6;
+    const pro = (100_000 * 1.32 + 100_000 * 0.044 + 20_000 * 3.96) / 1e6;
+    assert.ok(Math.abs(priced - (flash + pro)) < 1e-9, `${priced} against ${flash + pro}`);
+    assert.deepEqual(attemptsOf([{ task: "a", passed: true, input: 1_000_000, cached: 0, output: 0, cost: priced }]), [{ task: "a", passed: true, cost: priced }], "the saved cost wins");
+  });
+
+  it("tells a trial the API refused from one that failed", () => {
+    assert.equal(refusedByApi('API error 402: 402 {"error":{"message":"Insufficient Balance (request_id: x)"}}', "UnknownApiError"), true);
+    assert.equal(refusedByApi("API error 401: invalid api key"), true);
+    assert.equal(refusedByApi("… 7 more lines", "UnknownApiError"), true);
+    assert.equal(refusedByApi("Done: the tests pass.", null), false);
+    assert.equal(refusedByApi("Done.", "AgentTimeoutError"), false, "a time-out is the agent's own result");
   });
 
   it("starts a round only when it can finish outside the peak hours", () => {

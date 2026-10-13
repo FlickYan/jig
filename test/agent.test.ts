@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { failedTestRun, runAgent, type AgentOptions } from "../src/agent.ts";
+import { failedTestRun, runAgent, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import type { ModelTurn } from "../src/model.ts";
 import { TOOLS } from "../src/tools/index.ts";
@@ -226,5 +226,73 @@ describe("escalating to a stronger model", () => {
     assert.equal(run(piped, "Ran 4 tests in 0.002s\n\nOK\n\nExit code: 0"), false);
     assert.equal(run("pytest -q", "7 passed, 0 failed in 0.31s\n\nExit code: 0"), false);
     assert.equal(run("python check.py", "Traceback (most recent call last):\n\nExit code: 1"), false, "not a test runner");
+  });
+});
+
+describe("a reviewer before finishing", () => {
+  /** A reviewer that gives these verdicts in turn and records what it was shown. */
+  function fakeReviewer(...verdicts: (ReviewVerdict | Error)[]) {
+    const seen: Parameters<Reviewer["review"]>[0][] = [];
+    const reviewer: Reviewer = {
+      model: "strong",
+      async review(work) {
+        seen.push(work);
+        const verdict = verdicts.shift()!;
+        if (verdict instanceof Error) throw verdict;
+        const usage = { input: 50, cacheWrite: 0, cacheRead: 0, output: 5 };
+        return { verdict, ...(verdict === "problems" && { feedback: "A reviewer found: out.txt is missing." }), usage };
+      },
+    };
+    return { reviewer, seen };
+  }
+
+  it("sends the problems it finds back, and the model works on", async () => {
+    const { reviewer, seen } = fakeReviewer("problems");
+    const { options, conversation, messages } = setup(
+      [reply([toolUse("t1", "bash", { command: "echo hi > a.txt" })]), reply([text("Done.")]), reply([text("Fixed: out.txt written.")])],
+      { reviewer },
+    );
+    const result = await runAgent(conversation, options);
+    assert.equal(result.text, "Fixed: out.txt written.");
+    assert.deepEqual(result.reviewed, { model: "strong", step: 2, verdict: "problems", usage: { input: 50, cacheWrite: 0, cacheRead: 0, output: 5 } });
+    assert.equal(result.usage.input, 350, "the review's tokens count in the task's");
+    assert.deepEqual(messages[4], { role: "user", content: "A reviewer found: out.txt is missing." });
+    assert.equal(seen[0].task, "do the task");
+    assert.equal(seen[0].answer, "Done.");
+    assert.equal(seen[0].messages.length, 4, "the task and what the run did, up to the model's stop");
+  });
+
+  it("ends the task when it approves, and reviews once a task", async () => {
+    const approves = fakeReviewer("approved");
+    const approved = setup([reply([text("Done.")])], { reviewer: approves.reviewer });
+    const result = await runAgent(approved.conversation, approved.options);
+    assert.deepEqual([result.text, result.steps, result.reviewed?.verdict], ["Done.", 1, "approved"]);
+    const once = fakeReviewer("problems");
+    const twice = setup([reply([text("Done.")]), reply([text("Still done.")])], { reviewer: once.reviewer });
+    assert.equal((await runAgent(twice.conversation, twice.options)).text, "Still done.");
+    assert.equal(once.seen.length, 1);
+  });
+
+  it("stops as interrupted when Ctrl+C comes during the review", async () => {
+    const controller = new AbortController();
+    const reviewer: Reviewer = { model: "strong", async review() { controller.abort(); return { verdict: "none", usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } }; } };
+    const { options, conversation } = setup([reply([text("Done.")])], { reviewer });
+    assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
+  });
+
+  it("leaves the work as it is when the review fails, gives no verdict, or there is no step left", async () => {
+    const failing = fakeReviewer(new Error("overloaded"));
+    const failed = setup([reply([text("Done.")])], { reviewer: failing.reviewer });
+    const notices: string[] = [];
+    failed.options.ui = { ...failed.options.ui, notice: (n) => notices.push(n) };
+    const result = await runAgent(failed.conversation, failed.options);
+    assert.deepEqual([result.stop, result.text, result.reviewed], ["end_turn", "Done.", undefined]);
+    assert.match(notices.join("\n"), /The review failed \(overloaded\), so the work stands as it is/);
+    const silent = setup([reply([text("Done.")])], { reviewer: fakeReviewer("none").reviewer });
+    assert.equal((await runAgent(silent.conversation, silent.options)).reviewed?.verdict, "none");
+    const last = fakeReviewer("problems");
+    const lastStep = setup([reply([text("Done.")])], { reviewer: last.reviewer, maxSteps: 1 });
+    assert.equal((await runAgent(lastStep.conversation, lastStep.options)).text, "Done.");
+    assert.equal(last.seen.length, 0);
   });
 });
