@@ -4,6 +4,7 @@ node_modules/
 .DS_Store
 __pycache__/
 bench/logs/
+bench/dataset/
 eval/.venv/
 eval/jobs/
 dist/

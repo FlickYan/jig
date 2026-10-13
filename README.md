@@ -227,7 +227,7 @@ What jig can change about itself, and who decides whether it does:
 | its skills | `propose_skill` (`jig skills new`, `/learn`), measured with and without by `jig skills test` | you, when jig shows it to you |
 | what it remembers, and a project's AGENTS.md | `propose_memory` and `propose_instructions` (`/remember`, `/reflect`) | you, one proposal at a time |
 | its prompts, tools and loop | `npm run evolve -- run`: jig changes a copy of its own code, and a referee measures the change on benchmark tasks it wasn't made from | the referee, then you, by merging its branch or not |
-| its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests | whoever trains a model: jig doesn't |
+| its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests, and `bench/dataset.ts` a training set from every run's, split by task (milestone 26) | whoever trains a model: jig doesn't |
 
 ```bash
 node bench/run.ts --suite evolve2 --attempts 3 --label baseline   # the baseline: 21 tasks, 3 attempts each
@@ -243,6 +243,8 @@ npm run evolve -- list        # every candidate, its change and the verdict (--s
 jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
 node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # attempts that passed, only
 node bench/escalation.ts bench/results/evolve2/<run>.json eval/jobs/<job>   # where --escalate would hand over
+node bench/dataset.ts                     # a training set from every passed session (bench/dataset/)
+bench/train/run.sh <work dir>             # and a LoRA of a small model on it, on an Apple Silicon Mac
 ```
 
 A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
@@ -1766,6 +1768,64 @@ run lasts, which is what jig does there anyway.
 
 **Cost.** Under a cent.
 
+### Milestone 26: a training set from jig's own successes
+
+Milestones 23 and 24 brought in a second model, at a failure and before the end, and neither changed what
+deepseek-flash gets right. What is left of milestone 21's list is training a model on what jig has done.
+jig can't train one, and DeepSeek offers no fine-tuning, so this milestone builds what training would
+start from, and tries it on the one trainer that fits on this machine.
+
+`node bench/dataset.ts` gathers every attempt of jig as it was that passed tests the model never saw,
+from the benchmark suites and from Terminal-Bench (runs of evolve candidates and of other system prompts
+left out), exports its session (`src/export.ts`: OpenAI's chat fine-tuning format, thinking left out,
+secrets blanked), and keeps it only if
+
+- the model finished with a reply of its own: 401 didn't, nearly all of them evolve2 attempts stopped by
+  their 4-step budget (372), which pass their tests but end mid-work;
+- it never reached the answers: 8 sessions name the repository's own path or Terminal-Bench's
+  repository, among them milestone 14's ini-config attempt, which found its task's solution on the disk
+  (the path was in a tool's output, where a first check, of the tool inputs only, had missed it), and six
+  Terminal-Bench trials that passed after looking the benchmark up;
+- it fits in 32k tokens (27 didn't), and is among its task's 5 shortest successes (143 weren't).
+
+A task goes whole to one side: evolve2's held-out half, Terminal-Bench's 20 held-out tasks
+(`eval/heldout.txt`) and a fifth of the other suites' tasks, by name, are held out.
+
+| | examples | tasks | tokens | the model's own | by suite |
+|-|----------|-------|--------|-----------------|----------|
+| training | 225 | 60 | 1.71M | 0.71M | Terminal-Bench 83, explore 46, the main suite 45, evolve2 32, evolve 19 |
+| held out | 113 | 37 | 0.89M | 0.36M | Terminal-Bench 37, evolve2 36, the main suite 15, explore 13, evolve 12 |
+
+An example is 6k tokens at the median and 16k at the 90th percentile. The files go to `bench/dataset/`
+(not committed: the sessions hold the tasks' files and their output), with a manifest of every
+example's task, model, run and size.
+
+**A smoke test of the training.** This Mac (an M2 with 8 GB, Docker holding 3 of them) fits a LoRA of
+Qwen2.5-0.5B-Instruct (4-bit, with MLX) on sequences of 4,096 tokens.
+[`bench/train/run.sh`](bench/train/run.sh) converts the set (`bench/train/to_mlx.py`: tool calls'
+arguments become objects, as chat templates expect), trains on the 166 training examples under 8k tokens
+(each one's first 4,096) for two epochs, and measures the loss on 85 held-out examples, the model's own
+tokens apart from the rest (`bench/train/heldout_loss.py`, which checks that the chat template builds
+each conversation from its beginnings, so the split is exact):
+
+| loss on held-out tasks, nats a token | all tokens | the model's own (96k) | the rest (239k) |
+|---------------------------------------|------------|-----------------------|-----------------|
+| Qwen2.5-0.5B-Instruct | 1.667 | 1.219 | 1.847 |
+| after the LoRA | 0.714 | 0.975 | 0.609 |
+
+- **Most of the drop is the setting, not the work.** The trainer's own test loss fell by 57%, but most of
+  that is the rest: the system prompt and tool definitions, which are the same in every example, the
+  tasks' shape and the tools' output, all of which a model can learn by heart. On what the model writes,
+  its replies and tool calls on tasks it never trained on, the loss fell by 20%. The validation loss was
+  lowest after one epoch (0.511) and a little higher after two (0.531).
+- **What it shows, and what it doesn't.** The set trains, end to end, through a real trainer, and what
+  the model writes on unseen tasks becomes more like what flash wrote when it succeeded. Whether that
+  makes a better agent needs a model large enough to be one, a GPU or a fine-tuning service to train it
+  on (about 1.7M tokens an epoch), and an agent's evaluation rather than a loss: evolve2's held-out half
+  through `--api openai --base-url` (milestone 11), the base model against the fine-tuned one.
+
+**Cost.** Nothing at DeepSeek: about an hour of this Mac.
+
 ## Tests
 
 ```bash
@@ -1817,6 +1877,7 @@ installs and runs the tarball on every push.
 - [x] **23. Routing to a stronger model:** `--escalate <model>` hands the steps left to a stronger model once a test run fails (by the runner's report too, since `| tail` hides the exit code), its share of the tokens printed, kept in `--stats` and billed by `bench/run.ts`; `bench/escalation.ts` checks a trigger on saved sessions before it is paid for: in 676 attempts of jig as it was it would have reached 1 of 220 failures (flash's are silent) and handed over 21 times, all but one on attempts flash put right; deepseek-v4-pro alone at 4 steps: +7 points (−8 to +22) for five times the cost, ahead on the training half and level on the held-out one, so the referee would reject it; flash with 6 steps: 70%, 17 points more than v4-pro with 4 for a quarter of the cost
 - [x] **24. A second model reviews the work:** `--reviewer <model>`: the first time the model stops, a read-only subagent on another model checks the work against the task, and its problems go back once; on Terminal-Bench, deepseek-v4-pro reviewing flash's work: 75% against 70% (+5, −20 to +30) for 2.4 times the cost, and no result changed because of a review (16 approvals, 2 of them of failures; 1 problem report, not fixed); the reviewer can't see what only running shows, and it stays off by default; `tbcheck` now stops when the balance is low or the API refuses a trial, which runs again
 - [x] **25. The key stays on the host:** Terminal-Bench's containers get a token of the run, and `eval/key_proxy.py` on the host (127.0.0.1, reached as `host.docker.internal`) swaps it for the API key and streams the reply back; a model asked to print every process's environment found only the token; `--base-url` now reaches DeepSeek's Anthropic-compatible endpoint
+- [x] **26. A training set from jig's own successes:** `bench/dataset.ts`: every passed session of jig as it was, from the benchmark and Terminal-Bench, kept only if it finished, never reached the answers (8 hadn't, milestone 14's leak among them) and fits, five per task, split whole by task: 225 training examples from 60 tasks (1.71M tokens), 113 held out from 37; a LoRA of Qwen2.5-0.5B on this Mac (`bench/train/`) cut the loss on held-out tasks by 57%, but on the model's own tokens by 20%: the rest is the prompt and the tools learnt by heart
 
 ## License
 
