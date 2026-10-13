@@ -5,6 +5,7 @@
 // trains a model (see milestone 26 in docs/milestones.md for what that would take).
 //
 //   node bench/dataset.ts [--out bench/dataset] [--per-task 5] [--max-tokens 32000]
+//   node bench/dataset.ts --held-out <suite>     a suite's held-out tasks, for an evaluation
 
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -140,7 +141,7 @@ export function collect(): Found[] {
 }
 
 /** The held-out tasks: evolve2's held-out half, Terminal-Bench's held-out sample, and a fifth of the others by name. */
-function heldOutTasks(): (suite: string, task: string) => boolean {
+export function heldOutTasks(): (suite: string, task: string) => boolean {
   const lines = (file: string) => readFileSync(file, "utf8").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
   const evolve2 = new Set<string>(JSON.parse(readFileSync(join(BENCH, "evolve2", "split.json"), "utf8")).heldOut);
   const terminalBench = new Set(lines(join(ROOT, "eval", "heldout.txt")));
@@ -157,8 +158,18 @@ function main(): void {
       out: { type: "string", default: join(BENCH, "dataset") },
       "per-task": { type: "string", default: "5" },
       "max-tokens": { type: "string", default: "32000" },
+      "held-out": { type: "string" },
     },
   });
+  // --held-out <suite>: that suite's held-out tasks, all of them (with a training example or not), for an
+  // evaluation that must stay off what the model was trained on.
+  if (values["held-out"]) {
+    const suite = values["held-out"];
+    const held = heldOutTasks();
+    const dir = join(BENCH, suite === "tasks" ? "tasks" : join(suite, "tasks"));
+    console.log(readdirSync(dir).filter((task) => existsSync(join(dir, task, "task.json")) && held(suite, task)).sort().join(","));
+    return;
+  }
   const found = collect();
   const { train, heldOut, left } = build(found, { perTask: Number(values["per-task"]), maxTokens: Number(values["max-tokens"]), heldOut: heldOutTasks(), load: exportSession });
   mkdirSync(values.out, { recursive: true });

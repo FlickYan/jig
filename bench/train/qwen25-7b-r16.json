@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "run": "qwen25-7b-r16",
+  "epochs": 2,
+  "rank": 16,
+  "learning_rate": 0.0001,
+  "before": 0.8528984916373117,
+  "epoch 1": 0.6082192807508007,
+  "epoch 2": 0.5934894091522789,
+  "seconds": 2405,
+  "examples": {
+    "train": 294,
+    "heldout": 115
+  },
+  "own tokens": {
+    "train": 1127239,
+    "heldout": 408674
+  }
+}

@@ -10,3 +10,5 @@ eval/jobs/
 dist/
 *.tgz
 .bench-homes/
+bench/train/.venv/
+bench/train/runs/

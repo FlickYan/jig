@@ -32,6 +32,7 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **24. A second model reviews the work:** `--reviewer <model>`: the first time the model stops, a read-only subagent on another model checks the work against the task, and its problems go back once; on Terminal-Bench, deepseek-v4-pro reviewing flash's work: 75% against 70% (+5, −20 to +30) for 2.4 times the cost, and no result changed because of a review (16 approvals, 2 of them of failures; 1 problem report, not fixed); the reviewer can't see what only running shows, and it stays off by default; `tbcheck` now stops when the balance is low or the API refuses a trial, which runs again
 - [x] **25. The key stays on the host:** Terminal-Bench's containers get a token of the run, and `eval/key_proxy.py` on the host (127.0.0.1, reached as `host.docker.internal`) swaps it for the API key and streams the reply back; a model asked to print every process's environment found only the token; `--base-url` now reaches DeepSeek's Anthropic-compatible endpoint
 - [x] **26. A training set from jig's own successes:** `bench/dataset.ts`: every passed session of jig as it was, from the benchmark and Terminal-Bench, kept only if it finished, never reached the answers (8 hadn't, milestone 14's leak among them) and fits, five per task, split whole by task: 225 training examples from 60 tasks (1.71M tokens), 113 held out from 37; a LoRA of Qwen2.5-0.5B on this Mac (`bench/train/`) cut the loss on held-out tasks by 57%, but on the model's own tokens by 20%: the rest is the prompt and the tools learnt by heart
+- [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
 
 ## Milestone 9: checking before finishing
 
@@ -1056,3 +1057,83 @@ each conversation from its beginnings, so the split is exact):
   through `--api openai --base-url` (milestone 11), the base model against the fine-tuned one.
 
 **Cost.** Nothing at DeepSeek: about an hour of this Mac.
+
+## Milestone 27: a 7B model trained on jig's successes, driving jig
+
+Milestone 26 built the training set and showed, on a 0.5B model, that it trains. This one trains a model
+large enough to be an agent, on a rented GPU, and measures it as one: jig driving the model as it was
+against jig driving it after the training, on every held-out task of the in-house suites.
+
+**The model.** Qwen2.5-7B-Instruct. Qwen2.5-Coder-7B-Instruct came first, but although its chat template
+describes the tools and asks for `<tool_call>` blocks, it wrote its calls as XML in a code block
+(`<function name="bash">…`), so jig got no calls from it at all, and a comparison would have measured a
+format being learnt. The general model's calls parse, and it ran jig's loop from the first try.
+
+**The data.** `node bench/dataset.ts --per-task 10` (milestone 26 kept 5 a task): 294 training examples
+and 115 held out. By Qwen's tokenizer a training example is 6.9k tokens at the median, 21.4k at the 90th
+percentile and 46.4k at the longest (the 6 longer than 32,768 are cut to their first 32,768), 2.81M in
+all, 1.13M of them the model's own.
+
+**The training** ([`bench/train/modal_train.py`](../bench/train/modal_train.py), one H100 on Modal): a
+LoRA of rank 16 (alpha 32) on every projection, learning rate 1e-4 with a warmup and a cosine decay, 8
+examples a step, two epochs. The loss is on the model's own tokens only, its replies and tool calls
+(milestone 26 found a loss over every token mostly measures the system prompt learnt by heart), and only
+those positions get logits at all, which is what lets a 32k-token example fit. The adapter to evaluate,
+the last epoch's, was chosen before training. It took 40 minutes:
+
+| loss on the held-out examples' own tokens (409k), nats a token | |
+|-----------------------------------------------------------------|-|
+| Qwen2.5-7B-Instruct | 0.853 |
+| after one epoch | 0.608 |
+| after two | 0.593 |
+
+Two things a smoke test caught first: with a warmup, the first step's learning rate is 0, so a one-step
+test changes nothing (24 examples did: 0.996 to 0.973); and transformers' `apply_chat_template` now
+returns a dictionary unless told not to.
+
+**Serving** ([`bench/train/modal_serve.py`](../bench/train/modal_serve.py)): vLLM 0.21 on an L40S, with
+the base model as `qwen-base` and the LoRA as `jig` on the same server, so both sides run on the same GPU
+and software, 32,768 tokens a conversation, and a token that every request must carry. jig drives it as
+any OpenAI-compatible API: `--api openai --base-url <url>/v1 --compact-at 24000`.
+
+**The evaluation** ([`bench/train/eval.sh`](../bench/train/eval.sh)): every held-out task of the four
+in-house suites (`node bench/dataset.ts --held-out <suite>`), 23 tasks that no training example came
+from: the main suite's config-migration, git-merge, injection-output, inventory and mcp-ticket; 4 of
+evolve's; evolve2's 11; 3 of explore's. Three attempts each, 40 steps (evolve2's own 4 would leave a 7B
+model nothing to show). The base model ran while the LoRA trained, and the LoRA after; with a server of
+our own, no one else's load changes the replies between the two.
+[`bench/train/compare.ts`](../bench/train/compare.ts) pairs them by task:
+
+| | passed | steps | failed tool calls | stopped, unsolved, before the limit | made the same call 5+ times in a row | outgrew the server's 32k | the main suite | evolve | evolve2 | explore |
+|-|--------|-------|-------------------|--------------------------------------|---------------------------------------|---------------------------|----------------|--------|---------|---------|
+| Qwen2.5-7B-Instruct | 6 of 69 (9%) | 8.5 | 2.2 | 59 of 63 failures | 2 of 69 | 2 of 69 | 6 of 15 | 0 of 12 | 0 of 33 | 0 of 9 |
+| after the LoRA | 2 of 69 (3%) | 24.5 | 11.4 | 2 of 67 | 25 of 69 | 18 of 69 | 2 of 15 | 0 of 12 | 0 of 33 | 0 of 9 |
+
+Paired by task, the trained model is 6 points behind (−14 to 0) and ahead in none of the resamples. It
+lost on injection-output (3 of 3 to 2 of 3), inventory (2 to 0) and mcp-ticket (1 to 0), and solved
+nothing anywhere the base model hadn't. Neither followed the injected instruction (0 of 3 each).
+
+- **It learnt to keep going, not to get there.** The base model ended 59 of its 63 failures by saying it
+  was done, 8.5 steps in. The trained one almost never did (2 of 67): it ran out of steps 35 times, out
+  of time 12, and out of room 18. What it took from flash's successes is their shape (keep working, run
+  the tests, write test cases of its own) without what made them succeed: in 25 attempts it made the same
+  call five or more times in a row, against 2, and one of its replies on config-migration held 211 calls,
+  208 of them the same edit.
+- **Runaway output, and jig's echo of it.** In 17 of the 19 attempts that ended because the conversation
+  outgrew the server (18 of them the trained model's), the model had written until its output ran out
+  (one command writing test files until the 218th was cut off; for the base model, 9,700 blank lines), so
+  the call wasn't valid JSON, and jig sends an invalid call back to the model in full, so it can see what
+  it wrote: 40k to 155k characters in one tool result. Compaction can't save that conversation, since it
+  sends the whole of it to the same server. The fix belongs in jig (send back the start of an invalid
+  call and the parse error, and compact before a request that won't fit); it isn't made here, so that
+  milestone 28 compares jig as it was.
+- **The loss fell by 30% and the agent got worse.** Milestone 26's caution, measured: the loss says how
+  much the model's tokens look like flash's when flash succeeded, in the context of a success. As an
+  agent, the model writes in contexts of its own, and once it is off course, nothing it trained on shows
+  what to do there: every example is a success, and none shows an edit failing and what came next. The
+  next things to try train on the agent's own attempts, scored by the hidden tests (rejection sampling,
+  or reinforcement learning), which put the model in its own states; or start from a stronger model.
+  Either needs more GPU time than this milestone's.
+
+**Cost.** Nothing at DeepSeek. Modal billed $10.68: $4.35 for training (the H100, with the Coder model's
+start and the smoke tests) and $6.33 for three hours of serving.

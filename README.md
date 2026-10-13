@@ -246,7 +246,7 @@ What jig can change about itself, and who decides whether it does:
 | its skills | `propose_skill` (`jig skills new`, `/learn`), measured with and without by `jig skills test` | you, when jig shows it to you |
 | what it remembers, and a project's AGENTS.md | `propose_memory` and `propose_instructions` (`/remember`, `/reflect`) | you, one proposal at a time |
 | its prompts, tools and loop | `npm run evolve -- run`: jig changes a copy of its own code, and a referee measures the change on benchmark tasks it wasn't made from | the referee, then you, by merging its branch or not |
-| its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests, and `bench/dataset.ts` a training set from every run's, split by task (milestone 26) | whoever trains a model: jig doesn't |
+| its model | `jig sessions export` writes conversations as fine-tuning data; `bench/export.ts` writes only the benchmark attempts that passed their hidden tests, and `bench/dataset.ts` a training set from every run's, split by task (milestone 26); `bench/train/` trains a LoRA of a 7B model on it on Modal, serves it, and measures jig driving it (milestone 27) | whoever trains a model: jig doesn't |
 
 ```bash
 node bench/run.ts --suite evolve2 --attempts 3 --label baseline   # the baseline: 21 tasks, 3 attempts each
@@ -264,6 +264,10 @@ node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # atte
 node bench/escalation.ts bench/results/evolve2/<run>.json eval/jobs/<job>   # where --escalate would hand over
 node bench/dataset.ts                     # a training set from every passed session (bench/dataset/)
 bench/train/run.sh <work dir>             # and a LoRA of a small model on it, on an Apple Silicon Mac
+modal run bench/train/modal_train.py      # or of Qwen2.5-7B-Instruct, on an H100 at Modal (pip install modal)
+JIG_SERVE_KEY=<token> modal deploy bench/train/modal_serve.py   # served with vLLM, beside the base model
+JIG_SERVE_KEY=<token> bench/train/eval.sh <url>   # jig driving each on every suite's held-out tasks
+node bench/train/compare.ts               # the two, paired by task
 ```
 
 A candidate works on a copy of jig without the benchmarks, in a repository with no history, and may
@@ -336,10 +340,12 @@ What each question came to; the write-ups, with every number's run and caveat, a
 | A stronger model when the tests fail? (23) | the trigger replayed on 676 saved attempts; deepseek-v4-pro alone | the trigger would have reached 1 of 220 failures; v4-pro was 7 points ahead for 5 times the cost, while 2 more steps put flash 24 ahead |
 | A second model reviewing the work? (24) | Terminal-Bench, 20 tasks, alternating at each task | 5 points ahead (−20 to +30) for 2.4 times the cost; no result changed because of a review |
 | Training on its own successes? (26) | a LoRA of Qwen2.5-0.5B on 225 passed sessions, loss on held-out tasks | −57% overall, but −20% on the model's own tokens: the rest is the prompt and the tools learnt by heart |
+| Does that make a better agent? (27) | a LoRA of Qwen2.5-7B on 294 passed sessions (an H100 on Modal); jig driving it and the base model on 23 held-out tasks × 3 | the loss fell 30% and the agent got worse: 3% against 9% (−6, −14 to 0); it stopped giving up and started looping |
 
 The numbers in parentheses are milestones. deepseek-flash's failures turned out to be silent: it finishes
 sure it is done, its own checks passed or never run, and neither routing to a stronger model nor a
-second model's review could see them (milestones 23 and 24).
+second model's review could see them (milestones 23 and 24). Training a 7B model on its successes taught
+it their shape, not their judgment (milestone 27).
 
 ## How it is measured
 
@@ -390,6 +396,7 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 | 24 | A second model reviews the work | `--reviewer`; no result changed because of a review |
 | 25 | The key stays on the host | a proxy, so Terminal-Bench's containers hold only a token |
 | 26 | A training set from jig's own successes | `bench/dataset.ts`, and a LoRA smoke test on this Mac |
+| 27 | A 7B model trained on jig's successes | a LoRA on Modal, served next to the base model: the loss fell, the agent got worse |
 
 ## Tests
 
