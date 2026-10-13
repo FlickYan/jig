@@ -1,6 +1,6 @@
 // jig evolves itself: find what goes wrong, or wastes steps, in its own benchmark attempts; let jig change
 // its code to do better; and keep the change only if a referee the change can't touch says it helps. See
-// milestone 14 in the README.
+// milestone 14 in docs/milestones.md.
 
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";

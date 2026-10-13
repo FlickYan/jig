@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Runs an agent on the benchmark tasks and records how it did. See the Benchmark section of the README.
+// Runs an agent on the benchmark tasks and records how it did. See docs/evaluation.md.
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, readFileSync, type WriteStream } from "node:fs";

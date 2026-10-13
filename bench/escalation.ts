@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Where --escalate would have handed over, in runs already made: each attempt's saved session is read
 // and the loop's own rule (failedTestRun, in src/agent.ts) applied to every step, so a trigger can be
-// judged on transcripts before money goes on running it. See milestone 23 in the README.
+// judged on transcripts before money goes on running it. See milestone 23 in docs/milestones.md.
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";

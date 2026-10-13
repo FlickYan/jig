@@ -2,7 +2,7 @@
 // bench/memory/ has a first session in which the user says something once (a convention, a fact about
 // the project, a preference), then `jig memory reflect --yes`, then follow-up tasks that don't mention it,
 // run with what reflection kept and without it (--no-memory, and AGENTS.md as it was), each graded by a
-// check. See milestone 13 in the README.
+// check. See milestone 13 in docs/milestones.md.
 //
 //   node bench/memory.ts [--attempts 3] [--model deepseek-flash] [--scenario commit-style] [--keep]
 

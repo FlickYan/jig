@@ -2,7 +2,7 @@
 // jig's own successes as a training set: the sessions of attempts that passed tests the model never saw,
 // from the benchmark suites and from Terminal-Bench, filtered, capped per task, and split by task into
 // training and held-out examples, with a manifest of what went in and what was left out. Nothing here
-// trains a model (see milestone 26 in the README for what that would take).
+// trains a model (see milestone 26 in docs/milestones.md for what that would take).
 //
 //   node bench/dataset.ts [--out bench/dataset] [--per-task 5] [--max-tokens 32000]
 
