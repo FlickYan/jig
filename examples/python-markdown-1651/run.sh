@@ -6,6 +6,7 @@
 #   run.sh [jig options]     e.g. run.sh --model claude-opus-5-5 (default: jig's, deepseek-flash)
 #   AGENT=oracle run.sh      applies upstream's fix instead of running jig: must come out solved
 #   AGENT=noop run.sh        changes nothing: must come out not solved
+#   KEEP=1 run.sh            keep the project afterwards (it is deleted, so that no later attempt can read it)
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -40,4 +41,11 @@ esac
 git -C "$WORK" add -A
 git -C "$WORK" diff --cached > "$OUT/diff.patch"
 "$HERE/check.sh" "$WORK" 2>&1 | tee "$OUT/check.txt" || true
-echo "results in $OUT, the project in $WORK"
+# jig's sandbox can read the temp directories, so a project left there, with a fix in it, would be in reach
+# of the next attempt.
+if [[ ${KEEP:-} == 1 ]]; then
+  echo "results in $OUT, the project in $WORK"
+else
+  rm -rf "$TMP"
+  echo "results in $OUT"
+fi

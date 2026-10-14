@@ -38,20 +38,26 @@ Why this issue:
 | [`upstream/`](upstream) | the upstream fix ([`fix.patch`](upstream/fix.patch)), its three tests in a file of their own ([`test_issue_1651.py`](upstream/test_issue_1651.py)), and Python-Markdown's license |
 
 - **The prompt is the user's side of the issue.** It gives the symptom, a reproduction (not the one in the
-  hidden tests), the Python versions it shows on, and how to run the tests. The reporter's diagnosis,
-  the pointer to CPython's change, is left out, so finding the cause is jig's job.
+  hidden tests), the Python versions the issue names, and how to run the tests. The issue's diagnosis, its
+  pointer to CPython's change, is left out, so finding the cause is jig's job.
 - **The project holds no answer.** `setup.sh` fetches only the fix's parent and its ancestors, and keeps no
   remote, so the fix is in neither the files nor the history.
-- **The answers are out of reach.** `run.sh` gives jig a home of its own (no memories, skills or settings
-  from the machine), whose settings hide this folder (upstream's fix and tests) and jig's repository
-  history from jig's commands. Commands run in jig's sandbox, which also keeps them off the network, so
-  the fix can't be fetched either. This is how the benchmark keeps its answers out of reach
-  ([milestone 18](../../docs/milestones.md)).
+- **The answers are hidden.** `run.sh` gives jig a home of its own (no memories, skills or settings from
+  the machine), whose settings hide this folder (upstream's fix and tests) and jig's repository history
+  from jig's commands; jig's file tools work only in the project. Commands run in jig's sandbox, which
+  also keeps them off the network, so the fix can't be fetched either. This is how the benchmark keeps its
+  answers out of reach ([milestone 18](../../docs/milestones.md)). The sandbox can still read the rest of
+  the machine, though, and in the run below two copies of a fix were left where it could: the oracle
+  check's output, with upstream's fix, was written to `/tmp` before the attempts, and `run.sh` kept each
+  attempt's project, attempt 1's for attempts 2 and 3. No attempt went near them (no command or output in
+  the three sessions names another folder in `/tmp`), and `run.sh` now deletes each project after grading
+  it (`KEEP=1` keeps it); an oracle check's output belongs in `results/`, where it goes by default, which
+  is hidden.
 - **Solved means both.** Upstream's three tests must pass, and so must the whole suite, so a fix that
-  breaks other rendering fails.
+  breaks rendering the suite covers fails.
 - **The check is checked.** With upstream's fix applied (`AGENT=oracle run.sh`) the case comes out
   solved, and with nothing changed (`AGENT=noop run.sh`) it doesn't: the three tests fail and the suite
-  passes. Both on Python 3.13.16. And the cause is where the reporter said: the same code, on CPython's own
+  passes. Both on Python 3.13.16. And the cause is where the issue says: the same code, on CPython's own
   `html/parser.py` from v3.13.5, renders the whole example, and on the one from v3.13.6 drops the text.
 
 ## Results
@@ -143,7 +149,9 @@ like it. Attempts 2 and 3 test `< 0` where upstream tests `== -1`, which is the 
   fix differs from upstream on 11,644 inputs, so the corpus does reach the bug.
 - **Its own tests test the bug.** Each attempt's added tests fail on the code before the fix and pass
   with upstream's fix. Like upstream, each attempt also added a changelog entry, without an issue number
-  since it had none (attempts 1 and 3 said so to the user).
+  since it had none (attempts 1 and 3 said so to the user). Upstream also added "unterminated" to the
+  project's spelling dictionary (`.spell-dict`); attempt 3 used that word and "unparseable", which the
+  dictionary lacks too, and no attempt ran the project's spell check.
 
 ### What went wrong
 
@@ -151,8 +159,10 @@ like it. Attempts 2 and 3 test `< 0` where upstream tests `== -1`, which is the 
   already had the new `html.parser`: 3.13.16, 3.11.17, and Ubuntu's 3.12.3, which carries the change as a
   backported security patch. Attempts 1 and 2 ran the bug on them and saw it everywhere, with nothing
   to tell the versions apart. Attempt 2 told the user "The bug reproduces across Python versions here.";
-  attempt 1 left the versions out of its summary. Only attempt 3 explained them. The fix is right on every
-  version, but two of three users wouldn't have learnt why it broke when it did.
+  attempt 1 left the versions out of its summary. Only attempt 3 explained them. Attempt 3 took the prompt's
+  "3.13.6 and later" at its word, without running the machine's 3.11 and 3.12, which drop the text too.
+  The fix is right on every version, but two of three users wouldn't have learnt why it broke when it
+  did.
 - **Made-up issue numbers.** Not knowing the issue's number, attempt 2 wrote "(see #1654)" into a code
   comment at step 32 and attempt 3 "(see #1648)" into a test's docstring at step 20. Each removed it at the
   next step, and no final diff has one.
