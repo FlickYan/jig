@@ -1,0 +1,1069 @@
+(node:2031) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Let me start by exploring the repository structure.
+I'll start by exploring the repo and reproducing the bug.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && git log --oneline -3 && ls && .venv/bin/python --version
+  7a29324 Fix inline HTML case
+  3002575 Fix ancestor handling
+  b2125da Serialize HTML non-recursively
+  … 18 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -c 'import markdown; print(repr(markdown.markdown("Discard errors with `cmd 2</dev/null` and keep going.\n\n…
+  '<p>Discard errors with `cmd 2</p>'
+  Exit code: 0
+Reproduced. Python 3.13.16 here. The bug appeared in Python 3.13.6+. This is likely a change in the stdlib HTML parser (`html.parser.HTMLParser`) behavior regarding unclosed end tags. Actually, Python 3.13.6 changed `html.parser` to handle "end tag with attributes" or "invalid end tags". Let me think.
+
+`</dev/null` - HTMLParser sees this as an end tag? Actually `</dev/null>` would be an end tag with name "dev/null"? Hmm. But `</dev/null` without `>`... The markdown inline HTML processing.
+
+Let me look at how markdown handles raw HTML. Let's find the code. The issue mentions everything after an unclosed end tag is silently dropped. This is likely in markdown's `htmlparser.py` or the inline processor using HTMLParser.
+
+Let me search.
+Reproduced. Let me find how markdown handles raw HTML inline.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -rn "HTMLParser\|html.parser" markdown/ | head -30
+  grep: markdown/__pycache__/htmlparser.cpython-313.pyc: binary file matches
+  markdown/htmlparser.py:21:This module imports a copy of [`html.parser.HTMLParser`][] and modifies it heavily through monkey-patches.
+  markdown/htmlparser.py:39:# Import a copy of the html.parser lib as `htmlparser` so we can monkeypatch it.
+  … 9 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && ls markdown markdown/extensions
+  markdown:
+  __init__.py
+  __main__.py
+  … 36 more lines
+● read_file markdown/htmlparser.py
+       1	# Python Markdown
+       2	
+       3	# A Python implementation of John Gruber's Markdown.
+  … 419 more lines
+The issue: In Python 3.13.6, `html.parser.HTMLParser` changed something. Let me examine the CPython change. The bug: everything after an unclosed end tag such as `</dev/null` is silently dropped, even inside a code span.
+
+Actually wait, Python 3.13.6 changed `parse_endtag`? Let me look at CPython's html.parser in 3.13.6. There was a fix for CVE? Actually there's a known change: gh-... "HTMLParser: fix handling of unclosed end tags" maybe.
+
+Let me check the current stdlib source. In `.venv`, Python 3.13.16. Let me look at `parse_endtag` in the stdlib.
+
+Actually the key: `_HTMLParser.parse_endtag` is overridden. It checks `start = self.rawdata[i:i+3]`, `c = ord(start[-1])`. Wait it computes `ord(start[-1])` before checking `len(start) < 3`. If len < 3 that would fail... but start[-1] with len>=1 works. Hmm.
+
+Actually for `</dev/null`, `start = '</d'`, c = ord('d') = 100, valid letter. So it calls super().parse_endtag(i).
+
+Now stdlib parse_endtag in 3.13.6: let's look. In older versions, `endendtag` was `re.compile(r'>')` or similar, and it searched for `>` and if not found returned -1. But some change in 3.13.6? Let me actually read the stdlib file.
+
+The behavior: `</dev/null` with no `>`. In the markdown document it's inside a code span. The HTMLExtractor is called on... Actually the whole paragraph? Let's trace.
+
+`markdown.markdown("Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.")`
+
+Output: `<p>Discard errors with `cmd 2</p>`. So everything from `</dev/null` onwards vanished including the second paragraph. The `</dev/null` is unclosed end tag. HTMLParser's `parse_endtag` returns -1 when not found, and `goahead` then... Let me check goahead behavior: if parse_endtag returns -1, it feeds remaining data? Actually in stdlib goahead:
+
+```
+if startswith("<", i):
+    if starttagopen.match(rawdata, i):
+        k = self.parse_starttag(i)
+    elif endtagopen.match(rawdata, i):
+        k = self.parse_endtag(i)
+    ...
+    if k < 0:
+        # end of data
+        if self.cdata_elem:
+            ...
+        k = rawdata.find('>', i + 1)
+        if k < 0:
+            k = rawdata.find('<', i + 1)
+            if k < 0:
+                k = i + 1
+        else:
+            k += 1
+        self.handle_data(rawdata[i:k])
+    i = self.updatepos(i, k)
+```
+
+Hmm wait, that's old. Let me look at actual 3.13.6.
+
+Actually the change in 3.13.6: gh-133761? Let me search. There was a security fix in html.parser: "gh-135462"? Hmm.
+
+Let me just read the stdlib.
+Let me look at the stdlib `html.parser` this venv uses, especially `parse_endtag` and `goahead`.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -c "import html.parser, inspect; print(html.parser.__file__)"
+  /usr/lib/python3.13/html/parser.py
+  Exit code: 0
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import html.parser, inspect
+  src = inspect.getsource(html.parser.HTMLParser.goahead)
+  print(src)
+  EOF
+      def goahead(self, end):
+          rawdata = self.rawdata
+          i = 0
+  … 142 more lines
+The key is `endtagopen`. In stdlib 3.13.6+ (after the security fix gh-135462? or similar), `endtagopen = re.compile(r'</[a-zA-Z]')` maybe changed. Let me look at `parse_endtag` source and the regexes.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import html.parser, inspect, re
+  print("endtagopen:", html.parser.endtagopen.pattern)
+  print("starttagopen:", html.parser.starttagopen.pattern)
+  print("endendtag:", html.parser.endendtag.pattern)
+  print("=" * 40)
+  print(inspect.getsource(html.parser.HTMLParser.parse_endtag))
+  EOF
+  endtagopen: </[a-zA-Z]
+  starttagopen: <[a-zA-Z]
+  endendtag: >
+  … 28 more lines
+Now I see. In the stdlib's `parse_endtag`, there's a fast check: `if rawdata.find('>', i+2) < 0: return -1`. For `2</dev/null` and no `>` in the rest of the entire document, this returns -1.
+
+Then in `goahead`, `k = self.parse_endtag(i)` returns -1. Then `if k < 0: if not end: break`. When close() is called with end=True, it handles the remaining data. Hmm, but the markdown output shows everything is lost. Let's trace.
+
+Actually wait, the `_HTMLParser.parse_endtag` override returns `super().parse_endtag(i)` which returns -1. Then in goahead, when k<0 and end=True, the branch `elif startswith("</", i)`: `if i+2 == n` no; `elif endtagopen.match(rawdata, i)` -- note here `endtagopen` refers to the GLOBAL in html.parser module, which markdown monkeypatched to `re.compile('</[a-zA-Z]?')`. `</d` matches. So `pass`, then `k = n`. So no data handled for the rest, and then `updatepos(i, n)`. So all remaining rawdata is dropped. That's the bug! 
+
+Wait but that would drop everything from `</dev/null` onward, including the second paragraph. Yes exactly matches symptom: `<p>Discard errors with `cmd 2</p>`.
+
+Hmm, but was that behavior different in 3.13.5 and earlier? In earlier stdlib, `parse_endtag` was:
+
+```
+def parse_endtag(self, i):
+    rawdata = self.rawdata
+    assert rawdata[i:i+2] == "</", "unexpected call to parse_endtag"
+    match = endendtag.search(rawdata, i+1) # >
+    if not match:
+        return -1
+    gtpos = match.end()
+    match = endtagfind.match(rawdata, i) # </ + tag + >
+    if not match:
+        if self.cdata_elem is not None:
+            self.handle_data(rawdata[i:gtpos])
+            return gtpos
+        # find the match at end of the source
+        namematch = tagfind_tolerant.match(rawdata, i+2)
+        ...
+```
+
+Actually the key difference: In 3.13.6 there's the new fast check `if rawdata.find('>', i+2) < 0: return -1`. In earlier versions, `endendtag.search(rawdata, i+1)` -- `endendtag` is `>`? Wait, in older versions endendtag was `re.compile(r'>\s*')` maybe? Actually the monkeypatch sets `endendtag`? No, markdown doesn't patch endendtag. Let me check. In stdlib current, endendtag is `>`.
+
+Hmm regardless, both return -1 when no `>` present. So why does 3.13.5 work? Maybe there was a different fix. Let me actually check the CPython changelog. This is likely gh-133761 "gh-... html.parser: fix ...". The task says "On Python 3.13.6 and later". So the stdlib behavior changed between 3.13.5 and 3.13.6.
+
+Actually, maybe the difference is the security fix for CVE-2025-... in html.parser that was backported. Let me think: In 3.13.6, there was gh-135462 / CVE-2024-... Hmm. Actually there was the "HTMLParser quadratic complexity" fix? No.
+
+Let me compare: the 3.13.5 goahead likely had a different handling for k<0 and end. Let me recall older goahead:
+
+```
+if k < 0:
+    if not end:
+        break
+    k = rawdata.find('>', i + 1)
+    if k < 0:
+        k = rawdata.find('<', i + 1)
+        if k < 0:
+            k = i + 1
+    else:
+        k += 1
+    self.handle_data(rawdata[i:k])
+```
+
+Yes! Older versions: when `k < 0` and `end`, it searched for `>`; not found, then searched for `<`; not found -> k = i+1, then `handle_data(rawdata[i:k])` handles 1 char `"<"`, and advances. Then the loop continues processing the rest of rawdata as data. So nothing lost.
+
+In 3.13.6, the new goahead has:
+```
+if k < 0:
+    if not end:
+        break
+    if starttagopen.match(rawdata, i):  # < + letter
+        pass
+    elif startswith("</", i):
+        if i + 2 == n:
+            self.handle_data("</")
+        elif endtagopen.match(rawdata, i):  # </ + letter
+            pass
+        else:
+            # bogus comment
+            self.handle_comment(rawdata[i+2:])
+    ...
+    k = n
+```
+
+So for `</letter` unclosed with no `>`, it does `pass` and `k = n` — swallowing all remaining data without calling handle_data. That's the new "end-tag-open" HTML5 spec behavior. Hmm. Actually this was a change to comply with HTML5 spec. In the spec, an unclosed end tag at EOF is... actually it's ignored, the tag is discarded but the content isn't. But here since there's no `>`, the whole rest is considered part of the tag? No.
+
+Hmm, actually the new goahead logic: when parse_endtag returns -1 (no `>` found in rawdata), and end=True, for a valid end tag (`</letter`), it just sets k=n, dropping all of rawdata from i to n. That seems like a CPython bug or intentional spec behavior (an unterminated end tag at EOF is dropped). Actually per HTML5, at EOF within a tag, it's a parse error but the tag is emitted/ignored and the content after? There is no content after because EOF.
+
+But here the markdown code is feeding the entire document (all paragraphs) as one buffer. Since there's no `>` anywhere in the whole doc, the unterminated `</dev/null` swallows the rest. Wait but `2</dev/null` — there's a backtick, no `>`. And the second paragraph has no `>`. So find('>') < 0 -> returns -1.
+
+Hmm, but actually what does markdown feed to HTMLExtractor? The whole document? Let's check how HTMLExtractor is used. It's a preprocessor probably running on the whole doc. Let's check preprocessors.py.
+
+Regardless, the fix should be in markdown's `htmlparser.py` `_HTMLParser.parse_endtag` override: it should handle the case where the end tag is unclosed/invalid, treating it as data instead of dropping the rest. But note `HTMLExtractor` subclasses `htmlparser.HTMLParser` which markdown reassigned to `_HTMLParser`. So the fix goes in `_HTMLParser.parse_endtag`.
+
+Wait, but the `parse_endtag` override currently:
+```
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+For `</d`, valid letter, so super() called, returns -1, and goahead drops the rest.
+
+The base class approach: parse_endtag returning -1 signals "incomplete, wait for more data". At end (close), goahead handles it. The new goahead behavior for `</letter` + end drops. Hmm.
+
+But wait — the actual upstream Python-Markdown fix for this exists. Let me check git history / issue. This is probably issue #1553 or similar: "Fix regression with unclosed end tags on Python 3.13.6+". Let me search the repo for tests referencing `</dev/null` maybe already.
+
+Let me look at what tests exist and how the fix was made upstream. Perhaps simplest: in `_HTMLParser.parse_endtag`, detect when the end tag is not actually terminated by `>` and treat as data. But careful: parse_endtag may be called with rawdata not complete (streaming). Markdown feeds complete blocks though, per the comment about incomplete entities. Actually the comment: "We are always feeding a complete block". But HTMLExtractor feeds... let me check.
+
+Let me find how HTMLExtractor feeds data.
+Now let me see how markdown feeds data to the parser, and find related tests.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -rn "HTMLExtractor\|\.feed(\|\.close()" markdown/preprocessors.py markdown/*.py | head -30
+  markdown/preprocessors.py:30:from .htmlparser import HTMLExtractor
+  markdown/preprocessors.py:88:        parser = HTMLExtractor(self.md)
+  markdown/preprocessors.py:89:        parser.feed(source)
+  … 10 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -rn "dev/null\|unclosed end\|parse_endtag\|endtag" tests/ | head -30
+  tests/extensions/github_flavored.html:2:<pre><code class="language-diff">--- /dev/null
+  tests/extensions/github_flavored.txt:4:--- /dev/null
+  tests/test_syntax/extensions/test_md_in_html.py:920:    def test_md1_orphan_endtag(self):
+  … 12 more lines
+There's already a test `test_unclosed_endtag`. Let me read it.
+● read_file tests/test_syntax/blocks/test_html_blocks.py:1740
+    1740	            self.dedent(
+    1741	                '''
+    1742	                `</` <!-- `<!--[if mso]>` and <!-- </> and `<!--[if mso]>`
+  … 47 more lines
+The existing test only tests `</` (which is handled by the `len(start) < 3` branch and returns data). But `2</dev/null` has a letter after `</`, so it goes to super().
+
+Let me test some variants to understand behavior. Also check where the HTML is extracted & what source is fed.
+
+Let me test with htmlextractor directly, and understand the fix. Let me also check the upstream Python-Markdown repo history for the fix. Since no network, I'll reason.
+
+Let me reproduce with various inputs to see the exact behavior.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  cases = [
+      "Discard errors with `cmd 2</dev/null` and keep going.\n\nSecond para.",
+      "a </div b\n\nSecond para.",
+      "a </div>\n\nSecond para.",
+      "a </div b> c\n\nSecond para.",
+      "`</dev/null`\n\nSecond para.",
+      "text </dev/null and more",
+      "text </dev and more",
+  ]
+  for c in cases:
+      print(repr(c), "->", repr(markdown.markdown(c)))
+  EOF
+  'Discard errors with `cmd 2</dev/null` and keep going.\n\nSecond para.' -> '<p>Discard errors with `cmd 2</p>'
+  'a </div b\n\nSecond para.' -> '<p>a </p>'
+  'a </div>\n\nSecond para.' -> '<p>a </div></p>\n<p>Second para.</p>'
+  … 5 more lines
+So the bug is: any `</` followed by a letter, with no `>` after it in the whole document, drops the rest. Notice `</div b>` (with `>` later) is fine — `>` exists somewhere.
+
+Actually wait: `a </div b\n\nSecond para.` also drops the second paragraph. So the presence of `>` anywhere matters. In `a </div b>` there's a `>` so it's fine. So the issue is `rawdata.find('>', i+2) < 0` returns -1, and goahead's `k<0` + end branch drops everything.
+
+Now, what's the right fix in markdown? The parser is fed the whole document at once and then close() called. The cleanest fix: override the relevant behavior in `_HTMLParser` so that when an end tag is unterminated (no `>`), it's treated as data rather than dropping.
+
+But careful about streaming semantics: parse_endtag is called during goahead; returning -1 means "need more data". When end=True (close), goahead handles it. Since markdown always feeds complete input then closes, we can handle it.
+
+Option A: In `_HTMLParser.parse_endtag`, detect if there's no `>` after i in rawdata and treat `</` (or the partial token) as data. But we need to be careful with `get_endtag_text` in HTMLExtractor which uses `self.line_offset + self.offset`.
+
+Actually, let's think about what the correct output should be. For the docs use case, `` `cmd 2</dev/null` `` is inside a code span, and it should be escaped literally: `<code>cmd 2&lt;/dev/null</code>`. So `</dev/null` should be treated as data (text), not an HTML tag.
+
+Currently `_HTMLParser.parse_endtag` treats `</d...` as a real end tag (calls super). If the end tag is well-formed with `>`, then `handle_endtag` is invoked, and HTMLExtractor appends endtag text to cleandoc. But inside a code span, would that survive? Let's test `cm d 2</dev>`. Actually the original example uses backticks. Let's check what happens with a valid `</dev>` inside a code span.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  for c in ["`cmd 2</dev>` and more", "`cmd 2</dev/>` and more", "`cmd 2</dev x>` and more"]:
+      print(repr(c), "->", repr(markdown.markdown(c)))
+  EOF
+  '`cmd 2</dev>` and more' -> '<p><code>cmd 2&lt;/dev&gt;</code> and more</p>'
+  '`cmd 2</dev/>` and more' -> '<p><code>cmd 2&lt;/dev/&gt;</code> and more</p>'
+  '`cmd 2</dev x>` and more' -> '<p><code>cmd 2&lt;/dev x&gt;</code> and more</p>'
+  … 1 more line
+So well-formed end tags inside code spans are handled fine (escaped). The issue is specifically the unterminated end tag (no `>` anywhere) causing the drop.
+
+Now let's design the fix. The parser should not silently drop data. In `_HTMLParser`, we can override `parse_endtag` such that if the end tag is not terminated by `>`, we return -1? No — that leads to goahead drop.
+
+Better: override so that unterminated end tags get handled as data. But how to know it's "unterminated" vs "more data coming"? Markdown feeds complete blocks. Actually, does it feed the whole document once? Yes: `parser.feed(source); parser.close()`. `feed` calls `goahead(False)`. So during feed, if parse_endtag returns -1 with end=False, goahead breaks and waits for more. Then close() calls goahead(True) with remaining rawdata. In close, the base `close()` runs goahead(True) before HTMLExtractor.close's custom handling.
+
+Wait, HTMLExtractor.close:
+```
+def close(self):
+    super().close()   # this calls goahead(True) if rawdata
+    if len(self.rawdata):
+        ...
+```
+So super().close() -> goahead(1). In goahead(True), parse_endtag returns -1, and the new handling drops to n. Then `self.rawdata = rawdata[i:]` = '' (since i=n). So HTMLExtractor.close's `if len(self.rawdata)` is false. Data already dropped.
+
+So the fix must prevent goahead from swallowing. The cleanest: make `_HTMLParser.parse_endtag` not return -1 for the unterminated case, but instead treat as data. Since markdown always feeds complete blocks, we can do the "no `>` => data" logic.
+
+But careful: HTMLParser.feed may be called multiple times. In markdown's use, feed is called once with the whole source. But `_HTMLParser` is also exposed to MkDocs etc. To be safe, we could still handle the streaming case by returning -1 when not end... but parse_endtag doesn't know `end`.
+
+Alternative approach: Override `goahead`? That's heavy.
+
+Let me look at how upstream Python-Markdown fixed this. I recall there was an issue in 2025: Python 3.13.6 changed html.parser causing data loss. Let me check the git branches/tags in repo, maybe the fix commit is not present but there might be hints.
+
+Let me check the current version and recent commits.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && cat markdown/__meta__.py | grep -i version | head && git log -8 --format='%h %ad %s' --date=short
+  # Copyright 2004 Manfred Stienstra (the original version)
+  # __version_info__ format:
+  __version_info__ = (3, 11, 0, 'final', 0)
+  … 16 more lines
+The repo is fairly recent (3.11.0). The fix likely landed upstream after. Let me think about the correct upstream fix. I recall Python-Markdown issue #1571 / PR "Handle unclosed end tags on Python 3.13.6+". 
+
+Let me check the docs/changelog for hints, and also examine how `parse_endtag` is expected to behave. Let me search tests around endtags and the `endtagopen` monkeypatch.
+
+Actually, let me reconsider. The real problem: In Python 3.13.6, `HTMLParser.goahead` changed to conform to HTML5 spec, and now when an unterminated end tag is encountered at EOF, it discards the remaining rawdata. Markdown can override `parse_endtag` to avoid returning -1 for that scenario.
+
+The simplest robust fix within markdown's `_HTMLParser.parse_endtag`:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+We want: if there's no `>` starting from i+2 (i.e., rawdata.find('>', i+2) < 0), treat `</` as data and return i+2. Then goahead continues from i+2, processing "dev/null..." as data. That avoids the base parse_endtag returning -1.
+
+But is that correct for streaming? If markdown feeds in chunks and a chunk boundary splits `<` and `>`, we'd wrongly treat `</di` as data. But markdown feeds the entire source in one `feed()` call, then `close()`. Also the comment in the file says "We are always feeding a complete block". However `_HTMLParser` is used by MkDocs? Actually `htmlparser.HTMLParser = _HTMLParser` for people like MkDocs that pull it in. So external users might feed chunked data. Hmm.
+
+But even so: the base class's parse_endtag returns -1 when there's no `>` — it's specifically designed to wait for more data. The markdown wrapper should preserve that streaming behavior but avoid the data loss. Since goahead itself is what drops data, and we don't want to rewrite goahead...
+
+Hmm wait. Let's re-examine the new goahead. When k<0 and end=True:
+```
+elif startswith("</", i):
+    if i + 2 == n:
+        self.handle_data("</")
+    elif endtagopen.match(rawdata, i):  # </ + letter
+        pass
+    else:
+        # bogus comment
+        self.handle_comment(rawdata[i+2:])
+```
+For `</letter` unterminated, `endtagopen.match` true -> pass -> k=n -> all remaining data dropped.
+
+If instead endtagopen did NOT match, it'd be a bogus comment consumed. But `</d` matches.
+
+So one fix: monkeypatch `endtagopen`? No, that's used elsewhere and the monkeypatch is already `</[a-zA-Z]?`. Hmm, but goahead calls module-global `endtagopen`. If we set `endtagopen = re.compile('</[a-zA-Z]')` that doesn't change; `</d` still matches.
+
+Alternatively, we could override `parse_endtag` to handle the "no `>`" case itself: treat the `</` as data and let the rest be parsed. This is the natural place.
+
+Now, does treating `</` as data and returning `i+2` cause issues? After that, goahead does `i = updatepos(i, i+2)`. Next iteration: rawdata[i:] = "dev/null` and keep going...". `interesting.search` finds `&` or `<`. There's a backtick and letters, no `<` or `&` until... none. So it handles data. Good.
+
+But wait: for the case `a </div>\n\nSecond`, there IS a `>` after, so super() is called and normal handling. Good.
+
+What about `</>`? start = `</>`, c = ord('>') = 62, not letter -> handle_data('</') and return i+2. Then next char `>` is data. So `</>` -> `</` + `>` = `</>`. Good, consistent with existing behavior.
+
+What about `</ dev/null` (space after `</`)? start = `</ `, c=32 not letter -> data `</`, return i+2, then ` dev/null` data. Good.
+
+What about `</d` at very end of input with no `>`? Now handled as data `</` then `d` data. Good.
+
+What about a legitimate but malformed end tag like `</div` that's unterminated but followed later by `>` from some other tag? e.g. `a </div b> c`. Here `>` exists, so super() handles it: locatetagend matches `</div b>`? Let me not worry; current behavior already handles via super.
+
+But there's a subtlety: `rawdata.find('>', i+2) < 0` is exactly the fast check in the new stdlib parse_endtag. If `>` exists later but the end tag itself is malformed such that parse_endtag returns -1 again, goahead would drop. Let me check: stdlib parse_endtag after finding `>`:
+```
+match = locatetagend.match(rawdata, i+2)
+j = match.end()
+if rawdata[j-1] != ">":
+    return -1
+```
+When could this return -1 even though a `>` exists later? `locatetagend` matches from i+2 and may stop before a `>`. Example: `</div <p>`? Let's test. Actually the regex `locatetagend` — let's see. `[a-zA-Z][^`\t\n\r\f />]*` then optional attrs then `>?`. The `>` at end is optional, so match.end() could be at a position before `>` if the regex stops. Hmm. E.g. `</div/foo>`: tag name `div`, then `[\t\n\r\f /]*` matches `/`, then attr name... Let me test empirically which inputs still drop.
+
+Let me fuzz a bit: test various unterminated/malformed end tags and see if any still drop data. Let me write a script to compare output containing a marker "TAIL" for many patterns.
+Let me check whether other malformed end-tag shapes also lose data, to make the fix complete.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  pats = [
+   "</dev/null", "</dev x", "</dev=1", "</dev <p>", "</dev\n", "</dev\tx",
+   "</div b", "</div/", "</div/foo", "</3", "</_x", "</ dev", "</>", "</",
+   "<!x", "<?x", "<!--x", "<![CDATA[x", "<div", "<div ",
+  ]
+  for p in pats:
+      src = "A " + p + " B`\n\nSECOND PARA"
+      out = markdown.markdown(src)
+      lost = "SECOND" not in out
+      print(("LOST " if lost else "ok   "), repr(p), "->", repr(out))
+  EOF
+  LOST  '</dev/null' -> '<p>A </p>'
+  LOST  '</dev x' -> '<p>A </p>'
+  LOST  '</dev=1' -> '<p>A </p>'
+  … 18 more lines
+So all the LOST cases are end tags starting with `</` + letter and no `>` anywhere in the remaining data. The `</dev <p>` case has a `>` (from `<p>`) so super() handles it (treating it as bogus? output `&lt;/dev <p>`). Good.
+
+So the fix: in `_HTMLParser.parse_endtag`, before calling super(), if there is no `>` at/after i+2 in rawdata, treat `</` as data.
+
+But wait — is `>` the only terminator? stdlib `parse_endtag` uses `endtagopen`/`locatetagend` and requires `>`. `endendtag` is `>` too. So yes.
+
+However, there's a subtle difference: the stdlib's fast check is `rawdata.find('>', i+2) < 0`. But note if `>` exists somewhere later even far away, super() is called and may still return -1 if `locatetagend` doesn't reach that `>`. Let me test: `</dev x>` has `>` adjacent. What about `</dev\n\nmore\n>`? The `\n` ... locatetagend allows `[\t\n\r\f /]*` between name and attrs, and attribute names can't contain whitespace. Let's test a case where `>` is far and separated by chars that break matching, to see if still returns -1 and drops.
+
+Example: `</dev "x"` ... no `>`. needs a `>`. `</dev & >`? Tag name `dev`, whitespace, `&` could be attribute name, then space, then `>`. locatetagend: name `dev`, `[\t\n\r\f /]*` = ' ', attr `&` (attribute name char class `[^`\t\n\r\f />]` includes `&`), then optional `=`? no, then `[\t\n\r\f /]*` = ' ', then attrs loop again? then `>?` matches `>`. So j-1 = '>'. Fine.
+
+What about `</dev "unclosed` with a `>` later inside a string? Hmm.
+
+Let me just test a broader fuzz to find cases where `>` exists but data still lost.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  # cases where a '>' exists later but perhaps locatetagend doesn't reach it
+  pats = [
+   '</dev x"y>', '</dev "unclosed>', "</dev '\n>", '</dev\x00>', '</dev`>',
+   '</dev<x>', '</dev\n>', '</dev\t\t>', '</dev / >', '</dev//>',
+   '</dev x=y z>', '</dev\t>more', '</dev\n\n>',
+  ]
+  for p in pats:
+      src = "A " + p + " B\n\nSECOND PARA"
+      out = markdown.markdown(src)
+      lost = "SECOND" not in out
+      print(("LOST " if lost else "ok   "), repr(p), "->", repr(out))
+  EOF
+  ok    '</dev x"y>' -> '<p>A &lt;/dev x"y&gt; B</p>\n<p>SECOND PARA</p>'
+  ok    '</dev "unclosed>' -> '<p>A &lt;/dev "unclosed&gt; B</p>\n<p>SECOND PARA</p>'
+  ok    "</dev '\n>" -> "<p>A &lt;/dev '</p>\n<blockquote>\n<p>B</p>\n</blockquote>\n<p>SECOND PARA</p>"
+  … 11 more lines
+`</dev\`>`: backtick is excluded from tag names by the monkeypatched regexes (markdown's `locatetagend` adds backtick to exclusions). So `locatetagend.match` matches only `dev` and then... Let's check: pattern ends with `>?` optional, so it matches `dev` (j at position after 'dev', rawdata[j-1]='v' != '>') -> returns -1. Then goahead drops everything. So this case has `>` present but still drops! Because the backtick stops the tag name.
+
+So checking `'>' in rawdata[i+2:]` alone is not enough. We need a more robust approach: after calling super(), if it returns -1, we should handle the data ourselves rather than letting goahead drop it.
+
+But parse_endtag can't both return -1 (to signal incomplete) and handle data. Hmm. Actually the base contract: parse_endtag returns -1 only when there's not enough data. Markdown feeds complete blocks and calls close(). But goahead(False) during feed will break on -1, then goahead(True) in close will do the drop. 
+
+Idea: Override `goahead`? Too invasive.
+
+Alternative: Override `parse_endtag` to detect all cases where super() would return -1, and instead handle as data. We can call super() and if it returns -1, then handle the `</` as data and return i+2 (or handle appropriately). But during streaming feed (end=False), returning a positive value means we commit to treating it as data even though more data might complete the tag. But markdown feeds the complete source at once, so this is acceptable? However, `_HTMLParser` is advertised as usable by others. Hmm.
+
+Wait, but actually there's a subtlety. `feed()` calls `goahead(False)`. If a chunk ends mid-tag, parse_endtag returns -1 and goahead(False) breaks, keeping rawdata from i onward buffered. On next feed, more data appended, goahead continues. If we instead return i+2 treating `</` as data, then when the rest of the tag arrives in a later chunk, it'd be mishandled. But markdown feeds once. The monkeypatch comment "We are always feeding a complete block, so the 'incomplete' functionality is unnecessary" regarding entities supports the philosophy that markdown feeds complete blocks.
+
+Actually wait, let me re-read: entityref/incomplete monkeypatch: "We are always feeding a complete block". So yes, markdown guarantees complete blocks. So we can handle incomplete end tags as data.
+
+But hold on: if we call super().parse_endtag(i), and it returns -1, does it have side effects? Looking at stdlib parse_endtag: it does `assert rawdata[i:i+2] == "</"`. With the fast check it returns -1 immediately if no `>`. If `>` exists it may call `handle_endtag` and `clear_cdata_mode()` before checking j-1? Let's re-read:
+
+```
+match = locatetagend.match(rawdata, i+2)
+assert match
+j = match.end()
+if rawdata[j-1] != ">":
+    return -1
+
+# find the name
+match = tagfind_tolerant.match(rawdata, i+2)
+assert match
+tag = match.group(1).lower()
+self.handle_endtag(tag)
+self.clear_cdata_mode()
+return j
+```
+
+So handle_endtag is only called after verifying `j-1 == '>'`. So returning -1 has no side effects. Good. So we can safely call super() and if it returns -1, treat as data.
+
+But note: `parse_bogus_comment` path for `</` not followed by letter is also handled; but our `_HTMLParser.parse_endtag` already short-circuits those non-letter cases as data. Actually for `</ ` (space), start[2] = ' ', not letter -> handle_data('</') return i+2. Fine.
+
+So the fix:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    end = super().parse_endtag(i)
+    if end < 0:
+        # Unterminated end tag (no valid close). Treat as data to avoid
+        # the parser dropping all remaining content (Python 3.13.6+).
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return end
+```
+
+Wait, but there's a catch: for the base `goahead(False)` (during feed), if super returns -1 because more data could come, we now treat as data. Since markdown feeds complete blocks, fine. But what about `_HTMLParser` being used by MkDocs on incomplete chunks? There's a risk, but the parser is fed whole documents typically.
+
+Hmm, but actually let me reconsider whether upstream would prefer to keep -1 behavior for streaming and instead override `goahead`'s end handling. Let me check what the actual upstream fix was. I think I should search installed markdown or any newer copy? The .venv has a development install of this repo itself. No network.
+
+Let me think about the true correct fix more carefully, because `handle_data('</')` then returning i+2 will leave the tag name to be processed as data by goahead, which is what we want for unterminated tags. But for the case `</dev\`>` where `>` exists but regex fails, treating `</` as data and letting `dev\`>` be processed as data gives literal `</dev\`>` — correct.
+
+But there's a concern: when a real end tag has a `>` but `locatetagend` fails due to backtick, current (pre-3.13.6) behavior? Let me check on Python 3.13.5 semantics. Actually markdown monkeypatches locatetagend to exclude backticks specifically so that backticks don't get swallowed into tags. On older Python, parse_endtag with no `endendtag`? Let me recall older parse_endtag:
+
+Older (3.12-ish):
+```
+def parse_endtag(self, i):
+    rawdata = self.rawdata
+    assert rawdata[i:i+2] == "</", "unexpected call to parse_endtag"
+    match = endendtag.search(rawdata, i+1) # >
+    if not match:
+        return -1
+    gtpos = match.end()
+    match = endtagfind.match(rawdata, i) # </ + tag + >
+    if not match:
+        if self.cdata_elem is not None:
+            self.handle_data(rawdata[i:gtpos])
+            return gtpos
+        # find the match at end of the source
+        namematch = tagfind_tolerant.match(rawdata, i+2)
+        assert namematch is not None
+        if namematch.end() < gtpos:
+            # If the name is followed by a space, it is a bogus comment.
+            pass
+        ...
+```
+
+Hmm, actually older versions had different handling of malformed end tags. In old goahead, on -1 at end, it did `handle_data` fallback, so nothing was lost. So the old behavior for `</dev\`>` was probably to output literal. Our fix aligns.
+
+Now, one more consideration: `get_endtag_text` in HTMLExtractor. When we treat `</` as data via handle_data, no handle_endtag is called, so fine.
+
+Now let's also consider: are there cases where `super().parse_endtag(i)` returns -1 during `feed()` but the tag eventually is completed by data in the same buffer? No, because we only return -1 if no valid close exists in the entire current rawdata. During feed(whole doc) that means never. So safe.
+
+But hold on, what about `feed` being called multiple times with the source split? Let me check preprocessors to confirm single feed. Already saw: `parser.feed(source); parser.close()`. Good.
+
+However, there's also `md_in_html` extension which may use HTMLExtractor? Let me grep.
+
+Also, is `_HTMLParser` used anywhere with chunked feed in markdown itself? Let me grep for `.feed(`. Only preprocessors.py. Good.
+
+But wait, there's another subtlety with the approach: In goahead, after `handle_data` is called by parse_endtag and we return i+2, then goahead does `i = self.updatepos(i, k)` with k=i+2. Fine.
+
+Now let me also double check: what if `i+2` exceeds len? start = rawdata[i:i+3] length < 3 handled earlier. Good.
+
+Actually, wait: the very first line `c = ord(start[-1])` will raise IndexError if start is empty (i.e., i >= len(rawdata)). But goahead only calls parse_endtag when rawdata.startswith("</", i), so at least 2 chars. Fine, existing code.
+
+Let me now think: is there an even simpler/more correct fix that upstream used? Let me consider overriding `goahead`'s k<0 behavior. Actually there might be a cleaner fix: monkeypatch `htmlparser.endtagopen`? No.
+
+Hmm, let me reconsider the streaming concern once more. The comment at top: "This module imports a copy of html.parser.HTMLParser and modifies it heavily through monkey-patches." And `htmlparser.HTMLParser = _HTMLParser` for MkDocs. If MkDocs feeds chunked data, our change could break handling of `</tag` split across chunks. But MkDocs uses markdown's preprocessors which feed whole source. So okay.
+
+But maybe a safer approach that preserves streaming: only treat as data when we're at end. parse_endtag doesn't know. We could check `self.rawdata` ... no.
+
+Alternative safer: Override `goahead` to fix the end handling. But copying goahead is 150 lines and version-specific. Not good.
+
+Actually, we can override `goahead` minimally by wrapping? Hmm.
+
+Another approach: Override `close()` in `_HTMLParser` to pre-process rawdata. No.
+
+I think modifying parse_endtag is the intended fix. Let me check the actual upstream commit maybe in CHANGELOG docs. Let me grep docs for 3.13.6.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -rn "3\.13\.6\|unclosed\|end tag\|endtag" docs/ | head -20
+  docs/extensions/md_in_html.md:187:Notice that the parser properly recognizes that an unclosed  `<p>` tag ends when another `<p>` tag begins or when the
+  docs/changelog.md:65:* Fix infinite loop when multiple bogus or unclosed HTML comments appear in input (#1578).
+  docs/changelog.md:102:* Fix issue with unclosed comment parsing in Python 3.14 (#1537).
+  … 4 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -rn "HTMLExtractor\|htmlparser" markdown/ --include=*.py | grep -v __pycache__
+  markdown/extensions/md_in_html.py:29:from ..htmlparser import HTMLExtractor, blank_line_re
+  markdown/extensions/md_in_html.py:37:class HTMLExtractorExtra(HTMLExtractor):
+  markdown/extensions/md_in_html.py:39:    Override `HTMLExtractor` and create `etree` `Elements` for any elements which should have content parsed as
+  … 30 more lines
+Let me look at the changelog around line 100-110 to understand version context and whether there's a fix note placeholder.
+● read_file docs/changelog.md
+       1	---
+       2	title: Changelog
+       3	toc_depth: 2
+  … 118 more lines
+The repo is from ~2026-10. The bug reported is on Python 3.13.6+. This is presumably a new issue upstream. Let me implement the fix and add tests + changelog entry.
+
+Now let me be thorough: I want to verify my proposed fix handles all the LOST cases. Let me apply the edit and test.
+
+But before that, consider the `md_in_html` extension's `HTMLExtractorExtra` — it overrides some methods but not parse_endtag. It inherits. Good.
+
+Let me now also think about `parse_endtag` being called when `start[2]` letter but the tag is actually weird. E.g. `</div >` (space before >) — valid, super handles fine.
+
+Also there's `tagfind_tolerant` matching. Fine.
+
+Let me now form the edit. Current code:
+
+```python
+    def parse_endtag(self, i):
+        start = self.rawdata[i:i+3]
+        c = ord(start[-1])
+        if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+            self.handle_data(self.rawdata[i:i + 2])
+            return i + 2
+        return super().parse_endtag(i)
+```
+
+New:
+
+```python
+    def parse_endtag(self, i):
+        start = self.rawdata[i:i+3]
+        c = ord(start[-1])
+        if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+            self.handle_data(self.rawdata[i:i + 2])
+            return i + 2
+        end = super().parse_endtag(i)
+        if end < 0:
+            # The end tag is not properly closed and cannot be parsed. Treat
+            # the `</` as data rather than allowing the parser to discard all
+            # remaining content (Python 3.13.6 and later). See #1648.
+            self.handle_data(self.rawdata[i:i + 2])
+            return i + 2
+        return end
+```
+
+Wait, issue number unknown. Don't invent. Just describe.
+
+But hold on, careful with `super().parse_endtag(i)` side effects when it returns -1 in the "no `>`" fast path: none. In the locatetagend path: none (handle_endtag only after check). In the `parse_bogus_comment` path: but that's only when endtagopen doesn't match, which can't happen here since c is a letter and endtagopen is `</[a-zA-Z]?`. Actually endtagopen matches `</` + optional letter, so `</ ` also matches (optional). But we already returned for non-letter. For letter it matches. So no bogus comment path. Good.
+
+Hmm, one concern: does `super().parse_endtag` ever return -1 in a legitimate streaming scenario where the data is incomplete and we'd want to wait? Yes, if no `>`. But markdown feeds complete blocks. The monkeypatch philosophy supports this.
+
+However, consider `_HTMLParser` used outside markdown by MkDocs. MkDocs uses markdown preprocessors. Fine.
+
+Actually wait, there's another thought: maybe a better fix is to override `parse_endtag` such that when super returns -1, we don't immediately handle_data, but we need to also handle the `engtagopen` case in goahead. No, our approach works.
+
+But let me double-check the case where super().parse_endtag returns -1 for `</dev\`>`: locatetagend matches `dev` (backtick excluded), j-1 = 'v' != '>' -> -1. Then our handler: handle_data('</'), return i+2=...; goahead continues at 'dev`>' and processes as data -> literal `</dev`>` escaped. Let's verify output.
+
+Also the reported example should now produce the full doc with `</dev/null` escaped inside code span.
+
+Let me apply the edit.
+
+Actually, let me reconsider one more time: Is `handle_data(self.rawdata[i:i+2])` correct, or should it be `self.handle_data('</')`? Same. Existing code uses rawdata slice, consistent.
+
+Let me apply.
+I found the root cause. In Python 3.13.6+, `HTMLParser.goahead` conforms to the HTML5 spec: when an end tag like `</dev/null` has no closing `>`, `parse_endtag` returns `-1` and `goahead` now discards *all* remaining buffered data at `close()` instead of emitting it as text (the old fallback did `handle_data`). Markdown's `_HTMLParser` lets `-1` propagate. The fix is to treat an unparseable end tag as data.
+● edit_file markdown/htmlparser.py
+  -     def parse_endtag(self, i):
+  -         start = self.rawdata[i:i+3]
+  -         c = ord(start[-1])
+  -         if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+  -             self.handle_data(self.rawdata[i:i + 2])
+  -             return i + 2
+  -         return super().parse_endtag(i)
+  +     def parse_endtag(self, i):
+  +         start = self.rawdata[i:i+3]
+  +         c = ord(start[-1])
+  +         if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+  +             self.handle_data(self.rawdata[i:i + 2])
+  +             return i + 2
+  +         end = super().parse_endtag(i)
+  +         if end < 0:
+  +             # The end tag is unterminated (or otherwise unparseable). Treat the
+  +             # opening `</` as data. We are always feeding a complete block, so
+  +             # waiting for more data is unnecessary. On Python 3.13.6 and later,
+  +             # returning `-1` here causes ``goahead`` to discard all remaining
+  +             # data at the end of the document instead of emitting it as text.
+  +             self.handle_data(self.rawdata[i:i + 2])
+  +             return i + 2
+  +         return end
+  Edited markdown/htmlparser.py: replaced 7 lines at line 99 with 16 lines.
+Wait, `super().parse_endtag(i)` might return -1 during feed(False) with incomplete data. But markdown feeds whole doc. However, there's a subtlety: `feed` calls `goahead(False)`, and if parse_endtag returns -1 during feed, goahead breaks, and then `close()` calls goahead(True). But with our fix, parse_endtag never returns -1, so it's handled in the first feed pass. Good.
+
+Hmm, but actually wait: is our `parse_endtag` ever called with incomplete data in markdown? No, whole source fed. Good.
+
+Now let me test.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  print(repr(markdown.markdown("Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.")))
+  print("---")
+  pats = ["</dev/null", "</dev x", "</dev=1", "</dev\n", "</div b", "</div/foo", "</dev`>", "</dev <p>", "</3", "</>", "</"]
+  for p in pats:
+      src = "A " + p + " B`\n\nSECOND PARA"
+      out = markdown.markdown(src)
+      print(("LOST " if "SECOND" not in out else "ok   "), repr(p), "->", repr(out))
+  EOF
+  '<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and keep going.</p>\n<p>This second paragraph must survive.</p>'
+  ---
+  ok    '</dev/null' -> '<p>A &lt;/dev/null B`</p>\n<p>SECOND PARA</p>'
+  … 11 more lines
+Now the reported case works. Let me run the full test suite to check for regressions.
+
+But wait — I need to consider a potential problem with `</dev` inside a raw HTML block, where an end tag is unterminated but should be treated differently. Let me run tests.
+The reported case is fixed. Now let me run the full test suite.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -30
+  .................................................................................................................................s..............................…
+  ----------------------------------------------------------------------
+  Ran 1099 tests in 0.769s
+  … 2 more lines
+All tests pass. Now let me add a regression test. Let me look at the test file structure, particularly the test at line 1764 and how tests are written (assertMarkdownRenders, dedent). I'll add a test near test_unclosed_endtag.
+
+Let me view a bit more context of the class and imports.
+All 1099 tests pass. Now let me add regression tests covering the reported scenario.
+● read_file tests/test_syntax/blocks/test_html_blocks.py:1
+       1	# -*- coding: utf-8 -*-
+       2	"""
+       3	Python Markdown
+  … 38 more lines
+Now add a test after `test_unclosed_endtag`. The test should ensure content after an unclosed end tag (with a letter) is not dropped, including in a code span and following paragraph.
+
+Let me write a test using assertMarkdownRenders. The expected output uses `&lt;` etc. Let me confirm exact rendering of the main example.
+
+Expected:
+```
+<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and keep going.</p>
+<p>This second paragraph must survive.</p>
+```
+
+Also add a case for `cat </etc/hosts`. Let me test that too.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  src = ("Shell redirections like `2</dev/null` and `cat </etc/hosts` must work.\n"
+         "\n"
+         "A trailing `</div` in a code span too.\n")
+  print(markdown.markdown(src))
+  EOF
+  <p>Shell redirections like <code>2&lt;/dev/null</code> and <code>cat &lt;/etc/hosts</code> must work.</p>
+  <p>A trailing <code>&lt;/div</code> in a code span too.</p>
+  Exit code: 0
+● edit_file tests/test_syntax/blocks/test_html_blocks.py
+  -     def test_unclosed_endtag(self):
+  -         """Ensure unclosed end tag does not have side effects."""
+  - 
+  -         self.assertMarkdownRenders(
+  -             self.dedent(
+  -                 '''
+  -                 `</`
+  - 
+  -                 <div>
+  -                 <!--[if mso]>-->
+  -                 <p>foo</p>
+  -                 <!--<!endif]-->
+  -                 </div>
+  -                 '''
+  -             ),
+  -             self.dedent(
+  -                 '''
+  -                 <p><code>&lt;/</code></p>
+  -                 <div>
+  -                 <!--[if mso]>-->
+  -                 <p>foo</p>
+  -                 <!--<!endif]-->
+  -                 </div>
+  -                 '''
+  -             )
+  -         )
+  +     def test_unclosed_endtag(self):
+  +         """Ensure unclosed end tag does not have side effects."""
+  + 
+  +         self.assertMarkdownRenders(
+  +             self.dedent(
+  +                 '''
+  +                 `</`
+  + 
+  +                 <div>
+  +                 <!--[if mso]>-->
+  +                 <p>foo</p>
+  +                 <!--<!endif]-->
+  +                 </div>
+  +                 '''
+  … 47 more lines
+  Edited tests/test_syntax/blocks/test_html_blocks.py: replaced 26 lines at line 1764 with 61 lines.
+I referenced #1648 but I don't know the actual issue number. Better not invent an issue number. Let me remove that reference. The changelog's latest issue is #1647. This could be #1648 but I shouldn't guess. Let me remove "(see #1648)" from the docstring.
+
+Also I should add a changelog entry, but without an issue number? Existing entries all have numbers. I could add without a number or skip. The task just says fix it. Adding a changelog entry is in keeping with conventions, but inventing a number is bad. I'll add an entry without a number, or perhaps better to leave changelog alone? The repo convention includes numbers. Hmm. I'll add a changelog line but not fabricate a number... Actually every entry has a number. Since I can't know, I'll omit and just mention in final message. Actually, let me check if there's an issue number hint in the task. No.
+
+I'll remove the #1648 reference to avoid fabrication. And I'll skip changelog to avoid inventing a number? But convention strongly suggests adding. I think adding without a number is acceptable and honest. Let me add: "* Fix content being dropped after an unclosed end tag (e.g. \`2</dev/null\`) in Python 3.13.6 and later." No number. Hmm, but reviewers might want number. I'll leave it without a number.
+
+Actually, let me reconsider - maybe I can find the issue number from the CPython change? No. I'll just not fabricate. Let me remove #1648.
+
+Let me also reconsider whether the test helper `assertMarkdownRenders` dedents - the code span output line is long, need noqa. Fine.
+
+Let me fix the docstring.
+● edit_file tests/test_syntax/blocks/test_html_blocks.py
+  -         """Ensure unclosed end tags in code spans are rendered as text (see #1648)."""
+  +         """Ensure unclosed end tags in code spans are rendered as text."""
+  Edited tests/test_syntax/blocks/test_html_blocks.py: replaced 1 line at line 1811 with 1 line.
+Now add a changelog entry. Let me add under Unreleased Fixed section. The Unreleased currently just has a bullet list without "### Fixed" heading. Look at lines 15-20:
+
+```
+## [Unreleased]
+
+* Update serializer to be non-recursive (#1644).
+* Improve ancestor handling in the inline `Treeprocessor` (#1646).
+* Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
+```
+
+It's a flat list. I'll append a bullet without a fabricated issue number. Actually all have numbers... I'll write it without a number since I don't know it. That's the honest choice.
+
+Hmm, but maybe I can infer: next issue number after 1647 would be #1648. But guessing is risky and could be wrong. I'll add without number.
+
+Actually, wait. Let me reconsider - maybe the task expects a changelog entry. It's not strictly required. The core is the fix + tests. Adding a changelog entry without a number looks slightly off but is fine. I'll add it.
+Now add a changelog entry under Unreleased.
+● edit_file docs/changelog.md
+  - * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
+  + * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
+  + * Fix content being silently dropped after an unterminated end tag, such as
+  +   `` `cmd 2</dev/null` ``, on Python 3.13.6 and later.
+  Edited docs/changelog.md: replaced 1 line at line 19 with 3 lines.
+Now run the tests including the new one.
+
+Also I should double check flake8/ruff style. Let me see if there's a lint config. Run the new test class specifically and then full suite.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m unittest tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_with_name tests.te…
+  test_unclosed_endtag_with_name (tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_with_name)
+  Ensure an unclosed end tag with a name does not drop following content. ... ok
+  test_unclosed_endtag_in_code_span (tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_in_code_span)
+  … 7 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -5
+  .................................................................................................................................s..............................…
+  ----------------------------------------------------------------------
+  Ran 1103 tests in 0.705s
+  … 2 more lines
+All 1103 tests pass (4 more than before? Actually 1099 -> 1103; maybe earlier count discrepancy from discovery? We added 2 tests. Hmm, 1099 + 2 = 1101, not 1103. Maybe the first run discovery didn't import some? Wait earlier it was 1099, now 1103. Odd. Let me not worry—maybe the earlier run had test count variance due to something. Actually adding 2 tests should give 1101. Let me re-check: maybe earlier tail showed 1099 but that included... Hmm. Let me recount by running git stash? Not needed. Perhaps there were 1101 before and the display... no it said Ran 1099. 
+
+Wait, maybe `unittest discover` treats my edit's docstrings? No. Let me just verify the count difference isn't from duplicate discovery. Actually, the test file now has 2 more test methods. 1099+2=1101. But it says 1103. Let me check if I accidentally created something. Let me grep test method names.
+
+Actually maybe the first run I did `tail -30` and it said 1099, and the new run 1103. Could the `.pyc` caching have hidden tests earlier? Unlikely.
+
+Let me just check git diff stat and count. Actually, maybe the earlier discovery run used a stale .pyc? No, pyc doesn't affect discovery.
+
+Hmm, let me actually check by stashing changes and running. But that's a bit heavy. Let me instead count: run full suite with -v and count "ok$"? Simpler: check git diff to ensure only intended files changed.
+
+Actually, wait: adding 2 test methods = +2. Unless the original had 1101 and the previous output line wrapped... no, it clearly said "Ran 1099 tests". Let me look: maybe there is test ordering and `unittest discover` skips by default? The discovery might have failed to import a module in one run? It said OK both times.
+
+Let me just re-run a count of tests collected before my change using git stash to be safe, or simply trust. Let me check diff.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && git stash && .venv/bin/python -m unittest discover tests 2>&1 | tail -3 && git stash pop
+  Saved working directory and index state WIP on master: 7a29324 Fix inline HTML case
+  Ran 1099 tests in 0.813s
+  OK (skipped=52)
+  … 10 more lines
+Before: 1099. After: 1103. That's +4, but I added 2 tests. Something's off. Let me check if the `git stash` didn't remove test pycache or if discovery counts differently. Actually, `git stash pop` restored. Let me run again now to confirm 1103.
+
+Hmm, +4 could be because `assertMarkdownRenders` internally runs multiple sub-tests? No, that's one test.
+
+Wait — maybe unittest discovers test modules and my added methods are counted, but also the test file changes caused some parameterized tests? Let me just count test methods I added: test_unclosed_endtag_with_name and test_unclosed_endtag_in_code_span. Two.
+
+Unless... the stash run had cached `.pyc` from the new version? No, stash removes the source but `.pyc` for the test file might be stale and contain the new methods! Python checks mtime/size. When stashed, the file mtime changes and size differs -> recompiles. So should be 1099.
+
+Actually the reverse: the "after" run may include pycache artifacts? No.
+
+Let me re-run after and confirm number, then investigate by listing test ids count.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -3
+  Ran 1103 tests in 0.767s
+  OK (skipped=52)
+  Exit code: 0
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -n "def test_" tests/test_syntax/blocks/test_html_blocks.py | tail -8
+  1688:    def test_multiple_bogus_comments_no_hang(self):
+  1695:    def test_multiple_unclosed_comments_no_hang(self):
+  1702:    def test_no_hang_issue_1586(self):
+  … 6 more lines
+Only 2 added. So why +4? Let me count total test methods versus unittest's count. Maybe some tests use `subTest` or the test framework creates dynamic tests. 
+
+Actually, could it be that my edit inadvertently changed the dedent content such that a test class gets discovered differently? No.
+
+Hmm, wait: maybe the baseline 1099 was run with a stale pycache where a test module failed to load some tests? The stash run recompiled. Let me investigate: run baseline count by checking out HEAD version of the test file? Actually the difference is consistent: 1099 -> 1103.
+
+Let me look for dynamically generated tests. `markdown/test_tools.py` might create tests. Or `tests/test_legacy.py`. The number of discovered tests could depend on something like environment or random? Let me run twice in a row with current code.
+
+Actually, maybe the first discovery (before my edit) was in the same shell command as the fix? No, it was before the edit.
+
+Let me test: stash again and run twice.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && git stash && for i in 1 2; do .venv/bin/python -m unittest discover tests 2>&1 | tail -1; done && git stash pop && for i in 1…
+  Saved working directory and index state WIP on master: 7a29324 Fix inline HTML case
+  OK (skipped=52)
+  OK (skipped=52)
+  … 12 more lines
+The tail -1 only shows OK line, not the count. Let me get the count lines properly.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && git stash -q && echo BASELINE && .venv/bin/python -m unittest discover tests 2>&1 | grep "^Ran" && git stash pop -q && echo A…
+  BASELINE
+  Ran 1099 tests in 0.831s
+  AFTER
+  … 2 more lines
+Consistent +4 for +2 methods. That's strange. Let me count actual test IDs. Let me list all test methods and count. Perhaps `unittest discover` in tests has some tests that are parameterized with `subTest`, counted separately? subTest doesn't increase "Ran N tests" count... actually it can! `subTest` failures are separate, but the count counts test methods, not subtests. Hmm.
+
+Wait, maybe there's a test that dynamically generates test methods based on the file contents or something. Or maybe the difference is that `assertMarkdownRenders` now passes for tests that previously... no.
+
+Let me actually enumerate test ids with a small script using unittest loader, before and after.
+
+Actually simpler: maybe the Markdown test_tools has a mechanism where each `assertMarkdownRenders` call counts? No.
+
+Let me count methods in the whole tests dir.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import unittest
+  s = unittest.defaultTestLoader.discover('tests')
+  def count(t):
+      n = 0
+      for x in t:
+          if isinstance(x, unittest.TestSuite):
+              n += count(x)
+          else:
+              n += 1
+      return n
+  print("collected:", count(s))
+  EOF
+  collected: 1103
+  Exit code: 0
+1103 collected. And the two new tests account for 2. So baseline should be 1101, but it reported 1099. That means 2 tests that were previously not loaded are now loaded. Why?
+
+Maybe some test uses `assertMarkdownRenders` and there is a test that checks... no.
+
+Oh! Maybe the test file previously had a test whose execution was conditional on Python version or on markdown behavior, and my change to `htmlparser.py` affects test discovery? No, discovery imports modules.
+
+Wait — could it be that a test module fails to import in baseline due to my missing new methods? No.
+
+Let me actually diff the test IDs between baseline and after. Let me write ids to files.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && cat > /tmp/ids.py <<'EOF'
+  import unittest, sys
+  s = unittest.defaultTestLoader.discover('tests')
+  def walk(t):
+      for x in t:
+          if isinstance(x, unittest.TestSuite):
+              yield from walk(x)
+          else:
+              yield x.id()
+  with open(sys.argv[1], 'w') as f:
+      for i in sorted(walk(s)):
+          f.write(i + "\n")
+  EOF
+  git stash -q && .venv/bin/python /tmp/ids.py /tmp/before.txt && git stash pop -q && .venv/bin/python /tmp/ids.py /tmp/after.txt && diff /tmp/before.txt /tmp/aft…
+  513a514,515
+  > test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_in_code_span
+  > test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_with_name
+  … 4 more lines
+Ah, the test class `TestHTMLBlocks` is inherited/reused by `test_md_in_html.py` (TestDefaultwMdInHTML inherits from TestHTMLBlocks likely), so my two new tests get inherited too, giving +4. That's expected behavior for this test framework. Good—it means my tests also run under md_in_html, which is great (broader coverage).
+
+Let me verify the md_in_html variants pass (they did in full suite). Good.
+
+Now, is the md_in_html variant meaningful? Let me check test_md_in_html to ensure inherited tests are intended. Yes, full suite passes.
+
+Now let me also run the linter to keep style clean. Check tox.ini / pyproject for flake8/ruff.
+The +4 is because `TestHTMLBlocks` is subclassed in `test_md_in_html.py`, so both new tests run there too. Now let me check lint style.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && grep -n "flake8\|ruff\|lint" tox.ini pyproject.toml makefile 2>/dev/null | head; ls .flake8 setup.cfg 2>/dev/null
+  tox.ini:2:envlist = py{311, 312, 313, 314, 315}, pypy{311}, pygments, flake8, checkspelling, pep517check, checklinks
+  tox.ini:22:[testenv:flake8]
+  tox.ini:23:deps = flake8
+  … 4 more lines
+● read_file tox.ini:40
+      40	[testenv:pep517check]
+      41	deps = pep517
+      42	commands = python -m pep517.check {toxinidir}
+  … 4 more lines
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m flake8 markdown/htmlparser.py tests/test_syntax/blocks/test_html_blocks.py 2>&1 | head -20 || echo "flake…
+  /tmp/tmp.f8PISobJSJ/markdown/.venv/bin/python: No module named flake8
+  Exit code: 0
+flake8 not installed. Let me manually check line lengths of my changes. The test line with noqa is long; I added `# noqa: E501`. Let me verify no line exceeds 119 in my edits. The expected output line in test_unclosed_endtag_in_code_span:
+
+`                <p>Shell redirections like <code>2&lt;/dev/null</code> and <code>cat &lt;/etc/hosts</code> must work.</p>` plus noqa. That has noqa so fine. But wait, the noqa applies to the line with `'''  # noqa: E501`? I put noqa on the closing triple-quote line, not on the long string line. flake8 E501 reports the physical line that's too long — which is the `<p>...` line, not the `'''` line. Let me check.
+
+Looking at the other tests in the file, e.g. line 1759 had `'''  # noqa: E501` after the long line. Actually line 1755-1759: the long expected lines are inside a triple-quoted string, and `# noqa: E501` is on the closing `'''` line. flake8 might apply noqa per-line; the long string line would still be flagged. But those existing tests have noqa on the closing line... Let me count line 1755 length. It's 183 chars >119. Yet the repo presumably passes flake8. Hmm, maybe flake8's noqa on the closing quote line doesn't cover the content line. Unless flake8 with `# noqa` applies to the whole logical line? For multi-line strings, pycodestyle reports E501 on the physical line. So `# noqa` on a different physical line wouldn't suppress it.
+
+Wait, let me look at line 1753-1760 again:
+```
+1753	            self.dedent(
+1754	                '''
+1755	                <p>...
+1756	                <p>...
+1757	                <!-- Real comment -->
+1758	                <p>...
+1759	                <p>...
+1760	                '''  # noqa: E501
+```
+Hmm line 1755 is very long. How does this pass flake8? Maybe the repo's flake8 config ignores E501? It sets max-line-length=119, so no. Or maybe flake8 not run on this? It is run on tests. Hmm.
+
+Wait, maybe pycodestyle only applies E501 to lines that aren't part of a multiline string? No, it does apply. Let me check by installing flake8? No network. Let me use pycodestyle if available. Actually maybe `pycodestyle` is in venv as dependency? Let me check.
+
+Actually, maybe the trick: `# noqa` at the end of a multi-line string suppresses E501 for the entire string's logical line in modern pycodestyle/flake8? I recall that noqa is matched against the line, and flake8 has special handling where a noqa comment on the physical line. Hmm.
+
+Let me test with pyflakes/pycodestyle if present. Or just write a tiny check of all lines >119 in the test file including baseline's existing long lines. If baseline already has long lines, then flake8 must be configured to tolerate them somehow.
+
+Let me check for lines >119 in the test file.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && awk 'length>119 {print FILENAME":"FNR": "length}' tests/test_syntax/blocks/test_html_blocks.py | head -20; echo "--- htmlpars…
+  tests/test_syntax/blocks/test_html_blocks.py:1755: 141
+  tests/test_syntax/blocks/test_html_blocks.py:1756: 145
+  tests/test_syntax/blocks/test_html_blocks.py:1758: 141
+  … 4 more lines
+Baseline already has long lines at 1755 etc. with `# noqa: E501` on the closing quote line, and the repo passes flake8, so flake8 must treat the noqa as applying to the whole multiline string logical line (this is indeed a flake8 behavior: noqa applies per logical line for some checks, and E501 from pycodestyle... hmm). Actually there's a known flake8 behavior: `# noqa` on a line suppresses all errors reported for that line. But E501 is reported on line 1755. Unless flake8 maps multi-line string continuation? 
+
+Actually, I recall flake8's noqa handling: it uses the physical line of the error. So this wouldn't work... yet it passes CI. Let me verify by finding how the repo runs flake8 and whether these tests are excluded. tox flake8 runs on tests. 
+
+Maybe pycodestyle has `ignore` for E501 in strings? No.
+
+Let me look more carefully: maybe the `# noqa: E501` lines before/after. Actually in test_multiple_unclosed_comments, the long strings may be constructed with `self.dedent` and concatenated? No.
+
+Let me just check if pycodestyle is installed to test. Let me check installed packages.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/pip list 2>/dev/null | grep -i -E "flake8|pycodestyle|pyflakes|ruff" ; echo "exit $?"
+  exit 1
+  Exit code: 0
+Not installed. Given baseline has the same pattern, my `# noqa: E501` on the closing line matches the established convention, so it's fine. Line 1821 is 121 chars — that's my long `<p>...` line, with noqa on the closing line at 1822 presumably. Let me check. Actually awk showed 1821 as >119; the noqa line is 1822 (`'''  # noqa: E501`). But wait, my other long line at 1796? Let me look at the test I added to make sure noqa placement matches.
+
+Actually the reported long line 1821 (121) — my `<p>Shell...` line. Let me confirm there's a noqa nearby. Read lines 1810-1825.
+● read_file tests/test_syntax/blocks/test_html_blocks.py:1764
+    1764	    def test_unclosed_endtag(self):
+    1765	        """Ensure unclosed end tag does not have side effects."""
+    1766	
+  … 58 more lines
+Line 1804 is 76 chars, fine. Line 1821 is 121 with noqa on 1822, matching convention.
+
+Now, I'm a bit uneasy about whether the noqa on the closing line actually suppresses E501 for the string line. But since the baseline has the identical pattern and presumably passes CI, it's consistent. Good.
+
+Now let me think harder about correctness/edge cases of the fix, particularly in the `md_in_html` context where `HTMLExtractorExtra` tracks a stack. There, `handle_endtag` has extra logic. Our `parse_endtag` calling `handle_data` instead of `handle_endtag` for unterminated tags should be fine, and the inherited tests pass.
+
+But wait: there's an important subtlety. In `HTMLExtractorExtra`, is `parse_endtag` overridden? Let me check. Grep showed overrides for parse_pi and parse_html_declaration only. So parse_endtag inherited from `_HTMLParser`. Good.
+
+Now let me consider: could our change break the case where an end tag is unterminated but appears at the start of a line and is intended to close a raw HTML block? E.g.:
+
+```
+<div>
+foo
+</div
+```
+
+In markdown, `</div` unterminated inside a raw block. Previously on older Python, what happened? Let's test with our fix vs expectation. Actually the raw block starts because `<div>` at line start. Then `</div` unterminated. Our parse_endtag: letter after `</`, super() returns -1 (no `>` in remaining rawdata? there might be no `>`; `<div>` has `>` earlier but `find('>', i+2)` searches after i). So returns -1 -> handle_data('</') -> then "div\n" handled as data. So the raw block never closes; content remains raw. Output? Let's test.
+
+Old (3.13.5) behavior: goahead -1 fallback handle_data and continue, same result essentially. So consistent.
+
+Let me test a few raw-block scenarios to ensure no infinite loop and sensible output. Also test comments etc.
+
+Let me run the broader existing test suite already passed, which covers a lot. Let me also test some manual cases to be safe: md_in_html extension, and unterminated end tag as raw block.
+Let me sanity-check raw-block and `md_in_html` scenarios for regressions.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python - <<'EOF'
+  import markdown
+  cases = [
+   ("raw unterminated close", "text\n\n<div>\nfoo\n</div\n\nAfter para."),
+   ("raw block attrs", "<div class=\"x\">\nhello\n</div\n\nAfter."),
+   ("inline plain", "a </span b c\n\nAfter."),
+   ("two endtags", "a </x </y\n\nAfter."),
+  ]
+  for name, src in cases:
+      out = markdown.markdown(src)
+      print(name, "LOST" if "After" not in out else "ok", "->", repr(out))
+  print("--- md_in_html ---")
+  for name, src in cases:
+      out = markdown.markdown(src, extensions=['md_in_html'])
+      print(name, "LOST" if "After" not in out else "ok", "->", repr(out))
+  EOF
+  raw unterminated close ok -> '<p>text</p>\n<div>\nfoo\n</div\n\nAfter para.'
+  raw block attrs ok -> '<div class="x">\nhello\n</div\n\nAfter.'
+  inline plain ok -> '<p>a &lt;/span b c</p>\n<p>After.</p>'
+  … 7 more lines
+Behavior looks reasonable and consistent. Now let me view the final diff.
+Let me review the final diff.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && git diff
+  diff --git a/docs/changelog.md b/docs/changelog.md
+  index a6939f9..97b140a 100644
+  --- a/docs/changelog.md
+  … 73 more lines
+The changelog uses double-backtick inline code `` `cmd 2</dev/null` `` which in Markdown means a code span containing a literal backtick: `cmd 2</dev/null`. Actually `` `` `cmd...` `` `` renders as `<code>` + backtick + cmd... Hmm, the double-backtick syntax with spaces renders content including single backticks. That's a bit odd in a changelog. Better to use a plain code span without inner backticks: `` `2</dev/null` ``. Let me simplify to avoid weird rendering.
+
+Change to: ``such as `2</dev/null`, on Python 3.13.6 and later.``
+
+Let me edit.
+● edit_file docs/changelog.md
+  - * Fix content being silently dropped after an unterminated end tag, such as
+  -   `` `cmd 2</dev/null` ``, on Python 3.13.6 and later.
+  + * Fix content being silently dropped after an unterminated end tag such as
+  +   `2</dev/null`, on Python 3.13.6 and later.
+  Edited docs/changelog.md: replaced 2 lines at line 20 with 2 lines.
+Now let me run the full test suite one final time, plus the exact example from the report.
+
+Also, I want to double check the behavior on a Python version where the old goahead was used. We can't run 3.13.5 here. But our change makes `parse_endtag` never return -1 for these cases, so behavior is consistent across versions. Good.
+
+One more consideration: `super().parse_endtag(i)` might call `self.parse_bogus_comment(i)` for `</>` (no letter) — but we already handle `</>` before. For `</` followed by a letter, endtagopen matches, so no bogus comment. Good.
+
+What about a tag like `</a` where super's fast check finds a `>` somewhere but locatetagend fails because of a backtick, as tested. Our fix handles it.
+
+What about `</` followed by a letter but then the rest is huge and there IS a `>` eventually, and locatetagend matches a valid tag spanning way beyond intended? That's existing behavior, not our concern.
+
+Now, is there a scenario where `super().parse_endtag` returns -1 legitimately because we truly need more data, and markdown does feed in chunks? We established markdown feeds once. The comment in the code and monkeypatches confirm complete blocks. Good.
+
+Could `HTMLExtractor.feed` be called more than once anywhere? Only preprocessors.py line 89 once. And md_in_html uses HTMLExtractorExtra once. Good.
+
+Let me run final tests and the example.
+● bash cd /tmp/tmp.f8PISobJSJ/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -4 && .venv/bin/python -c 'import markdown; print(markdown.markdown("…
+  ----------------------------------------------------------------------
+  Ran 1103 tests in 0.731s
+  OK (skipped=52)
+  … 3 more lines
+All good. Let me summarize.
+
+Files changed:
+- markdown/htmlparser.py: `_HTMLParser.parse_endtag` treats unparseable/unterminated end tags as data instead of returning -1.
+- tests/test_syntax/blocks/test_html_blocks.py: two regression tests (also inherited by md_in_html tests).
+- docs/changelog.md: entry.
+
+Mention the user should check nothing else. Also mention Python 3.13.6+ change reason briefly.
+Fixed. Here's what was happening and what I changed.
+
+**Cause:** In Python 3.13.6, `html.parser.HTMLParser.goahead` changed to match the HTML5 spec. When an end tag like `</dev/null` has no closing `>`, `parse_endtag` returns `-1` and `goahead`, at end of input, discards *all* remaining buffered data instead of emitting it as text (older Pythons fell back to `handle_data`). Markdown's `_HTMLParser` let that `-1` propagate, so everything from `</dev/null` to the end of the document vanished silently.
+
+**Changes**
+- `markdown/htmlparser.py`: `_HTMLParser.parse_endtag` now checks the base result; if the end tag can't be parsed (`-1`), it emits the `</` as data and continues. Markdown always feeds a complete block (as the module's entity monkey-patches note), so waiting for more data is unnecessary. This also covers cases where a `>` exists later but can't terminate the tag, e.g. a backtick in `</dev\`>`.
+- `tests/test_syntax/blocks/test_html_blocks.py`: added `test_unclosed_endtag_with_name` (the exact reported case) and `test_unclosed_endtag_in_code_span` (`2</dev/null`, `cat </etc/hosts`). These are also picked up by the `md_in_html` test class, which subclasses this one.
+- `docs/changelog.md`: Unreleased entry (no issue number, since I don't know it — add one if you have it).
+
+**Verification:** the reported snippet now renders both paragraphs with the end tag escaped inside the code span, and the full suite passes (`Ran 1103 tests ... OK`).
+
+One note: I couldn't run flake8 (not installed in `.venv`), but the new long test line uses the same `# noqa: E501` convention as the existing tests.
+40 steps · 1034.8k tokens in (1012.0k from cache) · 20.7k out · 153.0s

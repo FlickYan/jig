@@ -1,0 +1,19 @@
+{
+  "model": "deepseek-flash",
+  "stop": "max_steps",
+  "steps": 50,
+  "modelCalls": 50,
+  "subagentModelCalls": 0,
+  "usage": {
+    "input": 37209,
+    "cacheWrite": 0,
+    "cacheRead": 1706112,
+    "output": 26897
+  },
+  "toolCalls": {
+    "bash": 45,
+    "read_file": 10,
+    "edit_file": 5
+  },
+  "seconds": 187
+}
