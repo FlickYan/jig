@@ -11,7 +11,8 @@ upstream's three tests on each, and each attempt's own added tests on the pre-fi
   compare.py coverage ROOT CORPUS OUT   (internal) count inputs reaching each branch of parse_endtag
   compare.py asserts ROOT OUT           (internal) check each assertion of attempt 2's added test separately
 
-Its work goes to $COMPARE_DIR (default: <temp dir>/python-markdown-1651-compare):
+Its work goes to $COMPARE_DIR, by default .compare/ beside this script: inside the folder run.sh hides from jig,
+since it holds upstream's fix and tests, and ignored by git.
   base/                       setup.sh's project: Python-Markdown at 7a29324 with .venv (dev install)
   v/<variant>                 a `git archive HEAD` copy of base with only the markdown/ part of a patch applied
                               (prefix: none, upstream: upstream/fix.patch, jig1..3: each attempt's diff.patch)
@@ -29,10 +30,9 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 
 CASE = os.path.dirname(os.path.abspath(__file__))
-DIR = os.environ.get('COMPARE_DIR') or os.path.join(tempfile.gettempdir(), 'python-markdown-1651-compare')
+DIR = os.environ.get('COMPARE_DIR') or os.path.join(CASE, '.compare')
 BASE = os.path.join(DIR, 'base')
 PY = os.path.join(BASE, '.venv', 'bin', 'python')
 ATTEMPTS = {

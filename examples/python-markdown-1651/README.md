@@ -14,7 +14,7 @@ Why this issue:
 
 - **The fix can't be remembered.** The issue was filed on 2026-10-05; jig's default model, deepseek-flash,
   was already in use here on 2026-10-01 (milestone 1), so neither the issue nor its fix can be in its
-  training data.
+  training data, as long as the model behind that name hasn't changed since.
 - **The cause isn't where the symptom is.** Nothing in Python-Markdown changed: on Python 3.13.5 the same
   code renders the whole document. A change to CPython's `html.parser` (gh-135462, the reporter found)
   made it drop an unfinished end tag, and everything after it, at the end of the input, and
@@ -105,7 +105,8 @@ All three found the same cause and made the same fix, by different roads:
   at steps 27 and 31 already lost text with a `>` further on. Its checks at steps 35–36 showed the gap, and
   at step 40 it reworked the fix into the same form as the others. It then spent its last ten steps on a
   test, a changelog entry and checks, and hit the 50-step limit before writing a summary: the work was
-  done, but the user would have been told nothing about it.
+  done, but beyond a few progress notes along the way (such as its one-line diagnosis at step 30), the
+  user would have had to read the diff to learn what had changed and whether it passed.
 
 ### Next to upstream's fix
 
@@ -142,80 +143,92 @@ like it. Attempts 2 and 3 test `< 0` where upstream tests `== -1`, which is the 
 `parse_endtag` returns no other negative value. Beyond the three hidden tests,
 [`compare.py`](compare.py) checks this:
 
-- **Same output on 148,188 renders.** It generates 49,396 inputs aimed at this code (every short context
-  around `</` and `<`, in and out of code spans and raw HTML blocks, at the end of the document and before
-  more paragraphs, plus random strings) and renders each with no extensions, with `md_in_html` and with
-  `extra`. Each of jig's three fixes gives exactly upstream's output for all of them; the code before the
-  fix differs from upstream on 11,644 inputs, so the corpus does reach the bug.
+- **Same output on 148,188 renders.** It generates 49,396 inputs aimed at this code (about 70 hand-picked
+  tokens around `</` and `<`, with short prefixes and suffixes and in some 40 contexts: in and out of code
+  spans and raw HTML blocks, at the end of the document and before more paragraphs; plus random strings)
+  and renders each with no extensions, with `md_in_html` and with `extra`. Each of jig's three fixes gives
+  exactly upstream's output for all of them; the code before the fix differs from upstream on 11,644
+  inputs, so the corpus does reach the bug.
 - **Its own tests test the bug.** Each attempt's added tests fail on the code before the fix and pass
   with upstream's fix. Like upstream, each attempt also added a changelog entry, without an issue number
   since it had none (attempts 1 and 3 said so to the user). Upstream also added "unterminated" to the
   project's spelling dictionary (`.spell-dict`); attempt 3 used that word and "unparseable", which the
-  dictionary lacks too, and no attempt ran the project's spell check.
+  dictionary lacks too. The spell check (pyspelling, with aspell) wasn't installed, so no attempt ran it.
 
 ### What went wrong
 
 - **The version question.** The user said 3.13.5 is fine and 3.13.6 isn't. Every Python on the machine
-  already had the new `html.parser`: 3.13.16, 3.11.17, and Ubuntu's 3.12.3, which carries the change as a
-  backported security patch. Attempts 1 and 2 ran the bug on them and saw it everywhere, with nothing
-  to tell the versions apart. Attempt 2 told the user "The bug reproduces across Python versions here.";
-  attempt 1 left the versions out of its summary. Only attempt 3 explained them. Attempt 3 took the prompt's
-  "3.13.6 and later" at its word, without running the machine's 3.11 and 3.12, which drop the text too.
-  The fix is right on every version, but two of three users wouldn't have learnt why it broke when it
-  did.
+  already had the new `html.parser`: 3.13.16; 3.11.17, a security release that carries the change;
+  Ubuntu's 3.12.3, which has it as a backported security patch; and a 3.14.5 bundled with the Google Cloud
+  SDK. Attempt 2 ran the bug on 3.11, 3.12 and 3.13 and saw it on all three, and told the user "The bug
+  reproduces across Python versions here."; attempt 1 ran it on 3.13 and 3.12 and read 3.11's parser,
+  which has the same code, and its summary names the versions it checked its fix on, not why 3.13.5 works
+  and 3.13.6 doesn't. Only attempt 3 explained that, and it took the prompt's "3.13.6 and later" at its
+  word, without running the machine's 3.11 and 3.12, which drop the text too. Each fix passes upstream's
+  tests on every Python on the machine, and with 3.13.5's and 3.13.6's `html/parser.py` alike, but two of
+  three users wouldn't have learnt why it broke when it did.
 - **Made-up issue numbers.** Not knowing the issue's number, attempt 2 wrote "(see #1654)" into a code
   comment at step 32 and attempt 3 "(see #1648)" into a test's docstring at step 20. Each removed it at the
   next step, and no final diff has one.
 - **No summary from attempt 2**, above. The default limit is 50 steps; a user who saw "Stopped after 50
-  steps" would have had to read the diff.
+  steps" had a few progress notes, and would have had to read the diff to see what had changed and
+  whether it passed.
 
 ### Did it look the answer up?
 
 No attempt got at the answer, but each looked for it:
 
-- **Nothing reached the answer.** No command touched the hidden folders, and none reached the network: the
-  only command that could have was a `pip download` with nothing to download (attempt 1, step 11), which
-  stops before any fetch. Two `find /` searches for other copies of `html/parser.py` (attempts 1 and 2)
-  found only the standard library's.
+- **Nothing reached the answer.** No command named the hidden folders or read anything in them (two
+  `find /` searches, in attempts 1 and 2, passed through them, but the sandbox shows them empty), and none
+  reached the network: the only command that could have was a `pip download` with nothing to download
+  (attempt 1, step 11), which stops before any fetch. The two `find /` searches, for other copies of
+  `html/parser.py`, found only the standard libraries of the machine's Pythons, all with the change.
 - **Each looked.** Attempt 2 ran `git branch -a`, `git tag` and `git log --all` at step 38 to see whether
   the fix was in the repository (it wasn't); attempt 3 looked through the log for hints at step 10;
   attempt 1 looked for other Pythons, and a pip cache, for an older `html/parser.py`. The benchmark counts
   an attempt that reaches the answer as failed; none did.
-- **The CPython change, from memory.** The prompt leaves out the reporter's pointer to CPython's change,
-  but all three guessed it in their thinking ("gh-135462?", among wrong numbers) before confirming the
-  mechanism in the standard library's source. That change is from 2025, before the model's training data
-  ends; the Python-Markdown fix isn't, and no attempt mentioned #1651, the upstream commit or its wording.
+- **The CPython change, from memory.** The prompt leaves out the issue's pointer to CPython's change, but
+  all three recalled it in their thinking ("gh-135462?", among wrong numbers): attempt 3 before it opened
+  the standard library's source, attempts 1 and 2 after they had worked the mechanism out of it (steps 7
+  and 28). That change is from 2025, and so are related Python-Markdown bugs in the project's changelog,
+  such as #1547 for Python 3.14; the fix for #1651 is not, and no attempt mentioned #1651 or the upstream
+  commit, or reproduced its sentences (attempt 3's changelog shares its term "unterminated end tag",
+  which the bug itself suggests).
 
 ### What this shows, and what it doesn't
 
-One issue and three attempts show what jig does on a real bug it can't have seen, not how often it
-succeeds: for that there are the benchmarks ([docs/evaluation.md](../../docs/evaluation.md)). The prompt is
-ours, the issue's symptom without its diagnosis, not the reporter's text. And the first try died before
-its first model call with `API error: Connection error.`: the container reached the API only through a
-proxy, which Node's `fetch` doesn't use unless `NODE_USE_ENV_PROXY=1` is set. It was deleted and the
-attempt run again with that set; the three above are the first three that reached the model.
+One issue and three attempts show what jig does on a real bug filed after its model was in use here, not
+how often it succeeds: for that there are the benchmarks ([docs/evaluation.md](../../docs/evaluation.md)).
+The prompt is ours, the issue's symptom without its diagnosis, not the reporter's text. And, as the run
+session's log records, its first try died before its first model call with `API error: Connection
+error.`: the container reached the API only through a proxy, which Node's `fetch` doesn't use unless
+`NODE_USE_ENV_PROXY=1` is set. That try was deleted and run again with the variable set (every transcript
+begins with Node's warning that it is on); the three above are the ones that followed.
 
 ## To repeat it
 
-You need Node 22.18 or newer, git, a Python on which the bug shows (3.13.6 or later, 3.12.14 or later,
-3.14, or a distribution's build that has the change backported, like Ubuntu 24.04's 3.12.3; `setup.sh`
-checks), network access for `setup.sh` (GitHub and PyPI), and on Linux bubblewrap for the sandbox
+You need Node 22.18 or newer, git, a Python on which the bug shows (one whose `html.parser` has CPython's
+change: 3.13.6 or later, 3.14, a security release of an older branch that carries it, like 3.11.17, or a
+distribution's backport, like Ubuntu 24.04's 3.12.3 with its security updates; `setup.sh` checks), network
+access for `setup.sh` (GitHub and PyPI), and on Linux bubblewrap for the sandbox
 (`sudo apt install bubblewrap`). Where the internet is reachable only through a proxy, set
-`NODE_USE_ENV_PROXY=1` so that Node's `fetch`, and so jig, uses it. From the root of a clone of jig, after
-`npm install`:
+`NODE_USE_ENV_PROXY=1` (Node 22.21 or newer) so that Node's `fetch`, and so jig, uses it. From the root
+of a clone of jig, after `npm install`:
 
 ```bash
 export DEEPSEEK_API_KEY=sk-...                      # or ANTHROPIC_API_KEY, and add --model claude-opus-5-5
 examples/python-markdown-1651/run.sh                # one attempt; extra arguments go to jig
 AGENT=oracle examples/python-markdown-1651/run.sh   # upstream's fix: solved
 AGENT=noop examples/python-markdown-1651/run.sh     # nothing changed: not solved
-python3 examples/python-markdown-1651/compare.py    # the attempts in results/ next to upstream's fix
+python3 examples/python-markdown-1651/compare.py    # the three attempts it names next to upstream's fix
 ```
 
 Each attempt leaves a folder in `results/` with what jig printed (`transcript.txt`), its session, every
 message and tool call (`session.jsonl`), the model calls, tokens and tool calls (`stats.json`), what it
-changed (`diff.patch`), and the grade (`check.txt`). If another checkout of Python-Markdown on the machine
-holds the fix, hide it too, or the attempt could read it.
+changed (`diff.patch`), and the grade (`check.txt`). jig's sandbox can read the whole machine except what
+is hidden, so any other copy of the fix must be hidden too: add it to the `hiddenPaths` line in `run.sh`,
+or the attempt could read it. `compare.py` keeps its work, upstream's fix included, in `.compare/` in this
+folder, which is hidden already.
 
 Python-Markdown is BSD-licensed; the files in `upstream/` come from it, under
 [its license](upstream/LICENSE.md).

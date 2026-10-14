@@ -1,7 +1,8 @@
 #!/bin/bash
 # Makes the project jig works on: Python-Markdown at the commit before the fix for issue #1651, with the
 # history up to that commit and nothing after it, and a development install in .venv. Then checks that the
-# bug shows on this Python (it needs the html.parser of Python 3.13.6 or later, 3.12.14 or later, or 3.14).
+# bug shows on this Python: it needs an html.parser with CPython's change, as in 3.13.6 or later, 3.14, a
+# security release of an older branch that carries it (like 3.11.17), or a distribution's backport.
 #
 #   setup.sh <dir>            PYTHON=python3.14 setup.sh <dir> to choose the Python
 set -euo pipefail
