@@ -34,6 +34,7 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **26. A training set from jig's own successes:** `bench/dataset.ts`: every passed session of jig as it was, from the benchmark and Terminal-Bench, kept only if it finished, never reached the answers (8 hadn't, milestone 14's leak among them) and fits, five per task, split whole by task: 225 training examples from 60 tasks (1.71M tokens), 113 held out from 37; a LoRA of Qwen2.5-0.5B on this Mac (`bench/train/`) cut the loss on held-out tasks by 57%, but on the model's own tokens by 20%: the rest is the prompt and the tools learnt by heart
 - [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
 - [x] **28. The loop and the tools again:** a new baseline (33 of 63) for the analysis, and three loop-only candidates against milestone 21's comparison runs, all rejected (+2, +5 and +5 points, ahead in 57 to 65% of resamples, at 19 to 34% more cost): the sessions show two of the changes never ran (a test re-run in 0 of 30 attempts, a multi-file `edit_file` used in 0), so their +5 is what a change that does nothing scores; and a request's narrowed tools are no limit, since the model called undeclared tools in 22 of 30 attempts and jig ran them; after the round, two fixes: an invalid call goes back as the parse error, its first 2,000 characters and the 400 before the error (milestone 27's echoes held up to 155k), and the loop runs only the tools the request declared
+- [x] **29. A reviewer that runs the work:** `jig review`: once the agent is done, a model checks the work by running it in a copy of the machine (on Terminal-Bench, a sibling container from `docker commit`, with no network), each problem's command runs again in a fresh copy before it goes back, and `eval/review_before.py` runs the hidden tests on the work as the review saw it; two smoke tests found three bugs and the first failure a review turned into a pass (mteb-retrieve); on the 20 tasks, 10 of 20, no result changed (one trial got problems back and failed before and after), no false alarm in 9 passes, and the causes of two failures found and lost, one to an empty `<shows>` the re-check dropped, one to a verdict written as a tool call; replays showed a cut-off review's verdict to be a coin toss, and the verdict at the time-out is now asked at low effort, in the asked form, by the time limit, and once more when it doesn't come
 
 ## Milestone 9: checking before finishing
 
@@ -1197,3 +1198,162 @@ what made 17 of milestone 27's 19 conversations outgrow theirs.
 **Cost.** By jig's token counts, at list prices: the baseline $0.89, the analysis $0.007, the three
 candidates $1.77 (their proposals $0.40). DeepSeek bills about half of that off-peak: the balance fell by
 8.78 CNY over the round, other projects' use included.
+
+## Milestone 29: a reviewer that runs the work
+
+Milestone 24's reviewer could only read, and of the four failures it reviewed it approved the two that
+only running the work shows: model-extraction-relu-logits' extracted matrix, and mteb-retrieve's ranking.
+Running things is also what makes a reviewer dangerous (a test that writes a cache, a script that "fixes"
+a file, a server it leaves running), so this one runs the work in a copy of the machine it was done on,
+and nothing it does there reaches what is judged. It was designed before it was built, and the design's
+checks came first:
+
+- **No isolation inside a container.** In a default Docker container, as Terminal-Bench runs them, even
+  root can't create a user or mount namespace (`unshare` fails with "Operation not permitted"), so neither
+  bubblewrap nor an overlay file system works in there: the copy is made from outside.
+- **A sibling container is a cheap, exact copy.** On filter-js-from-html's image (1.03 GB, x86-64 under
+  emulation), `docker commit` took 0.7 seconds after 200 MB of changes and 7.1 after 2 GB, and starting
+  the result 0.3 to 0.5. With `--network none` it couldn't resolve a name, reach an address or reach the
+  host, so not the key proxy either. A server the agent had left running wasn't in it, and a file deleted
+  in it was still in the original.
+- **What a commit leaves out.** Harbor bind-mounts `/logs/agent`, `/logs/verifier` and `/logs/artifacts`
+  into the task's container; a commit doesn't take mounts, and the copy must not have them, since
+  `/logs/verifier` is where the hidden tests write the reward. Harbor runs a task as the compose service
+  `main`, which is how the adapter, on the host, finds the container (in Harbor's local Docker
+  environment only; a cloud one would need its own way to snapshot).
+
+**What was built.**
+
+- **`jig review`** ([`src/review-cli.ts`](../src/review-cli.ts)): a review on its own, for a harness to call
+  once the agent is done. It takes the task, the agent's last message and a log of what it did from the
+  agent's session file, and the files the work changed from `--changes` (`docker diff`'s lines), and runs a
+  loop on the reviewer's model (20 replies) whose one tool is bash. Every command goes through `--exec`, a
+  prefix spawned without a shell (the adapter's is `docker exec <copy> bash -c`), so nothing in a command
+  reaches the host's. The prompt (`runningReviewPrompt` in [`src/review.ts`](../src/review.ts)) says what
+  the copy is (the agent's files, none of its running programs, no network; anything may be run, changed
+  or installed there) and asks for each of the task's requirements to be checked by running something, in
+  the minutes and replies it has. The reply is APPROVED, or PROBLEMS: and each problem as a `<problem>`
+  with `<what>`, `<command>` (one command that shows it) and `<shows>` (part of what that printed). The
+  verdict goes out as JSON.
+- **The re-check** (`--verify-exec`, on in the adapter by default): each problem's command runs again in
+  a fresh copy (`docker run --rm --network none` of the committed image), one at a time, up to five, a
+  minute each, and the problem is kept only if what it prints contains its `<shows>`. A review that
+  misreports what it saw sends nothing back.
+- **The adapter** ([`eval/jig_agent.py`](../eval/jig_agent.py), `--ak run_reviewer=deepseek-flash`): once
+  jig exits, if at least twice the review's time is left (5 minutes, or a quarter of the agent's limit if
+  that is less), it commits the task's container and starts the copy: no network, no mounts, the
+  container's limits (its memory capped to what Docker has free), `timeout -s KILL` inside where the image
+  has it. It runs `jig review` on the host, and if problems are kept, runs jig again in the task's
+  container, `--continue`, with the problems and their evidence as the next message, in the time left.
+  The copy and its image go in any case, except that the image of work a review sent problems back on is
+  kept, for [`eval/review_before.py`](../eval/review_before.py): after the trial, the task's hidden tests
+  on that image. So a trial that got problems back tells what the fix did, the reward before it beside
+  the trial's own after it, and [`eval/report.py`](../eval/report.py) prints a row for every review.
+
+**Two smoke tests, three bugs.** On the tasks the design named, the two failures milestone 24's reviewer
+approved and the one it caught (filter-js-from-html):
+
+1. **Harbor's log directory is relative** (`-o eval/jobs`) and `jig review` runs elsewhere, so the session
+   file wasn't found: mteb-retrieve's review failed in 0.6 seconds. The adapter now resolves it. In the
+   same test, jig took 22 minutes over filter-js-from-html and its review was skipped for time.
+2. **A `<what>` left open.** Flash wrote `<what>…` without `</what>`, and the problem's text took in its
+   command and output. A field now ends at its closing tag or the next field's.
+3. **Harbor removed the kept image.** At the end of a trial Harbor runs `docker compose down --rmi local`,
+   which removes the compose project's images, and a commit carries the container's compose labels, so
+   the image kept for `review_before.py` went with the trial. The labels go blank at the commit. A small
+   compose project showed it (the image removed without the fix, kept with it), and so did the round's
+   first trial with problems sent back.
+
+The second smoke test's mteb-retrieve was **the first failure a review turned into a pass**, in milestone
+24 or since. The review found that mteb 1.36.8's registry gives bge-small-zh-v1.5 a query instruction,
+with which the 5th document is "MTEB: Massive Text Embedding Benchmark", not the one jig wrote; the fresh
+copy showed it again; jig checked the registry and fixed the file. On filter-js-from-html (2 minutes of
+jig's this time) the review found two problems, both held: a slash-separated attribute,
+`<svg/onload=alert(1)>`, passed through untouched, a real XSS; and `on[a-z]+` removed attributes like
+`only`, debatable. jig rewrote its rule as a list of event handlers, and both hidden tests failed; the
+work as the review saw it (rebuilt from the session, since the kept image was the one Harbor had
+removed) failed them the same way, so the fix changed nothing. model-extraction-relu-logits' review
+approved, after checking the matrix against the true one and against a network of its own with 15
+hidden units; the hidden test's network didn't match on two rows.
+
+**The round**: jig with the reviewer on the 20 tasks, one attempt each, each its own Harbor job, started
+only where 45 minutes fit outside DeepSeek's peak hours (19:37 to 23:04). One side only: what a review
+does shows within its own trial, in the hidden tests before the fix and after it, and milestone 24's two
+sides couldn't tell five points from noise.
+
+| | |
+|-|-|
+| passed | 10 of 20 (50%, 30 to 70%) |
+| reviewed | 15: four trials had less than twice the review's time left (model-extraction-relu-logits by 7 seconds), and one timed out first |
+| approved | 12, of which 9 passed and 3 failed |
+| problems found | 3, in two reviews; 2 held in a fresh copy |
+| no verdict | 1 |
+| sent back | 1 (filter-js-from-html: failed before the fix and after it) |
+| cost | $0.068 a trial; a review $0.020 and 1.7 minutes |
+
+- **No result changed because of a review.** Nothing went back on 19 trials; on the one where something
+  did, filter-js-from-html, the problems were real (a `<meta>`'s content erased for containing
+  `javascript:`, a `<textarea>` holding the text `<script>…` emptied), and fixing them passed no more of
+  the hidden tests.
+- **No false alarm.** All nine reviewed trials that passed were approved.
+- **Two reviews were on to the cause of a failure, and neither sent it back.** mteb-retrieve's review found
+  the smoke test's query instruction again, with the right command, but left `<shows>` empty and wrote
+  what the command had printed after the problem; with nothing to look for, the re-check dropped it.
+  chess-best-move's review was working out whether the piece on c3 is a knight, not the pawn jig had
+  read (with a knight there, e2e4 mates too: the hidden test's other answer), when its time ran out, and
+  the verdict it was asked for came back as a tool call written out in DeepSeek's own markup, which isn't
+  one. Replayed, that request mostly got an approval (below).
+- **What the approvals missed**: requirements checked as the review understood them. dna-assembly's
+  primers lack the extra bases before the BsaI site that the hidden test calls a clamp, which the task
+  doesn't mention; headless-terminal's commands, which the review ran with generous waits, don't finish
+  in the 1 second the hidden test gives them; and polyglot-rust-c's review saw the two binaries jig had
+  compiled beside `main.rs` and decided they "don't conflict with anything the task asks for", which
+  asks for "a single file in /app/polyglot/main.rs" (the hidden test wants that file alone).
+- **The time is tight.** Five of the 15 reviews ran out of time (a review gets 5 minutes, or a quarter of
+  the task's if that is less: 2.5, 3.75 or 5 here), and the verdict asked for then took about 15 to 145
+  seconds, against the 30 kept for it: chess-best-move's review ended 5 seconds before the adapter would
+  have killed it.
+- **The re-check** dropped one problem in six, over this round and the second smoke test, and it was
+  real: mteb-retrieve's, which had turned the task into a pass in the smoke test. It dropped no false
+  problem, since none came.
+- **jig passed fewer than usual**: 10 of 20, where its ten earlier runs of these tasks (milestones 6 to
+  24, milestone 17's candidate left out) give 14.0, and 10 or fewer would come 0.5% of the time if those
+  per-task rates were exact (each comes from 16 to 21 attempts). The three usual passes that failed
+  (chess-best-move, 15 times in 18 before; polyglot-rust-c, 15 in 16; headless-terminal, 12 in 21)
+  failed for reasons of their own: a misread piece, binaries left beside the source, a slow first
+  command. The review starts only once jig is done, and the logs show no
+  refused tool calls and no trouble with the API; a run without the review, on the same day, would tell
+  whether something else had changed.
+
+**After the round: the verdict at the time-out.** The request a review gets when its time or steps run
+out was replayed, from the saved sessions, on the five conversations that had ended that way: 20
+replays and 4 second asks, 24 calls.
+
+- **On a cut-off review, the verdict is a coin toss.** chess-best-move's conversation gave an approval in
+  6 of 7 replays and a problem in free text once (c3 misread); mteb-retrieve's an approval in 2 of 6;
+  cobol-modernization's, approved in the round on work that passed, in 1 of 4. A review stopped
+  mid-check judges on what it had, and it often hadn't enough.
+- **The tool call written out** came back in none of the 24.
+- **The verdict took too long.** At flash's own effort, chess-best-move's took 145 to 269 seconds; at low
+  effort 70 to 187, and the four other conversations' 8 to 63.
+- **Problems came in free text**, which the re-check drops for want of a command, in 3 of 8 replays of
+  the old request and never in the form asked for; with the form named in the request, 7 of 12 came in it
+  and none in free text.
+
+So the verdict is now asked at low effort, names the form (a `<problem>` with its `<what>`, `<command>`
+and `<shows>`), and must come by the time limit, where it is cut off, so the adapter never has to kill a
+review; 60 seconds are kept for it, not 30. A reply with no verdict is answered once ("That reply has no
+verdict, and no tool runs now"): in the replays, three of seven replies to a first rewording, which had
+left out "starting with", opened with a summary instead, and one to the final wording with a heading,
+and the second asks gave a verdict all four times. A reply that opens `**Verdict: PROBLEMS**` counts too.
+Naming the form also means more problems reach the re-check, on work that passed as well:
+cobol-modernization's conversation gave three, differences from the COBOL program in cases the hidden
+tests don't try, which would go back if they held. None of this was measured on Terminal-Bench.
+
+**The re-check stays as it is.** In six problems it has lost a real one and stopped no false one. The
+other ways were to send a problem that has a command and no `<shows>` back with what the command
+printed in a fresh copy, or to drop the re-check.
+
+**Cost.** By jig's token counts, at list prices: the round $1.35 ($1.06 for jig, $0.30 for the 15
+reviews), the smoke tests $0.32, the replays about $0.27. The balance fell 17.7 CNY over the evening, the
+other projects' use included.

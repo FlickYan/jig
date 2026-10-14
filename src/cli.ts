@@ -21,6 +21,7 @@ import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt
 import { reviewer } from "./review.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
+import { reviewCommand } from "./review-cli.ts";
 import { listSessions, sessionsCommand } from "./sessions-cli.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
 import { proposeInstructionsTool } from "./instructions-proposals.ts";
@@ -87,6 +88,7 @@ snapshots the project's files before each task so /undo can put them back.
 jig skills list | add | remove | update | new | learn | test manages skills (jig skills --help).
 jig memory list | show | remove | reflect manages what jig remembers (jig memory --help).
 jig sessions list | export lists sessions, or exports them as fine-tuning data (jig sessions --help).
+jig review reviews an agent's finished work by running it, in a copy (jig review --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
 commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
@@ -155,12 +157,14 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // which could match jig itself. Where the title can't hide them (under emulation, say), pass the task as -.
   process.title = "jig";
   // `jig skills <command>` manages skills, `jig memory <command>` memories and `jig sessions <command>`
-  // sessions; skills new and learn, and memory reflect, run the model, so they carry on below.
+  // sessions; skills new and learn, and memory reflect, run the model, so they carry on below. `jig review`
+  // reviews finished work, by running it, on its own (review-cli.ts).
   const skillsVerb = argv[0] === "skills" && (argv[1] === "new" || argv[1] === "learn") ? argv[1] : undefined;
   const memoryVerb = argv[0] === "memory" && argv[1] === "reflect" ? argv[1] : undefined;
   if (argv[0] === "skills" && !skillsVerb) return skillsCommand(argv.slice(1));
   if (argv[0] === "memory" && !memoryVerb) return memoryCommand(argv.slice(1));
   if (argv[0] === "sessions") return sessionsCommand(argv.slice(1));
+  if (argv[0] === "review") return reviewCommand(argv.slice(1));
   const { values, positionals } = parseArgs({
     args: skillsVerb || memoryVerb ? argv.slice(2) : argv,
     allowPositionals: true,

@@ -203,6 +203,8 @@ export DEEPSEEK_API_KEY=sk-...
 eval/run.sh tb-jig jig -k 3                     # jig on the 20 tasks in eval/subset.txt, 3 attempts each
 eval/run.sh tb-mini mini-swe-agent -k 3         # the baseline
 eval/run.sh abl-effort-low jig --ak effort=low  # an ablation: any jig option, through the adapter
+eval/run.sh tb-review jig --ak run_reviewer=deepseek-flash   # each trial reviewed by running the work (milestone 29)
+eval/.venv/bin/python eval/review_before.py eval/jobs/tb-review   # the hidden tests on the work before the review's fix
 python3 eval/report.py eval/results/tb-jig.json eval/results/tb-mini.json   # the first table below
 python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json eval/results/abl-*.json
 ```
@@ -212,6 +214,11 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   container is the sandbox, so the whole file system is the project), and reads the turns and tokens back
   from the stats file. The API key stays on the host: jig in the container gets a token of the run, and
   its requests go through [`eval/key_proxy.py`](../eval/key_proxy.py), which puts the key in (milestone 25).
+  With `run_reviewer` (milestone 29), once jig is done the adapter commits the task's container, starts a
+  copy of it with no network and none of Harbor's mounts, and runs `jig review` on the host, its commands
+  going into the copy; the problems a fresh copy shows again go back to jig (`--continue`) in the time
+  left, and [`eval/review_before.py`](../eval/review_before.py) runs the hidden tests on the work as the
+  review saw it, so the report shows each review's before and after.
 - The tasks are a seeded random sample of 20 of the 61 that ask for 2 GB of memory, one CPU and at most 30
   minutes ([`eval/subset.txt`](../eval/subset.txt)), because this Mac gives Docker 3 GB. The task images are
   x86-64, so on Apple Silicon everything in them runs under emulation, for both agents alike, while the

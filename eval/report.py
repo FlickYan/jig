@@ -55,8 +55,17 @@ def trials(job: Path) -> list[dict]:
             "looked_up": any(BENCHMARK_REPOSITORY.search(command) for command in commands(path.parent)),
             # jig's calls on another model (its reviewer, or one that took over), priced apart.
             "shares": [share for key in ("escalated", "reviewed") if (share := (agent.get("metadata") or {}).get(key))],
+            # Milestone 29's review, which ran the work, and the hidden tests on the work it saw (review_before.py).
+            "run_review": (agent.get("metadata") or {}).get("run_review"),
+            "before": before_fix(path.parent),
         })
     return found
+
+
+def before_fix(trial: Path) -> float | None:
+    """The hidden tests' reward on the work a review sent problems back on, before the fix (review_before.py)."""
+    found = trial / "agent" / "review-before.json"
+    return json.loads(found.read_text()).get("reward") if found.exists() else None
 
 
 def commands(trial: Path) -> list[str]:
@@ -236,6 +245,28 @@ def main(args: list[str]) -> None:
                 marks.append("⊘" if trial.get("looked_up") else "✓" if trial["passed"] else "⏱" if error == "AgentTimeoutError" else "!" if error else "✗")
             cells.append("".join(marks) or " ")
         print(f"| {task} | " + " | ".join(cells) + " |")
+    reviews(runs)
+
+
+def reviews(runs: list[tuple[str, str, list[dict]]]) -> None:
+    """Milestone 29's reviews, trial by trial: the verdict, the problems and how many a fresh copy showed again,
+    and for those sent back, the hidden tests on the work before the fix, and after (the trial's own)."""
+    reviewed = [(job, trial) for job, _, found in runs for trial in found if trial.get("run_review")]
+    if not reviewed:
+        return
+    print("\nReviews that ran the work (milestone 29): problems found, and how many a fresh copy showed again; what went")
+    print("back; and for those, the hidden tests before the fix and after it (✓ passed, ✗ failed):\n")
+    print("| task | job | verdict | problems (held) | sent back | before → after | review | note |")
+    print("|------|-----|---------|-----------------|-----------|----------------|--------|------|")
+    mark = lambda reward: "-" if reward is None else "✓" if reward == 1.0 else "✗"  # noqa: E731
+    for job, trial in reviewed:
+        review = trial["run_review"]
+        sent = review.get("sent_back")
+        problems = f"{review['problems']} ({review['held']})" if "problems" in review else "-"
+        change = f"{mark(trial['before'])} → {'✓' if trial['passed'] else '✗'}" if sent else "-"
+        seconds = f"{review['review_seconds'] / 60:.1f} min" if review.get("review_seconds") is not None else "-"
+        note = review.get("skipped") or review.get("failed") or ""
+        print(f"| {trial['task']} | {job} | {review.get('verdict') or '-'} | {problems} | {'yes' if sent else 'no'} | {change} | {seconds} | {note} |")
 
 
 if __name__ == "__main__":

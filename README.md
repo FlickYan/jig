@@ -262,6 +262,8 @@ npm run evolve -- list        # every candidate, its change and the verdict (--s
 jig sessions export --out sessions.jsonl                                  # --all: every project's sessions
 node bench/export.ts bench/results/evolve/<run>.json --out passed.jsonl   # attempts that passed, only
 node bench/escalation.ts bench/results/evolve2/<run>.json eval/jobs/<job>   # where --escalate would hand over
+eval/run.sh <job> jig --ak run_reviewer=deepseek-flash   # Terminal-Bench, each trial reviewed by running the work
+eval/.venv/bin/python eval/review_before.py eval/jobs/<job>   # and the hidden tests on the work before the review's fix
 node bench/dataset.ts                     # a training set from every passed session (bench/dataset/)
 bench/train/run.sh <work dir>             # and a LoRA of a small model on it, on an Apple Silicon Mac
 modal run bench/train/modal_train.py      # or of Qwen2.5-7B-Instruct, on an H100 at Modal (pip install modal)
@@ -293,7 +295,8 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | File | What it does |
 | --- | --- |
 | [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed; with `--escalate`, hand over to a stronger model once a test run fails |
-| [`src/review.ts`](src/review.ts) | `--reviewer`: a second model, as a read-only subagent, checks the work against the task before it ends |
+| [`src/review.ts`](src/review.ts) | `--reviewer`: a second model, as a read-only subagent, checks the work against the task before it ends; and the prompt, verdict and re-check of a review that runs the work |
+| [`src/review-cli.ts`](src/review-cli.ts) | `jig review`: a review of finished work that runs it, its commands going into a copy of the machine through `--exec`, for an evaluation harness to call |
 | [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
@@ -339,13 +342,15 @@ What each question came to; the write-ups, with every number's run and caveat, a
 | Can jig improve its own code? (14–22, 28) | the evolve loop and its referee, on two suites | 19 candidates; one accepted (+15 and +17 points on the suite), then 15 points worse on Terminal-Bench, so not merged; neither advice in the prompt nor changes to the loop moved the suite, and two of the loop's changes never ran at all |
 | A stronger model when the tests fail? (23) | the trigger replayed on 676 saved attempts; deepseek-v4-pro alone | the trigger would have reached 1 of 220 failures; v4-pro was 7 points ahead for 5 times the cost, while 2 more steps put flash 24 ahead |
 | A second model reviewing the work? (24) | Terminal-Bench, 20 tasks, alternating at each task | 5 points ahead (−20 to +30) for 2.4 times the cost; no result changed because of a review |
+| A review that runs the work? (29) | Terminal-Bench, 20 tasks, the hidden tests on each trial's work before the review's fix and after it | in a smoke test, the first failure a review turned into a pass; in the round, no result changed, no false alarm in 9 passes, and the causes of two failures found and lost before they went back |
 | Training on its own successes? (26) | a LoRA of Qwen2.5-0.5B on 225 passed sessions, loss on held-out tasks | −57% overall, but −20% on the model's own tokens: the rest is the prompt and the tools learnt by heart |
 | Does that make a better agent? (27) | a LoRA of Qwen2.5-7B on 294 passed sessions (an H100 on Modal); jig driving it and the base model on 23 held-out tasks × 3 | the loss fell 30% and the agent got worse: 3% against 9% (−6, −14 to 0); it stopped giving up and started looping |
 
 The numbers in parentheses are milestones. deepseek-flash's failures turned out to be silent: it finishes
 sure it is done, its own checks passed or never run, and neither routing to a stronger model nor a
-second model's review could see them (milestones 23 and 24). Training a 7B model on its successes taught
-it their shape, not their judgment (milestone 27).
+second model's review could see them (milestones 23 and 24); a review that runs the work sometimes can,
+but the two in the round that did ran out of time, and what they found didn't go back (milestone 29).
+Training a 7B model on its successes taught it their shape, not their judgment (milestone 27).
 
 ## How it is measured
 
@@ -398,6 +403,7 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 | 26 | A training set from jig's own successes | `bench/dataset.ts`, and a LoRA smoke test on this Mac |
 | 27 | A 7B model trained on jig's successes | a LoRA on Modal, served next to the base model: the loss fell, the agent got worse |
 | 28 | The loop and the tools again | three candidates, all rejected; two never ran, and a step's narrowed tools were no limit (now they are, and an invalid call goes back in part) |
+| 29 | A reviewer that runs the work | `jig review`, in a copy of the machine; one failure turned into a pass, in a smoke test; in the round, no result changed |
 
 ## Tests
 

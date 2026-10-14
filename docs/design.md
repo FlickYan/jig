@@ -162,6 +162,15 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   ask it, the first time it stops, to show what proves each of the task's requirements. It fixed the
   failures it was aimed at, but ran other tasks out of time and solved no more overall, at 38-65% more
   cost (see [milestone 9's results](milestones.md#milestone-9-checking-before-finishing)), so it is off by default.
+- **A review that runs the work runs it in a copy.** A reviewer that only reads can't see what only
+  running shows (milestone 24's approved two such failures), and one that runs things can change what it
+  judges: a test that writes a cache, a server it leaves running, a file it "fixes". So `jig review` runs
+  its commands in a copy of the machine, made when the agent is done (on Terminal-Bench a sibling
+  container from `docker commit`, with no network and none of Harbor's mounts), through a prefix spawned
+  without a shell. A problem must come with the command that shows it and what that printed, and the
+  command runs again in a fresh copy before the problem goes back, so the model gets evidence it can
+  check rather than a claim. And what a review did is measured in the trial it happened in: the hidden
+  tests run on the work as the review saw it, beside the trial's own result after the fix.
 - **Waiting on the API is bounded and visible.** The SDK's timeout covers only the wait for a response
   to start (a stream's first bytes arrive within seconds when the API is healthy, however long the reply
   runs), so jig sets it to 2 minutes instead of 10, and prints a notice for each automatic retry. During a

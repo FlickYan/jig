@@ -19,7 +19,7 @@ import { TOOLS, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
-import { fakeMessagesApi } from "./fake-api.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
@@ -287,5 +287,24 @@ describe("the task's place on the command line", () => {
     const { code, commandLine } = await runCli(["Rename server.py to app.py."]);
     assert.equal(code, 0);
     assert.equal(commandLine, "jig");
+  });
+});
+
+describe("a one-shot run that continues the last session", () => {
+  it("goes on from the session's messages, the new task on stdin, as Terminal-Bench's adapter sends a review's problems", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const cwd = await mkdtemp(join(tmpdir(), "jig-continue-"));
+      const env = { JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const first = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--", "-"], { api, cwd, env, stdin: "Write out.txt." });
+      const second = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--continue", "--", "-"], { api, cwd, env, stdin: "A reviewer found problems: out.txt is empty." });
+      assert.deepEqual([first.code, second.code], [0, 0], second.output);
+      const messages = api.requests[1].messages as { role: string; content: unknown }[];
+      assert.deepEqual(messages.map((message) => message.role), ["user", "assistant", "user"]);
+      assert.match(JSON.stringify(messages[0].content), /Write out\.txt\./);
+      assert.match(JSON.stringify(messages[2].content), /A reviewer found problems: out\.txt is empty\./);
+    } finally {
+      api.close();
+    }
   });
 });
