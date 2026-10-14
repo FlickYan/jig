@@ -26,7 +26,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   (`eager_input_streaming`), so the API no longer validates it. The SDK's lenient parser can turn
   `"say "hi" now"` into `"say "`, which would silently write a truncated file. jig re-parses the raw JSON
   strictly and checks it against the tool's schema, and sends anything broken back to the model as
-  `INVALID_JSON` instead of running it.
+  `INVALID_JSON` instead of running it: the parser's error, with its position, and the input's start and
+  the text just before the error, not all of it, since a reply that ran to its output limit can leave a
+  call of 100k characters (milestone 27).
+- **Only the tools a request declared run.** A model can call a tool it wasn't offered (milestone 28), so
+  each model call reports the tools its request declared, and the loop refuses a call to any other.
 - **The history only grows.** The loop never edits earlier messages, and the system prompt and tool list
   stay fixed for the whole session. This keeps the prompt cache hitting (each call pays full price only
   for what is new) and keeps the model's earlier thinking blocks valid (the API can reject them once the

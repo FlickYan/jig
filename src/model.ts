@@ -34,6 +34,11 @@ export interface ModelTurn {
   message: Anthropic.Beta.BetaMessage;
   /** Raw input of each tool call whose streamed JSON did not parse, keyed by tool_use id. */
   malformed: Map<string, string>;
+  /**
+   * The tools the request declared, by name. A model can call one it wasn't offered (milestone 28: 22 of
+   * 30 attempts did, at a step that offered only the tools that edit), so the loop runs no other.
+   */
+  offered?: string[];
 }
 
 /**
@@ -293,7 +298,8 @@ async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, si
     const raw = rawInputs.get(index);
     if (block.type === "tool_use" && raw !== undefined && !isJson(raw)) malformed.set(block.id, raw);
   });
-  return { message: { ...message, content: dropDeclined(message.content) }, malformed };
+  const offered = (params.tools ?? []).flatMap((tool) => ("name" in tool ? [tool.name] : []));
+  return { message: { ...message, content: dropDeclined(message.content) }, malformed, offered };
 }
 
 function isJson(text: string): boolean {

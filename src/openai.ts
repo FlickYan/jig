@@ -184,7 +184,7 @@ export async function chatTurn(
       output_tokens: usage?.completion_tokens ?? 0,
     },
   } as unknown as Anthropic.Beta.BetaMessage; // the fields jig reads; the rest of the type is Claude's
-  return { message, malformed };
+  return { message, malformed, offered: tools.map((tool) => tool.function.name) };
 }
 
 /** The parsed tool input, or undefined if it isn't a JSON object. A tool without parameters may send none. */

@@ -1,30 +1,34 @@
-<!-- The analysis of bench/results/evolve2/2026-10-12T18-00-05_baseline-m19a.json's training attempts by deepseek-flash, for $0.0070. What it was shown: bench/evolve2/analysis-prompt.md -->
+<!-- The analysis of bench/results/evolve2/2026-10-14T03-55-17_baseline-m27.json's training attempts by deepseek-flash, for $0.0073. What it was shown: bench/evolve2/analysis-prompt.md -->
 
-One line per attempt:
+Attempt-by-attempt:
 
-1. bank/statement: all 4 steps spent reading modules; never edited anything.
-2. bank/statement: 4 steps, all reads; stopped before writing.
-3. bank/statement: 4 steps reading every module plus the visible tests; no code written.
-4. library/issue: 4 steps, 12 reads; no edit made.
-5. library/issue: read everything, ran pytest (not installed), no edit.
-6. words/spec: wrote a full rewrite on the last step; `from_words` unhandled/erroring, no step left to fix.
-7. words/spec: 4 steps of reads; no file written.
-8. words/spec: rewrite rejects inputs the spec accepts ("invalid text"); never verified.
-9. payroll/spec: rewrite with wrong bucketing of hours; assertion mismatches, no repair step.
-10. payroll/spec: rewrite raises KeyError on days not present; no run to catch it.
-11. shop/cents: 4 steps, 12 reads; no edit.
-12. shop/cents: 4 steps of reading; no edit.
-13. shop/cents: wrote 4 modules but never changed the consumer, so `Order` lacks the new attribute.
-14. table/spec: wrote, then spent the last step patching truncation; totals still broken/unverified.
-15. toml/spec: 4 steps of reads; no file written.
-16. units/spec: 4 steps, ending in Unicode byte inspection; no file written.
-17. units/spec: wrote and ran tests, but treated `1`/dimensionless as invalid — mismatch not covered by visible tests.
-18. units/spec: rewrite mishandles equivalent spellings; no verify step.
-19–24. passing: wrote early, and within budget; the ones that pass waste fewer steps on reading and one has a cheap post-write run.
+1. bank statement — 12 reads of every module, one edit to `dates.py` as the last step; no test run, so the error/exit-code behavior the hidden test checks went unverified.
+2. bank statement — 10 reads, no edit at all; budget spent entirely on reconnaissance.
+3. bank statement — 12 reads, no edit at all.
+4. ignore.py — read spec/tests, wrote 277 lines, ran tests; one hidden precedence case still wrong and no step left to fix it.
+5. ignore.py — 4 reads plus a `python3 --version`/`ls` probe, ended before writing anything.
+6. jsonpatch — spec/test reads plus `ls`, `git log`, `python3 --version` probes; no edit.
+7. library — 12 reads of every module, no edit.
+8. library — 11 reads plus a grep, no edit.
+9. library — 12 reads, no edit.
+10. words — 6 reads, no edit.
+11. words — 5 tool calls ending in a `Decimal`/NaN probe; no edit.
+12. shop — reads plus two probe scripts, then 4 batched `write_file`s; `order.py` never touched, tests never run.
+13. shop — reads plus grep, then 4 batched writes; `order.py` untouched, tests never run.
+14. shop — reads plus grep/git probes, then 4 batched writes; `order.py` untouched, tests never run.
+15. table — spec/test reads plus a `unicodedata` probe; no edit.
+16. toml_lite — 6 calls then a 676-line whole-file write; hidden NaN/inf case failed, no step to verify.
+17. ignore (pass) — read, wrote, ran tests; only waste was a redundant `ls`/`git log`.
+18. jsonpatch (pass) — read, wrote, ran tests.
+19. words (pass) — probe-free reads then a single whole-file write; no test run, passed by luck.
+20. payroll (pass) — same: reads then whole-file write, no test run.
+21. table (pass) — reads then whole-file write, no test run.
+22. toml_lite (pass) — reads then whole-file write, no test run.
+23. units (pass) — read, wrote, ran tests.
 
 ## Causes
 
-1. It front-loads reconnaissance and treats "understand everything" as prerequisite to writing, so with a small step cap it exhausts all steps on reads and never produces an edit. It should spend at most ~3 calls (spec/issue, visible tests, the one target module) and then write, iterating afterwards.
-2. It explores by dumping the repo — `ls`/`find`/`glob`, then opening every sibling module — rather than reading only the files the spec and tests point at. It should let the spec and test file select the modules instead of enumerating the package.
-3. It writes one large whole-file rewrite and then has no steps left to verify or repair; when the test runner is missing or misinvoked it gives up instead of falling back to a direct script. It should run the visible tests immediately after writing and treat the remaining steps as repair budget.
-4. On multi-file changes it edits the modules it read but skips the consumer/entry point that the hidden tests exercise, leaving missing attributes and `NotImplementedError`. It should map each item in the issue to every file that must change before editing.
+1. It reads the whole repository before writing anything. Almost every attempt enumerates with `glob` and then reads every source module and dependency, so the budget is often gone with no edit produced at all; it should read the spec/issue and only the files the change names plus their direct dependencies, and start editing early.
+2. The edit is effectively the last step, so the provided tests are almost never run afterwards. Failures a single test run would expose (an unhandled error path, a missing attribute, an unimplemented function) go to grading unverified; it should always reserve a step to run the tests and fix what fails.
+3. When it does write, it replaces entire files wholesale and batches several writes into one step, so it can change modules without touching every file the change requires and cannot iterate on mistakes. It should make targeted edits and include all files the change spans in the same pass.
+4. It spends whole steps on environment and scratch probes (`ls -la && git log`, `python3 --version`, ad-hoc `python3 -c` experiments) that don't advance the task. These should be folded into the edit/verify step or dropped.

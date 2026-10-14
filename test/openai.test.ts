@@ -148,7 +148,8 @@ describe("a chat completions reply", () => {
       ],
     ]);
     try {
-      const { message, malformed } = await createModel(options(api.url))([{ role: "user", content: "hi" }]);
+      const { message, malformed, offered } = await createModel(options(api.url))([{ role: "user", content: "hi" }]);
+      assert.deepEqual(offered, ["bash"]); // what the request declared, for the loop to run only those
       assert.deepEqual(message.content, [
         { type: "thinking", thinking: "Two calls.", signature: "" },
         { type: "text", text: "On it.", citations: null },

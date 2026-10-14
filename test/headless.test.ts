@@ -19,6 +19,7 @@ import { TOOLS, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { fakeMessagesApi } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
@@ -114,6 +115,22 @@ describe("--stats", () => {
       { stop: final.stop, steps: final.steps, modelCalls: final.modelCalls, usage: final.usage, toolCalls: final.toolCalls },
       { stop: "end_turn", steps: 2, modelCalls: 2, usage: { input: 200, cacheWrite: 0, cacheRead: 800, output: 20 }, toolCalls: { glob: 1 } },
     );
+  });
+});
+
+describe("a Messages API reply", () => {
+  it("says which tools the request declared, so the loop runs only those", async () => {
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: "ls" } }]);
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    try {
+      const tools = TOOLS.filter((tool) => ["read_file", "bash"].includes(tool.definition.name));
+      const { offered } = await createModel({ model: "claude-haiku-4-5", system: "", tools, baseURL: api.url })([{ role: "user", content: "hi" }]);
+      assert.deepEqual(offered, ["read_file", "bash"]);
+    } finally {
+      process.env = env;
+      api.close();
+    }
   });
 });
 

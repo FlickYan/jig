@@ -1,0 +1,63 @@
+diff --git a/src/agent.ts b/src/agent.ts
+index fa1c8dd..3b3641e 100644
+--- a/src/agent.ts
++++ b/src/agent.ts
+@@ -114,6 +114,8 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+   const taskMessage = conversation.messages.at(-1);
+   const task = textOf(taskMessage);
+   const sinceTask = () => conversation.messages.slice(Math.max(0, conversation.messages.indexOf(taskMessage!)));
++  // The last command that ran the tests, so a change can be checked against it without a model call.
++  let tests: string | undefined;
+ 
+   for (let step = 1; step <= opts.maxSteps; step++) {
+     let reply: Message;
+@@ -180,6 +182,16 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+     const results: ToolResult[] = [];
+     if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
+     else for (const call of calls) results.push(await handle(call));
++    // The tests the model ran before are remembered, so a change can be checked immediately below.
++    for (const [i, call] of calls.entries()) {
++      if (call.name === "bash" && !results[i].is_error && TEST_COMMAND.test(String((call.input as ToolInput).command ?? ""))) {
++        tests = String((call.input as ToolInput).command);
++      }
++    }
++    // A change the model landed and then left without running the tests again goes to grading unverified,
++    // so run them now, with the change's result: the step after this one, which would have been the final
++    // answer, sees what they say and can fix it. Running them costs a command, not a model call.
++    if (step < opts.maxSteps) await retestChange(calls, results, tests, conversation, opts, signal);
+     conversation.push({ role: "user", content: results }); // all results for one reply go in one message
+ 
+     // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
+@@ -194,6 +206,32 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
+   return result("max_steps", opts.maxSteps);
+ }
+ 
++/**
++ * Runs the last test command the model itself ran, once more, when a reply changed files but didn't run
++ * the tests after the change. The output goes with the changed file's result, so the model's next step
++ * sees whether the change holds and can fix it; on small tasks that step would otherwise be a final
++ * answer the tests never checked. The command already ran once in this conversation, so it is run again
++ * as it is — sandbox, working directory and all — and only ever here, before the step limit.
++ */
++async function retestChange(calls: ToolUse[], results: ToolResult[], command: string | undefined, conversation: Conversation, opts: AgentOptions, signal?: AbortSignal): Promise<void> {
++  const bash = opts.tools.find((tool) => tool.definition.name === "bash");
++  if (!bash || !command) return;
++  const kind = (name: string) => opts.tools.find((tool) => tool.definition.name === name)?.kind;
++  const changed = calls.map((call, i) => (kind(call.name) === "edit" && !results[i].is_error ? i : -1)).filter((i) => i >= 0).at(-1);
++  if (changed === undefined) return;
++  // The model ran the tests after this change itself, so they are already in front of it.
++  if (calls.some((call, i) => i > changed && call.name === "bash" && !results[i].is_error && TEST_COMMAND.test(String((call.input as ToolInput).command ?? "")))) return;
++  opts.ui.notice(`Running the tests again after the change.`);
++  let output: string;
++  try {
++    output = truncate(await bash.run({ command }, { cwd: opts.cwd, dirs: opts.dirs, versions: conversation.versions, signal, sandbox: opts.sandbox }));
++  } catch (err) {
++    output = `could not start: ${err instanceof Error ? err.message : String(err)}`;
++  }
++  const result = results[changed];
++  results[changed] = { ...result, content: `${String(result.content)}\n\nThe tests, run again after this change:\n$ ${command}\n${output}` };
++}
++
+ /**
+  * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
+  * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.

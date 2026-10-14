@@ -1,0 +1,31 @@
+{
+  "n": 13,
+  "branch": "evolve2/13",
+  "base": "f825ae9",
+  "cause": "It reads the whole repository before writing anything. Almost every attempt enumerates with `glob` and then reads every source module and dependency, so the budget is often gone with no edit produced at all; it should read the spec/issue and only the files the change names plus their direct dependencies, and start editing early.",
+  "subject": "Reserve the last two calls to make the change.",
+  "description": "What I changed: in the loop, once no file has been changed and only one call will remain after the current one, the model is asked with only the file-changing tools (`kind === \"edit\"`: `write_file`, `edit_file`), so it starts the change instead of reading until the budget is gone, and a following unrestricted call remains to check and fix it. The full tool set returns the moment any change lands, and nothing is narrowed before the run has taken at least one look. `CallModel` gained an optional per-call `tools` list for this (threaded through both API paths, by filtering the already-built definitions so each provider keeps its own tool shape). This targets the measured failure — attempts that spent all four calls reading and never edited — by converting the tail of the budget into an edit plus a repair step, one call earlier than the previously measured last-step version so a check remains. It costs nothing on runs that edit in time (the option is only passed when narrowing happens), and on long-budget runs like Terminal-Bench the condition is never reached, so exploration there is untouched.",
+  "files": [
+    "src/agent.ts",
+    "src/model.ts"
+  ],
+  "spent": 0.6173371920000001,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-14T04-36-48_evolve-13-train.json"
+  },
+  "target": "loop",
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4333333333333334,
+    "baseline": 0.4166666666666667,
+    "difference": 0.01666666666666666,
+    "low": -0.2,
+    "high": 0.2166666666666667,
+    "ahead": 0.5695,
+    "costRatio": 1.3361427590940287
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+2 points, ahead in 57% of resamples, cost ×1.34)"
+  }
+}

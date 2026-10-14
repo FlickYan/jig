@@ -1,0 +1,31 @@
+{
+  "n": 15,
+  "branch": "evolve2/15",
+  "base": "f825ae9",
+  "cause": "When it does write, it replaces entire files wholesale and batches several writes into one step, so it can change modules without touching every file the change requires and cannot iterate on mistakes. It should make targeted edits and include all files the change spans in the same pass.",
+  "subject": "(no summary: stopped after 60 steps)",
+  "description": "-   const seen = new Set<string>();\n  -   return changes.filter(({ path, old_string, new_string }) => {\n  -     const key = [path, old_string, new_string].join(\"\\u0000\");\n  -     return !seen.has(key) && !!seen.add(key);\n  -   });\n  +   // A model that gives its first change at the top level and repeats it in edits gets it made once.\n  +   const seen = new Set<string>();\n  +   return changes.filter(({ path, old_string, new_string }) => {\n  +     const key = [path, old_string, new_string].join(\"\\u0000\");\n  +     if (seen.has(key)) return false;\n  +     seen.add(key);\n  +     return true;\n  +   });\n  Edited src/tools/edit.ts: replaced 6 lines at line 81 with 8 lines.\nStopped after 60 steps (raise the limit with --max-steps).",
+  "files": [
+    "src/review.ts",
+    "src/tools/edit.ts"
+  ],
+  "spent": 0.622002072,
+  "runs": {
+    "train": "bench/results/evolve2/2026-10-14T05-33-43_evolve-15-train.json"
+  },
+  "target": "loop",
+  "train": {
+    "tasks": 10,
+    "candidate": 0.4666666666666667,
+    "baseline": 0.4166666666666667,
+    "difference": 0.05,
+    "low": -0.23333333333333334,
+    "high": 0.31666666666666665,
+    "ahead": 0.6504,
+    "costRatio": 1.2359917638984212
+  },
+  "verdict": {
+    "stage": "rejected",
+    "reason": "no better on the training tasks (+5 points, ahead in 65% of resamples, cost ×1.24)"
+  }
+}

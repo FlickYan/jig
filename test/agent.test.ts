@@ -137,6 +137,38 @@ describe("runAgent", () => {
     assert.ok(!existsSync(join(cwd, "x.txt")) && !existsSync(join(cwd, "y.txt")));
   });
 
+  it("sends back only the start of a long invalid input, and what came just before the error", async () => {
+    const raw = `{"path":"big.txt","content":"${"line\\n".repeat(30_000)}`; // cut off mid-string, as at an output limit
+    const { options, conversation, messages } = setup([
+      reply([toolUse("t1", "write_file", {})], "tool_use", new Map([["t1", raw]])),
+      reply([text("ok")]),
+    ]);
+    await runAgent(conversation, options);
+    const [result] = resultsIn(messages[2]);
+    const sent = JSON.parse(String(result.content));
+    assert.ok(String(result.content).length < 3_500, `${String(result.content).length} characters`);
+    assert.ok(sent.INVALID_JSON.startsWith('{"path":"big.txt","content":"line'));
+    assert.ok(sent.BEFORE_ERROR.endsWith("line\\n"));
+    assert.match(sent.error, /not valid JSON \(Unterminated string in JSON at position 180029/);
+    assert.match(sent.shown, /first 2000 characters, and the 400 before the error, of 180029/);
+    assert.ok(!existsSync(join(cwd, "big.txt")));
+  });
+
+  it("doesn't run a tool the request didn't offer", async () => {
+    const offered = (turn: ModelTurn, names: string[]) => ({ ...turn, offered: names });
+    const { options, conversation, messages } = setup([
+      offered(reply([toolUse("t1", "bash", { command: "touch ran.txt" }), toolUse("t2", "write_file", { path: "w.txt", content: "x" })]), ["write_file", "edit_file"]),
+      reply([text("ok")]),
+    ]);
+    await runAgent(conversation, options);
+    const [bash, write] = resultsIn(messages[2]);
+    assert.equal(bash.is_error, true);
+    assert.equal(bash.content, "Not run: bash isn't one of the tools offered for this step. Available: write_file, edit_file.");
+    assert.ok(!existsSync(join(cwd, "ran.txt")));
+    assert.equal(write.is_error, undefined);
+    assert.ok(existsSync(join(cwd, "w.txt")));
+  });
+
   it("reports unknown tools as errors", async () => {
     const { options, conversation, messages } = setup([reply([toolUse("t1", "teleport", {})]), reply([text("ok")])]);
     await runAgent(conversation, options);

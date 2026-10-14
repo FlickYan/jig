@@ -118,12 +118,13 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   for (let step = 1; step <= opts.maxSteps; step++) {
     let reply: Message;
     let malformed: Map<string, string>;
+    let offered: string[] | undefined;
     try {
       if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
         addUsage(usage, await compactConversation(conversation, opts, signal));
       }
       const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
-      ({ message: reply, malformed } = await callModel(conversation.messages, signal));
+      ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
     } catch (err) {
       if (signal?.aborted) return result("interrupted", step - 1);
       throw err;
@@ -173,7 +174,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
 
     // Every tool call gets a result, even ones that never run, or the next request is invalid.
     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete
-    const handle = (call: ToolUse) => handleToolCall(call, { cutOff, malformed: malformed.get(call.id) }, conversation, opts, usage, signal);
+    const handle = (call: ToolUse) => handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered }, conversation, opts, usage, signal);
     // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
     // run at the same time. Anything else runs in order, since one call may depend on another's effect.
     const readOnly = calls.every((call) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read");
@@ -209,14 +210,14 @@ async function compactConversation(conversation: Conversation, opts: AgentOption
 }
 
 /**
- * One tool call, through each check in turn: the tool exists, the run wasn't interrupted, the call wasn't
- * cut off mid-input, the input is valid, the hooks and then the permission policy allow it. Then it runs,
- * its output is trimmed, and the after-hooks have their say. A failed check becomes an error result that
- * says what went wrong, which the model can act on.
+ * One tool call, through each check in turn: the tool exists and the request offered it, the run wasn't
+ * interrupted, the call wasn't cut off mid-input, the input is valid, the hooks and then the permission
+ * policy allow it. Then it runs, its output is trimmed, and the after-hooks have their say. A failed check
+ * becomes an error result that says what went wrong, which the model can act on.
  */
 async function handleToolCall(
   call: ToolUse,
-  state: { cutOff: boolean; malformed?: string },
+  state: { cutOff: boolean; malformed?: string; offered?: string[] },
   conversation: Conversation,
   opts: AgentOptions,
   usage: Usage,
@@ -228,9 +229,11 @@ async function handleToolCall(
   };
 
   const tool = opts.tools.find((t) => t.definition.name === call.name);
-  if (!tool) {
+  // A tool the request didn't declare isn't the model's to call, even one jig has.
+  const offered = state.offered ?? opts.tools.map((t) => t.definition.name);
+  if (!tool || !offered.includes(call.name)) {
     opts.ui.toolCall(call.name, "", call.id);
-    return fail(`Unknown tool "${call.name}". Available: ${opts.tools.map((t) => t.definition.name).join(", ")}.`);
+    return fail(`${tool ? `Not run: ${call.name} isn't one of the tools offered for this step` : `Unknown tool "${call.name}"`}. Available: ${offered.join(", ")}.`);
   }
   if (signal?.aborted) {
     opts.ui.toolCall(call.name, "", call.id);
@@ -241,10 +244,10 @@ async function handleToolCall(
     return fail("Not run: your reply hit the output limit before this call was complete. Try again in smaller steps.");
   }
   // The model's input was streamed without server-side validation, so check it before anything runs.
-  const problem = state.malformed !== undefined ? "input is not valid JSON" : checkInput(tool, call.input);
+  const problem = state.malformed !== undefined ? jsonProblem(state.malformed) : checkInput(tool, call.input);
   if (problem) {
     opts.ui.toolCall(call.name, "(invalid input)", call.id);
-    return fail(JSON.stringify({ INVALID_JSON: state.malformed ?? JSON.stringify(call.input), error: problem }));
+    return fail(invalidInput(state.malformed ?? JSON.stringify(call.input), problem));
   }
 
   const input = call.input as ToolInput;
@@ -266,6 +269,33 @@ async function handleToolCall(
   if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
   opts.ui.toolResult(output, false, call.id);
   return { type: "tool_result", tool_use_id: call.id, content: output };
+}
+
+/** How much of an invalid call's input goes back to the model: its start, and what came just before the error. */
+const SHOWN_START = 2_000;
+const SHOWN_BEFORE_ERROR = 400;
+
+/**
+ * An invalid call, as the model is told of it: what was wrong, and enough of what it wrote to see why. Not
+ * all of it: a reply that runs until its output limit can leave a call of 100k characters, and in milestone
+ * 27, sent back whole, such calls made a 32k server's conversations outgrow it.
+ */
+function invalidInput(raw: string, error: string): string {
+  if (raw.length <= SHOWN_START) return JSON.stringify({ INVALID_JSON: raw, error });
+  const at = Number(/in JSON at position (\d+)/.exec(error)?.[1] ?? 0);
+  const before = at > SHOWN_START ? raw.slice(Math.max(SHOWN_START, at - SHOWN_BEFORE_ERROR), at) : "";
+  const shown = `its first ${SHOWN_START} characters${before ? `, and the ${before.length} before the error` : ""}, of ${raw.length}`;
+  return JSON.stringify({ INVALID_JSON: `${raw.slice(0, SHOWN_START)}…`, ...(before && { BEFORE_ERROR: `…${before}` }), error, shown });
+}
+
+/** Why streamed input isn't a tool's input, in the parser's words (they give the position). */
+function jsonProblem(raw: string): string {
+  try {
+    JSON.parse(raw || "{}");
+  } catch (err) {
+    return `input is not valid JSON (${(err instanceof Error ? err.message : String(err)).slice(0, 200)})`;
+  }
+  return "input is not a JSON object";
 }
 
 /** Commands that run a project's tests, by the usual runners' names. */

@@ -33,6 +33,7 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **25. The key stays on the host:** Terminal-Bench's containers get a token of the run, and `eval/key_proxy.py` on the host (127.0.0.1, reached as `host.docker.internal`) swaps it for the API key and streams the reply back; a model asked to print every process's environment found only the token; `--base-url` now reaches DeepSeek's Anthropic-compatible endpoint
 - [x] **26. A training set from jig's own successes:** `bench/dataset.ts`: every passed session of jig as it was, from the benchmark and Terminal-Bench, kept only if it finished, never reached the answers (8 hadn't, milestone 14's leak among them) and fits, five per task, split whole by task: 225 training examples from 60 tasks (1.71M tokens), 113 held out from 37; a LoRA of Qwen2.5-0.5B on this Mac (`bench/train/`) cut the loss on held-out tasks by 57%, but on the model's own tokens by 20%: the rest is the prompt and the tools learnt by heart
 - [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
+- [x] **28. The loop and the tools again:** a new baseline (33 of 63) for the analysis, and three loop-only candidates against milestone 21's comparison runs, all rejected (+2, +5 and +5 points, ahead in 57 to 65% of resamples, at 19 to 34% more cost): the sessions show two of the changes never ran (a test re-run in 0 of 30 attempts, a multi-file `edit_file` used in 0), so their +5 is what a change that does nothing scores; and a request's narrowed tools are no limit, since the model called undeclared tools in 22 of 30 attempts and jig ran them; after the round, two fixes: an invalid call goes back as the parse error, its first 2,000 characters and the 400 before the error (milestone 27's echoes held up to 155k), and the loop runs only the tools the request declared
 
 ## Milestone 9: checking before finishing
 
@@ -1126,7 +1127,7 @@ nothing anywhere the base model hadn't. Neither followed the injected instructio
   it wrote: 40k to 155k characters in one tool result. Compaction can't save that conversation, since it
   sends the whole of it to the same server. The fix belongs in jig (send back the start of an invalid
   call and the parse error, and compact before a request that won't fit); it isn't made here, so that
-  milestone 28 compares jig as it was.
+  milestone 28 compares jig as it was. (The first half came after milestone 28's round: see there.)
 - **The loss fell by 30% and the agent got worse.** Milestone 26's caution, measured: the loss says how
   much the model's tokens look like flash's when flash succeeded, in the context of a success. As an
   agent, the model writes in contexts of its own, and once it is off course, nothing it trained on shows
@@ -1137,3 +1138,62 @@ nothing anywhere the base model hadn't. Neither followed the injected instructio
 
 **Cost.** Nothing at DeepSeek. Modal billed $10.68: $4.35 for training (the H100, with the Coder model's
 start and the smoke tests) and $6.33 for three hours of serving.
+
+## Milestone 28: the loop and the tools again, and changes that never ran
+
+Milestone 22's round, in which candidates could change only the loop and the tools, came closest (+8
+and +5 points), and milestones 23 to 27 tried other levers. This round goes back to the loop, from jig as
+milestone 27 left it, whose default path is still milestone 20's (what came since is behind flags). A
+new baseline is the one the analysis sees: 33 of 63 (52%), within the earlier baselines' 27 to 36.
+Candidates are compared, as in milestones 21 and 22, with `baseline-m19b` and `-m19c`, which no analysis
+has seen. With the new run among them, the referee would accept a change that does nothing 1.6% of the
+time (2.4% against those two runs), and one that fixes a third of the failures 69%.
+
+The analysis named four causes: reading the whole repository before writing anything; an edit on the
+last step, so the tests never run after it; whole files rewritten, several in one step; and steps spent
+probing the environment. jig changed a copy of its loop or tools for each of the first three:
+
+| # | the change | training tasks | verdict |
+|---|------------|----------------|---------|
+| 13 | with one call left after this one and nothing changed yet, the request declares only the tools that change files | 43% against 42%, cost ×1.34 | rejected: ahead in 57% of resamples |
+| 14 | after an edit the model didn't test, the loop runs the last test command the model ran and adds what it printed to the edit's result | 47% against 42%, cost ×1.19 | rejected: ahead in 63% |
+| 15 | `edit_file` takes several changes, in several files, in one call (`edits`) | 47% against 42%, cost ×1.24 | rejected: ahead in 65% |
+
+- **Two of the three changes never ran.** The sessions show what each change did, which the referee
+  doesn't look at. Candidate 14 needs a test command the model ran before its edit, and in 4 steps flash
+  reads, then writes, and tests after, if at all: the re-run happened in none of its 30 attempts.
+  Candidate 15's model called `edit_file` once in 30 attempts, with one change, and `write_file` 29
+  times. So their +5 points are two measurements of changes that do nothing, ahead in 63% and 65% of
+  resamples: the noise the referee's bar of 80% is there for.
+- **A tool left out of a request is no limit.** At candidate 13's third step, with only the tools that
+  change files declared, the model called `read_file`, `bash` or `glob` in 22 of 30 attempts, and jig ran
+  them, since it runs any tool it has by name. Milestone 22's candidate 10 had the same hole. For a step's
+  tools to be a limit, the loop would have to refuse a call to a tool the request didn't offer.
+- **The same ideas again.** Given new words for the causes, the proposer came back to milestone 22's two
+  mechanisms: candidate 13 is candidate 10 on the last two steps instead of the last one, and candidate
+  14 runs the tests after an edit as candidate 12 did, with the model's own command instead of one it
+  found. What would tell the proposer, and the referee, whether a change takes effect is a count of how
+  often its code ran in the training attempts: a change that ran in none of them can be rejected for
+  what it costs, before its scores are read.
+
+**Two fixes, after the round.** Neither changes jig as the round measured it, except where it went wrong:
+
+- **An invalid call goes back in part.** The model is told the parser's error, with its position, and
+  shown the input's first 2,000 characters and the 400 before the error, instead of all of it (milestone
+  27's echoes held 40k to 155k). On a chat completions server, the reply itself keeps an invalid call's
+  input as `{}`, so that is all the conversation holds of a runaway call. Flash made no invalid call in
+  this round's 279 attempts, and 2 in Terminal-Bench's 532 sessions, the longer 443 characters, which
+  still goes back whole.
+- **The loop runs only the tools the request declared.** Each API path now returns the names of the
+  tools its request declared (`ModelTurn.offered`), and a call to any other gets "Not run: … isn't one
+  of the tools offered for this step", with the ones that were. jig's own requests declare every tool it
+  has, so for jig as it is nothing changes; a change like candidate 13, or milestone 22's candidate 10,
+  would now get the limit it meant.
+
+The second half of milestone 27's fix, compacting before a request that won't fit, isn't made: it needs
+the server's window, which jig doesn't know (`--compact-at` sets a smaller one by hand), and the echo was
+what made 17 of milestone 27's 19 conversations outgrow theirs.
+
+**Cost.** By jig's token counts, at list prices: the baseline $0.89, the analysis $0.007, the three
+candidates $1.77 (their proposals $0.40). DeepSeek bills about half of that off-peak: the balance fell by
+8.78 CNY over the round, other projects' use included.

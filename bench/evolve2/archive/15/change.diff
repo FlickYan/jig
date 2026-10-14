@@ -1,0 +1,205 @@
+diff --git a/src/review.ts b/src/review.ts
+index 8ccfc69..14ba676 100644
+--- a/src/review.ts
++++ b/src/review.ts
+@@ -99,7 +99,7 @@ export function workLog(messages: MessageParam[]): string {
+       const result = results.get(block.id);
+       const failed = result?.isError ? " (failed)" : "";
+       if (block.name === "bash") entries.push(`$ ${oneLine(String(input.command ?? ""), 300)}\n  ${howItEnded(result?.content ?? "")}`);
+-      else if (block.name === "write_file" || block.name === "edit_file") entries.push(`${block.name} ${String(input.path ?? "")}${failed}`);
++      else if (block.name === "write_file" || block.name === "edit_file") entries.push(`${block.name} ${changedFiles(input).join(", ")}${failed}`);
+       else if (!["read_file", "grep", "glob", "subagent", "memory", "skill"].includes(block.name)) entries.push(`${block.name}${failed}`);
+     }
+   }
+@@ -109,6 +109,13 @@ export function workLog(messages: MessageParam[]): string {
+   return entries.length > kept.length ? `(${entries.length - kept.length} earlier entries left out)\n${log}` : log;
+ }
+ 
++/** The files a call that changes files names: one path, or every file an edit_file's several changes reach. */
++function changedFiles(input: Record<string, unknown>): string[] {
++  const edits = Array.isArray(input.edits) ? (input.edits as Record<string, unknown>[]) : [];
++  const named = [input.path, ...edits.map((edit) => (edit && typeof edit === "object" ? edit.path : undefined))];
++  return [...new Set(named.filter((file): file is string => typeof file === "string" && file !== ""))];
++}
++
+ /** A command's ending, from bash's result: the exit code and the last line it printed. */
+ function howItEnded(content: string): string {
+   const lines = content.trimEnd().split("\n");
+diff --git a/src/tools/edit.ts b/src/tools/edit.ts
+index 19481dc..acb5759 100644
+--- a/src/tools/edit.ts
++++ b/src/tools/edit.ts
+@@ -1,10 +1,19 @@
+ // edit_file: replaces a string that must occur exactly once in the file. When it doesn't match, the error
+ // points at the nearest thing the file does hold (leftover line numbers, other indentation, a first line
+-// that matches), so the model can fix its next try in one step. A file's Windows line endings are kept.
++// that matches), so the model can fix its next try in one step. One call may carry several changes, each in
++// its own file, so a change that reaches several places or several files is made in one pass rather than a
++// whole-file rewrite per file. A file's Windows line endings are kept.
+ 
+ import { readFile, writeFile } from "node:fs/promises";
+-import type { Tool } from "./index.ts";
+-import { assertFile, lineCount, numbered, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";
++import type { Tool, ToolInput } from "./index.ts";
++import { assertFile, type FileVersions, lineCount, numbered, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";
++
++/** One change: the file it is in, the text it replaces, and what replaces it (missing until checked). */
++interface Change {
++  path: string;
++  old_string?: string;
++  new_string?: string;
++}
+ 
+ export const editTool: Tool = {
+   definition: {
+@@ -12,62 +21,111 @@ export const editTool: Tool = {
+     description:
+       "Replace text in a file. old_string must match the file's current content exactly, including " +
+       "whitespace and indentation, and must occur exactly once: include enough surrounding lines to make it " +
+-      "unique. Don't include the line-number prefixes from read_file. Read the file before editing it.",
++      "unique. Don't include the line-number prefixes from read_file. Read the file before editing it. One " +
++      "call can make several changes, in this file or in others (edits): make the change everywhere it " +
++      "reaches, in every file, in one call, rather than rewriting those files whole or waiting for a reply.",
+     input_schema: {
+       type: "object",
+       properties: {
+-        path: { type: "string", description: "Path to the file, relative to the working directory" },
++        path: { type: "string", description: "Path to the file, relative to the working directory (the default for edits)" },
+         old_string: { type: "string", description: "The exact text to replace" },
+         new_string: { type: "string", description: "The text to replace it with" },
++        edits: {
++          type: "array",
++          description:
++            "More changes to make in the same call, each {path?, old_string, new_string}, path defaulting to the one above. " +
++            "Use it for every place, and every file, the change reaches.",
++        },
+       },
+-      required: ["path", "old_string", "new_string"],
++      required: ["path"],
+       additionalProperties: false,
+     },
+   },
+   kind: "edit",
+-  describe: ({ path, old_string, new_string }) =>
+-    [String(path), ...prefixLines(String(old_string), "- "), ...prefixLines(String(new_string), "+ ")].join("\n"),
++  describe: (input) =>
++    changesOf(input)
++      .map(({ path, old_string = "", new_string = "" }) => [path, ...prefixLines(old_string, "- "), ...prefixLines(new_string, "+ ")].join("\n"))
++      .join("\n"),
+ 
+   async run(input, { cwd, versions, dirs }) {
+-    const { path, old_string: oldText, new_string: newText } = input as {
+-      path: string;
+-      old_string: string;
+-      new_string: string;
+-    };
+-    if (oldText === "") {
+-      throw new Error("old_string is empty. Use write_file to create a file, or include a nearby line in old_string.");
++    const changes = changesOf(input);
++    if (changes.length === 0) {
++      throw new Error("There is nothing to change: give old_string and new_string, or edits for several changes.");
+     }
+-    if (oldText === newText) throw new Error("old_string and new_string are identical; there is nothing to change.");
+-    const file = resolveInRoot(cwd, path, dirs);
+-    await assertFile(file, path);
+-    // No read-before-edit check here, unlike write_file: an exact, unique match of old_string already
+-    // shows the model knows the text it replaces, and can't overwrite anything it hasn't seen. In the
+-    // benchmark the check refused 22 edits across five runs, and every refusal was a false alarm.
+-    const text = await readFile(file, "utf8");
+-
+-    // The model writes \n line endings. In a file that uses \r\n, match in either style, and always write
+-    // new lines the file's way (a one-line old_string matches as-is, but its replacement can add lines).
+-    const crlf = usesCRLF(text);
+-    const search = crlf && !text.includes(oldText) ? toCRLF(oldText) : oldText;
+-    const replacement = crlf ? toCRLF(newText) : newText;
+-
+-    const count = countOccurrences(text, search);
+-    if (count === 0) throw new Error(explainMissing(path, text, oldText));
+-    if (count > 1) {
+-      throw new Error(
+-        `old_string occurs ${count} times in ${path}, but must occur exactly once. ` +
+-          "Include more surrounding lines to make it unique.",
+-      );
++    const done: string[] = [];
++    for (const change of changes) {
++      try {
++        done.push(await applyEdit(change, cwd, versions, dirs));
++      } catch (err) {
++        // The changes before this one are already on disk: say so, so the model knows the state it is in.
++        const before = done.length ? `The changes before it were made (${done.join(" ")}). ` : "";
++        throw new Error(before + (err instanceof Error ? err.message : String(err)));
++      }
+     }
+-    const at = text.indexOf(search);
+-    // Splice instead of text.replace(), which would expand patterns like $& and $1 in new_string.
+-    await writeFile(file, text.slice(0, at) + replacement + text.slice(at + search.length));
+-    await versions.record(file);
+-    const line = text.slice(0, at).split("\n").length;
+-    return `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}.`;
++    return done.join("\n");
+   },
+ };
+ 
++/** The changes one call asks for: the top-level old_string and new_string, then each entry in `edits`. */
++function changesOf(input: ToolInput): Change[] {
++  const text = (value: unknown) => (typeof value === "string" ? value : undefined);
++  const path = text(input.path) ?? "";
++  const changes: Change[] = [];
++  if ("old_string" in input || "new_string" in input) {
++    changes.push({ path, old_string: text(input.old_string), new_string: text(input.new_string) });
++  }
++  for (const entry of Array.isArray(input.edits) ? input.edits : []) {
++    const edit = (entry && typeof entry === "object" ? entry : {}) as ToolInput;
++    changes.push({ path: text(edit.path) ?? path, old_string: text(edit.old_string), new_string: text(edit.new_string) });
++  }
++  // A model that gives its first change at the top level and repeats it in edits gets it made once.
++  const seen = new Set<string>();
++  return changes.filter(({ path, old_string, new_string }) => {
++    const key = [path, old_string, new_string].join("\u0000");
++    if (seen.has(key)) return false;
++    seen.add(key);
++    return true;
++  });
++}
++
++/** One change, made to the file as it is now: several changes to one file apply one after another. */
++async function applyEdit({ path, old_string: oldText, new_string: newText }: Change, cwd: string, versions: FileVersions, dirs?: string[]): Promise<string> {
++  if (oldText === undefined || newText === undefined) {
++    throw new Error(`A change to ${path || "a file"} needs both old_string and new_string, and one of them is missing.`);
++  }
++  if (oldText === "") {
++    throw new Error("old_string is empty. Use write_file to create a file, or include a nearby line in old_string.");
++  }
++  if (oldText === newText) throw new Error("old_string and new_string are identical; there is nothing to change.");
++  const file = resolveInRoot(cwd, path, dirs);
++  await assertFile(file, path);
++  // No read-before-edit check here, unlike write_file: an exact, unique match of old_string already
++  // shows the model knows the text it replaces, and can't overwrite anything it hasn't seen. In the
++  // benchmark the check refused 22 edits across five runs, and every refusal was a false alarm.
++  const text = await readFile(file, "utf8");
++
++  // The model writes \n line endings. In a file that uses \r\n, match in either style, and always write
++  // new lines the file's way (a one-line old_string matches as-is, but its replacement can add lines).
++  const crlf = usesCRLF(text);
++  const search = crlf && !text.includes(oldText) ? toCRLF(oldText) : oldText;
++  const replacement = crlf ? toCRLF(newText) : newText;
++
++  const count = countOccurrences(text, search);
++  if (count === 0) throw new Error(explainMissing(path, text, oldText));
++  if (count > 1) {
++    throw new Error(
++      `old_string occurs ${count} times in ${path}, but must occur exactly once. ` +
++        "Include more surrounding lines to make it unique.",
++    );
++  }
++  const at = text.indexOf(search);
++  // Splice instead of text.replace(), which would expand patterns like $& and $1 in new_string.
++  await writeFile(file, text.slice(0, at) + replacement + text.slice(at + search.length));
++  await versions.record(file);
++  const line = text.slice(0, at).split("\n").length;
++  return `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}.`;
++}
++
+ /** Counts overlapping matches too: "aa" occurs twice in "aaa", so it does not pick out one place. */
+ function countOccurrences(text: string, search: string): number {
+   let count = 0;
