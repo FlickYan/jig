@@ -27,6 +27,10 @@ agent harness does for a model.)
 - **It changes itself, under a referee it can't reach.** jig diagnoses its own failures, proposes changes
   to its own code in a copy without the benchmarks, and a referee whose false acceptances were measured
   first judges them on training tasks, then held-out ones, then Terminal-Bench.
+- **On a real issue, filed after its model.** [Python-Markdown #1651](examples/python-markdown-1651), filed
+  after jig's default model was in use, with the maintainers' tests hidden: in three attempts jig traced
+  the lost text through Python-Markdown's parser into the standard library's, fixed it the way the
+  maintainers did (the same output on 148,188 generated inputs) and passed their tests, for $0.13 in all.
 
 ## Quick start
 
@@ -337,6 +341,7 @@ What each question came to; the write-ups, with every number's run and caveat, a
 |----------|---------------------|---------------|
 | Does jig work? | the in-house benchmark: 20 tasks, hidden tests, 3 attempts each | 60 of 60 for every version since milestone 7, on macOS and Linux; no attempt followed a prompt injection |
 | Against another agent? | Terminal-Bench 2.0, 20 tasks × 3, against mini-swe-agent on the same model (deepseek-flash) | 68% against 73%: 5 points behind (−3 to +15), within the noise, at 39% lower cost |
+| On a real bug, filed after its model was in use? | [Python-Markdown #1651](examples/python-markdown-1651), filed after deepseek-flash was in use; the maintainers' tests hidden; 3 attempts | 3 of 3 solved, $0.13 in all; each fix renders 148,188 generated inputs exactly as upstream's does; one of the three explained why the bug depends on the Python version, and one ran out of steps before its summary |
 | Does checking before finishing help? (9) | Terminal-Bench, the 20 tasks and 20 held-out ones | it fixed the failures it aimed at, ran others out of time and solved no more, at 38–65% more cost: opt-in |
 | Do skills and memory work? (12, 13) | each with and without, 9 runs each | a skill learned from one session: 9 of 9 against 0 of 9; a convention remembered from an earlier session: 9 of 9 against 0 of 9 |
 | Can jig improve its own code? (14–22, 28) | the evolve loop and its referee, on two suites | 19 candidates; one accepted (+15 and +17 points on the suite), then 15 points worse on Terminal-Bench, so not merged; neither advice in the prompt nor changes to the loop moved the suite, and two of the loop's changes never ran at all |
