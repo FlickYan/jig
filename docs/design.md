@@ -68,7 +68,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   packaged everywhere (Flatpak uses it), and needs no privileges where user namespaces are allowed.
   Each command gets its own namespace, so a server one command starts is out of reach of the next; on
   macOS it isn't. Killing a command's process group still reaches everything inside, and
-  `--die-with-parent` takes the sandbox down if jig dies.
+  `--die-with-parent` takes the sandbox down if jig dies. Commands keep the machine's process IDs, so
+  they can signal the user's other processes: in a PID namespace of their own (`--unshare-pid`), a job a
+  command leaves in the background would die with its shell, which the rule above leaves running. And
+  `--unshare-net` cuts off IP only: a daemon listening on a Unix socket (Docker's, say) stays within
+  reach, and closing that would take seccomp.
 - **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach,
   so they check paths themselves: against the project and the `--add-dir` directories, and a change
   again by where its path really leads. Without that, a symlink (a cloned repository can carry one, a
@@ -77,6 +81,13 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   the hidden paths, which are checked by real path instead, and would break linked packages. A git
   directory's `config` and hooks are never changed, since git runs the programs they name outside the
   sandbox.
+- **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
+  own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
+  `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig
+  runs git with fsmonitor and hooks turned off and without its API keys. The sandbox also keeps the
+  project's git config and hooks read-only, and its git directory in place, for the user's own git after
+  the session. That can't cover every way: a command can still point git at another git directory (a
+  `commondir` file does) or make a repository of its own, so jig's git doesn't rely on it.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

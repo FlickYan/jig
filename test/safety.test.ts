@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
-import { createSandbox, type Sandbox, sandboxProblem } from "../src/sandbox.ts";
+import { createSandbox, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { runCommand } from "../src/tools/bash.ts";
@@ -77,6 +78,39 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     const flags = (network: boolean) => createSandbox(project, { network })!.wrap("x").args.join(" ");
     assert.match(flags(false), /deny network|--unshare-net/);
     assert.doesNotMatch(flags(true), /deny network|--unshare-net/);
+  });
+
+  it("keeps the repository's git config and hooks read-only, and its git directory in place", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: repo });
+      const config = await readFile(join(repo, ".git", "config"), "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // git runs the programs these name outside the sandbox: the user's git later, in a shell prompt say.
+      assert.match(await inRepo('git config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inRepo('echo "touch planted" > .git/hooks/pre-commit'), /Exit code: [1-9]/);
+      // Moved aside, it could be replaced by a git directory with a config of the command's own.
+      assert.match(await inRepo("mv .git .git-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      assert.equal(existsSync(join(repo, ".git", "hooks", "pre-commit")), false);
+      assert.match(sandbox.limits, /git config and hooks are read-only/);
+      // The rest of git works as before.
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s";
+      assert.equal(await inRepo(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the macOS sandbox's profile", () => {
+  it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], "/p/.git");
+    const locked = profile.indexOf('(deny file-write* (literal "/p/.git/config") (subpath "/p/.git/hooks"))');
+    assert.ok(locked > profile.indexOf('(allow file-write* (subpath "/p")'), "after the rule it overrides, since the last rule wins");
+    assert.match(profile, /^\(deny file-write-unlink \(literal "\/p\/\.git"\)\)$/m);
+    assert.doesNotMatch(seatbeltProfile(["/p"], false, []), /\.git/);
   });
 });
 

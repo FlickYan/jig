@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, relative } from "node:path";
+import { SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
 const FILE_TOOLS = ["read_file", "grep", "glob", "write_file", "edit_file"];
@@ -125,7 +126,8 @@ Environment:
 
 function gitRoot(cwd: string): string | null {
   try {
-    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const args = [...SAFE_GIT, "rev-parse", "--show-toplevel"];
+    return execFileSync("git", args, { cwd, env: withoutKeys(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   } catch {
     return null;
   }

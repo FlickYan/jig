@@ -107,11 +107,14 @@ received (subagents included), and how many input tokens came from the prompt ca
 
 - **Sandbox.** Commands run in the operating system's sandbox, as in Codex and Claude Code: Seatbelt on
   macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but write
-  only inside the project, its git directory, the directories added with `--add-dir` and the temp
-  directories, and they can't reach the network (`--allow-network` lifts that). On macOS, localhost stays
-  open; on Linux each command gets an empty network of its own, so a test can still start a server and
-  talk to it, but only within one command. Because a sandboxed command can't harm anything outside the
-  project or send data out, in the default `edits` mode commands run without asking. On Linux the sandbox
+  only inside the project, its git directory (not its config or hooks, which name programs git runs),
+  the directories added with `--add-dir` and the temp directories, and they can't reach the network
+  (`--allow-network` lifts that). On macOS, localhost stays open; on Linux each command gets an empty
+  network of its own, so a test can still start a server and talk to it, but only within one command.
+  Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
+  within reach. And commands share the machine's processes, so they can see yours and signal them.
+  Because a sandboxed command can't change files outside the project or reach the network, in the
+  default `edits` mode commands run without asking. On Linux the sandbox
   needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where it can't
   run, jig says why, and commands ask first. `--no-sandbox` turns it off.
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
@@ -119,7 +122,8 @@ received (subagents included), and how many input tokens came from the prompt ca
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
   as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
   git directory's `config` or hooks, or a `.git` file or `commondir` that tells git where they are, which
-  could make git run programs outside the sandbox.
+  could make git run programs outside the sandbox. The git that `grep` and `glob` run to list files
+  runs with `core.fsmonitor` and hooks turned off, and without jig's API keys.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,

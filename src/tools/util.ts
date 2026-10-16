@@ -80,7 +80,7 @@ async function realTarget(abs: string): Promise<string | undefined> {
  * user or jig runs git, and grep and glob run git outside the sandbox. A bare repository's are left alone:
  * setting up a server's hooks can be the task.
  */
-function isGitControl(real: string): boolean {
+export function isGitControl(real: string): boolean {
   const parts = real.toLowerCase().split(sep); // macOS's file systems usually ignore case
   const at = parts.indexOf(".git");
   if (at === -1) return false;
@@ -92,6 +92,25 @@ function isGitControl(real: string): boolean {
 
 /** The files in a git directory that hold its config or say where it is. */
 const GIT_CONFIG = ["config", "config.worktree", "commondir"];
+
+/**
+ * Options for the git that jig runs itself in a project (listing files for grep and glob, finding the
+ * repository), in its own process where the sandbox doesn't reach. A repository's config can name
+ * programs for git to run, and a command the model ran may have set one: core.fsmonitor runs on every
+ * ls-files. So that is off, and hooks with it; the commands jig runs start nothing else the config names.
+ * Run it with withoutKeys() as well.
+ */
+export const SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"];
+
+// jig's own credentials. The commands the model runs never need them, and they shouldn't see them: in
+// the Terminal-Bench runs the model printed the environment with `env` to look around, which put the key
+// into the conversation and the logs, and a prompt injection could send it somewhere instead.
+const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
+
+/** jig's environment without its credentials, for commands and for the git it runs in a project. */
+export function withoutKeys(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
+}
 
 /** Whether an absolute path is root itself or below it. */
 export function isInside(root: string, abs: string): boolean {

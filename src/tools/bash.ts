@@ -9,13 +9,9 @@ import { resolve } from "node:path";
 import type { Sandbox } from "../sandbox.ts";
 import type { Tool } from "./index.ts";
 import { parseCommand } from "./shell.ts";
-import { type FileVersions, isInside } from "./util.ts";
+import { type FileVersions, isInside, withoutKeys } from "./util.ts";
 
 const DEFAULT_TIMEOUT = 120; // seconds
-// jig's own credentials. The commands the model runs never need them, and they shouldn't see them: in
-// the Terminal-Bench runs the model printed the environment with `env` to look around, which put the key
-// into the conversation and the logs, and a prompt injection could send it somewhere instead.
-const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
 const MAX_TIMEOUT = 600;
 const MAX_CAPTURE = 5_000_000; // characters; a command printing more than this is killed
 const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
@@ -83,8 +79,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
-    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
-    const child = spawn(program, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let killedBecause = "";
     let done = false;

@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { dirname, join, relative, resolve } from "node:path";
-import { assertVisible, isInside, realHiddenPaths, resolveInRoot } from "./util.ts";
+import { assertVisible, isInside, realHiddenPaths, resolveInRoot, SAFE_GIT, withoutKeys } from "./util.ts";
 
 /** Directories that are never worth searching, even when git doesn't ignore them. */
 const SKIP_DIRS = new Set([
@@ -48,9 +48,9 @@ async function withoutHidden(root: string, files: string[], hidden: string[]): P
 
 /** Tracked and untracked files that git doesn't ignore, or null outside a git repository. */
 function gitFiles(root: string, dir: string): Promise<string[] | null> {
-  const args = ["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", dir];
+  const args = [...SAFE_GIT, "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", dir];
   return new Promise((resolve) => {
-    execFile("git", args, { cwd: root, maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+    execFile("git", args, { cwd: root, env: withoutKeys(), maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
       if (err) return resolve(null);
       // --cached also lists files deleted since the last commit.
       resolve(stdout.split("\0").filter((file) => file && existsSync(join(root, file))));

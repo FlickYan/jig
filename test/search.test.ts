@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { before, describe, it } from "node:test";
@@ -57,6 +58,36 @@ describe("listFiles", () => {
     const { cwd } = await project(false);
     const files = await listFiles(cwd, "src");
     assert.deepEqual(files, ["src/app.py", "src/util/strings.py", "src/util/strings_test.py"]);
+  });
+
+  it("doesn't run a program the repository's git config names", async () => {
+    const { cwd } = await project(true);
+    const outside = await mkdtemp(join(tmpdir(), "jig-fsmonitor-"));
+    // git runs core.fsmonitor on every ls-files, and a command the model ran may have set it.
+    execFileSync("git", ["config", "core.fsmonitor", `env > ${join(outside, "ran")}; false`], { cwd });
+    assert.ok((await listFiles(cwd)).includes("src/app.py"));
+    assert.equal(existsSync(join(outside, "ran")), false);
+  });
+
+  it("runs git without jig's API keys", async () => {
+    const { cwd } = await project(true);
+    const bin = await mkdtemp(join(tmpdir(), "jig-bin-"));
+    // A git that notes its environment, then runs the real one from the rest of the PATH.
+    await writeFile(join(bin, "git"), `#!/bin/sh\nenv > "${bin}/env"\nPATH="\${PATH#*:}" exec git "$@"\n`, { mode: 0o755 });
+    const saved = { PATH: process.env.PATH, DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY };
+    process.env.PATH = `${bin}:${saved.PATH}`;
+    process.env.DEEPSEEK_API_KEY = "sk-test-secret";
+    try {
+      assert.ok((await listFiles(cwd)).includes("src/app.py"));
+    } finally {
+      for (const [name, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+    const env = await readFile(join(bin, "env"), "utf8");
+    assert.match(env, /^HOME=/m, "the rest of the environment is still there");
+    assert.doesNotMatch(env, /sk-test-secret|DEEPSEEK_API_KEY/);
   });
 });
 
