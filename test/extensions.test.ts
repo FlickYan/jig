@@ -338,6 +338,15 @@ describe("subagents", () => {
     assert.equal(last.role, "user");
     assert.match(JSON.stringify(last.content), /tool_result.*run out of steps/, "the request rides on the tool results");
   });
+
+  it("report what they found when they are stopped for repeating themselves", async () => {
+    const seen: MessageParam[][] = [];
+    const again = Array.from({ length: 8 }, (_, i) => reply([toolUse(`s${i}`, "glob", { pattern: "*" })]));
+    const answer = await subagentTool(setup(fakeModel(again, seen), 10)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: loop.)");
+    assert.equal(seen.length, 6, "five steps, then the request for what it found");
+  });
 });
 
 describe("parallel tool calls", () => {
@@ -361,7 +370,8 @@ describe("parallel tool calls", () => {
   it("runs calls that only read at the same time, and the rest in order", async () => {
     for (const [kind, expected] of [["read", 3], ["edit", 1]] as const) {
       const { tool, stats } = slowTool(kind);
-      const calls = [toolUse("a", "slow", {}), toolUse("b", "slow", {}), toolUse("c", "slow", {})];
+      // Different inputs: a call identical to an earlier one in the reply wouldn't run.
+      const calls = [toolUse("a", "slow", { n: 1 }), toolUse("b", "slow", { n: 2 }), toolUse("c", "slow", { n: 3 })];
       const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
       await runAgent(conversation, agentOptions(fakeModel([reply(calls), reply([text("Done.")])]), { tools: [tool] }));
       assert.equal(stats.most, expected, kind);

@@ -118,12 +118,12 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const result = await runAgent(conversation, options, timeUp.signal).finally(() => clearTimeout(timer));
   stats?.finish(result);
   let text = result.stop === "end_turn" ? result.text : "";
-  // Out of steps or time, it gives its verdict on what it has checked (milestone 24's reviews used their
-  // steps up three times in five and gave none), within the time limit, since a verdict after it leaves none
-  // for the re-runs. A reply without a verdict (in milestone 29, a tool call written out as text) is answered
-  // once, while there is time.
-  if (result.stop === "max_steps" || result.stop === "interrupted") {
-    let request = withRequest(conversation.messages, outOf(result.stop === "max_steps" ? "steps" : "time"));
+  // Out of steps or time, or stopped for repeating itself, it gives its verdict on what it has checked
+  // (milestone 24's reviews used their steps up three times in five and gave none), within the time limit,
+  // since a verdict after it leaves none for the re-runs. A reply without a verdict (in milestone 29, a tool
+  // call written out as text) is answered once, while there is time.
+  if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "interrupted") {
+    let request = withRequest(conversation.messages, outOf(result.stop === "interrupted" ? "time" : "steps"));
     for (let ask = 0; ask < 2 && secondsLeft() > 5; ask++) {
       const signal = AbortSignal.timeout(secondsLeft() * 1000);
       const turn = await meteredVerdict(request, signal, { summarize: true }).catch((err: unknown) => {

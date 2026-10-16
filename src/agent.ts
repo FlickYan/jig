@@ -91,9 +91,10 @@ export interface Usage {
 export interface RunResult {
   /**
    * Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours.
+   * "loop": the model made the same calls and got the same results, SAME_STEPS steps in a row.
    * "unapproved" is the CLI's: it stops a task whose tool calls keep needing an approval nobody can give.
    */
-  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "unapproved";
+  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "loop" | "unapproved";
   /**
    * Text of the final reply, after that of the replies it continues if they were cut off at the output limit.
    * At max_steps, the wrap-up's, if there was one (see AgentOptions.wrapUp).
@@ -137,6 +138,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   // before the last one, for the log that follows a summary.
   let compactFrom = 1;
   let compactedWork: MessageParam[] = [];
+  // The last step's calls and results, and how many steps in a row have had the same.
+  let lastStep = "";
+  let sameSteps = 0;
 
   /**
    * Compacts; resolves to whether there was anything to compact. Unless the task is the request kept after
@@ -192,6 +196,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     if (reply.stop_reason === "refusal") return result("refusal", step);
 
     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
+    // A step without calls ends a run of identical ones: what follows it (a request to go on, or to check
+    // the work, or a reviewer's problems) gives the model something new to act on.
+    if (calls.length === 0) lastStep = "";
     // The reply's text, after that of the replies it continues if they were cut off at the output limit.
     const answer = unfinished + replyText(reply);
     unfinished = "";
@@ -257,14 +264,28 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
 
     // Every tool call gets a result, even ones that never run, or the next request is invalid.
     const cutOff = reply.stop_reason !== "tool_use"; // e.g. max_tokens: the last call's input may be incomplete
-    const handle = (call: ToolUse) => handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered }, conversation, opts, usage, signal);
+    const reads = (call: ToolUse) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read";
+    // A call identical to an earlier one in the same reply doesn't run, unless a call between them may have
+    // changed something: it could only do the same again, or fail for having been done (one reply in
+    // milestone 27 held the same edit 208 times). A test run after an edit runs again.
+    const keys = calls.map((call) => callKey(call, malformed.get(call.id)));
+    const earlier = new Map<string, number>(); // the calls since the last that may have changed something
+    const repeats = calls.map((call, i) => {
+      const first = earlier.get(keys[i]);
+      if (first !== undefined) return first + 1;
+      if (!reads(call)) earlier.clear();
+      earlier.set(keys[i], i);
+      return undefined;
+    });
+    const handle = (call: ToolUse, i: number) =>
+      handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered, repeats: repeats[i] }, conversation, opts, usage, signal);
     // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
     // run at the same time. Anything else runs in order, since one call may depend on another's effect.
-    const readOnly = calls.every((call) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read");
+    const readOnly = calls.every(reads);
     const results: ToolResult[] = [];
     try {
       if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
-      else for (const call of calls) results.push(await handle(call));
+      else for (const [i, call] of calls.entries()) results.push(await handle(call, i));
     } catch (err) {
       // handleToolCall turns failures into results, so only a bug in jig gets here. The error still ends
       // the task, but the calls left open get a result first, so the conversation can go on afterwards.
@@ -284,6 +305,15 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     }
 
     if (signal?.aborted) return result("interrupted", step);
+
+    // The same calls with the same results, step after step: what the model sees doesn't change, so neither
+    // will what it does, and it would spend the steps left on them (milestone 27's trained model made the
+    // same call 5 or more times in a row in 25 of 69 attempts). The results count, so polling that gets
+    // somewhere isn't stopped.
+    const thisStep = JSON.stringify(calls.map((_, i) => [keys[i], results[i].content, results[i].is_error]));
+    sameSteps = thisStep === lastStep ? sameSteps + 1 : 1;
+    lastStep = thisStep;
+    if (sameSteps >= SAME_STEPS) return result("loop", step);
   }
   if (!opts.wrapUp) return result("max_steps", opts.maxSteps);
 
@@ -330,6 +360,13 @@ export const WRAP_UP = "You have run out of steps. Don't call any tools: say wha
 const COMPACT_AGAIN_AFTER = 3;
 
 /**
+ * How many steps in a row with the same calls and the same results end a run ("loop"). Five, as milestone
+ * 27 counted looping: nothing warns the model first, and waiting for something slow (a server starting)
+ * can poll a few times with the same result.
+ */
+export const SAME_STEPS = 5;
+
+/**
  * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
  * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.
  * The loop's note after a reply that wasn't an answer is no request: kept, it would point at a reply the
@@ -347,14 +384,15 @@ async function compactConversation(conversation: Conversation, opts: AgentOption
 }
 
 /**
- * One tool call, through each check in turn: the tool exists and the request offered it, the run wasn't
- * interrupted, the call wasn't cut off mid-input, the input is valid, the hooks and then the permission
- * policy allow it. Then it runs, its output is trimmed, and the after-hooks have their say. A failed check
- * becomes an error result that says what went wrong, which the model can act on.
+ * One tool call, through each check in turn: it doesn't repeat an earlier call in the reply, the tool
+ * exists and the request offered it, the run wasn't interrupted, the call wasn't cut off mid-input, the
+ * input is valid, the hooks and then the permission policy allow it. Then it runs, its output is trimmed,
+ * and the after-hooks have their say. A failed check becomes an error result that says what went wrong,
+ * which the model can act on.
  */
 async function handleToolCall(
   call: ToolUse,
-  state: { cutOff: boolean; malformed?: string; offered?: string[] },
+  state: { cutOff: boolean; malformed?: string; offered?: string[]; repeats?: number },
   conversation: Conversation,
   opts: AgentOptions,
   usage: Usage,
@@ -365,6 +403,11 @@ async function handleToolCall(
     return { type: "tool_result", tool_use_id: call.id, content, is_error: true };
   };
 
+  // The earlier call's result answers this one, whatever it was.
+  if (state.repeats) {
+    opts.ui.toolCall(call.name, "", call.id);
+    return fail(`Not run: identical to an earlier call in this reply (call ${state.repeats}).`);
+  }
   const tool = opts.tools.find((t) => t.definition.name === call.name);
   // A tool the request didn't declare isn't the model's to call, even one jig has.
   const offered = state.offered ?? opts.tools.map((t) => t.definition.name);
@@ -421,6 +464,16 @@ async function handleToolCall(
   }
   opts.ui.toolResult(output, false, call.id);
   return { type: "tool_result", tool_use_id: call.id, content: output };
+}
+
+/**
+ * What makes two calls the same: the tool and the input, its keys sorted (models don't always write them
+ * in the same order), or the input as written when it wasn't valid JSON.
+ */
+function callKey(call: ToolUse, malformed?: string): string {
+  const sorted = (_key: string, value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : 1))) : value;
+  return JSON.stringify([call.name, malformed ?? call.input], sorted);
 }
 
 /** A call as the terminal shows it. Only shown, so a tool that can't describe its input shows the input. */

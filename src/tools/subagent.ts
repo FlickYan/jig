@@ -42,8 +42,9 @@ export function subagentTool(setup: SubagentSetup): Tool {
       const result = await runAgent(conversation, { ...setup, ui: setup.ui(description) }, signal);
       if (usage) addUsage(usage, asApiUsage(result.usage)); // the task's cost includes its subagents'
       let answer = result.text.trim();
-      if (result.stop === "max_steps") {
-        // Out of steps in the middle of its research: get what it found so far, rather than nothing.
+      if (result.stop === "max_steps" || result.stop === "loop") {
+        // Out of steps in the middle of its research, or stopped for repeating itself: get what it found so
+        // far, rather than nothing.
         const { message } = await setup.callModel(withRequest(conversation.messages, OUT_OF_STEPS), signal, { summarize: true });
         if (usage) addUsage(usage, message.usage);
         answer = message.content.map((block) => (block.type === "text" ? block.text : "")).join("").trim();

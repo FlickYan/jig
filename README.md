@@ -104,7 +104,8 @@ received (subagents included), and how many input tokens came from the prompt ca
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
-tool calls needed approval and there was no terminal to ask, and 130 on Ctrl+C. So
+tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
+same tool calls (see below), and 130 on Ctrl+C. So
 `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
 
 ## What it does
@@ -350,6 +351,10 @@ check its work against the task, if a step is left for that, and stops at the ne
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
 or only thinking): it stays out of the history, and the model is asked once to go on.
+A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
+same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
+its step limit), and a call identical to an earlier one in the same reply, with only reads between them,
+isn't run (its result says which call it repeats).
 At `--max-steps`, jig makes one more call, in which the model can't call tools, asking what it changed,
 what it verified and how, and what is left, and prints the reply: the model's own report, not evidence.
 Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`

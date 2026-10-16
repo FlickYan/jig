@@ -460,15 +460,29 @@ describe("a one-shot run's exit code", () => {
     // The task says how the model behaves: answers, calls tools until the steps run out, is cut off, declines.
     const api = await fakeMessagesApi((request) => {
       const task = JSON.stringify((request.messages as { content: unknown }[])[0].content);
-      if (task.includes("Loop")) return [{ tool: "glob", input: { pattern: "*" } }];
+      if (task.includes("Search")) return [{ tool: "glob", input: { pattern: "*" } }];
       if (task.includes("Ramble")) return { blocks: [{ text: "and so on, and" }], stop: "max_tokens" };
       if (task.includes("Decline")) return { blocks: [], stop: "refusal" };
       return [{ text: "Done." }];
     });
     try {
       const codes: Record<string, number | null> = {};
-      for (const task of ["Finish.", "Loop.", "Ramble.", "Decline."]) codes[task] = (await runJig([...args, "--max-steps", "3", task], { api, cwd: project })).code;
-      assert.deepEqual(codes, { "Finish.": 0, "Loop.": 2, "Ramble.": 3, "Decline.": 4 });
+      for (const task of ["Finish.", "Search.", "Ramble.", "Decline."]) codes[task] = (await runJig([...args, "--max-steps", "3", task], { api, cwd: project })).code;
+      assert.deepEqual(codes, { "Finish.": 0, "Search.": 2, "Ramble.": 3, "Decline.": 4 });
+    } finally {
+      api.close();
+    }
+  });
+
+  it("is 6 when the model makes the same calls, with the same results, 5 steps in a row", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Let me list them again." }, { tool: "glob", input: { pattern: "*" } }]);
+    try {
+      const file = join(outside, "stats.json");
+      const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 6, output);
+      assert.equal(api.requests.length, 5);
+      assert.match(output, /Stopped: the model made the same tool calls, and got the same results, 5 steps in a row\.\n5 steps · /);
+      assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "loop");
     } finally {
       api.close();
     }
@@ -500,7 +514,7 @@ describe("a one-shot run's exit code", () => {
 
   it("is listed in --help", () => {
     const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" }).replace(/\s+/g, " ");
-    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), and 130 when interrupted\./);
+    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, and 130 when interrupted\./);
   });
 });
 

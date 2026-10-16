@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
@@ -467,6 +467,110 @@ describe("a check around a tool call that throws", () => {
     const [a, b] = resultsIn(messages[2]);
     assert.deepEqual([a.tool_use_id, a.content], ["a", "one\n\nExit code: 0"]);
     assert.deepEqual([b.tool_use_id, b.is_error, b.content], ["b", true, "No result: jig failed while handling this call (the terminal is gone)."]);
+  });
+});
+
+describe("a model that repeats itself", () => {
+  const REPEAT = "Not run: identical to an earlier call in this reply (call 1).";
+
+  it("runs a call repeated within one reply once, and answers the repeats without running them", async () => {
+    await writeFile(join(cwd, "a.py"), "x = 1\n");
+    const ids = Array.from({ length: 10 }, (_, i) => `e${i}`);
+    const edit = { path: "a.py", old_string: "x = 1", new_string: "x = 1  # checked" };
+    const { options, conversation, messages } = setup([reply(ids.map((id) => toolUse(id, "edit_file", edit))), reply([text("Done.")])]);
+    assert.equal((await runAgent(conversation, options)).text, "Done.");
+    assert.equal(await readFile(join(cwd, "a.py"), "utf8"), "x = 1  # checked\n", "the edit ran once, not ten times");
+    const results = resultsIn(messages[2]);
+    assert.deepEqual(results.map((r) => r.tool_use_id), ids, "every call is answered, in order");
+    assert.equal(results[0].is_error, undefined);
+    for (const repeat of results.slice(1)) assert.deepEqual([repeat.is_error, repeat.content], [true, REPEAT]);
+  });
+
+  it("tells a repeat from a call that differs, whatever the order of its input's keys", async () => {
+    const { options, conversation, messages } = setup([
+      reply([
+        toolUse("a", "bash", { command: "echo one >> log.txt", timeout: 5 }),
+        toolUse("b", "bash", { timeout: 5, command: "echo one >> log.txt" }),
+        toolUse("c", "bash", { command: "echo two >> log.txt" }),
+        toolUse("d", "bash", { command: "echo two >> log.txt", timeout: 6 }),
+      ]),
+      // Read-only calls run at the same time; a repeat among them doesn't run either.
+      reply([toolUse("r1", "read_file", { path: "log.txt" }), toolUse("r2", "read_file", { path: "log.txt" })]),
+      // Input that isn't JSON is compared as it was written, not as the lenient parser read it.
+      reply([toolUse("m1", "write_file", {}), toolUse("m2", "write_file", {})], "tool_use", new Map([["m1", '{"path":"a'], ["m2", '{"path":"b']])),
+      reply([text("Done.")]),
+    ]);
+    await runAgent(conversation, options);
+    assert.equal(await readFile(join(cwd, "log.txt"), "utf8"), "one\ntwo\ntwo\n");
+    assert.deepEqual(resultsIn(messages[2]).map((r) => r.content === REPEAT), [false, true, false, false]);
+    const [read, repeat] = resultsIn(messages[4]);
+    assert.match(String(read.content), /1\tone\n\s+2\ttwo\n\s+3\ttwo/);
+    assert.equal(repeat.content, REPEAT);
+    assert.deepEqual(resultsIn(messages[6]).map((r) => /INVALID_JSON/.test(String(r.content))), [true, true]);
+  });
+
+  it("runs a repeat again once a call between them may have changed something", async () => {
+    await writeFile(join(cwd, "check.sh"), "grep -q good value.txt && echo PASS || { echo FAIL; exit 1; }\n");
+    await writeFile(join(cwd, "value.txt"), "good\n");
+    const test = { command: "sh check.sh" };
+    const fix = { path: "value.txt", old_string: "bad", new_string: "good" };
+    const { options, conversation, messages } = setup([
+      reply([
+        toolUse("t1", "bash", test),
+        toolUse("e1", "edit_file", { path: "value.txt", old_string: "good", new_string: "bad" }),
+        toolUse("t2", "bash", test),
+        toolUse("r1", "read_file", { path: "value.txt" }),
+        toolUse("e2", "edit_file", fix),
+        toolUse("r2", "read_file", { path: "value.txt" }),
+        // The second edit and read again: nothing that may change anything has run since, so they don't.
+        toolUse("e3", "edit_file", fix),
+        toolUse("r3", "read_file", { path: "value.txt" }),
+      ]),
+      reply([text("Done.")]),
+    ]);
+    await runAgent(conversation, options);
+    const results = resultsIn(messages[2]).map((r) => String(r.content));
+    assert.match(results[0], /^PASS/);
+    assert.match(results[2], /^FAIL/, "the test run after the edit ran, rather than pointing at the one before it");
+    assert.match(results[3], /1\tbad/);
+    assert.match(results[5], /1\tgood/, "so did the read after the second edit");
+    assert.deepEqual(results.slice(6), ["Not run: identical to an earlier call in this reply (call 5).", "Not run: identical to an earlier call in this reply (call 6)."]);
+  });
+
+  it("stops a run whose model makes the same calls, with the same results, 5 steps in a row", async () => {
+    const again = Array.from({ length: 8 }, (_, i) => reply([text("Let me look again."), toolUse(`t${i}`, "read_file", { path: "missing.txt" })]));
+    const { options, conversation, messages, historyLengths, summaries } = setup(again, { wrapUp: true });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["loop", 5, ""]);
+    assert.equal(historyLengths.length, 5);
+    assert.equal(summaries.length, 0, "it is no report on work, so no wrap-up is asked for");
+    assert.equal(messages.at(-1)?.role, "user", "it ends on the calls' results, so the conversation can go on");
+  });
+
+  it("doesn't stop a call whose result changes, or a run of repeats another call broke", async () => {
+    const counting = Array.from({ length: 7 }, (_, i) => reply([toolUse(`t${i}`, "bash", { command: "echo x >> log.txt && wc -l < log.txt" })]));
+    const polling = setup([...counting, reply([text("Done.")])]);
+    assert.deepEqual(await runAgent(polling.conversation, polling.options).then((r) => [r.stop, r.steps]), ["end_turn", 8]);
+    const same = (i: number) => reply([toolUse(`s${i}`, "bash", { command: "true" })]);
+    const other = reply([toolUse("o", "bash", { command: "echo other" })]);
+    const broken = setup([same(1), same(2), same(3), same(4), other, same(5), same(6), same(7), same(8), reply([text("Done.")])]);
+    assert.deepEqual(await runAgent(broken.conversation, broken.options).then((r) => [r.stop, r.steps]), ["end_turn", 10]);
+  });
+
+  it("counts again after a step without calls, which gives the model something new to act on", async () => {
+    const same = (i: number) => reply([toolUse(`s${i}`, "bash", { command: "true" })]);
+    const usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+    const reviewer: Reviewer = { model: "strong", review: async () => ({ verdict: "problems", feedback: "PROBLEMS: start the server first.", usage }) };
+    const between: [ModelTurn, Partial<AgentOptions>][] = [
+      [reply([text("It's down.")]), { review: "Check your work." }], // --check's request
+      [reply([text("It's down.")]), { reviewer }], // the reviewer's problems
+      [reply([]), {}], // an empty reply: the model is asked to go on
+      [reply([text("It's do")], "max_tokens"), {}], // cut off: the model is asked to continue
+    ];
+    for (const [step, overrides] of between) {
+      const { options, conversation } = setup([same(1), same(2), same(3), same(4), step, same(5), reply([text("Still down.")])], overrides);
+      assert.deepEqual(await runAgent(conversation, options).then((r) => [r.stop, r.steps]), ["end_turn", 7]);
+    }
   });
 });
 

@@ -9,7 +9,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, type ToolHooks, type Usage } from "./agent.ts";
+import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks } from "./hooks.ts";
@@ -101,8 +101,8 @@ Ctrl+C stops the current task (press it again to force quit).
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
-declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), and 130 when
-interrupted.`;
+declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
+made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, and 130 when interrupted.`;
 
 /** How a task ended: as the loop stopped, or "error" if it failed. */
 type Ending = RunResult["stop"] | "error";
@@ -112,7 +112,7 @@ type Ending = RunResult["stop"] | "error";
  * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
  * Any other ending, a failure included, is 1.
  */
-const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, interrupted: 130 };
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, interrupted: 130 };
 
 // With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
 const MAX_UNAPPROVED = 3;
@@ -697,6 +697,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     model_context_window_exceeded: "The conversation no longer fits in the context window. Use /compact or /reset.",
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
+    loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
     unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;

@@ -8,7 +8,7 @@ import type { ModelTurn } from "../src/model.ts";
 import { problemsOf, recheck, reviewer, reviewPrompt, runningReviewPrompt, sentBackWithEvidence, verdictOf, workLog } from "../src/review.ts";
 import { TOOLS } from "../src/tools/index.ts";
 import type { SubagentSetup } from "../src/tools/subagent.ts";
-import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { fakeMessagesApi, type Reply, runJig } from "./fake-api.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
@@ -92,6 +92,10 @@ describe("the reviewer", () => {
     authorize: async () => null,
     ui: () => ({ toolCall() {}, toolResult() {}, notice() {} }),
   });
+  const look = (id: string): ModelTurn => ({
+    message: { content: [{ type: "tool_use", id, name: "glob", input: { pattern: "*" } }], stop_reason: "tool_use", usage: { input_tokens: 40, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } as unknown as Anthropic.Beta.BetaMessage,
+    malformed: new Map(),
+  });
   const work = { task: "Write out.txt.", answer: "Done.", messages: [{ role: "user", content: "Write out.txt." }] as MessageParam[] };
 
   it("runs a loop of its own on the review, and words the problems for the model", async () => {
@@ -105,15 +109,20 @@ describe("the reviewer", () => {
 
   it("is asked for its verdict when it runs out of steps", async () => {
     const seen: MessageParam[][] = [];
-    const look = (id: string): ModelTurn => ({
-      message: { content: [{ type: "tool_use", id, name: "glob", input: { pattern: "*" } }], stop_reason: "tool_use", usage: { input_tokens: 40, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } as unknown as Anthropic.Beta.BetaMessage,
-      malformed: new Map(),
-    });
     const setup = await setupWith([look("a"), look("b"), look("c"), look("d"), turn("PROBLEMS:\n- out.txt is missing")], seen);
     const review = await reviewer("strong", setup).review(work);
     assert.equal(review.verdict, "problems");
     assert.match(JSON.stringify(seen.at(-1)!.at(-1)), /You have run out of steps/);
     assert.equal(review.usage.input, 200, "the four steps and the verdict");
+  });
+
+  it("is asked for its verdict when it is stopped for repeating itself", async () => {
+    const seen: MessageParam[][] = [];
+    const setup = await setupWith([look("a"), look("b"), look("c"), look("d"), look("e"), turn("APPROVED")], seen);
+    const review = await reviewer("strong", { ...setup, maxSteps: 10 }).review(work);
+    assert.equal(review.verdict, "approved");
+    assert.equal(seen.length, 6, "five steps, then the request for its verdict");
+    assert.match(JSON.stringify(seen.at(-1)!.at(-1)), /You have run out of steps/);
   });
 
   it("sends nothing back when it approves or stays cut off, and finishes a verdict that was cut off", async () => {
@@ -188,9 +197,9 @@ describe("jig review", () => {
       (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [{ text: queue.length > 1 ? queue.shift()! : queue[0] }];
   };
 
-  async function review(verdict: string | string[], extra: string[] = []) {
+  async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = []) {
     const dir = await mkdtemp(join(tmpdir(), "jig-review-cli-"));
-    const api = await fakeMessagesApi(replies(verdict));
+    const api = await fakeMessagesApi(typeof verdict === "function" ? verdict : replies(verdict));
     try {
       const args = ["review", "--session", await session(dir), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
       const { code, output } = await runJig(args, { api, cwd: dir });
@@ -224,6 +233,14 @@ describe("jig review", () => {
     assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\..*starting with APPROVED, or with PROBLEMS: and each problem as a <problem> with its <what>, <command> and <shows>/);
     assert.deepEqual(requests.at(-1)!.tool_choice, { type: "none" });
     assert.deepEqual([requests[0].output_config, requests.at(-1)!.output_config], [{ effort: "medium" }, { effort: "low" }]);
+  });
+
+  it("asks for the verdict, as when the steps run out, when the reviewer is stopped for repeating itself", async () => {
+    // The same command every step, until it is asked for its verdict (the request that allows no tool).
+    const again = (request: Record<string, unknown>): Reply => (request.tool_choice ? [{ text: "APPROVED" }] : [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }]);
+    const { verdict, requests } = await review(again);
+    assert.deepEqual([verdict.verdict, verdict.stop, verdict.steps, requests.length], ["approved", "loop", 5, 6]);
+    assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\./);
   });
 
   it("answers a verdict request's reply that has no verdict once, as when a model writes a tool call out as text", async () => {
