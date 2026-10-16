@@ -49,6 +49,12 @@ export interface AgentOptions {
   escalate?: { model: string; callModel: CallModel };
   /** A second model that checks the work against the task the first time the model stops (--reviewer). */
   reviewer?: Reviewer;
+  /**
+   * Out of steps mid-task, ask the model once more, without tools, what it changed, what it verified and
+   * what is left (WRAP_UP), so the run doesn't end on a tool result. Off for subagents and the reviewer,
+   * which ask for their own, and with --no-wrap-up.
+   */
+  wrapUp?: boolean;
   ui: AgentUI;
 }
 
@@ -85,7 +91,10 @@ export interface Usage {
 export interface RunResult {
   /** Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours. */
   stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted";
-  /** Text of the final reply, after that of the replies it continues if they were cut off at the output limit. */
+  /**
+   * Text of the final reply, after that of the replies it continues if they were cut off at the output limit.
+   * At max_steps, the wrap-up's, if there was one (see AgentOptions.wrapUp).
+   */
   text: string;
   steps: number;
   /** Every model call's tokens, the escalation's included. */
@@ -273,7 +282,32 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
 
     if (signal?.aborted) return result("interrupted", step);
   }
-  return result("max_steps", opts.maxSteps);
+  if (!opts.wrapUp) return result("max_steps", opts.maxSteps);
+
+  // Out of steps, the last reply's calls answered: one more call, with the tools declared but none allowed
+  // (summarize), asks where the work stands. It is a report, not more work, so if it fails or says
+  // nothing, the run ends as it would have without it, and the request stays out of the history.
+  opts.ui.notice("Out of steps: asking the model where the work stands.");
+  const request: MessageParam = { role: "user", content: WRAP_UP };
+  const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
+  let report: Message;
+  try {
+    ({ message: report } = await callModel([...conversation.messages, request], signal, { summarize: true }));
+  } catch (err) {
+    if (signal?.aborted) return result("interrupted", opts.maxSteps);
+    opts.ui.notice(`The wrap-up failed (${errorMessage(err)}), so the task ends without one.`);
+    return result("max_steps", opts.maxSteps);
+  }
+  addUsage(usage, report.usage);
+  if (escalated) addUsage(escalated.usage, report.usage);
+  const text = replyText(report);
+  if (report.stop_reason === "refusal" || !text.trim()) return result("max_steps", opts.maxSteps);
+  conversation.push(request);
+  // A server can ignore tool_choice: a call here would never run, and unanswered it would make every
+  // later request invalid, so it is left out.
+  conversation.push({ role: "assistant", content: report.content.filter((block) => block.type !== "tool_use") });
+  conversation.tokens = contextSize(report.usage);
+  return result("max_steps", opts.maxSteps, text);
 }
 
 /** What the model is told after a reply that wasn't an answer, and how often a cut-off one is continued. */
@@ -282,6 +316,12 @@ const CUT_OFF_BEFORE_ANSWER = "Your last reply was cut off at the output limit b
 const CONTINUE = "Your reply was cut off at the output limit; continue from where it stopped, more briefly.";
 const MAX_CONTINUATIONS = 2;
 const NOT_AN_ANSWER = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER, CONTINUE];
+
+/**
+ * What the model is asked once the steps have run out mid-task (see AgentOptions.wrapUp). Its reply is a
+ * report the loop asked for, not a finished answer: export.ts knows it by this request.
+ */
+export const WRAP_UP = "You have run out of steps. Don't call any tools: say what you changed, what you verified and how, and what is left undone.";
 
 /** How many steps after a failed compaction the next one is tried. */
 const COMPACT_AGAIN_AFTER = 3;

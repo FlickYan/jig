@@ -116,9 +116,11 @@ async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without
     const baseline = gitBaseline(project);
     if (arm === "with") cpSync(skill.dir, join(home, ".jig", "skills", skill.name), { recursive: true });
     const statsFile = join(work, "stats.json");
+    // Without the wrap-up at the step limit: an extra call, in the steps and the cost, that earlier results lack.
     const args = [
       options.cli ?? process.argv[1],
       "--yes",
+      "--no-wrap-up",
       "--stats", statsFile,
       "--model", options.model,
       ...(options.api ? ["--api", options.api] : []),

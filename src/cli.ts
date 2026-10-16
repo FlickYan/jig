@@ -65,6 +65,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
+      --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
+                          changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents      leave out the subagent tool
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
@@ -186,6 +188,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       cwd: { type: "string", short: "C", default: "." },
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
       tools: { type: "string" },
@@ -389,6 +392,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     hooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
+    wrapUp: values["wrap-up"],
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
   conversation.describe(context);
@@ -668,6 +672,8 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     interrupted: "Interrupted.",
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
+  // The model's wrap-up at the step limit wasn't streamed (it is asked for like a summary), so it is printed here.
+  if (result.stop === "max_steps" && result.text.trim()) ui.println(result.text.trim());
   if (note) ui.notice(note);
   // The benchmark runner (bench/run.ts) reads these lines, so keep their format.
   const tokens = (usage: Usage) => `${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`;

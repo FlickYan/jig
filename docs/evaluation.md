@@ -11,7 +11,8 @@ instruction worded the way a user would ask, hidden tests, and a reference solut
 
 For each attempt the runner:
 1. copies the task's project to a temporary directory and commits it to a fresh git repository;
-2. runs jig on the instruction (`--yes`, with a step limit and a timeout);
+2. runs jig on the instruction (`--yes`, with a step limit and a timeout, and `--no-wrap-up` in versions
+   that have it, so an attempt that hits the limit makes no extra call);
 3. copies in the hidden tests, which the agent never saw, and runs them. Passing means solved.
 
 It records whether each attempt passed, plus steps, tool calls, failed tool calls (by tool), tokens,

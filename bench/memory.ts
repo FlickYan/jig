@@ -67,10 +67,12 @@ for (const scenario of scenarios) {
   const env = { ...process.env, JIG_HOME: home, NO_COLOR: "1" };
   console.log(`${scenario.name}: ${scenario.description}`);
 
-  // The first session, then reflection on it, which keeps what it proposes (--yes).
+  // The first session, then reflection on it, which keeps what it proposes (--yes). Every run goes without
+  // the wrap-up at the step limit (--no-wrap-up), an extra call earlier runs didn't make, so steps and costs
+  // compare with theirs.
   const first = reset(work, scenario, "project");
-  await jig(["--yes", "--model", model, "--", "-"], { cwd: first, env, stdin: scenario.first });
-  await jig(["memory", "reflect", "--yes", "--model", model], { cwd: first, env });
+  await jig(["--yes", "--no-wrap-up", "--model", model, "--", "-"], { cwd: first, env, stdin: scenario.first });
+  await jig(["memory", "reflect", "--yes", "--no-wrap-up", "--model", model], { cwd: first, env });
   const memories = listMemories(home);
   const instructions = existsSync(join(first, "AGENTS.md")) ? readFileSync(join(first, "AGENTS.md"), "utf8") : "";
   kept[scenario.name] = { memories, instructions };
@@ -84,7 +86,7 @@ for (const scenario of scenarios) {
         const dir = reset(work, scenario, name, arm === "with" && name === "project" ? instructions : "");
         const stats = join(work, "stats.json");
         rmSync(stats, { force: true });
-        await jig(["--yes", "--model", model, "--stats", stats, ...(arm === "without" ? ["--no-memory"] : []), "--", "-"], { cwd: dir, env, stdin: followup.prompt });
+        await jig(["--yes", "--no-wrap-up", "--model", model, "--stats", stats, ...(arm === "without" ? ["--no-memory"] : []), "--", "-"], { cwd: dir, env, stdin: followup.prompt });
         const passed = check(followup.check, dir);
         const data = existsSync(stats) ? JSON.parse(readFileSync(stats, "utf8")) : {};
         const cost = data.usage ? costOf(model, data.usage) : undefined;

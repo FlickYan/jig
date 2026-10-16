@@ -426,6 +426,32 @@ describe("a one-shot run that continues the last session", () => {
   });
 });
 
+describe("a run that reaches --max-steps", () => {
+  it("asks the model, without tools, what it did and what is left, prints that, and counts the call; --no-wrap-up doesn't", async () => {
+    const api = await fakeMessagesApi((request) => (request.tool_choice ? [{ text: "Listed the files; nothing verified; the fix is left." }] : [{ tool: "glob", input: { pattern: "*" } }]));
+    try {
+      const file = join(project, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--max-steps", "2", "--stats", file];
+      const { code, output } = await runJig([...args, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 3);
+      const last = api.requests[2];
+      assert.deepEqual(last.tool_choice, { type: "none" });
+      assert.ok((last.tools as unknown[]).length > 0, "the tools stay declared, so the cached prefix stays the same");
+      assert.match(output, /Out of steps: asking the model where the work stands\.\nListed the files; nothing verified; the fix is left\.\nStopped after 2 steps \(raise the limit with --max-steps\)\.\n2 steps · /);
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.stop, stats.steps, stats.modelCalls, stats.usage.input], ["max_steps", 2, 3, 30]);
+
+      const off = await runJig([...args, "--no-wrap-up", "Fix the parser."], { api, cwd: project });
+      assert.equal(api.requests.length, 5);
+      assert.doesNotMatch(off.output, /Out of steps|Listed the files/);
+      assert.match(off.output, /Stopped after 2 steps/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a hook configured as for Claude Code", () => {
   it('runs around every call with the matcher "*", without jig\'s API key', async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo listed" } }] : [{ text: "Done." }]));

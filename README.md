@@ -86,6 +86,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
+      --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
       --tools <names>   give the model only some of jig's tools, e.g. --tools bash
@@ -342,6 +343,10 @@ check its work against the task, if a step is left for that, and stops at the ne
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
 or only thinking): it stays out of the history, and the model is asked once to go on.
+At `--max-steps`, jig makes one more call, in which the model can't call tools, asking what it changed,
+what it verified and how, and what is left, and prints the reply: the model's own report, not evidence.
+Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
+and `jig skills test` do, so that their steps and costs compare with earlier runs.
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at

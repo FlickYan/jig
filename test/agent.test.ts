@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { failedTestRun, runAgent, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
+import { failedTestRun, runAgent, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
-import type { ModelTurn } from "../src/model.ts";
+import type { CallModel, ModelTurn } from "../src/model.ts";
 import { toChatMessages } from "../src/openai.ts";
 import { TOOLS, type Tool } from "../src/tools/index.ts";
 
@@ -32,9 +32,13 @@ function reply(content: Block[], stopReason?: Anthropic.Beta.BetaStopReason, mal
  */
 function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
   const historyLengths: number[] = [];
+  const summaries: MessageParam[][] = [];
   const options: AgentOptions = {
     callModel: async (messages, _signal, { summarize } = {}) => {
-      if (summarize) return reply([text("SUMMARY: half the plan is written.")]);
+      if (summarize) {
+        summaries.push(messages);
+        return reply([text("SUMMARY: half the plan is written.")]);
+      }
       historyLengths.push(messages.length);
       const next = replies.shift();
       if (!next) throw new Error("the fake model ran out of replies");
@@ -49,7 +53,7 @@ function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
     ...overrides,
   };
   const conversation = new Conversation(undefined, [{ role: "user", content: "do the task" }]);
-  return { options, conversation, messages: conversation.messages, historyLengths };
+  return { options, conversation, messages: conversation.messages, historyLengths, summaries };
 }
 
 function resultsIn(message: MessageParam): ToolResult[] {
@@ -281,11 +285,79 @@ describe("runAgent", () => {
 
   it("stops at the step limit with a valid history", async () => {
     const forever = Array.from({ length: 5 }, (_, i) => reply([toolUse(`t${i}`, "bash", { command: "true" })]));
-    const { options, conversation, messages } = setup(forever, { maxSteps: 3 });
+    const { options, conversation, messages, summaries } = setup(forever, { maxSteps: 3 });
     const result = await runAgent(conversation, options);
     assert.equal(result.stop, "max_steps");
     assert.equal(result.steps, 3);
+    assert.equal(result.text, "");
     assert.equal(messages.at(-1)?.role, "user"); // ends with tool results, so the next request is valid
+    assert.equal(summaries.length, 0, "without wrapUp (--no-wrap-up), nothing more is asked");
+  });
+
+  it("at the step limit, asks once more, without tools, where the work stands", async () => {
+    const forever = Array.from({ length: 5 }, (_, i) => reply([toolUse(`t${i}`, "bash", { command: "true" })]));
+    const notices: string[] = [];
+    const { options, conversation, messages, historyLengths, summaries } = setup(forever, {
+      maxSteps: 3,
+      wrapUp: true,
+      ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
+    });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["max_steps", 3, "SUMMARY: half the plan is written."]);
+    assert.deepEqual(historyLengths, [1, 3, 5]);
+    // One call more, with summarize: the tools stay declared, but none may be called.
+    assert.equal(summaries.length, 1);
+    assert.deepEqual(summaries[0].at(-1), { role: "user", content: WRAP_UP });
+    assert.equal(result.usage.input, 400, "its tokens count in the run's");
+    // The request and the reply join the history, after the last step's results, and it ends on the reply.
+    assert.deepEqual(resultsIn(messages[6]).map((r) => r.tool_use_id), ["t2"]);
+    assert.deepEqual(messages.slice(7), [
+      { role: "user", content: WRAP_UP },
+      { role: "assistant", content: [text("SUMMARY: half the plan is written.")] },
+    ]);
+    assert.deepEqual(notices, ["Out of steps: asking the model where the work stands."]);
+  });
+
+  /** A run that calls a tool at every step, up to its limit of 3, and whose wrap-up gets `answer`. */
+  function outOfSteps(answer: () => Promise<ModelTurn>) {
+    const notices: string[] = [];
+    let step = 0;
+    const callModel: CallModel = async (_messages, _signal, { summarize } = {}) => (summarize ? answer() : reply([toolUse(`t${++step}`, "bash", { command: "true" })]));
+    const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+    return { notices, ...setup([], { maxSteps: 3, wrapUp: true, callModel, ui }) };
+  }
+
+  it("runs no tool call the wrap-up makes anyway, and keeps it out of the history", async () => {
+    // A server can ignore tool_choice.
+    const late = toolUse("w", "write_file", { path: "late.txt", content: "x" });
+    const { options, conversation, messages } = outOfSteps(async () => reply([thinking("Out of steps."), text("The parser is fixed; the tests are left."), late]));
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text], ["max_steps", "The parser is fixed; the tests are left."]);
+    assert.ok(!existsSync(join(cwd, "late.txt")));
+    assert.deepEqual(messages.at(-1), { role: "assistant", content: [thinking("Out of steps."), text("The parser is fixed; the tests are left.")] });
+  });
+
+  it("leaves the run as it was when the wrap-up fails or says nothing, and stops on Ctrl+C during it", async () => {
+    const failed = outOfSteps(async () => {
+      throw new Error("overloaded");
+    });
+    const result = await runAgent(failed.conversation, failed.options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["max_steps", "", 3]);
+    assert.deepEqual(failed.messages.map((m) => m.role), ["user", "assistant", "user", "assistant", "user", "assistant", "user"]);
+    assert.equal(failed.notices.at(-1), "The wrap-up failed (overloaded), so the task ends without one.");
+    // Nothing to show, the request stays out of the history too: no request is left unanswered there.
+    const silent = outOfSteps(async () => reply([thinking("Nothing to say.")]));
+    assert.deepEqual(await runAgent(silent.conversation, silent.options).then((r) => [r.stop, r.text]), ["max_steps", ""]);
+    assert.equal(silent.messages.length, 7);
+    const refused = outOfSteps(async () => reply([text("I can't")], "refusal"));
+    assert.deepEqual(await runAgent(refused.conversation, refused.options).then((r) => [r.stop, r.text]), ["max_steps", ""]);
+    assert.equal(refused.messages.length, 7);
+    const controller = new AbortController();
+    const interrupted = outOfSteps(async () => {
+      controller.abort();
+      throw new Error("Request was aborted.");
+    });
+    assert.equal((await runAgent(interrupted.conversation, interrupted.options, controller.signal)).stop, "interrupted");
   });
 
   it("keeps a refused reply out of the history", async () => {
@@ -420,6 +492,15 @@ describe("escalating to a stronger model", () => {
     assert.equal(result.escalated?.model, "strong");
     assert.equal(result.escalated?.step, 2);
     assert.deepEqual([result.escalated?.usage.input, result.usage.input], [100, 200]);
+  });
+
+  it("asks the model that took over for the wrap-up at the step limit", async () => {
+    const strong = stronger([reply([toolUse("t2", "bash", { command: "true" })]), reply([text("Half fixed; pytest still fails.")])]);
+    const { options, conversation } = setup([reply([toolUse("t1", "bash", { command: "false && pytest" })])], { maxSteps: 2, escalate: strong.escalate, wrapUp: true });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text], ["max_steps", "Half fixed; pytest still fails."]);
+    assert.deepEqual(strong.seen, [3, 6], "its step, then the wrap-up, the request added");
+    assert.deepEqual([result.escalated?.usage.input, result.usage.input], [200, 300]);
   });
 
   it("keeps its own model while the tests pass, and on the last step", async () => {
