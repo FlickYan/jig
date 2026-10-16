@@ -20,7 +20,7 @@ import { readTool } from "../src/tools/read.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
-import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
@@ -212,24 +212,33 @@ const finish =
 
 describe("a reply that breaks off", () => {
 
-  /** Calls the model against a local server whose first `drops` replies break off halfway: the connection
-   * drops, or the server sends an overload error. */
-  async function callWithDrops(drops: number, how: "drop" | "overload" = "drop"): Promise<{ result: Promise<ModelTurn>; notices: () => string[]; done: () => void }> {
+  /** Calls the model against a local server whose first `drops` replies break off: the connection drops
+   * halfway, the server sends an overload error, or it goes quiet. Quiet, it sends nothing more after half
+   * the reply; queued, it sends none of it, only keep-alive comments, as DeepSeek does while it holds a
+   * request under load. The model gives up on either after 0.4 seconds. The notices collected are those
+   * of both kinds. */
+  async function callWithDrops(drops: number, how: "drop" | "overload" | "quiet" | "queued" = "drop"): Promise<{ result: Promise<ModelTurn>; notices: () => string[]; done: () => void }> {
     let requests = 0;
     const server = createServer((req, res) => {
       req.resume();
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.write(begin);
-      if (++requests > drops) res.end(finish);
+      const answer = ++requests > drops;
+      if (answer || how !== "queued") res.write(begin);
+      if (answer) res.end(finish);
       else if (how === "overload") res.end(event("error", { error: { type: "overloaded_error", message: "Overloaded" } }));
-      else setTimeout(() => res.socket?.destroy(), 20);
+      else if (how === "queued") {
+        const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 50);
+        // Closed in the end, as DeepSeek does after 30 minutes: a call still waiting then fails, not hangs.
+        const close = setTimeout(() => res.end(), 2000);
+        res.on("close", () => (clearInterval(keepAlive), clearTimeout(close)));
+      } else if (how === "drop") setTimeout(() => res.socket?.destroy(), 20);
     });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     const env = { ...process.env };
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.ANTHROPIC_API_KEY = "test-key";
-    const { notices, stop } = collectNotices("broke off");
-    const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [] })([{ role: "user", content: "hi" }]);
+    const { notices, stop } = collectNotices("broke off", "No output");
+    const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [], idle: 400 })([{ role: "user", content: "hi" }]);
     return {
       result,
       notices: () => notices,
@@ -250,7 +259,8 @@ describe("a reply that breaks off", () => {
     } finally {
       call.done();
     }
-    assert.match(call.notices()[0], /The reply broke off before it was finished; trying again \(2 tries left\)/);
+    // and only that notice: the wait before trying again isn't a quiet reply
+    assert.deepEqual(call.notices(), ["The reply broke off before it was finished; trying again (2 tries left)."]);
   });
 
   it("asks again after an overload error in the middle of the reply", async () => {
@@ -271,6 +281,73 @@ describe("a reply that breaks off", () => {
       call.done();
     }
     assert.equal(call.notices().length, 2);
+  });
+
+  it("says so when it goes quiet partway, then asks again", async () => {
+    const call = await callWithDrops(1, "quiet");
+    try {
+      assert.deepEqual((await call.result).message.content, [{ type: "text", text: "Hello" }]);
+    } finally {
+      call.done();
+    }
+    assert.deepEqual(call.notices(), [
+      "No output from the API for 0.2 seconds; still waiting, for up to 0.4 seconds.",
+      "No output from the API for 0.4 seconds; trying again (2 tries left).",
+    ]);
+  });
+
+  it("does the same when the reply never starts, only keep-alive comments coming", async () => {
+    // No event at all: the clock has to start with the response itself.
+    const call = await callWithDrops(1, "queued");
+    try {
+      assert.deepEqual((await call.result).message.content, [{ type: "text", text: "Hello" }]);
+    } finally {
+      call.done();
+    }
+    assert.deepEqual(call.notices(), [
+      "No output from the API for 0.2 seconds; still waiting, for up to 0.4 seconds.",
+      "No output from the API for 0.4 seconds; trying again (2 tries left).",
+    ]);
+  });
+
+  it("gives up on a reply that stays quiet after three tries, rather than waiting forever", async () => {
+    const call = await callWithDrops(3, "queued");
+    try {
+      await assert.rejects(call.result, /no output from the API for 0\.4 seconds/);
+    } finally {
+      call.done();
+    }
+    assert.equal(call.notices().filter((notice) => notice.includes("trying again")).length, 2);
+  });
+
+  it("waits for as long as the reply keeps coming, however slowly", async () => {
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // An event every 0.25 seconds: 1.5 seconds in all, longer than the limit, but never a second without one.
+      const events = messagesReply([{ text: "Hello" }]).split(/(?<=\n\n)/);
+      const next = setInterval(() => {
+        res.write(events.shift());
+        if (events.length) return;
+        clearInterval(next);
+        res.end();
+      }, 250);
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    const { notices, stop } = collectNotices("No output");
+    try {
+      const baseURL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const turn = await createModel({ model: "claude-haiku-4-5", system: "", tools: [], baseURL, idle: 1000 })([{ role: "user", content: "hi" }]);
+      assert.deepEqual(turn.message.content, [{ type: "text", text: "Hello" }]);
+    } finally {
+      stop();
+      process.env = env;
+      server.closeAllConnections();
+      server.close();
+    }
+    assert.deepEqual(notices, []);
   });
 });
 

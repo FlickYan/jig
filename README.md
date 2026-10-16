@@ -159,8 +159,9 @@ received (subagents included), and how many input tokens came from the prompt ca
   `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results
   are answered as interrupted when a session is loaded, so the history is always valid.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
-  estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
-  continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
+  estimated for tool output since, and from the text's length when a server reports no usage). Past
+  `--compact-at` it asks the model to summarize the conversation and continues from that summary alone;
+  `/compact` does it on demand and `/context` shows the numbers.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
   User memories (how you like to work) hold in every project; project memories (facts about a project
   that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,
@@ -334,6 +335,12 @@ check its work against the task, and stops at the next such reply. Also on `--ma
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
 or only thinking): it stays out of the history, and the model is asked once to go on.
+
+**What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
+5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at
+most, with a notice each time. Keep-alive comments, which DeepSeek sends while it holds a request under
+load, aren't parts. `JIG_STREAM_IDLE_MS` sets the 5 minutes, in milliseconds (0: no limit), for a model
+that can go longer than that without output.
 
 ## Results
 

@@ -1,7 +1,7 @@
 // Calling the model. createModel returns one function, CallModel: the conversation in, the model's next
 // message out, streamed to the terminal on the way. Claude and DeepSeek go through the Messages API, any
 // other model through an OpenAI-compatible one (openai.ts). It retries what the SDK can't (a reply that
-// broke off, malformed tool input) and checks streamed tool input strictly before any tool sees it.
+// broke off or went quiet, malformed tool input) and checks streamed tool input strictly before any tool sees it.
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages";
@@ -54,6 +54,8 @@ export interface ModelOptions {
   quiet?: boolean;
   /** Milliseconds to wait for the API to start answering (default: 2 minutes); for tests. */
   timeout?: number;
+  /** Milliseconds a reply that has started may send nothing (default: JIG_STREAM_IDLE_MS, or 5 minutes); for tests. */
+  idle?: number;
   /** Left out, the model's own default is used. */
   effort?: Effort;
   system: string;
@@ -90,6 +92,69 @@ const DEEPSEEK_OPENAI_BASE_URL = "https://api.deepseek.com";
 const REQUEST_TIMEOUT_MS = 120_000;
 
 /**
+ * How long a reply that has started may send nothing. The timeout above ends once it starts, and a server
+ * can then hold the connection open with nothing in it: DeepSeek, under load, sends keep-alive comments
+ * for up to 30 minutes. Only the reply's own events count (the SDKs pass on neither comments nor pings),
+ * so after a minute without one jig says so, and after 5 minutes it asks again, as for a reply that broke
+ * off. A model that thinks that long without showing anything would be asked again too, hence 5 minutes;
+ * JIG_STREAM_IDLE_MS sets another limit.
+ */
+const IDLE_NOTICE_MS = 60_000;
+const IDLE_LIMIT_MS = 300_000;
+
+/** The idle limit: JIG_STREAM_IDLE_MS in milliseconds (0: none), or 5 minutes. */
+function idleLimit(): number {
+  const set = process.env.JIG_STREAM_IDLE_MS;
+  if (!set) return IDLE_LIMIT_MS;
+  const ms = Number(set);
+  if (!Number.isInteger(ms) || ms < 0) throw new Error("JIG_STREAM_IDLE_MS must be a whole number of milliseconds (0: no limit).");
+  return Math.min(ms, 2 ** 31 - 1); // setTimeout's longest wait, about 25 days
+}
+
+/**
+ * Stops a reply that has gone quiet. Its signal is the caller's, and also aborts once the reply has sent
+ * nothing for the limit. The turn calls alive() when the reply starts and at each event it sends.
+ */
+class Watchdog {
+  readonly signal: AbortSignal;
+  private readonly own = new AbortController();
+  private readonly limit: number;
+  private timers: NodeJS.Timeout[] = [];
+
+  constructor(limit: number, signal?: AbortSignal) {
+    this.limit = limit;
+    this.signal = signal ? AbortSignal.any([signal, this.own.signal]) : this.own.signal;
+  }
+
+  /** Whether it stopped the reply. */
+  get idle(): boolean {
+    return this.own.signal.aborted;
+  }
+
+  /** The reply started, or sent an event: the clock starts again. */
+  alive(): void {
+    this.stop();
+    if (!this.limit) return;
+    const notice = Math.min(IDLE_NOTICE_MS, this.limit / 2);
+    this.timers = [
+      setTimeout(() => ui.notice(`No output from the API for ${duration(notice)}; still waiting, for up to ${duration(this.limit)}.`), notice),
+      setTimeout(() => this.own.abort(), this.limit),
+    ];
+  }
+
+  stop(): void {
+    for (const timer of this.timers) clearTimeout(timer);
+  }
+}
+
+/** 300_000 → "5 minutes", 400 → "0.4 seconds". */
+function duration(ms: number): string {
+  const [n, unit] = ms >= 60_000 ? [ms / 60_000, "minute"] : [ms / 1000, "second"];
+  const rounded = Math.round(n * 10) / 10;
+  return `${rounded} ${unit}${rounded === 1 ? "" : "s"}`;
+}
+
+/**
  * The SDK retries rate limits, overloads, server errors and timeouts on its own, with backoff. It
  * reports each retry in its log; this turns those lines into notices, so a struggling API doesn't
  * look like a frozen agent.
@@ -106,27 +171,33 @@ export const retryNotices = {
   error() {},
 };
 
-type Turn = (messages: MessageParam[], signal: AbortSignal | undefined, summarize: boolean) => Promise<ModelTurn>;
+type Turn = (messages: MessageParam[], watchdog: Watchdog, summarize: boolean) => Promise<ModelTurn>;
 
 /**
- * The model, as a CallModel. A call is tried up to three times when the reply broke off or its tool input
- * was malformed; other errors go to the caller, after whatever retries the SDK made of them.
+ * The model, as a CallModel. A call is tried up to three times when the reply broke off, went quiet or
+ * had malformed tool input; other errors go to the caller, after whatever retries the SDK made of them.
  */
 export function createModel(options: ModelOptions): CallModel {
   const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
+  const idle = options.idle ?? idleLimit();
   const turn = (options.api ?? defaultApi(options.model)) === "openai" ? chatCompletions(options, settings) : messagesApi(options, settings);
 
   return async (messages, signal, { summarize = false } = {}) => {
     for (let attempt = 1; ; attempt++) {
+      const watchdog = new Watchdog(idle, signal);
       try {
-        return await turn(messages, signal, summarize);
-      } catch (err) {
+        // Stopped once the reply is in or has failed: the wait before trying again isn't the API's.
+        return await turn(messages, watchdog, summarize).finally(() => watchdog.stop());
+      } catch (thrown) {
+        // A reply the watchdog stopped broke off, whatever the SDK made of the abort.
+        const err = watchdog.idle ? new ReplyBrokeOff(`no output from the API for ${duration(idle)}`) : thrown;
         // API errors are mostly not retried here: the SDK already retries rate limits, overloads and
         // requests that fail before a reply begins. What it can't retry is a reply that broke off partway,
         // or one with malformed tool input.
         if (attempt === 3 || signal?.aborted) throw err;
         if (brokeOff(err)) {
-          ui.notice(`The reply broke off before it was finished; trying again (${3 - attempt} ${3 - attempt === 1 ? "try" : "tries"} left).`);
+          const what = watchdog.idle ? `No output from the API for ${duration(idle)}` : "The reply broke off before it was finished";
+          ui.notice(`${what}; trying again (${3 - attempt} ${3 - attempt === 1 ? "try" : "tries"} left).`);
           await new Promise((done) => setTimeout(done, 500));
         } else if (err instanceof MalformedToolInput) {
           ui.notice("The model sent malformed tool input; asking again.");
@@ -147,11 +218,11 @@ function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
   // Anthropic() reads ANTHROPIC_API_KEY.
   const client = deepseek ? deepseekClient({ ...settings, ...baseURL }) : new Anthropic({ ...settings, ...baseURL });
   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
-  return (messages, signal, summarize) => {
+  return (messages, watchdog, summarize) => {
     const sent = deepseek ? withoutIsError(messages) : messages;
     // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
     const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
-    return streamTurn(client, params, signal, summarize || options.quiet);
+    return streamTurn(client, params, watchdog, summarize || options.quiet);
   };
 }
 
@@ -170,7 +241,8 @@ function chatCompletions(options: ModelOptions, settings: ClientSettings): Turn 
   // DeepSeek gets the output limit its Anthropic endpoint gets; elsewhere the server's default stands (OpenAI's
   // reasoning models refuse max_tokens).
   const chat = { ...options, maxTokens: deepseek ? 64_000 : undefined };
-  return (messages, signal, summarize) => chatTurn(client, chat, messages, { signal, quiet: summarize || options.quiet, summarize });
+  return (messages, watchdog, summarize) =>
+    chatTurn(client, chat, messages, { signal: watchdog.signal, alive: () => watchdog.alive(), quiet: summarize || options.quiet, summarize });
 }
 
 function claudeRequest({ model, effort = "medium", system, tools }: ModelOptions): Request {
@@ -257,14 +329,17 @@ function brokeOff(err: unknown): boolean {
  * One streamed reply from the Messages API. Text and thinking go to the terminal as they arrive (unless
  * quiet); each tool call's input is kept as it streamed, to be checked strictly once the reply is complete.
  */
-async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, signal?: AbortSignal, quiet = false): Promise<ModelTurn> {
-  const stream = client.beta.messages.stream(params, { signal });
+async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, watchdog: Watchdog, quiet = false): Promise<ModelTurn> {
+  const stream = client.beta.messages.stream(params, { signal: watchdog.signal });
+  // Watched from when the reply starts: until then, the SDK's timeout applies.
+  stream.on("connect", () => watchdog.alive());
   const rawInputs = new Map<number, string>(); // content block index -> tool input JSON as streamed
   let message: Anthropic.Beta.BetaMessage;
 
   if (!quiet) ui.status("thinking…");
   try {
     for await (const event of stream) {
+      watchdog.alive();
       // Kept even when quiet: a subagent's or a reviewer's calls run too, so they are checked like any other.
       if (event.type === "content_block_delta" && event.delta.type === "input_json_delta") {
         rawInputs.set(event.index, (rawInputs.get(event.index) ?? "") + event.delta.partial_json);

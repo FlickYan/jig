@@ -181,7 +181,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   DeepSeek outage in milestone 6, jig had sat silent for half an hour. The SDK retries only requests that
   fail before their reply begins, so jig itself asks again, up to twice, when a reply breaks off partway:
   the connection drops, the stream ends early, or an overload error arrives mid-stream. In milestone 10
-  one dropped connection had ended a Terminal-Bench task.
+  one dropped connection had ended a Terminal-Bench task. Once a reply has started, nothing in the SDK
+  bounds the wait for the rest of it: a server can hold the connection open and send nothing, and
+  DeepSeek, under load, sends only keep-alive comments for up to 30 minutes. So jig watches each reply's
+  events (comments and pings don't count): after a minute without one it says so, and after 5 minutes it
+  asks again, as for a reply that broke off. The limit is generous because a model can think for minutes
+  without showing anything, and `JIG_STREAM_IDLE_MS` changes it.
 - **One message format, translated at the edge.** DeepSeek's Anthropic-compatible API lets the same SDK
   and message format serve Claude and DeepSeek. DeepSeek does not support `is_error` on tool results, so
   for DeepSeek failures are marked with `Error:` in the text instead, and the Claude-only settings
