@@ -160,8 +160,14 @@ received (subagents included), and how many input tokens came from the prompt ca
   are answered as interrupted when a session is loaded, so the history is always valid.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since, and from the text's length when a server reports no usage). Past
-  `--compact-at` it asks the model to summarize the conversation and continues from that summary alone;
-  `/compact` does it on demand and `/context` shows the numbers.
+  `--compact-at` it asks the model to summarize the conversation and continues from that summary;
+  `/compact` does it on demand and `/context` shows the numbers. Mid-task, the task's own words and a
+  list of the file changes and commands so far follow the summary. When the API rejects a request as too
+  long for the model, jig compacts and asks again, once (not with `--compact-at 0`). The conversation is
+  then too long to summarize as well, so the summary is written from a copy with the tool output cut to
+  its start and end, the oldest first (`/compact` does the same when the API rejects its request). Past
+  `--compact-at`, a summary that fails doesn't end the task: it goes on as it is, and compaction is tried
+  again 3 steps later. After the API's rejection it does, since the conversation can't go on as it is.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
   User memories (how you like to work) hold in every project; project memories (facts about a project
   that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,

@@ -326,6 +326,33 @@ function brokeOff(err: unknown): boolean {
 }
 
 /**
+ * How each API says a request is too long for the model's context window. Kept to these wordings, since
+ * each match costs a compaction: Anthropic's, OpenAI's (its message and its code), DeepSeek's and vLLM's,
+ * Ollama's and llama.cpp's, and a stop reason some servers send as an error.
+ */
+const TOO_LONG = [
+  /prompt is too long/, // Anthropic: "prompt is too long: 208310 tokens > 200000 maximum"
+  /input length and `max_tokens` exceed context limit/, // Anthropic, with max_tokens counted in
+  /maximum context length is \d+ tokens/, // OpenAI, DeepSeek, vLLM
+  /exceeds the context window/, // OpenAI: "Your input exceeds the context window of this model."
+  /\bcontext_length_exceeded\b/, // OpenAI's code
+  /longer than the maximum model length/, // vLLM: "The decoder prompt (length 40000) is longer than ..."
+  /prompt too long; exceeded (max )?context length/, // Ollama
+  /exceeds the available context size/, // llama.cpp
+  /\bmodel_context_window_exceeded\b/,
+];
+
+/**
+ * Whether the API rejected a request as too long for the model. jig doesn't know every model's window, so
+ * this is its word that the conversation must be compacted. A rate limit (429) never is, whatever it says.
+ */
+export function tooLong(err: unknown): boolean {
+  if (!(err instanceof Anthropic.APIError || err instanceof OpenAI.APIError) || err.status === 429) return false;
+  const code = err instanceof OpenAI.APIError ? err.code : undefined;
+  return TOO_LONG.some((pattern) => pattern.test(`${err.message} ${code ?? ""}`));
+}
+
+/**
  * One streamed reply from the Messages API. Text and thinking go to the terminal as they arrive (unless
  * quiet); each tool call's input is kept as it streamed, to be checked strictly once the reply is complete.
  */

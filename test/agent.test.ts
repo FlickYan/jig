@@ -264,7 +264,7 @@ describe("runAgent", () => {
     // The note asking for the rest went into the summary too, so it doesn't point at text the model can't see.
     assert.deepEqual(historyLengths, [1, 1]);
     assert.deepEqual(messages.map((m) => m.role), ["user", "assistant"]);
-    assert.match(String(messages[0].content), /SUMMARY: half the plan is written\.\n\nContinue the task from where it stopped\.$/);
+    assert.match(String(messages[0].content), /SUMMARY: half the plan is written\.\n\nThe task you are working on, word for word:\n\ndo the task\n\nContinue the task from where it stopped\.$/);
     // The same for the note after an empty reply.
     const empty = setup([reply([]), reply([text("Done.")])], { compactAt: 99 });
     assert.equal((await runAgent(empty.conversation, empty.options)).text, "Done.");

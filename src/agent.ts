@@ -3,13 +3,15 @@
 // drive the same loop; what differs between them comes in through AgentOptions.
 
 import type Anthropic from "@anthropic-ai/sdk";
-import { compact } from "./compact.ts";
+import { compact, type CompactOptions } from "./compact.ts";
 import type { Conversation } from "./conversation.ts";
-import type { CallModel } from "./model.ts";
+import { type CallModel, tooLong } from "./model.ts";
+import { workLog } from "./review.ts";
 import type { Sandbox } from "./sandbox.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
+type MessageParam = Anthropic.Beta.BetaMessageParam;
 type ToolUse = Anthropic.Beta.BetaToolUseBlock;
 type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
@@ -119,19 +121,53 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   const taskMessage = conversation.messages.at(-1);
   const task = textOf(taskMessage);
   const sinceTask = () => conversation.messages.slice(Math.max(0, conversation.messages.indexOf(taskMessage!)));
+  // The first step compaction may run at (it waits a few steps after one that failed), and what the run did
+  // before the last one, for the log that follows a summary.
+  let compactFrom = 1;
+  let compactedWork: MessageParam[] = [];
+
+  /**
+   * Compacts; resolves to whether there was anything to compact. Unless the task is the request kept after
+   * the summary, the task and a log of what was done for it follow the summary word for word.
+   */
+  const compactNow = async (rejected: boolean): Promise<boolean> => {
+    const work = [...compactedWork, ...sinceTask()];
+    const restate = conversation.messages.at(-1) !== taskMessage ? { text: task, log: workLog(work) } : undefined;
+    const compacted = await compactConversation(conversation, opts, { task: restate, tooLong: rejected, signal });
+    if (!compacted) return false;
+    addUsage(usage, compacted.usage);
+    compactedWork = work;
+    // A cut-off reply is only in the summary now, so the next reply can't continue it: it stands alone.
+    unfinished = "";
+    return true;
+  };
 
   for (let step = 1; step <= opts.maxSteps; step++) {
     let reply: Message;
     let malformed: Map<string, string>;
     let offered: string[] | undefined;
     try {
-      if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
-        addUsage(usage, await compactConversation(conversation, opts, signal));
-        // A cut-off reply is only in the summary now, so the next reply can't continue it: it stands alone.
-        unfinished = "";
+      if (opts.compactAt > 0 && conversation.tokens > opts.compactAt && step >= compactFrom) {
+        try {
+          await compactNow(false);
+        } catch (err) {
+          if (signal?.aborted) throw err;
+          // A failed summary needn't end the task: the conversation may still fit, so it goes on as it is.
+          compactFrom = step + COMPACT_AGAIN_AFTER;
+          opts.ui.notice(`Compaction failed (${errorMessage(err)}), so the conversation goes on as it is; compacting again from step ${compactFrom}.`);
+        }
       }
       const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
-      ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
+      try {
+        ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
+      } catch (err) {
+        // The API's word that the conversation is too long for the model, whose window jig may not know:
+        // compacted, it may fit, so the call is made again, once. If it can't be compacted, the error stands.
+        if (signal?.aborted || opts.compactAt === 0 || !tooLong(err)) throw err;
+        opts.ui.notice("The API says the conversation is too long for the model; compacting it and asking again.");
+        if (!(await compactNow(true))) throw err;
+        ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
+      }
     } catch (err) {
       if (signal?.aborted) return result("interrupted", step - 1);
       throw err;
@@ -245,20 +281,24 @@ const CONTINUE = "Your reply was cut off at the output limit; continue from wher
 const MAX_CONTINUATIONS = 2;
 const NOT_AN_ANSWER = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER, CONTINUE];
 
+/** How many steps after a failed compaction the next one is tried. */
+const COMPACT_AGAIN_AFTER = 3;
+
 /**
  * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
  * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.
  * The loop's note after a reply that wasn't an answer is no request: kept, it would point at a reply the
  * model can no longer see, so it goes into the summary too.
  */
-async function compactConversation(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal) {
+async function compactConversation(conversation: Conversation, opts: AgentOptions, options: Pick<CompactOptions, "task" | "tooLong" | "signal">) {
   const last = conversation.messages.at(-1);
   const isRequest = last?.role === "user" && typeof last.content === "string" && !NOT_AN_ANSWER.includes(last.content);
   opts.ui.notice(`Compacting the conversation (${formatTokens(conversation.tokens)} tokens)…`);
-  const compacted = await compact(conversation, opts.callModel, { signal, keep: isRequest ? [last] : [], continueTask: !isRequest });
-  if (!compacted) return { input_tokens: 0, output_tokens: 0 } as Anthropic.Beta.BetaUsage;
-  opts.ui.notice(`Compacted ${formatTokens(compacted.before)} tokens into about ${formatTokens(compacted.after)}.`);
-  return compacted.usage;
+  const compacted = await compact(conversation, opts.callModel, { ...options, keep: isRequest ? [last] : [], continueTask: !isRequest });
+  if (!compacted) return undefined;
+  const cut = compacted.cut ? ` (summarized with ${compacted.cut} tool result${compacted.cut === 1 ? "" : "s"} cut short, to fit)` : "";
+  opts.ui.notice(`Compacted ${formatTokens(compacted.before)} tokens into about ${formatTokens(compacted.after)}${cut}.`);
+  return compacted;
 }
 
 /**

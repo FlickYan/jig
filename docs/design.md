@@ -40,6 +40,16 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   keeping the last few turns verbatim would replay thinking blocks whose earlier history is gone, which
   the API can reject, and a fresh start is valid for both providers. A request the user just typed is
   kept word for word after the summary, and the model must read files again before editing them.
+  Mid-task, the task is restated word for word after the summary, with the log of file changes and
+  commands a reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
+- **The API says when the conversation is too long.** jig doesn't know every server's window, so it
+  doesn't compact before a request that won't fit (milestone 28); when the API rejects one as too long,
+  by one of a few specific wordings, it compacts and makes the call again, once. The summary request is
+  the history plus one message, so it would be rejected as well: it gets a copy whose tool results are
+  cut to their start and end, the oldest first, until it is 0.7, then 0.5, of the size (`/compact` does
+  this once its whole request is rejected). The copy is only sent; the history is still replaced
+  whole. Past `--compact-at`, a summary that fails doesn't end the task, since the conversation may
+  still fit: it goes on as it is, and compaction waits 3 steps before it is tried again.
 - **Every tool call gets a result.** Even calls that never ran (declined, interrupted, cut off at
   `max_tokens`, invalid input) get an error result, so the next request is always valid.
 - **Only a reply with something in it joins the history.** A reply with no text and no tool call (empty,
