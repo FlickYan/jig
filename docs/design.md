@@ -144,7 +144,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   (their questions would overlap, as `propose_skill`'s could in milestone 12), and subagents don't get them.
 - **Nothing that looks like a secret is written down.** A memory goes into every later prompt, so a key
   pasted into one would leak from then on. Memories, AGENTS.md edits and skills are refused if they hold
-  something shaped like an API key, a token, a private key or a password assignment.
+  something shaped like an API key, a token, a private key or a password assignment, or a password in a
+  URL whose host isn't this machine or an example, since `postgres://postgres:postgres@localhost` is the
+  kind of local convention AGENTS.md is for. A JWT is blanked out of exports only: tests hold made-up ones.
 - **jig never judges its own changes.** Reading a change to a prompt says little about whether it helps,
   and a judge the change could reach could be changed with it. So a candidate may change only `src/` and
   `skills/`; it works on a copy that has no benchmarks and, being a new repository, no history to find

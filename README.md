@@ -211,7 +211,11 @@ received (subagents included), and how many input tokens came from the prompt ca
   is one fact, its description one line, and nothing that looks like a secret), shows it to you, and keeps
   it only if you say yes. Memories were true when saved, so the prompt asks the model to check one that
   names a file, function or command before relying on it, and to propose forgetting one that turned out
-  wrong. `--no-memory` leaves memory out.
+  wrong. `--no-memory` leaves memory out. What counts as a secret here, and is blanked out of
+  `jig sessions export`: a key or token in the shape a provider gives out (`sk-`, `ghp_`, `github_pat_`,
+  `glpat-`, `hf_`, `npm_`, `AIza`, `sk_live_` and others), a private key, a password assignment, and a
+  password in a URL, unless its host is this machine or an example (`postgres://postgres:postgres@localhost`
+  is fine). Exports blank out JWTs too.
 
 ### Extensions
 

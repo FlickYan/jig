@@ -115,6 +115,43 @@ describe("secrets", () => {
     assert.equal(findSecret("password: hunter22hunter"), "a password or token");
     assert.equal(findSecret("Run the tests with make check; the token budget is small."), undefined);
   });
+
+  it("are recognized by each provider's prefix, and a password in a URL unless the host is local", () => {
+    // Made of repeated pieces, so a secret scanner doesn't take them for real ones.
+    const secrets: [string, string][] = [
+      [`github_pat_11${"A".repeat(20)}_${"b1".repeat(29)}c`, "a GitHub token"],
+      [`glpat-${"x1".repeat(10)}`, "a GitLab token"],
+      [`hf_${"aB".repeat(17)}`, "a Hugging Face token"],
+      [`npm_${"a1".repeat(18)}`, "an npm token"],
+      [`pypi-AgEIcHlwaS5vcmc${"x".repeat(60)}`, "a PyPI token"],
+      [`AIza${"Sy".repeat(17)}A`, "a Google API key"],
+      [`sk_live_${"4e".repeat(12)}`, "a Stripe key"],
+      [`rk_test_${"4e".repeat(12)}`, "a Stripe key"],
+      [`whsec_${"w9".repeat(16)}`, "a Stripe key"],
+      [`xai-${"aZ".repeat(40)}`, "an API key"],
+      [`gsk_${"q8".repeat(26)}`, "an API key"],
+      [`ASIA${"Q".repeat(16)}`, "an AWS access key"],
+      [`xapp-1-A0${"1".repeat(9)}-${"2".repeat(13)}-${"ab".repeat(32)}`, "a Slack token"],
+      [`SG.${"a".repeat(22)}.${"b".repeat(43)}`, "a SendGrid key"],
+      ["DATABASE_URL=postgres://app:s3cr3tpw@db.internal.corp:5432/app", "a password in a URL"],
+      ["redis://:s3cr3tpw@cache.prod.io:6379", "a password in a URL"],
+    ];
+    for (const [text, kind] of secrets) assert.equal(findSecret(`it is ${text}.`), kind, text);
+    // Names that share a prefix, local conventions AGENTS.md is for, placeholders, and a URL with an @ in it.
+    const ordinary = [
+      'hf_hub_download(repo_id="gpt2")',
+      "npm_config_cache=/tmp/npm",
+      "sudo apt install xapp-sn-watcher xapp-gtk3-module xapp-symbolic-icons",
+      "https://example.com/user@x",
+      "https://shop.io:8443?return=me@mail.com",
+      "DATABASE_URL=postgres://postgres:postgres@localhost:5432/test",
+      "redis://:dev@127.0.0.1:6379 and mysql://root:root@[::1]:3306/app",
+      "curl https://user:pass@api.example.com/v1",
+      "postgres://app:${DB_PASSWORD}@db.internal:5432/app or postgres://app:<password>@db.internal/app",
+      "the hash is aGVsbG8gd29ybGQ= and sk_test is the mode",
+    ];
+    for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
+  });
 });
 
 describe("proposals in the agent loop", () => {

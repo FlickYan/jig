@@ -153,4 +153,16 @@ describe("redacting secrets", () => {
     assert.deepEqual(redactSecrets(code), { text: code, count: 0 });
     assert.deepEqual(redactSecrets("SECRET=abcdefgh12345678 token: 'Zx81Qw93Lm'"), { text: "SECRET=[REDACTED] token: '[REDACTED]'", count: 2 });
   });
+
+  it("blanks out providers' keys and JWTs whole, and only the password of a URL that isn't local", () => {
+    const keys = [`github_pat_11${"A".repeat(20)}_${"b1".repeat(29)}c`, `sk_live_${"4e".repeat(12)}`, `hf_${"aB".repeat(17)}`, `AIza${"Sy".repeat(17)}A`];
+    for (const key of keys) assert.deepEqual(redactSecrets(`KEY=${key} and more`), { text: "KEY=[REDACTED] and more", count: 1 }, key);
+    const jwt = [{ alg: "HS256" }, { sub: "1234" }].map((part) => Buffer.from(JSON.stringify(part)).toString("base64url")).join(".") + `.${"s1".repeat(20)}`;
+    assert.deepEqual(redactSecrets(`Authorization: Bearer ${jwt}`), { text: "Authorization: Bearer [REDACTED]", count: 1 });
+    assert.deepEqual(redactSecrets("postgres://app:s3cr3tpw@db.internal:5432/app"), { text: "postgres://app:[REDACTED]@db.internal:5432/app", count: 1 });
+    // A key that is the password is blanked once.
+    assert.deepEqual(redactSecrets(`https://x-access-token:ghs_${"c".repeat(36)}@github.com/o/r.git`), { text: "https://x-access-token:[REDACTED]@github.com/o/r.git", count: 1 });
+    const ordinary = "DATABASE_URL=postgres://postgres:postgres@localhost:5432/test\npostgres://app:${DB_PASSWORD}@db.internal/app\nhf_hub_download(x)\nnpm_config_cache=/tmp/npm\napt install xapp-sn-watcher\nhttps://example.com/user@x";
+    assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
+  });
 });
