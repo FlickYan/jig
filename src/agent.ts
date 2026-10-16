@@ -51,6 +51,13 @@ export interface AgentOptions {
   /** A second model that checks the work against the task the first time the model stops (--reviewer). */
   reviewer?: Reviewer;
   /**
+   * The settings' Stop hooks (see hooks.ts), asked each time the model gives its final answer with a step
+   * left: resolves to why the task isn't done, which the model is told, or null. `active` says whether they
+   * have sent the model back already in this task. Only a task's own loop has them: a subagent's or the
+   * reviewer's answer doesn't end the task.
+   */
+  stopHooks?(stop: { task: string; answer: string; active: boolean; session?: string }, signal?: AbortSignal): Promise<string | null>;
+  /**
    * Out of steps mid-task, ask the model once more, without tools, what it changed, what it verified and
    * what is left (WRAP_UP), so the run doesn't end on a tool result. Off for subagents and the reviewer,
    * which ask for their own, and with --no-wrap-up.
@@ -125,8 +132,10 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   let escalated: RunResult["escalated"];
   let review: RunResult["reviewed"];
   const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage, ...(escalated && { escalated }), ...(review && { reviewed: review }) });
-  // Whether the work was checked (by --check's request or a reviewer): it is, at most once a run.
+  // Whether the work was checked (by --check's request or a reviewer): it is, at most once a run. And how
+  // often the Stop hooks have sent the model back: MAX_STOP_BLOCKS times at most.
   let reviewed = false;
+  let stopBlocks = 0;
   // Replies that weren't answers: whether the model was asked again after one with no text or tool call,
   // how many cut off at the output limit it was asked to continue, and the text of those so far.
   let askedAgain = false;
@@ -277,6 +286,31 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         conversation.push({ role: "user", content: opts.review });
         continue;
       }
+      // Then the project's own check, its Stop hooks, at every stop with a step left to act on what they say.
+      if (opts.stopHooks && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
+        let blocked: string | null = null;
+        try {
+          blocked = await opts.stopHooks({ task, answer, active: stopBlocks > 0, session: conversation.sessionPath }, signal);
+        } catch (err) {
+          // As with a hook that fails, the work stands: the hooks were only a check.
+          if (!signal?.aborted) opts.ui.notice(`The Stop hooks failed (${errorMessage(err)}), so the task ends.`);
+        }
+        if (signal?.aborted) return result("interrupted", step);
+        if (blocked) {
+          const short = blocked.trim().replace(/\s+/g, " ");
+          const said = `"${short.length > 160 ? `${short.slice(0, 160)}…` : short}"`;
+          if (stopBlocks < MAX_STOP_BLOCKS) {
+            stopBlocks++;
+            opts.count?.("hook.stopBlocked");
+            opts.ui.notice(`A Stop hook says the task isn't done (${said}); the model goes on (${stopBlocks} of ${MAX_STOP_BLOCKS}).`);
+            // A test suite's whole output can be long, so it is cut like a tool's.
+            conversation.push({ role: "user", content: stopBlocked(truncate(blocked)) });
+            continue;
+          }
+          opts.count?.("hook.stopCapped");
+          opts.ui.notice(`A Stop hook still says the task isn't done (${said}), but it has sent the model back ${MAX_STOP_BLOCKS} times, so the task ends.`);
+        }
+      }
       return result(reply.stop_reason ?? "end_turn", step, answer);
     }
 
@@ -388,6 +422,21 @@ export const WRAP_UP = "You have run out of steps. Don't call any tools: say wha
 
 /** How many steps after a failed compaction the next one is tried. */
 const COMPACT_AGAIN_AFTER = 3;
+
+/**
+ * How often a task's Stop hooks may send the model back. A check the model can't satisfy (a test it can't
+ * fix, a broken command) would otherwise take every step left, each a model call and a run of the hooks.
+ */
+export const MAX_STOP_BLOCKS = 3;
+
+/** What the model is told when the Stop hooks won't let the task end, with what they reported. */
+function stopBlocked(reason: string): string {
+  return `A Stop hook, a check this project runs before a task may end, says the task isn't done:
+
+${reason}
+
+Deal with what it reports, then finish.`;
+}
 
 /**
  * How many steps in a row with the same calls and the same results end a run ("loop"). Five, as milestone

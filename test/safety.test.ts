@@ -109,6 +109,21 @@ describe("snapshots", () => {
     assert.equal(snapshots.undo(), undefined);
   });
 
+  it("lists the files changed since the last snapshot, for the Stop hooks, and undo still puts them back", async () => {
+    await writeFile(join(dir, "keep.txt"), "v1\n");
+    await writeFile(join(dir, "gone.txt"), "x\n");
+    const snapshots = new Snapshots(dir);
+    assert.equal(snapshots.changed(), undefined, "no snapshot yet");
+    snapshots.take("task");
+    assert.deepEqual(snapshots.changed(), []);
+    await writeFile(join(dir, "keep.txt"), "v2\n");
+    await rm(join(dir, "gone.txt"));
+    await writeFile(join(dir, "new.txt"), "n\n");
+    assert.deepEqual(snapshots.changed(), ["gone.txt", "keep.txt", "new.txt"]);
+    assert.deepEqual(snapshots.undo(), { changed: ["gone.txt", "keep.txt"], removed: ["new.txt"] });
+    assert.equal(await readFile(join(dir, "gone.txt"), "utf8"), "x\n");
+  });
+
   it("refuses projects too big to copy", async () => {
     await writeFile(join(dir, "data.bin"), Buffer.alloc(201_000_000));
     assert.throws(() => new Snapshots(dir).take("t"), /201 MB of files that aren't ignored/);
@@ -186,13 +201,26 @@ describe("settings", () => {
   it("explains a bad settings file", async () => {
     await writeSettings({}, { deny: "git push" });
     assert.throws(() => readSettings(dir), /"deny" must be a list of commands/);
-    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { BeforeEverything: [] } }));
-    assert.throws(() => readSettings(dir), /unknown hook event "BeforeEverything"/);
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "(", command: "true" }] } }));
     assert.throws(() => readSettings(dir), /\.jig\/settings\.json: the hook matcher "\(" is not a valid regular expression \(Invalid regular expression: .*\)$/);
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "*", command: "true" }] } }));
     assert.equal(readSettings(dir).project?.settings.hooks[0].matcher, "*", "* is every tool, as in Claude Code");
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ mcpServers: { db: { args: [] } } }));
     assert.throws(() => readSettings(dir), /MCP server "db" needs a "command"/);
+  });
+
+  it("takes Stop hooks, behind the project's trust, and leaves out events jig doesn't have, with a warning", async () => {
+    // As settings written for Claude Code can have: the file loads, without those hooks.
+    await writeSettings({ hooks: { UserPromptSubmit: [{ command: "./log.sh" }] } }, { hooks: { SessionStart: [{ command: "echo hi" }], Stop: [{ command: "npm test 1>&2 || exit 2" }] } });
+    const { user, project, warnings } = readSettings(dir);
+    assert.deepEqual(user.hooks, []);
+    assert.deepEqual(project!.settings.hooks, [{ event: "Stop", matcher: undefined, command: "npm test 1>&2 || exit 2" }]);
+    assert.deepEqual(warnings, [
+      `${join(dir, ".jig-home", "settings.json")}: jig has no hook event "UserPromptSubmit", so those hooks don't run (it has PreToolUse, PostToolUse, Stop).`,
+      `${join(dir, ".jig", "settings.json")}: jig has no hook event "SessionStart", so those hooks don't run (it has PreToolUse, PostToolUse, Stop).`,
+    ]);
+    assert.deepEqual(needsTrust(project!.settings), ["run a Stop hook: npm test 1>&2 || exit 2"]);
+    assert.deepEqual(mergeSettings(user, project!.settings, false).hooks, []);
+    assert.deepEqual(mergeSettings(user, project!.settings, true).hooks, project!.settings.hooks);
   });
 });

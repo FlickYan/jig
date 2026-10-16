@@ -12,7 +12,7 @@ import { parseArgs } from "node:util";
 import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
-import { runHooks } from "./hooks.ts";
+import { runHooks, runStopHooks } from "./hooks.ts";
 import { connectMcpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
@@ -94,8 +94,9 @@ jig sessions list | export lists sessions, or exports them as fine-tuning data (
 jig review reviews an agent's finished work by running it, in a copy (jig review --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
-commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
-loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
+commands, hooks around tool calls and before a task ends, and MCP servers. A project's settings can
+only run programs or loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without
+asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
 Ctrl+C stops the current task (press it again to force quit).
@@ -284,6 +285,15 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   cleanup.push(mcp.close);
   for (const error of mcp.errors) ui.notice(error);
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
+  // The files the task changed, for the Stop hooks: by the snapshot taken before it, while /undo works.
+  const changedFiles = () => {
+    try {
+      return snapshots?.changed();
+    } catch {
+      return undefined;
+    }
+  };
+  const stopHooks = settings.hooks.some((hook) => hook.event === "Stop") ? stopHookRunner(settings.hooks, cwd, changedFiles) : undefined;
   let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
   // Memory: notes from earlier sessions (--no-memory leaves them out, for a with-and-without comparison).
   let memories = values.memory ? loadMemories(cwd) : [];
@@ -419,6 +429,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     authorize,
     sandbox,
     hooks,
+    // Not the subagents' or the reviewer's: their answers don't end the task.
+    stopHooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
     wrapUp: values["wrap-up"],
@@ -631,7 +643,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
  * once the user trusts them, which is asked again whenever the file changes. Deny rules always apply.
  */
 async function loadSettings(cwd: string): Promise<Settings> {
-  const { user, project } = readSettings(cwd);
+  const { user, project, warnings } = readSettings(cwd);
+  for (const warning of warnings) ui.notice(warning);
   if (!project) return user;
   const asks = needsTrust(project.settings);
   const file = relative(cwd, project.path);
@@ -652,7 +665,7 @@ async function loadSettings(cwd: string): Promise<Settings> {
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
 function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
-  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2], signal?: AbortSignal) => {
+  const run = async (event: Exclude<HookEvent, "Stop">, call: Parameters<typeof runHooks>[2], signal?: AbortSignal) => {
     const outcome = await runHooks(hooks, event, call, cwd, { signal });
     for (const warning of outcome.warnings) ui.notice(warning);
     return outcome;
@@ -660,6 +673,16 @@ function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
   return {
     before: async (tool, input, signal) => (await run("PreToolUse", { tool, input }, signal)).block ?? null,
     after: async (tool, input, output, signal) => (await run("PostToolUse", { tool, input, output }, signal)).feedback ?? null,
+  };
+}
+
+/** The settings' Stop hooks, before a task ends. Likewise, a broken one is reported and otherwise ignored. */
+function stopHookRunner(hooks: Hook[], cwd: string, changedFiles: () => string[] | undefined): AgentOptions["stopHooks"] {
+  return async ({ task, answer, active, session }, signal) => {
+    const stop = { task, last_message: answer, stop_hook_active: active, session_path: session, changed_files: changedFiles() };
+    const outcome = await runStopHooks(hooks, stop, cwd, { signal });
+    for (const warning of outcome.warnings) ui.notice(warning);
+    return outcome.block ?? null;
   };
 }
 

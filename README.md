@@ -250,12 +250,13 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   A tool the server marks read-only runs like jig's own read tools; any other asks first (outside `auto`
   mode) and is refused in `plan` mode, because it acts outside the sandbox's reach. `[a]lways` approves one
   tool for the session; allow and deny rules can name tools too.
-- **Hooks.** Commands that run around tool calls, configured like Claude Code's:
+- **Hooks.** Commands that run around tool calls, and before a task ends, configured like Claude Code's:
 
   ```json
   { "hooks": {
       "PreToolUse":  [{ "matcher": "bash", "command": "./scripts/check-command.sh" }],
-      "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }] } }
+      "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }],
+      "Stop":        [{ "command": "npm test 1>&2 || exit 2" }] } }
   ```
 
   `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
@@ -263,6 +264,16 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
   stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
   and otherwise ignored; a hook still running after 60 seconds is stopped, with everything it started.
+
+  A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
+  done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
+  task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
+  already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
+  Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task going: the model is
+  told the stderr or the reason, and works on. A task's Stop hooks send it back 3 times at most; after
+  that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
+  too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
+  doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
   touch) to a fresh agent loop with a context of its own. It gets the tools that only look, under `plan`
   mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the
@@ -342,7 +353,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/proposals.ts`](src/proposals.ts), [`src/secrets.ts`](src/secrets.ts) | Putting a proposal to the user; what jig refuses to write down because it looks like a secret |
 | [`skills/`](skills) | The skills that come with jig: `skill-writer`, which `/skills new` and `/learn` follow |
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
-| [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
+| [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls, and before a task ends |
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
 | [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments on Linux |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
@@ -369,6 +380,8 @@ At `--max-steps`, jig makes one more call, in which the model can't call tools, 
 what it verified and how, and what is left, and prints the reply: the model's own report, not evidence.
 Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
 and `jig skills test` do, so that their steps and costs compare with earlier runs.
+A `Stop` hook can send the model back to work from its final answer, after `--check` and the reviewer,
+with a step left and 3 times a task at most (see Hooks).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at

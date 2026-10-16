@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -581,6 +581,40 @@ describe("a hook configured as for Claude Code", () => {
       assert.equal(await readFile(join(project, "hooked.txt"), "utf8"), "bash without a key\n");
       const [, , results] = api.requests[1].messages as { content: { type: string; content: string }[] }[];
       assert.match(results.content[0].content, /^listed\n\nExit code: 0$/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("sends the model back from a Stop until the project's check passes, and skips events jig doesn't have", async () => {
+    // The model says it is done at once; sent back, it writes the file the check wants, and is done again.
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 3 ? [{ tool: "write_file", input: { path: "done.txt", content: "done\n" } }] : [{ text: "Done." }],
+    );
+    try {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const log = join(outside, "stops.jsonl");
+      const check = { command: `{ cat; echo; } >> ${JSON.stringify(log)}; test -f done.txt || { echo "done.txt is missing" >&2; exit 2; }` };
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ command: "echo hi" }], Stop: [check] } }));
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file, "Write done.txt."];
+      const { code, output } = await runJig(args, { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      assert.match(output, /settings\.json: jig has no hook event "SessionStart", so those hooks don't run/);
+      assert.match(output, /A Stop hook says the task isn't done \("done\.txt is missing"\); the model goes on \(1 of 3\)\./);
+      assert.equal(api.requests.length, 3);
+      const sentBack = (api.requests[1].messages as { content: unknown }[])[2];
+      assert.match(JSON.stringify(sentBack.content), /says the task isn't done:\\n\\ndone\.txt is missing\\n/);
+      const stops = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+      assert.deepEqual(
+        stops.map((stop) => [stop.event, stop.task, stop.last_message, stop.stop_hook_active, stop.changed_files]),
+        [
+          ["Stop", "Write done.txt.", "Done.", false, []],
+          ["Stop", "Write done.txt.", "Done.", true, ["done.txt"]],
+        ],
+      );
+      assert.deepEqual([stops[0].cwd, stops[0].session_path.endsWith(".jsonl")], [await realpath(project), true]);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "hook.stopBlocked": 1 });
     } finally {
       api.close();
     }

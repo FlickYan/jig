@@ -8,7 +8,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions, type Usage } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
-import { runHooks } from "../src/hooks.ts";
+import { runHooks, runStopHooks } from "../src/hooks.ts";
 import { connectMcpServers, type McpServers } from "../src/mcp.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
@@ -272,6 +272,14 @@ describe("hooks", () => {
     assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
   });
 
+  it("doesn't even wait a moment for a job that holds only a tool hook's stdout, which nothing reads", async () => {
+    // Waiting for a background job's last words takes a second; a tool hook's stdout has none to give.
+    const started = Date.now();
+    const outcome = await runHooks([{ event: "PostToolUse", command: "sleep 5 2>/dev/null &" }], "PostToolUse", { tool: "edit_file", input: {}, output: "ok" }, dir);
+    assert.deepEqual(outcome, { warnings: [] });
+    assert.ok(Date.now() - started < 800, `${Date.now() - started} ms`);
+  });
+
   it("passes on PostToolUse feedback, and only warns about a hook that fails", async () => {
     const hooks = [
       { event: "PostToolUse" as const, command: "echo 'lint: missing semicolon' >&2; exit 2" },
@@ -284,6 +292,32 @@ describe("hooks", () => {
     const pre = await runHooks(hooks, "PreToolUse", { tool: "bash", input: {} }, dir);
     assert.equal(pre.block, undefined);
     assert.match(pre.warnings.join(), /failed: broken/);
+  });
+
+  const stop = { task: "fix the tests", last_message: "Done.", stop_hook_active: false, changed_files: ["a.py"] };
+
+  it("keeps the task from ending when a Stop hook exits with code 2 or prints a block decision, and tells it the task", async () => {
+    const hooks = [
+      { event: "Stop" as const, command: `cat > "$JIG_PROJECT_DIR/stop.json"; echo "$JIG_EVENT: 2 tests failed" >&2; exit 2` },
+      { event: "Stop" as const, command: `echo '{"decision": "block", "reason": "lint: a.py:3 unused import"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'` },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [], block: "Stop: 2 tests failed\nlint: a.py:3 unused import\nthe hook gave no reason" });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "stop.json"), "utf8")), { event: "Stop", ...stop, cwd: dir });
+  });
+
+  it("lets the task end when the Stop hooks pass, or fail otherwise, and runs them only then", async () => {
+    const hooks = [
+      { event: "Stop" as const, matcher: "bash", command: "echo 'all 9 tests passed'" }, // output that isn't a decision, and a matcher, which doesn't apply
+      { event: "Stop" as const, command: `echo '{"decision": "approve"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'; exit 1` },
+      { event: "PreToolUse" as const, command: "exit 2" },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [`Hook "echo '{"decision": "block"}'; exit 1" failed: the hook exited with code 1`] });
+    const pre = await runHooks([{ event: "Stop", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(pre.block, undefined, "a Stop hook doesn't run around tool calls");
   });
 
   it("are applied around tool calls by the agent loop", async () => {

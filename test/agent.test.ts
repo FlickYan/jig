@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { failedTestRun, runAgent, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
+import { failedTestRun, MAX_STOP_BLOCKS, runAgent, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { toChatMessages } from "../src/openai.ts";
@@ -696,6 +696,96 @@ describe("a reviewer before finishing", () => {
   });
 });
 
+describe("Stop hooks before finishing", () => {
+  /** What the hooks were asked, without the session file (the tests have none). */
+  type Asked = { task: string; answer: string; active: boolean };
+  const notices: string[] = [];
+  const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+  beforeEach(() => {
+    notices.length = 0;
+  });
+
+  it("send the model back with what they report, and let the task end once they pass", async () => {
+    const asked: Asked[] = [];
+    const verdicts = ["2 tests failed: test_parse, test_empty", null];
+    const { options, conversation, messages } = setup(
+      [reply([text("Done.")]), reply([toolUse("t1", "bash", { command: "echo fixed" })]), reply([text("Fixed; the tests pass.")])],
+      { stopHooks: async ({ task, answer, active }) => (asked.push({ task, answer, active }), verdicts.shift()!), ui },
+    );
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["end_turn", 3, "Fixed; the tests pass."]);
+    assert.deepEqual(messages[2], {
+      role: "user",
+      content: "A Stop hook, a check this project runs before a task may end, says the task isn't done:\n\n2 tests failed: test_parse, test_empty\n\nDeal with what it reports, then finish.",
+    });
+    // Asked again with stop_hook_active, as Claude Code's are, so a hook can let the model go the second time.
+    assert.deepEqual(asked, [
+      { task: "do the task", answer: "Done.", active: false },
+      { task: "do the task", answer: "Fixed; the tests pass.", active: true },
+    ]);
+    assert.deepEqual(notices, ['A Stop hook says the task isn\'t done ("2 tests failed: test_parse, test_empty"); the model goes on (1 of 3).']);
+    // A whole test suite's output is cut from the middle, as a tool's would be.
+    const verbose = ["FAIL test_parse\n".repeat(10_000), null];
+    const long = setup([reply([text("Done.")]), reply([text("Fixed.")])], { stopHooks: async () => verbose.shift()! });
+    await runAgent(long.conversation, long.options);
+    const sent = String(long.messages[2].content);
+    assert.ok(sent.length < 41_000, `${sent.length} characters`);
+    assert.match(sent, /characters truncated/);
+  });
+
+  it(`end the task, with a notice, once they have sent the model back ${MAX_STOP_BLOCKS} times`, async () => {
+    let runs = 0;
+    const events: string[] = [];
+    const answers = Array.from({ length: 6 }, (_, i) => reply([text(`Done (${i}).`)]));
+    const { options, conversation, messages } = setup(answers, { stopHooks: async () => (runs++, "tests fail"), count: (event) => events.push(event), ui });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["end_turn", 4, "Done (3)."]);
+    assert.equal(runs, 4);
+    assert.deepEqual(events, ["hook.stopBlocked", "hook.stopBlocked", "hook.stopBlocked", "hook.stopCapped"]);
+    assert.equal(notices.at(-1), 'A Stop hook still says the task isn\'t done ("tests fail"), but it has sent the model back 3 times, so the task ends.');
+    assert.equal(messages.at(-1)?.role, "assistant", "the session ends on the answer");
+  });
+
+  it("don't run with no step left to act on what they say, or on a reply that isn't an answer", async () => {
+    let runs = 0;
+    const stopHooks = async () => (runs++, "tests fail");
+    const last = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([text("Done.")])], { stopHooks, maxSteps: 2 });
+    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.text]), ["end_turn", "Done."]);
+    const cutOff = (t: string) => reply([text(t)], "max_tokens");
+    const unfinished = setup([cutOff("a"), cutOff("b"), cutOff("c")], { stopHooks });
+    assert.equal((await runAgent(unfinished.conversation, unfinished.options)).stop, "max_tokens");
+    assert.equal(runs, 0);
+  });
+
+  it("run after --check's request and after a reviewer, at the model's next stop or the same one", async () => {
+    const asked: string[] = [];
+    const stopHooks = async ({ answer }: Asked) => (asked.push(answer), null);
+    const checked = setup([reply([text("Done.")]), reply([text("Checked.")])], { stopHooks, review: "Check your work." });
+    assert.equal((await runAgent(checked.conversation, checked.options)).text, "Checked.");
+    const usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+    const reviewer: Reviewer = { model: "strong", review: async () => ({ verdict: "approved", usage }) };
+    const reviewed = setup([reply([text("Reviewed.")])], { stopHooks, reviewer });
+    assert.equal((await runAgent(reviewed.conversation, reviewed.options)).reviewed?.verdict, "approved");
+    assert.deepEqual(asked, ["Checked.", "Reviewed."]);
+  });
+
+  it("leave the work as it is when they fail, and stop the task on Ctrl+C during them", async () => {
+    const failing = setup([reply([text("Done.")])], {
+      stopHooks: async () => {
+        throw new Error("bash is missing");
+      },
+      ui,
+    });
+    assert.deepEqual(await runAgent(failing.conversation, failing.options).then((r) => [r.stop, r.text]), ["end_turn", "Done."]);
+    assert.deepEqual(notices, ["The Stop hooks failed (bash is missing), so the task ends."]);
+    const controller = new AbortController();
+    // Ctrl+C kills a hook, which then only warns: the loop has to notice.
+    const stopHooks = async () => (controller.abort(), null);
+    const interrupted = setup([reply([text("Done.")])], { stopHooks });
+    assert.equal((await runAgent(interrupted.conversation, interrupted.options, controller.signal)).stop, "interrupted");
+  });
+});
+
 describe("counting the loop's mechanisms (--stats)", () => {
   /** The mechanisms a run counted, in order. */
   async function counted(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}): Promise<string[]> {
@@ -722,6 +812,8 @@ describe("counting the loop's mechanisms (--stats)", () => {
     assert.deepEqual(await counted(forever, { maxSteps: 2, wrapUp: true }), ["wrapUp"]);
     const again = Array.from({ length: 6 }, (_, i) => reply([toolUse(`t${i}`, "read_file", { path: "missing.txt" })]));
     assert.deepEqual(await counted(again), ["loop"]);
+    const verdicts = ["tests fail", null];
+    assert.deepEqual(await counted([reply([text("Done.")]), reply([text("Fixed.")])], { stopHooks: async () => verdicts.shift()! }), ["hook.stopBlocked"]);
   });
 
   it("counts the calls that didn't run as asked, and the hooks' say", async () => {
