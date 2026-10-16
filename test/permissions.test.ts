@@ -65,8 +65,17 @@ describe("Permissions", () => {
 
     assert.equal(permissions.alwaysLabel(tool("edit_file"), { path: "a" }), "file changes");
     permissions.allowAlways(tool("edit_file"), { path: "a" });
-    assert.equal(permissions.mode, "edits");
+    assert.equal(permissions.decide(tool("write_file"), { path: "b", content: "" }), "allow");
     assert.equal(permissions.alwaysLabel(tool("bash"), { command: "echo $(date)" }), null, "can't generalize this");
+  });
+
+  it("'always' on a file change allows file changes, not contained commands", () => {
+    // It used to switch the mode to edits, which also runs every command the sandbox contains.
+    const permissions = new Permissions("ask", "/project", { contained: true });
+    permissions.allowAlways(tool("write_file"), { path: "a.txt", content: "" });
+    assert.equal(permissions.decide(tool("edit_file"), { path: "b.txt" }), "allow");
+    assert.equal(permissions.mode, "ask");
+    assert.ok(!bash(permissions, "npm install"), "commands still ask");
   });
 });
 

@@ -134,7 +134,8 @@ received (subagents included), and how many input tokens came from the prompt ca
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
   `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
-  When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session.
+  When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session. On a
+  file change it approves file changes only: commands still ask, even ones the sandbox contains.
 - **Rules.** `~/.jig/settings.json` and the project's `.jig/settings.json` can list commands to always
   allow or always refuse:
 

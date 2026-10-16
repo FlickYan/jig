@@ -59,6 +59,11 @@ export class Permissions {
   private readonly programs = new Set<string>();
   /** External tools (MCP) the user chose to always allow for this session. */
   private readonly externalTools = new Set<string>();
+  /**
+   * Whether the user chose to always allow file changes. A flag, not a switch to edits mode: that mode also
+   * runs the commands the sandbox contains, which the user wasn't asked about.
+   */
+  private editsAllowed = false;
 
   constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false, dirs = [] }: PolicyOptions = {}) {
     this.mode = mode;
@@ -85,7 +90,7 @@ export class Permissions {
       return { refuse: "Refused: plan mode is on, so nothing may be changed. Investigate, then describe the changes you would make." };
     }
     if (this.mode === "auto") return "allow";
-    if (tool.kind === "edit") return this.mode === "edits" ? "allow" : "ask";
+    if (tool.kind === "edit") return this.mode === "edits" || this.editsAllowed ? "allow" : "ask";
     if (commands?.every((argv) => this.readsOnly(argv) || this.isApproved(argv) || this.allowedByRule(argv))) return "allow";
     return this.mode === "edits" && this.contained ? "allow" : "ask";
   }
@@ -112,7 +117,7 @@ export class Permissions {
   /** Remembers an "always" answer for the rest of the session. */
   allowAlways(tool: Tool, input: ToolInput): void {
     if (tool.kind === "external") this.externalTools.add(tool.definition.name);
-    if (tool.kind === "edit" && this.mode === "ask") this.mode = "edits";
+    if (tool.kind === "edit") this.editsAllowed = true;
     for (const program of this.newPrograms(input)) this.programs.add(program);
   }
 
