@@ -177,6 +177,13 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
   continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
+- **Long output.** Tool output over 40,000 characters (about 10k tokens) is cut from the middle, keeping
+  its start and its end (errors and test summaries tend to be at the end). A command's whole output then
+  goes to a file in the temp directory that only you can read, and the model is told where, so it can
+  search what it didn't see instead of running the command again (though not in plan mode, whose commands
+  may only read inside the project). The files hold 100 million characters at most, the oldest making
+  room, and jig deletes them when it exits. However much a command prints, jig keeps only its start and
+  end in memory, so the command runs to the end.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
   User memories (how you like to work) hold in every project; project memories (facts about a project
   that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,

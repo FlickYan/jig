@@ -7,6 +7,7 @@ import { compact } from "./compact.ts";
 import type { Conversation } from "./conversation.ts";
 import type { CallModel } from "./model.ts";
 import type { Sandbox } from "./sandbox.ts";
+import type { OutputFiles } from "./tools/bash.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -34,6 +35,8 @@ export interface AgentOptions {
   authorize(tool: Tool, input: ToolInput): Promise<string | null>;
   /** Where commands run, if not directly on the machine. */
   sandbox?: Sandbox;
+  /** Where bash keeps the whole of an output too long to show, for the model to search. */
+  outputs?: OutputFiles;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
   /** Paths the settings hide (hiddenPaths), which the file tools refuse too. */
@@ -262,7 +265,7 @@ async function handleToolCall(
   let output: string;
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
-    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage };
+    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage };
     output = truncate(await tool.run(input, context));
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -96,6 +97,50 @@ describe("hiddenPaths", () => {
       assert.doesNotMatch(results, /listen 8080/);
     } finally {
       api.close();
+    }
+  });
+});
+
+describe("a command's long output", () => {
+  it("goes whole to a file the model can search, which jig removes when it exits", async () => {
+    let path = "";
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as { content: unknown }[];
+      if (messages.length === 1) return [{ tool: "bash", input: { command: "seq 1 20000" } }];
+      if (messages.length > 3) return [{ text: "Done." }];
+      path = /The whole output is in (\S+):/.exec(JSON.stringify(messages[2].content))?.[1] ?? "";
+      return [{ tool: "bash", input: { command: `sed -n 10000p ${path}` } }]; // a line the result left out
+    });
+    try {
+      const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Count to 20000."], { api, cwd: project });
+      assert.equal(code, 0);
+      assert.ok(path, "the result says where the whole output is");
+      const last = (api.requests[2].messages as { content: { content: string }[] }[])[4];
+      assert.equal(last.content[0].content, "10000\n\nExit code: 0");
+      assert.equal(existsSync(path), false);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("is removed when a signal ends jig too, as closing its terminal does", async () => {
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) {
+      let path = "";
+      const api = await fakeMessagesApi((request) => {
+        const messages = request.messages as { content: unknown }[];
+        if (messages.length === 1) return [{ tool: "bash", input: { command: "seq 1 20000" } }];
+        path = /The whole output is in (\S+):/.exec(JSON.stringify(messages[2].content))?.[1] ?? "";
+        // Without the sandbox, jig runs bash itself, so the command's $PPID is jig.
+        return [{ tool: "bash", input: { command: `kill -${signal} $PPID` } }];
+      });
+      try {
+        const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Count to 20000."], { api, cwd: project });
+        assert.equal(code, 128 + constants.signals[signal]);
+        assert.ok(path, "the result says where the whole output is");
+        assert.equal(existsSync(path), false, `${signal} left ${path} behind`);
+      } finally {
+        api.close();
+      }
     }
   });
 });

@@ -4,7 +4,7 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Usage } from "../agent.ts";
-import { bashOnItsOwn, bashTool } from "./bash.ts";
+import { bashOnItsOwn, bashTool, type OutputFiles } from "./bash.ts";
 import { editTool } from "./edit.ts";
 import { globTool } from "./glob.ts";
 import { grepTool } from "./grep.ts";
@@ -23,6 +23,8 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** Where commands run, if not directly on the machine. */
   sandbox?: Sandbox;
+  /** Where bash keeps the whole of an output too long to show, for the model to search. */
+  outputs?: OutputFiles;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
   /** Paths the settings hide (hiddenPaths): the file tools refuse them, wherever a symlink leads. */

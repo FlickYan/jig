@@ -8,7 +8,7 @@ import { after, before, beforeEach, describe, it } from "node:test";
 import { createSandbox, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
-import { runCommand } from "../src/tools/bash.ts";
+import { OutputFiles, runCommand } from "../src/tools/bash.ts";
 
 let dir: string;
 beforeEach(async () => {
@@ -71,6 +71,28 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     } finally {
       await rm(hidden, { recursive: true, force: true });
       await rm(shown, { recursive: true, force: true });
+    }
+  });
+
+  it("lets commands read the whole of a long output, but not send jig's writes to it elsewhere", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const outputs = new OutputFiles();
+    const target = join(homedir(), `.jig-sandbox-target-${process.pid}`);
+    const fileOf = (out: string) => /The whole output is in (\S+):/.exec(out)?.[1];
+    try {
+      const path = fileOf(await runCommand("seq 1 20000", project, 20, undefined, sandbox, outputs));
+      assert.equal(await run(`wc -l < ${path}`, sandbox), "20000\n\nExit code: 0");
+      // Midway, a command puts a symlink to a file it can't write in place of the file jig writes to, which
+      // it finds by what it printed (other tests' files may be there too).
+      await writeFile(target, "untouched\n");
+      const mark = `jig-sandbox-swap-${process.pid}`;
+      const swap = `f=$(grep -l ${mark} ${tmpdir()}/jig-output-*.log 2>/dev/null) && rm "$f" && ln -s ${target} "$f" && swapped=$f`;
+      const out = await runCommand(`echo ${mark}; seq 1 20000; sleep 0.5; ${swap}; seq 1 20000; echo "swapped $swapped"`, project, 20, undefined, sandbox, outputs);
+      assert.match(out, new RegExp(`swapped ${fileOf(out)}\n`));
+      assert.equal(await readFile(target, "utf8"), "untouched\n");
+    } finally {
+      outputs.remove();
+      await rm(target, { force: true });
     }
   });
 

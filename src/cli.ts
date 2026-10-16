@@ -7,6 +7,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
+import { constants } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, type ToolHooks, type Usage } from "./agent.ts";
@@ -34,6 +35,7 @@ import { skillsCommand } from "./skills-cli.ts";
 import { Snapshots } from "./snapshots.ts";
 import { type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
+import { OutputFiles } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -247,6 +249,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
   const contained = !!sandbox && !network;
   const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
+  // The whole of a command's output too long to show, for the model to search. Only the main loop's: the
+  // subagents work under plan mode's rules, which don't let commands read outside the project.
+  const outputs = new OutputFiles();
+  process.on("exit", () => outputs.remove()); // on a forced quit (a second Ctrl+C) too
+  // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
+  // leave the files behind: they end it with an ordinary exit instead, and the exit code a shell would give.
+  for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
   const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
@@ -388,6 +397,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     compactAt: compactLimit,
     authorize,
     sandbox,
+    outputs,
     hooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),

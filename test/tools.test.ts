@@ -1,15 +1,15 @@
 import assert from "node:assert/strict";
 import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
-import { bashTool, runCommand } from "../src/tools/bash.ts";
+import { bashTool, OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
-import { checkInput, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
+import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
@@ -431,6 +431,49 @@ describe("bash", () => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 100);
     assert.match(await runCommand("sleep 30", cwd, 60, controller.signal), /Killed: the user interrupted it/);
+  });
+
+  it("shows a long output's head and tail, and says which file holds all of it", async () => {
+    const outputs = new OutputFiles();
+    try {
+      const command = "seq 1 20000; echo 'FAIL: test_middle'; seq 20001 40000";
+      const whole = execFileSync("bash", ["-c", command], { encoding: "utf8" });
+      const out = await bashTool.run({ command }, { ...ctx, outputs });
+      assert.ok(out.length <= MAX_OUTPUT_CHARS, "short enough that the loop leaves it as it is");
+      const [, head, left, path, tail] = /^(.*)\n\n\[\.\.\. (\d+) characters truncated\. The whole output is in (\S+): search it with grep -n.*\]\n\n(.*)\n\nExit code: 0$/s.exec(out) ?? [];
+      assert.ok(whole.startsWith(head) && whole.trimEnd().endsWith(tail) && head.length + Number(left) + tail.length === whole.trimEnd().length);
+      assert.doesNotMatch(out, /FAIL/);
+      assert.equal(readFileSync(path, "utf8"), whole);
+      assert.equal(statSync(path).mode & 0o777, 0o600, "only the user can read it");
+      outputs.remove();
+      assert.equal(existsSync(path), false);
+    } finally {
+      outputs.remove();
+    }
+  });
+
+  it("lets a command that prints a lot run to the end", async () => {
+    // It used to be killed at 5 million characters, its exit code lost.
+    const out = await runCommand("head -c 6000000 /dev/zero | tr '\\0' a; echo; echo done; exit 4", cwd, 30);
+    assert.match(out, /^a{19500}\n\n\[\.\.\. 5961006 characters truncated \.\.\.\]\n\na+\ndone\n\nExit code: 4$/);
+  });
+
+  it("keeps the newest outputs in its files, up to its limit", async () => {
+    const outputs = new OutputFiles(100_000);
+    try {
+      const run = async (command: string) => /(?:is|are) in (\S+):/.exec(await bashTool.run({ command }, { ...ctx, outputs }))?.[1] ?? "";
+      const first = await run("seq 1 10000"); // 48,894 characters
+      assert.ok(existsSync(first));
+      const second = await run("seq 10001 20000"); // 60,000: the first makes room
+      assert.equal(existsSync(first), false);
+      assert.equal(readFileSync(second, "utf8"), execFileSync("seq", ["10001", "20000"], { encoding: "utf8" }));
+      const out = await bashTool.run({ command: "seq 1 20000" }, { ...ctx, outputs }); // 108,894: more than there is room for
+      const [, third] = /The output's first 100000 characters are in (\S+):/.exec(out) ?? [];
+      assert.equal(existsSync(second), false);
+      assert.equal(readFileSync(third, "utf8"), execFileSync("seq", ["1", "20000"], { encoding: "utf8" }).slice(0, 100_000));
+    } finally {
+      outputs.remove();
+    }
   });
 });
 
