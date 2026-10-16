@@ -104,10 +104,12 @@ describe("compaction", () => {
       return replies.shift() ?? reply([text("Done.")]);
     };
     const notices: string[] = [];
-    const result = await runAgent(conversation, { ...options(callModel, 1000), ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) } });
+    const events: string[] = [];
+    const result = await runAgent(conversation, { ...options(callModel, 1000), ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) }, count: (event) => events.push(event) });
 
     assert.deepEqual([result.stop, result.text], ["end_turn", "Done."]);
     assert.deepEqual(summarizedAfter, [1, 4], "tried before step 2, then again before step 5");
+    assert.deepEqual(events, ["compaction.failed", "compaction"]);
     assert.ok(notices.includes("Compaction failed (the model wrote no summary), so the conversation goes on as it is; compacting again from step 5."), notices.join("\n"));
     assert.equal(conversation.messages.length, 2);
     assert.match(String(conversation.messages[0].content), /SUMMARY: echoed 1 to 4\./);
@@ -186,12 +188,14 @@ describe("a conversation too long for the model", () => {
       return answer(++calls);
     };
     const notices: string[] = [];
-    const run = (compactAt = 1_000_000) => runAgent(conversation, { ...options(callModel, compactAt), ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) } });
-    return { conversation, output, result, summaries, notices, run };
+    const events: string[] = [];
+    const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+    const run = (compactAt = 1_000_000) => runAgent(conversation, { ...options(callModel, compactAt), ui, count: (event) => events.push(event) });
+    return { conversation, output, result, summaries, notices, events, run };
   }
 
   it("compacts when the API rejects a request as too long, and asks again", async () => {
-    const { conversation, output, result: stored, summaries, notices, run } = setup((call) => {
+    const { conversation, output, result: stored, summaries, notices, events, run } = setup((call) => {
       if (call === 1) throw TOO_LONG;
       return reply([text("Fixed.")]);
     });
@@ -199,6 +203,7 @@ describe("a conversation too long for the model", () => {
 
     assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Fixed.", 1]);
     assert.ok(notices.some((n) => /too long for the model; compacting it and asking again/.test(n)), notices.join("\n"));
+    assert.deepEqual(events, ["compaction.tooLong", "compaction"]);
     // The summary was written from a copy with the tool output cut to its start and end...
     assert.equal(summaries.length, 1);
     const sent = (summaries[0][2].content as { content: string }[])[0].content;
@@ -290,6 +295,30 @@ describe("sessions", () => {
     assert.deepEqual(loaded[1], { role: "user", content: "second task" });
     assert.deepEqual(SessionFile.list(dir), [session.path]);
     assert.equal(SessionFile.firstRequest(session.path), "first task");
+  });
+
+  it("records when each message was written, and how long its model call or its tool calls took", async () => {
+    const session = SessionFile.create(dir, "fake-model");
+    const conversation = new Conversation(session, []);
+    const began = Date.now(); // before the task's message, the first line it checks
+    conversation.push({ role: "user", content: "do it" });
+    const replies = [reply([toolUse("t1", "bash", { command: "sleep 0.3" }), toolUse("t2", "bash", { command: "true" })]), reply([text("Done.")])];
+    const slow: CallModel = async () => {
+      await new Promise((done) => setTimeout(done, 100));
+      return replies.shift()!;
+    };
+    await runAgent(conversation, options(slow, 0));
+
+    const [start, ...entries] = (await readFile(session.path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(start.type, "start");
+    const times = entries.map((entry) => Date.parse(entry.at));
+    assert.ok(times.every((time, i) => time >= (times[i - 1] ?? began) && time <= Date.now()), JSON.stringify(entries.map((entry) => entry.at)));
+    const [task, call, results, answer] = entries;
+    assert.deepEqual([task.ms, task.toolMs], [undefined, undefined], "the user's message took no step");
+    assert.ok(call.ms >= 90 && answer.ms >= 90, `the model calls took ${call.ms} and ${answer.ms} ms`);
+    assert.deepEqual(Object.keys(results.toolMs), ["t1", "t2"]);
+    assert.ok(results.toolMs.t1 >= 250 && results.toolMs.t2 < results.toolMs.t1, JSON.stringify(results.toolMs));
+    assert.deepEqual(SessionFile.load(session.path), conversation.messages, "the timing stays out of the messages");
   });
 
   it("writes nothing until there is a message", () => {

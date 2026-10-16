@@ -5,11 +5,21 @@ import { jigHome, projectKey } from "./paths.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
-/** One line of a session file. */
+/** One line of a session file. Each line after the start also has `at`, the time it was written. */
 type Entry =
   | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
-  | { type: "message"; message: MessageParam }
+  | ({ type: "message"; message: MessageParam } & Timing)
   | { type: "compaction"; messages: MessageParam[] };
+
+/**
+ * How long the step behind a message took, in milliseconds, so a session shows where a task's time went:
+ * the model call that wrote a reply (`ms`, retries included), or each tool call whose result the message
+ * holds, by the call's id (`toolMs`; calls that only read run at the same time, so these can overlap).
+ */
+export interface Timing {
+  ms?: number;
+  toolMs?: Record<string, number>;
+}
 
 /** Where a project's sessions are kept: ~/.jig/sessions/<project path, with / replaced by ->. */
 export function sessionDir(cwd: string): string {
@@ -60,7 +70,8 @@ export class SessionFile {
       appendFileSync(this.path, `${JSON.stringify(this.start)}\n`);
       this.start = undefined;
     }
-    appendFileSync(this.path, `${JSON.stringify(entry)}\n`);
+    const { type, ...rest } = entry;
+    appendFileSync(this.path, `${JSON.stringify({ type, at: new Date().toISOString(), ...rest })}\n`);
   }
 
   /** The messages a session file ended with. */

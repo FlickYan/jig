@@ -442,7 +442,7 @@ class Jig(BaseInstalledAgent):
             parts += [dollars(s["model"], own), *(dollars(share["model"], share["usage"]) for share in shares)]
         if None not in parts:
             context.cost_usd = sum(parts)
-        keys = ("stop", "steps", "modelCalls", "subagentModelCalls", "toolCalls", "seconds", "escalated", "reviewed")
+        keys = ("stop", "steps", "modelCalls", "subagentModelCalls", "toolCalls", "events", "seconds", "escalated", "reviewed")
         context.metadata = {key: stats.get(key) for key in keys if key in stats}
         if (self.logs_dir / "review-run.json").exists():
             context.metadata["run_review"] = review_summary(self.logs_dir)

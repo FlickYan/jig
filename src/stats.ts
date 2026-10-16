@@ -15,9 +15,55 @@ interface ShareTotals {
 }
 
 /**
+ * The mechanisms --stats counts, each time one fires: what jig did besides calling the model and running
+ * the tools. A change to one of them can then be seen to run at all; in milestone 28, two candidates'
+ * changes ran in none of their attempts, which only reading the sessions showed.
+ */
+export type Mechanism =
+  // The model's calls (model.ts): a request the SDK sent again (a rate limit, an overload, a server error,
+  // a timeout), and a reply jig asked for again because it broke off, went quiet, or its tool input wasn't JSON.
+  | "retry.api"
+  | "retry.brokeOff"
+  | "retry.quiet"
+  | "retry.malformed"
+  // The loop (agent.ts): a summary replaced the conversation; past --compact-at one failed, so the task went
+  // on as it was; the API said the conversation was too long, so it was compacted and the call made again.
+  | "compaction"
+  | "compaction.failed"
+  | "compaction.tooLong"
+  // A reply with no text or tool call, one cut off at the output limit (the model was asked to go on, or to
+  // continue), and one a safety classifier declined.
+  | "reply.empty"
+  | "reply.continued"
+  | "reply.refused"
+  // Tool calls that didn't run as asked: a repeat of an earlier call in the reply, a tool the request didn't
+  // offer, a call cut off at the output limit, invalid input, and one the permission check refused (plan
+  // mode, a deny rule, a subagent's call that would need asking, the user's no), which includes those the
+  // CLI counts as needing an approval nobody was there to give; a PreToolUse hook's block, a PostToolUse
+  // hook's report on a result, and output cut to its start and end to fit.
+  | "call.repeat"
+  | "call.notOffered"
+  | "call.cutOff"
+  | "call.invalid"
+  | "call.refused"
+  | "call.unapproved"
+  | "hook.blocked"
+  | "hook.feedback"
+  | "output.truncated"
+  // --check's request, --reviewer's review and the problems it sent back, --escalate's handover, the stop
+  // for repeating the same calls, and the wrap-up at --max-steps.
+  | "check"
+  | "review"
+  | "review.problems"
+  | "escalated"
+  | "loop"
+  | "wrapUp";
+
+/**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,
- * tokens (subagents included) and tool calls. It is rewritten after every model call, so a run that
- * is killed, at a benchmark's time limit say, still leaves its numbers behind.
+ * tokens (subagents included), tool calls, and how often each Mechanism fired. It is rewritten after
+ * every model call and every mechanism that fires, so a run that is killed, at a benchmark's time limit
+ * say, still leaves its numbers behind.
  */
 export class Stats {
   private readonly path: string;
@@ -36,6 +82,8 @@ export class Stats {
     /** With --reviewer: the reviewer's calls and tokens, which the totals include. */
     reviewed?: ShareTotals;
     toolCalls: Record<string, number>;
+    /** How often each mechanism fired, by name, subagents' and the reviewer's included; those that didn't are left out. */
+    events: Partial<Record<Mechanism, number>>;
     seconds: number;
   };
 
@@ -49,6 +97,7 @@ export class Stats {
       subagentModelCalls: 0,
       usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 },
       toolCalls: {},
+      events: {},
       seconds: 0,
     };
     this.write();
@@ -73,6 +122,12 @@ export class Stats {
 
   toolCall(name: string): void {
     this.data.toolCalls[name] = (this.data.toolCalls[name] ?? 0) + 1;
+  }
+
+  /** Written at once: a run killed while the API is asked again, say, still shows that it was. */
+  count(event: Mechanism): void {
+    this.data.events[event] = (this.data.events[event] ?? 0) + 1;
+    this.write();
   }
 
   finish(result: RunResult): void {

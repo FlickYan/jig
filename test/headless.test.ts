@@ -116,6 +116,18 @@ describe("--stats", () => {
       { stop: final.stop, steps: final.steps, modelCalls: final.modelCalls, usage: final.usage, toolCalls: final.toolCalls },
       { stop: "end_turn", steps: 2, modelCalls: 2, usage: { input: 200, cacheWrite: 0, cacheRead: 800, output: 20 }, toolCalls: { glob: 1 } },
     );
+    assert.deepEqual(final.events, {}, "nothing but model and tool calls happened");
+  });
+
+  it("counts the mechanisms that fired, by name, writing each count as it comes", async () => {
+    const file = join(project, "stats.json");
+    const stats = new Stats(file, "test-model");
+    const events = async () => JSON.parse(await readFile(file, "utf8")).events;
+    stats.count("retry.quiet");
+    assert.deepEqual(await events(), { "retry.quiet": 1 }, "a run killed while the API is asked again still shows it");
+    stats.count("retry.quiet");
+    stats.count("compaction");
+    assert.deepEqual(await events(), { "retry.quiet": 2, compaction: 1 });
   });
 });
 
@@ -182,8 +194,9 @@ describe("a hung API", () => {
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.ANTHROPIC_API_KEY = "test-key";
     const { notices, stop } = collectNotices("trying again");
+    const events: string[] = [];
     try {
-      const callModel = createModel({ model: "claude-haiku-4-5", system: "", tools: [], timeout: 100 });
+      const callModel = createModel({ model: "claude-haiku-4-5", system: "", tools: [], timeout: 100, count: (event) => events.push(event) });
       await assert.rejects(callModel([{ role: "user", content: "hi" }]), /timed out/i);
     } finally {
       stop();
@@ -193,6 +206,7 @@ describe("a hung API", () => {
     }
     assert.equal(notices.length, 2);
     assert.match(notices[0], /The API didn't answer in time; trying again \(2 tries left\)/);
+    assert.deepEqual(events, ["retry.api", "retry.api"], "each retry the SDK made is counted");
   });
 });
 
@@ -216,8 +230,8 @@ describe("a reply that breaks off", () => {
    * halfway, the server sends an overload error, or it goes quiet. Quiet, it sends nothing more after half
    * the reply; queued, it sends none of it, only keep-alive comments, as DeepSeek does while it holds a
    * request under load. The model gives up on either after 0.4 seconds. The notices collected are those
-   * of both kinds. */
-  async function callWithDrops(drops: number, how: "drop" | "overload" | "quiet" | "queued" = "drop"): Promise<{ result: Promise<ModelTurn>; notices: () => string[]; done: () => void }> {
+   * of both kinds; the events, what the model counted for --stats. */
+  async function callWithDrops(drops: number, how: "drop" | "overload" | "quiet" | "queued" = "drop"): Promise<{ result: Promise<ModelTurn>; notices: () => string[]; events: string[]; done: () => void }> {
     let requests = 0;
     const server = createServer((req, res) => {
       req.resume();
@@ -238,10 +252,12 @@ describe("a reply that breaks off", () => {
     process.env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
     process.env.ANTHROPIC_API_KEY = "test-key";
     const { notices, stop } = collectNotices("broke off", "No output");
-    const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [], idle: 400 })([{ role: "user", content: "hi" }]);
+    const events: string[] = [];
+    const result = createModel({ model: "claude-haiku-4-5", system: "", tools: [], idle: 400, count: (event) => events.push(event) })([{ role: "user", content: "hi" }]);
     return {
       result,
       notices: () => notices,
+      events,
       done() {
         stop();
         process.env = env;
@@ -261,6 +277,7 @@ describe("a reply that breaks off", () => {
     }
     // and only that notice: the wait before trying again isn't a quiet reply
     assert.deepEqual(call.notices(), ["The reply broke off before it was finished; trying again (2 tries left)."]);
+    assert.deepEqual(call.events, ["retry.brokeOff"]);
   });
 
   it("asks again after an overload error in the middle of the reply", async () => {
@@ -281,6 +298,7 @@ describe("a reply that breaks off", () => {
       call.done();
     }
     assert.equal(call.notices().length, 2);
+    assert.deepEqual(call.events, ["retry.brokeOff", "retry.brokeOff"], "the third failure isn't tried again, so isn't counted");
   });
 
   it("says so when it goes quiet partway, then asks again", async () => {
@@ -294,6 +312,7 @@ describe("a reply that breaks off", () => {
       "No output from the API for 0.2 seconds; still waiting, for up to 0.4 seconds.",
       "No output from the API for 0.4 seconds; trying again (2 tries left).",
     ]);
+    assert.deepEqual(call.events, ["retry.quiet"]);
   });
 
   it("does the same when the reply never starts, only keep-alive comments coming", async () => {
@@ -441,6 +460,7 @@ describe("a run that reaches --max-steps", () => {
       assert.match(output, /Out of steps: asking the model where the work stands\.\nListed the files; nothing verified; the fix is left\.\nStopped after 2 steps \(raise the limit with --max-steps\)\.\n2 steps · /);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.steps, stats.modelCalls, stats.usage.input], ["max_steps", 2, 3, 30]);
+      assert.deepEqual(stats.events, { wrapUp: 1 });
 
       const off = await runJig([...args, "--no-wrap-up", "Fix the parser."], { api, cwd: project });
       assert.equal(api.requests.length, 5);
@@ -529,7 +549,8 @@ describe("a one-shot run with no terminal", () => {
       assert.equal(code, 5, output);
       assert.equal(api.requests.length, 3);
       assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it\. Run jig with --yes/);
-      assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "unapproved");
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.stop, stats.events], ["unapproved", { "call.unapproved": 3, "call.refused": 3 }]);
     } finally {
       api.close();
     }

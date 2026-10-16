@@ -93,7 +93,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --hide-skill <name>  leave a skill out, as if it weren't installed (repeatable)
       --no-memory       leave out what jig remembers from earlier sessions
       --system-prompt <text>  use this system prompt instead of jig's own
-      --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
+      --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
 ```
@@ -107,6 +107,14 @@ of steps, 3 when a reply hit the output limit or the context window, 4 when the 
 tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
 same tool calls (see below), and 130 on Ctrl+C. So
 `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
+
+`--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
+reason, steps, model calls, tokens (subagents' included), tool calls by name, seconds, and `events`, how
+often each of jig's mechanisms fired: retries (`retry.api`, `retry.brokeOff`, `retry.quiet`), compactions,
+the model asked again after a reply that wasn't an answer, calls that didn't run as asked (the permission
+policy's refusals among them, `call.refused`), hooks' blocks, `--check`, the reviewer, `--escalate`, the
+stop for repeating and the wrap-up (`src/stats.ts` lists them).
+So a change to one can be seen to run at all, which in milestone 28 only reading the sessions showed.
 
 ## What it does
 
@@ -166,7 +174,9 @@ same tool calls (see below), and 130 on Ctrl+C. So
 - **Sessions.** Every message is appended to a JSON Lines file in `~/.jig/sessions/<project>/` the moment
   it exists, so nothing is lost on a crash or Ctrl+C. `jig -c` continues the most recent session,
   `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results
-  are answered as interrupted when a session is loaded, so the history is always valid.
+  are answered as interrupted when a session is loaded, so the history is always valid. Each line says
+  when it was written (`at`); a reply, how long its model call took, retries included (`ms`); and tool
+  results, how long each call took (`toolMs`), in milliseconds, so a session shows where the time went.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since, and from the text's length when a server reports no usage). Past
   `--compact-at` it asks the model to summarize the conversation and continues from that summary;
@@ -340,7 +350,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
-| [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs; the price table |
+| [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 

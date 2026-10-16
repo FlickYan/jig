@@ -695,3 +695,51 @@ describe("a reviewer before finishing", () => {
     assert.equal(last.seen.length, 0);
   });
 });
+
+describe("counting the loop's mechanisms (--stats)", () => {
+  /** The mechanisms a run counted, in order. */
+  async function counted(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}): Promise<string[]> {
+    const events: string[] = [];
+    const { options, conversation } = setup(replies, { count: (event) => events.push(event), ...overrides });
+    await runAgent(conversation, options);
+    return events;
+  }
+  const bash = (id: string, command: string) => toolUse(id, "bash", { command });
+  const usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+
+  it("counts each one as it fires, and nothing in a run that needs none", async () => {
+    assert.deepEqual(await counted([reply([bash("t1", "true")]), reply([text("Done.")])]), []);
+    assert.deepEqual(await counted([reply([]), reply([text("Done.")])]), ["reply.empty"]);
+    assert.deepEqual(await counted([reply([text("The plan: ")], "max_tokens"), reply([text("done.")])]), ["reply.continued"]);
+    assert.deepEqual(await counted([reply([text("Sure, here is")], "refusal")]), ["reply.refused"]);
+    assert.deepEqual(await counted([reply([bash("t1", "true")]), reply([text("Done.")])], { compactAt: 50 }), ["compaction"]);
+    assert.deepEqual(await counted([reply([text("Done.")]), reply([text("Checked.")])], { review: "Check your work." }), ["check"]);
+    const reviewer: Reviewer = { model: "strong", review: async () => ({ verdict: "problems", feedback: "PROBLEMS: out.txt is missing.", usage }) };
+    assert.deepEqual(await counted([reply([text("Done.")]), reply([text("Fixed.")])], { reviewer }), ["review", "review.problems"]);
+    const escalate = { model: "strong", callModel: async () => reply([text("Fixed it.")]) };
+    assert.deepEqual(await counted([reply([bash("t1", "false && pytest")])], { maxSteps: 4, escalate }), ["escalated"]);
+    const forever = Array.from({ length: 3 }, (_, i) => reply([bash(`t${i}`, `echo ${i}`)]));
+    assert.deepEqual(await counted(forever, { maxSteps: 2, wrapUp: true }), ["wrapUp"]);
+    const again = Array.from({ length: 6 }, (_, i) => reply([toolUse(`t${i}`, "read_file", { path: "missing.txt" })]));
+    assert.deepEqual(await counted(again), ["loop"]);
+  });
+
+  it("counts the calls that didn't run as asked, and the hooks' say", async () => {
+    const hooks = {
+      before: async (_tool: string, input: Record<string, unknown>) => (String(input.command).startsWith("rm") ? "no deleting" : null),
+      after: async () => "lint: fine",
+    };
+    const calls = reply([
+      bash("a", "echo one"), // runs, and the after-hook reports on it
+      bash("b", "echo one"), // a repeat of a
+      toolUse("c", "teleport", {}),
+      toolUse("d", "write_file", { path: "x.txt" }), // no content
+      bash("e", "rm -rf build"), // blocked by the hook
+    ]);
+    assert.deepEqual(await counted([calls, reply([text("Done.")])], { hooks }), ["hook.feedback", "call.repeat", "call.notOffered", "call.invalid", "hook.blocked"]);
+    const plan = { authorize: async () => "Refused: plan mode is on, so nothing may be changed." };
+    assert.deepEqual(await counted([reply([toolUse("t1", "write_file", { path: "x.txt", content: "x" })]), reply([text("ok")])], plan), ["call.refused"]);
+    assert.deepEqual(await counted([reply([toolUse("t1", "write_file", { path: "half.txt", content: "tru" })], "max_tokens"), reply([text("ok")])]), ["call.cutOff"]);
+    assert.deepEqual(await counted([reply([bash("t1", "seq 100000")]), reply([text("ok")])]), ["output.truncated"]);
+  });
+});

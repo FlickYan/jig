@@ -7,6 +7,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import type { BetaMessageStreamParams } from "@anthropic-ai/sdk/resources/beta/messages";
 import OpenAI from "openai";
 import { chatTurn, ReplyBrokeOff } from "./openai.ts";
+import type { Mechanism } from "./stats.ts";
 import type { Tool } from "./tools/index.ts";
 import * as ui from "./ui.ts";
 
@@ -64,6 +65,8 @@ export interface ModelOptions {
   api?: Api;
   /** The API's address, instead of the provider's own. */
   baseURL?: string;
+  /** Told each time a request or a reply is tried again, for --stats. */
+  count?(event: Mechanism): void;
 }
 
 /**
@@ -157,19 +160,22 @@ function duration(ms: number): string {
 /**
  * The SDK retries rate limits, overloads, server errors and timeouts on its own, with backoff. It
  * reports each retry in its log; this turns those lines into notices, so a struggling API doesn't
- * look like a frozen agent.
+ * look like a frozen agent, and counts them.
  */
-export const retryNotices = {
-  info(message: string) {
-    const retry = /(timed out|failed with status (\d+)|failed).* - retrying, (\d+) attempts? remaining/.exec(message);
-    if (!retry) return;
-    const what = retry[1] === "timed out" ? "didn't answer in time" : retry[2] ? `answered with status ${retry[2]}` : "couldn't be reached";
-    ui.notice(`The API ${what}; trying again (${retry[3]} ${retry[3] === "1" ? "try" : "tries"} left).`);
-  },
-  debug() {},
-  warn() {},
-  error() {},
-};
+export function retryNotices(count?: ModelOptions["count"]) {
+  return {
+    info(message: string) {
+      const retry = /(timed out|failed with status (\d+)|failed).* - retrying, (\d+) attempts? remaining/.exec(message);
+      if (!retry) return;
+      count?.("retry.api");
+      const what = retry[1] === "timed out" ? "didn't answer in time" : retry[2] ? `answered with status ${retry[2]}` : "couldn't be reached";
+      ui.notice(`The API ${what}; trying again (${retry[3]} ${retry[3] === "1" ? "try" : "tries"} left).`);
+    },
+    debug() {},
+    warn() {},
+    error() {},
+  };
+}
 
 type Turn = (messages: MessageParam[], watchdog: Watchdog, summarize: boolean) => Promise<ModelTurn>;
 
@@ -178,7 +184,7 @@ type Turn = (messages: MessageParam[], watchdog: Watchdog, summarize: boolean) =
  * had malformed tool input; other errors go to the caller, after whatever retries the SDK made of them.
  */
 export function createModel(options: ModelOptions): CallModel {
-  const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices, logLevel: "info" as const };
+  const settings = { timeout: options.timeout ?? REQUEST_TIMEOUT_MS, logger: retryNotices(options.count), logLevel: "info" as const };
   const idle = options.idle ?? idleLimit();
   const turn = (options.api ?? defaultApi(options.model)) === "openai" ? chatCompletions(options, settings) : messagesApi(options, settings);
 
@@ -196,10 +202,12 @@ export function createModel(options: ModelOptions): CallModel {
         // or one with malformed tool input.
         if (attempt === 3 || signal?.aborted) throw err;
         if (brokeOff(err)) {
+          options.count?.(watchdog.idle ? "retry.quiet" : "retry.brokeOff");
           const what = watchdog.idle ? `No output from the API for ${duration(idle)}` : "The reply broke off before it was finished";
           ui.notice(`${what}; trying again (${3 - attempt} ${3 - attempt === 1 ? "try" : "tries"} left).`);
           await new Promise((done) => setTimeout(done, 500));
         } else if (err instanceof MalformedToolInput) {
+          options.count?.("retry.malformed");
           ui.notice("The model sent malformed tool input; asking again.");
         } else {
           throw err;
@@ -209,7 +217,7 @@ export function createModel(options: ModelOptions): CallModel {
   };
 }
 
-type ClientSettings = { timeout: number; logger: typeof retryNotices; logLevel: "info" };
+type ClientSettings = { timeout: number; logger: ReturnType<typeof retryNotices>; logLevel: "info" };
 
 /** Claude, or DeepSeek through its Anthropic-compatible endpoint. */
 function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {

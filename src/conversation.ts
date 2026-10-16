@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import type { SessionFile } from "./session.ts";
+import type { SessionFile, Timing } from "./session.ts";
 import { FileVersions } from "./tools/util.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -36,10 +36,11 @@ export class Conversation {
     if (context) this.session?.describe(context);
   }
 
-  push(message: MessageParam): void {
+  /** `timing` is how long the step that made the message took; it goes only to the session file. */
+  push(message: MessageParam, timing?: Timing): void {
     this.messages.push(message);
     this.tokens += estimateTokens(message.content);
-    this.session?.write({ type: "message", message });
+    this.session?.write({ type: "message", ...timing, message });
   }
 
   /** Starts over from `messages`, after compaction. The session file still has the full history. */

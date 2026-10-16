@@ -32,7 +32,7 @@ import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
 import { Snapshots } from "./snapshots.ts";
-import { type Share, Stats } from "./stats.ts";
+import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
@@ -71,7 +71,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --no-subagents      leave out the subagent tool
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
                           (from ${TOOL_NAMES.join(", ")}; default: all)
-      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far, and how often
+                          each of jig's mechanisms fired (retries, compactions, the wrap-up, ...)
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
@@ -255,6 +256,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
   const toolNames = values.tools === undefined ? undefined : parseToolList(values.tools);
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
+  // Every model and loop below counts its mechanisms in the stats file as they fire, subagents' included.
+  const count = stats && ((event: Mechanism) => stats.count(event));
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
   const settings = await loadSettings(cwd);
@@ -305,7 +308,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
-    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
+    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true);
   };
   const subagents: SubagentSetup = {
     callModel: newSubagentModel(),
@@ -320,6 +323,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     },
     sandbox,
     hooks,
+    count,
     ui: ui.subagentUI,
   };
   // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
@@ -328,7 +332,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (!reviewing) return undefined;
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     const api = (values.api ?? defaultApi(reviewing)) as Api;
-    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools }), true, { kind: "reviewed", model: reviewing });
+    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true, { kind: "reviewed", model: reviewing });
     return reviewer(reviewing, { ...subagents, tools: researchTools, callModel, maxSteps: REVIEW_MAX_STEPS });
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
@@ -360,9 +364,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // The same for the model that takes over, so the conversation carries over whole.
     const stronger = values.escalate;
     escalation = stronger
-      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, { kind: "escalated", model: stronger }) }
+      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools, count }), false, { kind: "escalated", model: stronger }) }
       : undefined;
-    return metered(createModel({ model, effort, api, baseURL, system, tools }));
+    return metered(createModel({ model, effort, api, baseURL, system, tools, count }));
   };
   // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
   const fromLast = values.continue || skillsVerb === "learn" || !!memoryVerb;
@@ -386,6 +390,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (!process.stdin.isTTY) {
       // The model would try call after call that can't run until its steps ran out. It may manage without
       // one or two (a check it can skip), so the task stops at the third.
+      count?.("call.unapproved");
       if (++unapproved >= MAX_UNAPPROVED) task?.abort();
       return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
     }
@@ -417,6 +422,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
     wrapUp: values["wrap-up"],
+    count,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
   conversation.describe(context);

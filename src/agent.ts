@@ -8,6 +8,7 @@ import type { Conversation } from "./conversation.ts";
 import { type CallModel, tooLong } from "./model.ts";
 import { workLog } from "./review.ts";
 import type { Sandbox } from "./sandbox.ts";
+import type { Mechanism } from "./stats.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -55,6 +56,8 @@ export interface AgentOptions {
    * which ask for their own, and with --no-wrap-up.
    */
   wrapUp?: boolean;
+  /** Told each time one of the loop's mechanisms fires (compaction, the wrap-up, ...), for --stats. */
+  count?(event: Mechanism): void;
   ui: AgentUI;
 }
 
@@ -151,6 +154,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     const restate = conversation.messages.at(-1) !== taskMessage ? { text: task, log: workLog(work) } : undefined;
     const compacted = await compactConversation(conversation, opts, { task: restate, tooLong: rejected, signal });
     if (!compacted) return false;
+    opts.count?.("compaction");
     addUsage(usage, compacted.usage);
     compactedWork = work;
     // A cut-off reply is only in the summary now, so the next reply can't continue it: it stands alone.
@@ -162,6 +166,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     let reply: Message;
     let malformed: Map<string, string>;
     let offered: string[] | undefined;
+    let began = 0; // when the call that gave the reply began, for the session file
     try {
       if (opts.compactAt > 0 && conversation.tokens > opts.compactAt && step >= compactFrom) {
         try {
@@ -170,30 +175,38 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
           if (signal?.aborted) throw err;
           // A failed summary needn't end the task: the conversation may still fit, so it goes on as it is.
           compactFrom = step + COMPACT_AGAIN_AFTER;
+          opts.count?.("compaction.failed");
           opts.ui.notice(`Compaction failed (${errorMessage(err)}), so the conversation goes on as it is; compacting again from step ${compactFrom}.`);
         }
       }
       const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
       try {
+        began = Date.now();
         ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
       } catch (err) {
         // The API's word that the conversation is too long for the model, whose window jig may not know:
         // compacted, it may fit, so the call is made again, once. If it can't be compacted, the error stands.
         if (signal?.aborted || opts.compactAt === 0 || !tooLong(err)) throw err;
+        opts.count?.("compaction.tooLong");
         opts.ui.notice("The API says the conversation is too long for the model; compacting it and asking again.");
         if (!(await compactNow(true))) throw err;
+        began = Date.now();
         ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
       }
     } catch (err) {
       if (signal?.aborted) return result("interrupted", step - 1);
       throw err;
     }
+    const ms = Date.now() - began;
     addUsage(usage, reply.usage);
     if (escalated) addUsage(escalated.usage, reply.usage);
 
     // A safety classifier declined, even after the fallback model. Whatever was streamed before the
     // decline is not a real answer, so it stays out of the history.
-    if (reply.stop_reason === "refusal") return result("refusal", step);
+    if (reply.stop_reason === "refusal") {
+      opts.count?.("reply.refused");
+      return result("refusal", step);
+    }
 
     const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
     // A step without calls ends a run of identical ones: what follows it (a request to go on, or to check
@@ -209,6 +222,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       conversation.tokens = contextSize(reply.usage) - reply.usage.output_tokens; // the request, without the reply
       if (!askedAgain && step < opts.maxSteps && (reply.stop_reason === "end_turn" || reply.stop_reason === "max_tokens")) {
         askedAgain = true;
+        opts.count?.("reply.empty");
         opts.ui.notice("The model replied without text or a tool call; asking it to go on.");
         conversation.push({ role: "user", content: reply.stop_reason === "max_tokens" ? CUT_OFF_BEFORE_ANSWER : EMPTY_REPLY });
         continue;
@@ -217,7 +231,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       return result(reply.stop_reason ?? "end_turn", step, answer);
     }
 
-    conversation.push({ role: "assistant", content: reply.content });
+    conversation.push({ role: "assistant", content: reply.content }, { ms });
     conversation.tokens = contextSize(reply.usage); // measured: the whole request plus this reply
     // A reply with no tool calls is the final answer, unless the work is still to be checked.
     if (calls.length === 0) {
@@ -225,6 +239,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       if (reply.stop_reason === "max_tokens" && continued < MAX_CONTINUATIONS && step < opts.maxSteps) {
         continued++;
         unfinished = answer;
+        opts.count?.("reply.continued");
         opts.ui.notice("The reply was cut off at the output limit; asking the model to continue.");
         conversation.push({ role: "user", content: CONTINUE });
         continue;
@@ -233,6 +248,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       if (opts.reviewer && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
         reviewed = true;
         const { model } = opts.reviewer;
+        opts.count?.("review");
         opts.ui.notice(`${model} is reviewing the work.`);
         try {
           const found = await opts.reviewer.review({ task, answer, messages: sinceTask() }, signal);
@@ -240,6 +256,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
           if (signal?.aborted) return result("interrupted", step);
           review = { model, step, verdict: found.verdict, usage: found.usage };
           if (found.feedback) {
+            opts.count?.("review.problems");
             opts.ui.notice(`${model} found problems; the model takes them up.`);
             conversation.push({ role: "user", content: found.feedback });
             continue;
@@ -255,6 +272,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         // Or by the model itself, once, likewise with a step left: asked on the last, it couldn't reply, and
         // the answer it gave would be lost.
         reviewed = true;
+        opts.count?.("check");
         opts.ui.notice("Checking the work before finishing.");
         conversation.push({ role: "user", content: opts.review });
         continue;
@@ -277,8 +295,14 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       earlier.set(keys[i], i);
       return undefined;
     });
-    const handle = (call: ToolUse, i: number) =>
-      handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered, repeats: repeats[i] }, conversation, opts, usage, signal);
+    // How long each call took, by id, for the session file.
+    const toolMs: Record<string, number> = {};
+    const handle = (call: ToolUse, i: number) => {
+      const started = Date.now();
+      return handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered, repeats: repeats[i] }, conversation, opts, usage, signal).finally(() => {
+        toolMs[call.id] = Date.now() - started;
+      });
+    };
     // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
     // run at the same time. Anything else runs in order, since one call may depend on another's effect.
     const readOnly = calls.every(reads);
@@ -292,15 +316,16 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       const answered = new Set(results.map((result) => result.tool_use_id));
       const content = `No result: jig failed while handling this call (${errorMessage(err)}).`;
       const open = calls.filter((call) => !answered.has(call.id)).map((call): ToolResult => ({ type: "tool_result", tool_use_id: call.id, content, is_error: true }));
-      conversation.push({ role: "user", content: [...results, ...open] });
+      conversation.push({ role: "user", content: [...results, ...open] }, { toolMs });
       throw err;
     }
-    conversation.push({ role: "user", content: results }); // all results for one reply go in one message
+    conversation.push({ role: "user", content: results }, { toolMs }); // all results for one reply go in one message
 
     // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
     // the steps left, with the whole conversation, so it starts where the first one stopped.
     if (opts.escalate && !escalated && step < opts.maxSteps && calls.some((call, i) => failedTestRun(call, results[i]))) {
       escalated = { model: opts.escalate.model, step: step + 1, usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 } };
+      opts.count?.("escalated");
       opts.ui.notice(`A test run failed: ${opts.escalate.model} takes over from step ${step + 1}.`);
     }
 
@@ -313,17 +338,22 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     const thisStep = JSON.stringify(calls.map((_, i) => [keys[i], results[i].content, results[i].is_error]));
     sameSteps = thisStep === lastStep ? sameSteps + 1 : 1;
     lastStep = thisStep;
-    if (sameSteps >= SAME_STEPS) return result("loop", step);
+    if (sameSteps >= SAME_STEPS) {
+      opts.count?.("loop");
+      return result("loop", step);
+    }
   }
   if (!opts.wrapUp) return result("max_steps", opts.maxSteps);
 
   // Out of steps, the last reply's calls answered: one more call, with the tools declared but none allowed
   // (summarize), asks where the work stands. It is a report, not more work, so if it fails or says
   // nothing, the run ends as it would have without it, and the request stays out of the history.
+  opts.count?.("wrapUp");
   opts.ui.notice("Out of steps: asking the model where the work stands.");
   const request: MessageParam = { role: "user", content: WRAP_UP };
   const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
   let report: Message;
+  const asked = Date.now();
   try {
     ({ message: report } = await callModel([...conversation.messages, request], signal, { summarize: true }));
   } catch (err) {
@@ -338,7 +368,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   conversation.push(request);
   // A server can ignore tool_choice: a call here would never run, and unanswered it would make every
   // later request invalid, so it is left out.
-  conversation.push({ role: "assistant", content: report.content.filter((block) => block.type !== "tool_use") });
+  conversation.push({ role: "assistant", content: report.content.filter((block) => block.type !== "tool_use") }, { ms: Date.now() - asked });
   conversation.tokens = contextSize(report.usage);
   return result("max_steps", opts.maxSteps, text);
 }
@@ -405,6 +435,7 @@ async function handleToolCall(
 
   // The earlier call's result answers this one, whatever it was.
   if (state.repeats) {
+    opts.count?.("call.repeat");
     opts.ui.toolCall(call.name, "", call.id);
     return fail(`Not run: identical to an earlier call in this reply (call ${state.repeats}).`);
   }
@@ -412,6 +443,7 @@ async function handleToolCall(
   // A tool the request didn't declare isn't the model's to call, even one jig has.
   const offered = state.offered ?? opts.tools.map((t) => t.definition.name);
   if (!tool || !offered.includes(call.name)) {
+    opts.count?.("call.notOffered");
     opts.ui.toolCall(call.name, "", call.id);
     return fail(`${tool ? `Not run: ${call.name} isn't one of the tools offered for this step` : `Unknown tool "${call.name}"`}. Available: ${offered.join(", ")}.`);
   }
@@ -420,12 +452,14 @@ async function handleToolCall(
     return fail("Not run: the user interrupted.");
   }
   if (state.cutOff) {
+    opts.count?.("call.cutOff");
     opts.ui.toolCall(call.name, "", call.id);
     return fail("Not run: your reply hit the output limit before this call was complete. Try again in smaller steps.");
   }
   // The model's input was streamed without server-side validation, so check it before anything runs.
   const problem = state.malformed !== undefined ? jsonProblem(state.malformed) : checkInput(tool, call.input);
   if (problem) {
+    opts.count?.("call.invalid");
     opts.ui.toolCall(call.name, "(invalid input)", call.id);
     return fail(invalidInput(state.malformed ?? JSON.stringify(call.input), problem));
   }
@@ -439,11 +473,17 @@ async function handleToolCall(
   try {
     // Hooks first, as in Claude Code: no point asking the user about a call a hook would block anyway.
     const blocked = await opts.hooks?.before(call.name, input, signal);
-    if (blocked) return fail(`Blocked by a hook: ${blocked}`);
+    if (blocked) {
+      opts.count?.("hook.blocked");
+      return fail(`Blocked by a hook: ${blocked}`);
+    }
     if (signal?.aborted) return fail("Not run: the user interrupted.");
     checking = "the permission check";
     const refusal = await opts.authorize(tool, input);
-    if (refusal) return fail(refusal);
+    if (refusal) {
+      opts.count?.("call.refused");
+      return fail(refusal);
+    }
   } catch (err) {
     return fail(`Not run: ${checking} failed: ${errorMessage(err)}`);
   }
@@ -451,13 +491,18 @@ async function handleToolCall(
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
     const context = { cwd: opts.cwd, dirs: opts.dirs, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage };
-    output = truncate(await tool.run(input, context));
+    const whole = await tool.run(input, context);
+    output = truncate(whole);
+    if (output !== whole) opts.count?.("output.truncated");
   } catch (err) {
     return fail(errorMessage(err));
   }
   try {
     const feedback = await opts.hooks?.after(call.name, input, output, signal);
-    if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+    if (feedback) {
+      opts.count?.("hook.feedback");
+      output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+    }
   } catch (err) {
     // The call has run, so its result stands; the user hears that the hooks couldn't check it.
     opts.ui.notice(`The PostToolUse hooks failed: ${errorMessage(err)}`);
