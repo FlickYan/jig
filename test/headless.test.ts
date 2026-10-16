@@ -534,7 +534,116 @@ describe("a one-shot run's exit code", () => {
 
   it("is listed in --help", () => {
     const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" }).replace(/\s+/g, " ");
-    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, and 130 when interrupted\./);
+    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, 7 when it reached --time-limit, and 130 when interrupted\./);
+  });
+});
+
+describe("a one-shot run with --time-limit", () => {
+  const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"];
+
+  it("stops at the limit, a command still running included, starts no model call after it, and exits with 7", async () => {
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: "sleep 30" } }]);
+    try {
+      const file = join(outside, "stats.json");
+      const started = Date.now();
+      const { code, output } = await runJig([...args, "--time-limit", "1", "--stats", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 7, output);
+      assert.ok(Date.now() - started < 10_000, "the command was stopped, not waited for");
+      assert.equal(api.requests.length, 1);
+      assert.match(output, /Killed: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n1 step · /);
+      assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "time_limit");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("stops a model call still waiting at the limit", async () => {
+    const server = createServer((req) => req.resume()); // takes the request and never answers
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+    try {
+      const started = Date.now();
+      const { code, output } = await runJig([...args, "--time-limit", "1", "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 7, output);
+      assert.ok(Date.now() - started < 10_000, "the API's own timeout is 2 minutes");
+      assert.match(output, /Stopped at the time limit \(--time-limit\)\.\n0 steps · /);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("still checks the work with --check while most of the time is left", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig([...args, "--check", "--time-limit", "600", "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 2);
+      assert.doesNotMatch(output, /Too little time/);
+    } finally {
+      api.close();
+    }
+  });
+
+  /** With --check and 4 seconds, the model runs `sleep <seconds>`, then says it is done, and is asked to check. */
+  async function checkAfter(seconds: number): Promise<{ code: number | null; output: string; requests: number; events: Record<string, number> }> {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: `sleep ${seconds}` } }] : [{ text: "Done." }]));
+    try {
+      const file = join(outside, "stats.json");
+      const { code, output } = await runJig([...args, "--check", "--time-limit", "4", "--stats", file, "Fix the parser."], { api, cwd: project });
+      return { code, output, requests: api.requests.length, events: JSON.parse(await readFile(file, "utf8")).events };
+    } finally {
+      api.close();
+    }
+  }
+
+  it("checks it past the first quarter of the time too", async () => {
+    const { code, output, requests, events } = await checkAfter(1.2);
+    assert.equal(code, 0, output);
+    assert.equal(requests, 3, "the command, the answer, and the answer after the check");
+    assert.doesNotMatch(output, /Too little time/);
+    assert.deepEqual(events, { check: 1 });
+  });
+
+  it("doesn't check it in the last quarter, says so, and counts that", async () => {
+    // Past 3 of the 4 seconds, with the rest left to answer in.
+    const { code, output, requests, events } = await checkAfter(3.1);
+    assert.equal(code, 0, output);
+    assert.equal(requests, 2);
+    assert.match(output, /Too little time is left to check the work \(--time-limit\), so it stands as it is\./);
+    assert.deepEqual(events, { "check.skipped": 1 });
+  });
+
+  it("is still a Ctrl+C when the deadline passes while the task stops", async () => {
+    // The command starts a job that leaves its process group, so jig's kill misses it and its output stays open,
+    // then presses Ctrl+C itself, inside the 1 second: jig waits a second for the job's last output, and the
+    // deadline passes meanwhile.
+    const job = `python3 -c 'import os, time; os.setsid(); open("ready", "w").close(); time.sleep(3)' & until [ -e ready ]; do sleep 0.05; done; kill -INT $PPID; sleep 30`;
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: job } }]);
+    try {
+      const file = join(outside, "stats.json");
+      const { code, output } = await runJig([...args, "--time-limit", "1", "--stats", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 130, output);
+      assert.match(output, /Killed: the user interrupted it\./);
+      assert.match(output, /\nInterrupted\.\n1 step · /);
+      assert.doesNotMatch(output, /time limit/);
+      assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "interrupted");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("refuses a limit that isn't a positive number of seconds, or is too long for a timer", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      for (const limit of ["0", "soon", "1e9"]) {
+        const { code, output } = await runJig([...args, "--time-limit", limit, "Fix the parser."], { api, cwd: project });
+        assert.equal(code, 1, output);
+        assert.match(output, /--time-limit must be a positive number of seconds/);
+      }
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
   });
 });
 

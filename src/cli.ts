@@ -65,6 +65,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
+      --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
+                          included, and --check and --reviewer don't start in its last quarter (default: none)
       --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
                           changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
@@ -104,7 +106,8 @@ Ctrl+C stops the current task (press it again to force quit).
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
 declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
-made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, and 130 when interrupted.`;
+made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, 7 when it reached --time-limit,
+and 130 when interrupted.`;
 
 /** How a task ended: as the loop stopped, or "error" if it failed. */
 type Ending = RunResult["stop"] | "error";
@@ -114,10 +117,17 @@ type Ending = RunResult["stop"] | "error";
  * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
  * Any other ending, a failure included, is 1.
  */
-const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, interrupted: 130 };
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, interrupted: 130 };
 
 // With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
 const MAX_UNAPPROVED = 3;
+
+// With --time-limit, the share of it, at the end, in which --check and the reviewer no longer start: what is
+// left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts into their time
+// limit, against 4 without it.
+const CHECK_SHARE = 0.25;
+// What a command, a hook or a tool call stopped at --time-limit is said to have been stopped by.
+const TIME_UP = "the time limit (--time-limit) was reached";
 
 const SUBAGENT_MAX_STEPS = 30;
 // A review reads what the task names and the work touched, not the whole project, and the task's clock runs.
@@ -208,6 +218,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       cwd: { type: "string", short: "C", default: "." },
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      "time-limit": { type: "string" },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
@@ -250,6 +261,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
   if (!Number.isInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer");
+  const timeLimit = values["time-limit"] === undefined ? undefined : Number(values["time-limit"]);
+  if (timeLimit !== undefined && !(timeLimit > 0 && timeLimit * 1000 < 2 ** 31)) throw new Error("--time-limit must be a positive number of seconds, under 24 days");
   const compactAt = Number(values["compact-at"]);
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
@@ -461,6 +474,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   function runTask(text: string, label = text): Promise<Ending> {
+    // --time-limit counts from here, the snapshot included.
+    const begun = Date.now();
+    const deadline = timeLimit === undefined ? undefined : begun + timeLimit * 1000;
+    const checkUntil = timeLimit === undefined ? undefined : begun + timeLimit * 1000 * (1 - CHECK_SHARE);
     if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
       modelKnowsPlanMode = permissions.mode === "plan";
       notes.push(
@@ -476,9 +493,14 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     unapproved = 0;
     const started = Date.now();
     return asTask(async (signal) => {
-      const result = await runAgent(conversation, agent, signal);
-      // Stopped by authorize, not by the user.
+      // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
+      // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
+      const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
+      const result = await runAgent(conversation, { ...agent, checkUntil }, signal).finally(() => clearTimeout(timer));
+      // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
+      // after a Ctrl+C the task can still be stopping when the deadline passes.
       if (result.stop === "interrupted" && unapproved >= MAX_UNAPPROVED) result.stop = "unapproved";
+      if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
       return result.stop;
@@ -727,6 +749,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
     loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
+    time_limit: "Stopped at the time limit (--time-limit).",
     unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;

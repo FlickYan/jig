@@ -86,6 +86,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
+      --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
@@ -105,15 +106,15 @@ received (subagents included), and how many input tokens came from the prompt ca
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
 tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
-same tool calls (see below), and 130 on Ctrl+C. So
+same tool calls (see below), 7 at `--time-limit`, and 130 on Ctrl+C. So
 `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
 
 `--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
 reason, steps, model calls, tokens (subagents' included), tool calls by name, seconds, and `events`, how
 often each of jig's mechanisms fired: retries (`retry.api`, `retry.brokeOff`, `retry.quiet`), compactions,
 the model asked again after a reply that wasn't an answer, calls that didn't run as asked (the permission
-policy's refusals among them, `call.refused`), hooks' blocks, `--check`, the reviewer, `--escalate`, the
-stop for repeating and the wrap-up (`src/stats.ts` lists them).
+policy's refusals among them, `call.refused`), hooks' blocks, `--check` and the reviewer (or either one
+skipped for time), `--escalate`, the stop for repeating and the wrap-up (`src/stats.ts` lists them).
 So a change to one can be seen to run at all, which in milestone 28 only reading the sessions showed.
 
 ## What it does
@@ -368,7 +369,9 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
 check its work against the task, if a step is left for that, and stops at the next such reply. Also on
-`--max-steps` model calls, on
+`--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
+and none starts after; nor do `--check` and `--reviewer` in the last quarter of the time, since what they
+find might not get done), on
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
 or only thinking): it stays out of the history, and the model is asked once to go on.

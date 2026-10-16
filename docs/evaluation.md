@@ -327,6 +327,7 @@ What the runs and their logs showed:
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
   may owe something to it. Each agent had three, on the same tasks (`tune-mjcf` twice and
   `cobol-modernization` once); counting them as failures gives 38/60 against 41/60, the same gap.
+  (Since then, the adapter gives jig the limit, less 30 seconds, as `--time-limit`, and jig stops there.)
 - **The evaluation found six problems in jig, now fixed.** File tools confined to the project could not
   touch `/etc` or `/var` in a container (`--add-dir`); there was no way to get turns and tokens out
   (`--stats`); during a DeepSeek outage jig waited 10 minutes per attempt in silence (now 2 minutes, with

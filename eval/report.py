@@ -38,6 +38,10 @@ def trials(job: Path) -> list[dict]:
         agent = result.get("agent_result") or {}
         model = ((result.get("agent_info") or {}).get("model_info") or {}).get("name", "")
         exception = (result.get("exception_info") or {}).get("exception_type")
+        # jig stops itself just before the agent's time limit (--time-limit), in either of its runs (see the
+        # adapter's populate_context_post_run): a time-out all the same.
+        if not exception and (agent.get("metadata") or {}).get("time_limit"):
+            exception = "AgentTimeoutError"
         execution = result.get("agent_execution") or {}
         found.append({
             "task": result["task_name"],

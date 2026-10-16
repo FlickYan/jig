@@ -9,6 +9,7 @@ import { type CallModel, tooLong } from "./model.ts";
 import { workLog } from "./review.ts";
 import type { Sandbox } from "./sandbox.ts";
 import type { Mechanism } from "./stats.ts";
+import { whyStopped } from "./tools/bash.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -50,6 +51,12 @@ export interface AgentOptions {
   escalate?: { model: string; callModel: CallModel };
   /** A second model that checks the work against the task the first time the model stops (--reviewer). */
   reviewer?: Reviewer;
+  /**
+   * With --time-limit, the time (as Date.now() gives it) after which neither the reviewer nor `review`'s
+   * request starts: closer to the limit, there may be no time to act on what they find (in milestone 9,
+   * --check ran tasks out of time), so the answer stands.
+   */
+  checkUntil?: number;
   /**
    * The settings' Stop hooks (see hooks.ts), asked each time the model gives its final answer with a step
    * left: resolves to why the task isn't done, which the model is told, or null. `active` says whether they
@@ -103,8 +110,9 @@ export interface RunResult {
    * Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours.
    * "loop": the model made the same calls and got the same results, SAME_STEPS steps in a row.
    * "unapproved" is the CLI's: it stops a task whose tool calls keep needing an approval nobody can give.
+   * So is "time_limit": it stops a task at --time-limit.
    */
-  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "loop" | "unapproved";
+  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "loop" | "unapproved" | "time_limit";
   /**
    * Text of the final reply, after that of the replies it continues if they were cut off at the output limit.
    * At max_steps, the wrap-up's, if there was one (see AgentOptions.wrapUp).
@@ -252,6 +260,13 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         opts.ui.notice("The reply was cut off at the output limit; asking the model to continue.");
         conversation.push({ role: "user", content: CONTINUE });
         continue;
+      }
+      // Too close to the time limit, the work isn't checked, now or at a later stop, which would be closer still.
+      const checking = !!(opts.reviewer || opts.review) && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps;
+      if (checking && opts.checkUntil !== undefined && Date.now() >= opts.checkUntil) {
+        reviewed = true;
+        opts.count?.(opts.reviewer ? "review.skipped" : "check.skipped");
+        opts.ui.notice("Too little time is left to check the work (--time-limit), so it stands as it is.");
       }
       // By a second model, once, while there are steps left to act on what it finds.
       if (opts.reviewer && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
@@ -498,7 +513,7 @@ async function handleToolCall(
   }
   if (signal?.aborted) {
     opts.ui.toolCall(call.name, "", call.id);
-    return fail("Not run: the user interrupted.");
+    return fail(`Not run: ${whyStopped(signal, "the user interrupted")}.`);
   }
   if (state.cutOff) {
     opts.count?.("call.cutOff");
@@ -526,13 +541,15 @@ async function handleToolCall(
       opts.count?.("hook.blocked");
       return fail(`Blocked by a hook: ${blocked}`);
     }
-    if (signal?.aborted) return fail("Not run: the user interrupted.");
+    if (signal?.aborted) return fail(`Not run: ${whyStopped(signal, "the user interrupted")}.`);
     checking = "the permission check";
     const refusal = await opts.authorize(tool, input);
     if (refusal) {
       opts.count?.("call.refused");
       return fail(refusal);
     }
+    // The user can take longer to approve a call than --time-limit had left.
+    if (signal?.aborted) return fail(`Not run: ${whyStopped(signal, "the user interrupted")}.`);
   } catch (err) {
     return fail(`Not run: ${checking} failed: ${errorMessage(err)}`);
   }

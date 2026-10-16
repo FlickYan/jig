@@ -3,7 +3,7 @@ import type { Socket } from "node:net";
 import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { hookMatcher, type Hook, type HookEvent } from "./settings.ts";
-import { envWithoutKeys, LINGER_MS } from "./tools/bash.ts";
+import { envWithoutKeys, LINGER_MS, whyStopped } from "./tools/bash.ts";
 import type { ToolInput } from "./tools/index.ts";
 
 const TIMEOUT = 60_000;
@@ -126,7 +126,7 @@ function run(
       }
     };
     const timer = setTimeout(() => kill(`it timed out after ${timeout / 1000}s`), timeout);
-    const onAbort = () => kill("the user interrupted it");
+    const onAbort = () => kill(whyStopped(signal, "the user interrupted it"));
     signal?.addEventListener("abort", onAbort, { once: true });
     let lingering: NodeJS.Timeout | undefined;
     const finish = (code: number | null, note = "") => {

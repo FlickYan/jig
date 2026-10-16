@@ -8,6 +8,10 @@ from the environment harbor runs in and stays on the host: jig's process in the 
 this run instead, and its requests go through key_proxy.py, which puts the key in (milestone 25; with
 --ak key_proxy=false jig gets the key itself, as before). Either way it is never written into the job's files.
 
+jig is given the agent's time limit, less 30 seconds, as --time-limit, so that it stops itself before Harbor
+stops waiting and runs the hidden tests: without it, jig worked on into them (milestone 6). A version of jig
+from before --time-limit (--ak ref=...) runs without it.
+
 With --ak run_reviewer=deepseek-flash (milestone 29), once jig is done, that model reviews the work by running
 it: the task's container is committed to an image, a copy started from it with no network and no mounts, and
 `jig review` run here on the host with its commands going into the copy. Each problem's command is run again
@@ -50,6 +54,9 @@ REVIEW_FILE = "/installed-agent/review.txt"
 # The review's time: 5 minutes, or a quarter of the agent's time limit if that is less. It starts only with
 # at least twice that left, so that a fix after it has as long as the review had.
 REVIEW_SECONDS = 300
+# How long before the agent's time limit jig is told to stop (--time-limit): enough for what its clock doesn't
+# count, Node starting say, and for it to stop and exit.
+TIME_MARGIN = 30
 # What docker diff lists that isn't the agent's work: jig's own install, and OrbStack's certificate.
 NOT_THE_WORK = re.compile(r"^/(installed-agent|root/\.nvm|root/\.npm|logs)(/|$)|orbstack", re.I)
 MAX_CHANGES = 150
@@ -224,14 +231,33 @@ class Jig(BaseInstalledAgent):
         # in its arguments (which its process title can't hide under emulation) or in the shell's.
         await self._upload_text(environment, instruction, TASK_FILE)
         env = {key_name: secret, "NO_COLOR": "1", "JIG_HOME": "/logs/agent/jig-home"}
-        await self.exec_as_agent(environment, command=self._jig(model, flags, TASK_FILE, "jig-stats.json"), env=env)
+        await self.exec_as_agent(environment, command=self._jig(model, flags + self._time_limit(environment, started), TASK_FILE, "jig-stats.json"), env=env)
         if not reviewing:
             return
         feedback = await self._review(environment, reviewing, key_name, key, before, started)
         if feedback:
             # The review's problems, in the time left, as the next message of jig's own conversation.
             await self._upload_text(environment, feedback, REVIEW_FILE)
-            await self.exec_as_agent(environment, command=self._jig(model, f"{flags} --continue", REVIEW_FILE, "jig-stats-2.json"), env=env)
+            limit = self._time_limit(environment, started)
+            await self.exec_as_agent(environment, command=self._jig(model, f"{flags} --continue{limit}", REVIEW_FILE, "jig-stats-2.json"), env=env)
+
+    def _time_limit(self, environment: BaseEnvironment, started: float) -> str:
+        """jig's --time-limit: the agent's time left, less TIME_MARGIN. Nothing when the limit can't be worked out,
+        or when the version of jig chosen has no --time-limit, which it would refuse as an unknown option."""
+        try:
+            limit = self._agent_timeout(environment)
+            if not limit or not self._jig_has("--time-limit"):
+                return ""
+        except Exception:  # jig then runs as it did before it was given a limit, rather than not at all
+            return ""
+        return f" --time-limit {max(1, int(limit - (time.monotonic() - started) - TIME_MARGIN))}"
+
+    def _jig_has(self, option: str) -> bool:
+        """Whether the version of jig chosen (the working tree, or --ak ref) has an option."""
+        if not self.options.ref:
+            return option in (REPO / "src" / "cli.ts").read_text()
+        cli = subprocess.run(["git", "show", f"{self.options.ref}:src/cli.ts"], cwd=REPO, check=True, capture_output=True, text=True)
+        return option in cli.stdout
 
     @staticmethod
     def _jig(model: str, flags: str, task_file: str, stats: str) -> str:
@@ -444,6 +470,8 @@ class Jig(BaseInstalledAgent):
             context.cost_usd = sum(parts)
         keys = ("stop", "steps", "modelCalls", "subagentModelCalls", "toolCalls", "events", "seconds", "escalated", "reviewed")
         context.metadata = {key: stats.get(key) for key in keys if key in stats}
+        # Whether jig stopped itself at --time-limit in either run, for the report: "stop" is the first run's only.
+        context.metadata["time_limit"] = any(s.get("stop") == "time_limit" for s in runs)
         if (self.logs_dir / "review-run.json").exists():
             context.metadata["run_review"] = review_summary(self.logs_dir)
 

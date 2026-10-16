@@ -54,10 +54,12 @@ export type Mechanism =
   // so the task ended anyway.
   | "hook.stopBlocked"
   | "hook.stopCapped"
-  // --check's request, --reviewer's review and the problems it sent back, --escalate's handover, the stop
-  // for repeating the same calls, and the wrap-up at --max-steps.
+  // --check's request, --reviewer's review and the problems it sent back (either skipped, too close to
+  // --time-limit), --escalate's handover, the stop for repeating the same calls, and the wrap-up at --max-steps.
   | "check"
+  | "check.skipped"
   | "review"
+  | "review.skipped"
   | "review.problems"
   | "escalated"
   | "loop"

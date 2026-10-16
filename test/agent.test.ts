@@ -94,6 +94,21 @@ describe("checking the work before finishing (one-shot runs)", () => {
     assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "All done.", 2]);
     assert.equal(messages.at(-1)?.role, "assistant", "the session ends on the answer, not on an unanswered request");
   });
+
+  it("doesn't ask too close to the time limit, then or at a later stop, and says so once", async () => {
+    const notices: string[] = [];
+    const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+    const verdicts = ["tests fail", null];
+    const late = setup([reply([text("Done.")]), reply([text("Fixed.")])], { review: REVIEW, checkUntil: Date.now(), stopHooks: async () => verdicts.shift()!, ui });
+    const result = await runAgent(late.conversation, late.options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Fixed.", 2]);
+    assert.ok(!late.messages.some((m) => m.content === REVIEW));
+    assert.deepEqual(notices.filter((n) => n.startsWith("Too little time")), ["Too little time is left to check the work (--time-limit), so it stands as it is."]);
+    // With time left, it asks as before.
+    const early = setup([reply([text("Done.")]), reply([text("Checked.")])], { review: REVIEW, checkUntil: Date.now() + 60_000 });
+    assert.equal((await runAgent(early.conversation, early.options)).text, "Checked.");
+    assert.deepEqual(early.messages[2], { role: "user", content: REVIEW });
+  });
 });
 
 describe("runAgent", () => {
@@ -379,6 +394,30 @@ describe("runAgent", () => {
     const [slow, next] = resultsIn(messages[2]);
     assert.match(String(slow.content), /interrupted/);
     assert.match(String(next.content), /Not run/);
+  });
+
+  it("says what stopped the calls when the task is stopped with words, as at --time-limit", async () => {
+    const controller = new AbortController();
+    const { options, conversation, messages } = setup([
+      reply([toolUse("slow", "bash", { command: "sleep 30" }), toolUse("next", "bash", { command: "echo hi" })]),
+    ]);
+    setTimeout(() => controller.abort("the time limit (--time-limit) was reached"), 100);
+    assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
+    const [slow, next] = resultsIn(messages[2]);
+    assert.match(String(slow.content), /\n\nKilled: the time limit \(--time-limit\) was reached\.$/);
+    assert.deepEqual([next.is_error, next.content], [true, "Not run: the time limit (--time-limit) was reached."]);
+  });
+
+  it("doesn't run a call approved after the task was stopped, as at --time-limit during the question", async () => {
+    const controller = new AbortController();
+    const authorize = async () => {
+      controller.abort("the time limit (--time-limit) was reached");
+      return null;
+    };
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "bash", { command: "touch ran.txt" })])], { authorize });
+    assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
+    assert.equal(resultsIn(messages[2])[0].content, "Not run: the time limit (--time-limit) was reached.");
+    assert.ok(!existsSync(join(cwd, "ran.txt")));
   });
 
   it("doesn't run a call when Ctrl+C comes while the hooks check it", async () => {
@@ -694,6 +733,17 @@ describe("a reviewer before finishing", () => {
     assert.equal((await runAgent(lastStep.conversation, lastStep.options)).text, "Done.");
     assert.equal(last.seen.length, 0);
   });
+
+  it("doesn't start too close to the time limit, and the work stands", async () => {
+    const late = fakeReviewer("problems");
+    const { options, conversation } = setup([reply([text("Done.")])], { reviewer: late.reviewer, checkUntil: Date.now() });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.reviewed], ["end_turn", "Done.", undefined]);
+    assert.equal(late.seen.length, 0);
+    const early = fakeReviewer("approved");
+    const inTime = setup([reply([text("Done.")])], { reviewer: early.reviewer, checkUntil: Date.now() + 60_000 });
+    assert.equal((await runAgent(inTime.conversation, inTime.options)).reviewed?.verdict, "approved");
+  });
 });
 
 describe("Stop hooks before finishing", () => {
@@ -806,6 +856,8 @@ describe("counting the loop's mechanisms (--stats)", () => {
     assert.deepEqual(await counted([reply([text("Done.")]), reply([text("Checked.")])], { review: "Check your work." }), ["check"]);
     const reviewer: Reviewer = { model: "strong", review: async () => ({ verdict: "problems", feedback: "PROBLEMS: out.txt is missing.", usage }) };
     assert.deepEqual(await counted([reply([text("Done.")]), reply([text("Fixed.")])], { reviewer }), ["review", "review.problems"]);
+    assert.deepEqual(await counted([reply([text("Done.")])], { review: "Check your work.", checkUntil: Date.now() }), ["check.skipped"]);
+    assert.deepEqual(await counted([reply([text("Done.")])], { reviewer, checkUntil: Date.now() }), ["review.skipped"]);
     const escalate = { model: "strong", callModel: async () => reply([text("Fixed it.")]) };
     assert.deepEqual(await counted([reply([bash("t1", "false && pytest")])], { maxSteps: 4, escalate }), ["escalated"]);
     const forever = Array.from({ length: 3 }, (_, i) => reply([bash(`t${i}`, `echo ${i}`)]));

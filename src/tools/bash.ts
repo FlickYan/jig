@@ -82,6 +82,14 @@ export function envWithoutKeys(): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
 }
 
+/**
+ * Why a task's signal stopped something, for its result: the words the task was stopped with (the CLI's, at
+ * --time-limit), or else `byUser`, since Ctrl+C gives none.
+ */
+export function whyStopped(signal: AbortSignal | undefined, byUser: string): string {
+  return typeof signal?.reason === "string" ? signal.reason : byUser;
+}
+
 /** Runs a command; resolves to its output and how it ended, and rejects only if it can't be started. */
 export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal, sandbox?: Sandbox): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -109,7 +117,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     child.stderr.setEncoding("utf8").on("data", collect);
 
     const timer = setTimeout(() => kill(`it timed out after ${seconds}s`), seconds * 1000);
-    const onAbort = () => kill("the user interrupted it");
+    const onAbort = () => kill(whyStopped(signal, "the user interrupted it"));
     signal?.addEventListener("abort", onAbort, { once: true });
     let lingering: NodeJS.Timeout | undefined;
     const settle = () => {
