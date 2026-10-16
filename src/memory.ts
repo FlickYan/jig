@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
+import { jigHome, projectDir } from "./paths.ts";
 import { type Approve, notApproved } from "./proposals.ts";
 import { findSecret } from "./secrets.ts";
 import { frontmatterFields, nameProblems } from "./skills.ts";
@@ -35,7 +35,7 @@ const MAX_INDEX = 100; // memories per scope in the prompt, the most recently sa
 /** Where a scope's memories are. A project is known by its real path, so a symlink to it shares them. */
 export function memoryDir(scope: MemoryScope, project: string): string {
   if (scope === "user") return join(jigHome(), "memory", "user");
-  return join(jigHome(), "memory", "project", projectKey(existsSync(project) ? realpathSync(project) : project));
+  return projectDir(join("memory", "project"), project);
 }
 
 /** The project's memories, then the user's. A file without a description is left out. */

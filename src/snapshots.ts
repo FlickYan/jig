@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
+import { jigHome, projectDir } from "./paths.ts";
 import { isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_PROJECT_BYTES = 200_000_000;
@@ -27,7 +27,7 @@ export class Snapshots {
 
   constructor(root: string, maxBytes = MAX_PROJECT_BYTES) {
     this.root = root;
-    this.gitDir = join(jigHome(), "snapshots", projectKey(root));
+    this.gitDir = projectDir("snapshots", root);
     this.maxBytes = maxBytes;
   }
 

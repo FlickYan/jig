@@ -1,19 +1,19 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
+import { projectDir } from "./paths.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
-/** One line of a session file. */
+/** One line of a session file. A start begins with type and cwd, which paths.ts reads without the rest. */
 type Entry =
   | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
   | { type: "message"; message: MessageParam }
   | { type: "compaction"; messages: MessageParam[] };
 
-/** Where a project's sessions are kept: ~/.jig/sessions/<project path, with / replaced by ->. */
+/** Where a project's sessions are kept: ~/.jig/sessions/<project key> (see projectKey). */
 export function sessionDir(cwd: string): string {
-  return join(jigHome(), "sessions", projectKey(cwd));
+  return projectDir("sessions", cwd);
 }
 
 /**

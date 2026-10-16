@@ -177,6 +177,11 @@ received (subagents included), and how many input tokens came from the prompt ca
   it exists, so nothing is lost on a crash or Ctrl+C. `jig -c` continues the most recent session,
   `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results
   are answered as interrupted when a session is loaded, so the history is always valid.
+  A project's directory there, as in `~/.jig/memory/` and `~/.jig/snapshots/`, is named after its real path
+  and a short hash of it: a symlink to a project shares its sessions, and `/a/my-app` and `/a/my/app` no
+  longer do. The sessions, memories and snapshots under the older name, the path alone, move to the new
+  one together the first time, if the sessions saved there all started in this project; if there are
+  none, or one started in another project, they all stay where they were.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
   continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
@@ -250,6 +255,10 @@ received (subagents included), and how many input tokens came from the prompt ca
   A tool the server marks read-only runs like jig's own read tools; any other asks first (outside `auto`
   mode) and is refused in `plan` mode, because it acts outside the sandbox's reach. `[a]lways` approves one
   tool for the session; allow and deny rules can name tools too.
+  A name keeps only letters, digits, `_` and `-` (the rest become `_`) and 64 characters, so two tools can
+  come out with the same one (servers `db.prod` and `db prod`, say). Then each gets a short hash of its
+  server's and its own name added, jig says so, and `/mcp` shows which server each is from; a deny rule
+  or hook naming the name they shared applies to each.
 - **Hooks.** Commands that run around tool calls, configured like Claude Code's:
 
   ```json

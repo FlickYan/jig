@@ -16,6 +16,7 @@ import { discoverSkills, frontmatter, skillCatalog, skillTool } from "../src/ski
 import { TOOLS, type Tool, type ToolContext } from "../src/tools/index.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -183,6 +184,76 @@ describe("MCP", () => {
     });
     assert.equal(servers.tools.length, 5);
     assert.match(servers.errors.join(), /The MCP server "missing" failed to start: .*ENOENT/);
+  });
+
+  it("adds a hash to tools whose names come out the same, so each call reaches its own server", async () => {
+    const servers = await connect({
+      "db.prod": { command: process.execPath, args: [fixture], env: { DATABASE: "prod database" } },
+      "db prod": { command: process.execPath, args: [fixture], env: { DATABASE: "test database" } },
+      test: { command: process.execPath, args: [fixture] },
+    });
+    const names = servers.tools.map((tool) => tool.definition.name);
+    assert.equal(new Set(names).size, 15);
+    assert.ok(names.includes("mcp__test__fail"), "a name no other tool has stays as it is");
+    // The model tells the two apart by the description, which names the server.
+    const fail = (server: string) =>
+      servers.tools.find((tool) => /^mcp__db_prod__fail_[0-9a-f]{8}$/.test(tool.definition.name) && tool.definition.description!.includes(`"${server}"`))!;
+    await assert.rejects(fail("db.prod").run({}, context()), /the prod database is locked/);
+    await assert.rejects(fail("db prod").run({}, context()), /the test database is locked/);
+    assert.deepEqual(servers.errors, ['Tools of the MCP servers "db.prod" and "db prod" come out with the same names, so each has a short hash added (/mcp lists them).']);
+    assert.equal(servers.renamed.get(fail("db.prod").definition.name)?.was, "mcp__db_prod__fail");
+  });
+
+  it("and to tools whose names are cut to the same 64 characters", async () => {
+    const servers = await connect({ [`server-${"x".repeat(60)}`]: { command: process.execPath, args: [fixture] } });
+    const names = servers.tools.map((tool) => tool.definition.name);
+    assert.equal(new Set(names).size, 5);
+    assert.ok(names.every((name) => /^mcp__server-x+_[0-9a-f]{8}$/.test(name) && name.length === 64), names.join());
+    const add = servers.tools.find((tool) => tool.definition.description!.includes('"add" tool'))!;
+    assert.equal(await add.run({ a: 2, b: 3 }, context()), "5");
+  });
+
+  it("keeps a deny rule that names the name such tools shared", async () => {
+    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const server = { command: process.execPath, args: [fixture] };
+    await writeFile(join(home, "settings.json"), JSON.stringify({ mcpServers: { "db.prod": server, "db prod": server }, deny: ["mcp__db_prod__add"] }));
+    const api = await fakeMessagesApi((request) => {
+      const adds = (request.tools as { name: string }[]).map((tool) => tool.name).filter((name) => name.startsWith("mcp__db_prod__add_"));
+      return (request.messages as unknown[]).length === 1 ? adds.map((tool) => ({ tool, input: { a: 2, b: 3 } })) : [{ text: "Done." }];
+    });
+    try {
+      const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Add 2 and 3."], { api, cwd: dir, env: { JIG_HOME: home } });
+      assert.match(output, /Tools of the MCP servers "db\.prod" and "db prod" come out with the same names/);
+      const names = (api.requests[0].tools as { name: string }[]).map((tool) => tool.name);
+      assert.equal(new Set(names).size, names.length, "every tool the model is offered has a name of its own");
+      const results = JSON.stringify(api.requests[1].messages);
+      assert.equal(results.match(/the mcp__db_prod__add_[0-9a-f]{8} tool is denied in jig's settings/g)?.length, 2);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("and the hooks whose matcher names that name, before the call and after it", async () => {
+    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const server = { command: process.execPath, args: [fixture] };
+    const hooks = {
+      PreToolUse: [{ matcher: "mcp__db_prod__add", command: "echo 'no adding on prod' >&2; exit 2" }],
+      PostToolUse: [{ matcher: "mcp__db_prod__pid", command: "echo 'pid checked' >&2; exit 2" }],
+    };
+    await writeFile(join(home, "settings.json"), JSON.stringify({ mcpServers: { "db.prod": server, "db prod": server }, hooks }));
+    const api = await fakeMessagesApi((request) => {
+      const calls = (request.tools as { name: string }[]).map((tool) => tool.name).filter((name) => /^mcp__db_prod__(add|pid)_/.test(name));
+      const input = (tool: string) => (tool.includes("add") ? { a: 2, b: 3 } : {});
+      return (request.messages as unknown[]).length === 1 ? calls.map((tool) => ({ tool, input: input(tool) })) : [{ text: "Done." }];
+    });
+    try {
+      await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Add 2 and 3."], { api, cwd: dir, env: { JIG_HOME: home } });
+      const results = JSON.stringify(api.requests[1].messages);
+      assert.equal(results.match(/Blocked by a hook: no adding on prod/g)?.length, 2);
+      assert.equal(results.match(/A hook checked this result and reported:\\npid checked/g)?.length, 2);
+    } finally {
+      api.close();
+    }
   });
 });
 

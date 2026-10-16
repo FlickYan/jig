@@ -14,7 +14,7 @@ import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type Revi
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks } from "./hooks.ts";
-import { connectMcpServers } from "./mcp.ts";
+import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
@@ -248,7 +248,6 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
   const contained = !!sandbox && !network;
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
   // The whole of a command's output too long to show, for the model to search. Only the main loop's: the
   // subagents work under plan mode's rules, which don't let commands read outside the project.
   const outputs = new OutputFiles();
@@ -268,7 +267,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const mcp = await connectMcpServers(settings.mcpServers, cwd);
   cleanup.push(mcp.close);
   for (const error of mcp.errors) ui.notice(error);
-  const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
+  // A deny rule or hook that names a tool still holds once a clash of names has added a hash to it.
+  const deny = [...settings.deny, ...[...mcp.renamed].filter(([, { was }]) => settings.deny.includes(was)).map(([name]) => name)];
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs });
+  const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd, mcp.renamed) : undefined;
   let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
   // Memory: notes from earlier sessions (--no-memory leaves them out, for a with-and-without comparison).
   let memories = values.memory ? loadMemories(cwd) : [];
@@ -287,7 +289,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const own = selectTools(toolNames);
   const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
-  const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
+  const research = new Permissions("plan", cwd, { deny, contained, dirs });
   const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
   let researchTools = researchFrom(extensions);
   const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
@@ -554,7 +556,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/mcp") {
       if (!Object.keys(settings.mcpServers).length) ui.notice('No MCP servers. Add them under "mcpServers" in jig\'s settings.');
       for (const line of [...mcp.status, ...mcp.errors]) ui.println(`  ${line}`);
-      for (const tool of mcp.tools) ui.println(ui.dim(`    ${tool.definition.name}${tool.kind === "read" ? " (read-only)" : ""}`));
+      for (const tool of mcp.tools) {
+        const renamed = mcp.renamed.get(tool.definition.name);
+        const notes = [...(renamed ? [`from "${renamed.server}"`] : []), ...(tool.kind === "read" ? ["read-only"] : [])];
+        ui.println(ui.dim(`    ${tool.definition.name}${notes.length ? ` (${notes.join(", ")})` : ""}`));
+      }
     } else if (skills.some((skill) => name === `/${skill.name}`)) {
       await runSkill(skills.find((skill) => name === `/${skill.name}`)!, line.slice(name.length).trim());
     } else if (name === "/context") {
@@ -632,9 +638,9 @@ async function loadSettings(cwd: string): Promise<Settings> {
 }
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
-function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
+function hookRunner(hooks: Hook[], cwd: string, renamed: McpServers["renamed"]): ToolHooks {
   const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2]) => {
-    const outcome = await runHooks(hooks, event, call, cwd);
+    const outcome = await runHooks(hooks, event, call, cwd, renamed.get(call.tool)?.was);
     for (const warning of outcome.warnings) ui.notice(warning);
     return outcome;
   };

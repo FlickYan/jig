@@ -1,16 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
+import { loadMemories } from "../src/memory.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
+import { projectKey } from "../src/paths.ts";
 import { loadInstructions, systemPrompt } from "../src/prompt.ts";
 import { SessionFile } from "../src/session.ts";
+import { Snapshots } from "../src/snapshots.ts";
 import { TOOLS } from "../src/tools/index.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
@@ -133,6 +137,97 @@ describe("sessions", () => {
       role: "user",
       content: [{ type: "tool_result", tool_use_id: "t9", content: "Not run: the session ended before this call ran.", is_error: true }],
     });
+  });
+});
+
+describe("a project's directories in jig's home", () => {
+  // Before, a project's key was its path with / replaced by -, and nothing else.
+  const oldKey = (path: string) => path.replace(/[\\/:]/g, "-");
+  const start = (cwd: string) => `${JSON.stringify({ type: "start", cwd, model: "m", date: "" })}\n`;
+
+  it("differ for paths that read alike once / is -, and a symlink shares its target's", async () => {
+    await mkdir(join(dir, "my-app"));
+    await mkdir(join(dir, "my", "app"), { recursive: true });
+    await symlink(join(dir, "my-app"), join(dir, "link"));
+    assert.notEqual(projectKey(join(dir, "my-app")), projectKey(join(dir, "my", "app")));
+    assert.equal(projectKey(join(dir, "link")), projectKey(join(dir, "my-app")));
+    assert.match(projectKey(join(dir, "my-app")), /-my-app-[0-9a-f]{8}$/, "the path is still there to read");
+    assert.ok(SessionFile.create(join(dir, "link"), "m").path.startsWith(join(dir, "home", "sessions", projectKey(join(dir, "my-app")))));
+  });
+
+  it("take over the sessions, memories and snapshots kept under the old key", async () => {
+    const project = join(dir, "my-app");
+    await mkdir(project);
+    const old = (store: string, path = project) => join(dir, "home", store, oldKey(path));
+    await mkdir(old("sessions"), { recursive: true });
+    await writeFile(join(old("sessions"), "2026-10-01T10-00-00-abcd.jsonl"), start(project));
+    const memories = old(join("memory", "project"), await realpath(project)); // memory went by the real path already
+    await mkdir(memories, { recursive: true });
+    await writeFile(join(memories, "make-check.md"), "---\nname: make-check\ndescription: Tests run with make check\n---\n");
+    await mkdir(old("snapshots"), { recursive: true });
+    await writeFile(join(old("snapshots"), "HEAD"), "ref: refs/heads/master\n");
+
+    assert.deepEqual(SessionFile.list(project).map((file) => basename(file)), ["2026-10-01T10-00-00-abcd.jsonl"]);
+    assert.deepEqual(loadMemories(project).map((memory) => memory.name), ["make-check"]);
+    new Snapshots(project);
+    assert.ok(existsSync(join(dir, "home", "snapshots", projectKey(project), "HEAD")));
+    for (const moved of [old("sessions"), memories, old("snapshots")]) assert.equal(existsSync(moved), false, moved);
+    assert.equal(SessionFile.list(project).length, 1, "and only once");
+  });
+
+  it("put together the sessions saved through a symlink and through its target", async () => {
+    const project = await realpath(await mkdtemp(join(dir, "real-")));
+    const link = join(dir, "link");
+    await symlink(project, link);
+    for (const [path, name] of [[link, "a.jsonl"], [project, "b.jsonl"]]) {
+      await mkdir(join(dir, "home", "sessions", oldKey(path)), { recursive: true });
+      await writeFile(join(dir, "home", "sessions", oldKey(path), name), start(path));
+    }
+    assert.deepEqual(SessionFile.list(link).map((file) => basename(file)), ["a.jsonl", "b.jsonl"]);
+  });
+
+  it("leave what two projects shared under the old key where it is", async () => {
+    const [mine, other] = [join(dir, "my-app"), join(dir, "my", "app")];
+    await mkdir(mine);
+    await mkdir(other, { recursive: true });
+    const shared = join(dir, "home", "sessions", oldKey(mine));
+    await mkdir(shared, { recursive: true });
+    await writeFile(join(shared, "a.jsonl"), start(mine));
+    await writeFile(join(shared, "b.jsonl"), start(other));
+    assert.deepEqual(SessionFile.list(mine), []);
+    assert.deepEqual(SessionFile.list(other), []);
+    assert.ok(existsSync(join(shared, "a.jsonl")) && existsSync(join(shared, "b.jsonl")));
+  });
+
+  it("move together, so a project whose path reads alike can't take what the sessions leave behind", async () => {
+    const base = await realpath(dir);
+    const [mine, other] = [join(base, "my-app"), join(base, "my", "app")];
+    await mkdir(mine);
+    await mkdir(other, { recursive: true });
+    const old = (store: string) => join(dir, "home", store, oldKey(mine));
+    await mkdir(old("sessions"), { recursive: true });
+    await writeFile(join(old("sessions"), "a.jsonl"), start(mine));
+    await mkdir(old(join("memory", "project")), { recursive: true });
+    await writeFile(join(old(join("memory", "project")), "deploy-key.md"), "---\nname: deploy-key\ndescription: Deploys use the key in the vault\n---\n");
+    await mkdir(old("snapshots"), { recursive: true });
+    await writeFile(join(old("snapshots"), "HEAD"), "ref: refs/heads/master\n");
+
+    assert.deepEqual(loadMemories(other), [], "the session says whose they are");
+    assert.equal(SessionFile.list(mine).length, 1); // jig --sessions, say, which asks for nothing else
+    assert.deepEqual(loadMemories(other), []);
+    new Snapshots(other);
+    assert.equal(existsSync(join(dir, "home", "snapshots", projectKey(other))), false);
+    assert.deepEqual(loadMemories(mine).map((memory) => memory.name), ["deploy-key"]);
+    assert.ok(existsSync(join(dir, "home", "snapshots", projectKey(mine), "HEAD")));
+  });
+
+  it("leave what no session says was the project's where it is", async () => {
+    const project = await realpath(await mkdtemp(join(dir, "real-")));
+    const memories = join(dir, "home", "memory", "project", oldKey(project));
+    await mkdir(memories, { recursive: true });
+    await writeFile(join(memories, "make-check.md"), "---\nname: make-check\ndescription: Tests run with make check\n---\n");
+    assert.deepEqual(loadMemories(project), []);
+    assert.ok(existsSync(join(memories, "make-check.md")));
   });
 });
 

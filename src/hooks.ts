@@ -19,16 +19,20 @@ export interface HookOutcome {
  * (plus JIG_TOOL, JIG_FILE and JIG_PROJECT_DIR in its environment). Exit code 0 lets things go on; exit
  * code 2 blocks the call (PreToolUse) or sends stderr to the model (PostToolUse); anything else is a
  * broken hook, reported to the user but not blocking. Hooks are the user's own commands, so they run
- * outside the sandbox.
+ * outside the sandbox. A matcher may also name the tool by `was`: the name an MCP tool would have had if
+ * another hadn't come out the same (see mcp.ts), so a hook that guards that name still guards the tool.
  */
 export async function runHooks(
   hooks: Hook[],
   event: HookEvent,
   call: { tool: string; input: ToolInput; output?: string },
   cwd: string,
+  was?: string,
 ): Promise<HookOutcome> {
   const outcome: HookOutcome = { warnings: [] };
-  const matching = hooks.filter((hook) => hook.event === event && (!hook.matcher || new RegExp(`^(?:${hook.matcher})$`).test(call.tool)));
+  const names = was ? [call.tool, was] : [call.tool];
+  const matches = (hook: Hook) => !hook.matcher || names.some((name) => new RegExp(`^(?:${hook.matcher})$`).test(name));
+  const matching = hooks.filter((hook) => hook.event === event && matches(hook));
   for (const hook of matching) {
     const file = typeof call.input.path === "string" ? resolve(cwd, call.input.path) : "";
     const env = { ...process.env, JIG_EVENT: event, JIG_TOOL: call.tool, JIG_FILE: file, JIG_PROJECT_DIR: cwd };
