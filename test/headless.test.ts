@@ -433,7 +433,7 @@ describe("a run that reaches --max-steps", () => {
       const file = join(project, "stats.json");
       const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--max-steps", "2", "--stats", file];
       const { code, output } = await runJig([...args, "Fix the parser."], { api, cwd: project });
-      assert.equal(code, 0, output);
+      assert.equal(code, 2, output);
       assert.equal(api.requests.length, 3);
       const last = api.requests[2];
       assert.deepEqual(last.tool_choice, { type: "none" });
@@ -446,6 +446,88 @@ describe("a run that reaches --max-steps", () => {
       assert.equal(api.requests.length, 5);
       assert.doesNotMatch(off.output, /Out of steps|Listed the files/);
       assert.match(off.output, /Stopped after 2 steps/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
+describe("a one-shot run's exit code", () => {
+  const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
+  const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+
+  it("says whether the task finished, and if not, why it stopped", async () => {
+    // The task says how the model behaves: answers, calls tools until the steps run out, is cut off, declines.
+    const api = await fakeMessagesApi((request) => {
+      const task = JSON.stringify((request.messages as { content: unknown }[])[0].content);
+      if (task.includes("Loop")) return [{ tool: "glob", input: { pattern: "*" } }];
+      if (task.includes("Ramble")) return { blocks: [{ text: "and so on, and" }], stop: "max_tokens" };
+      if (task.includes("Decline")) return { blocks: [], stop: "refusal" };
+      return [{ text: "Done." }];
+    });
+    try {
+      const codes: Record<string, number | null> = {};
+      for (const task of ["Finish.", "Loop.", "Ramble.", "Decline."]) codes[task] = (await runJig([...args, "--max-steps", "3", task], { api, cwd: project })).code;
+      assert.deepEqual(codes, { "Finish.": 0, "Loop.": 2, "Ramble.": 3, "Decline.": 4 });
+    } finally {
+      api.close();
+    }
+  });
+
+  it("is 130 after Ctrl+C", async () => {
+    let pid = 0;
+    const server = createServer((req) => {
+      req.resume();
+      process.kill(pid, "SIGINT"); // and never answers
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    try {
+      const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1" };
+      const child = spawn(process.execPath, [cli, ...args, "Fix the parser."], { cwd: project, env });
+      pid = child.pid!;
+      let output = "";
+      child.stdout.on("data", (chunk) => (output += chunk));
+      child.stderr.on("data", (chunk) => (output += chunk));
+      child.stdin.end();
+      const code = await new Promise<number | null>((done) => child.on("close", done));
+      assert.equal(code, 130, output);
+      assert.match(output, /Interrupted\./);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  });
+
+  it("is listed in --help", () => {
+    const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" }).replace(/\s+/g, " ");
+    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), and 130 when interrupted\./);
+  });
+});
+
+describe("a one-shot run with no terminal", () => {
+  const args = ["--no-sandbox", "--model", "claude-haiku-4-5"];
+
+  it("stops at the third tool call that needed approval, rather than spending its steps on calls that can't run", async () => {
+    const api = await fakeMessagesApi((request) => [{ tool: "bash", input: { command: `touch made-${(request.messages as unknown[]).length}` } }]);
+    try {
+      const file = join(project, "stats.json");
+      const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 5, output);
+      assert.equal(api.requests.length, 3);
+      assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it\. Run jig with --yes/);
+      assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "unapproved");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("goes on after one, which the model may manage without", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "touch made" } }] : [{ text: "Done without it." }]));
+    try {
+      const { code, output } = await runJig([...args, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      assert.match(output, /Not run: there is no one to approve it \(no terminal\)/);
+      assert.equal(api.requests.length, 2);
     } finally {
       api.close();
     }

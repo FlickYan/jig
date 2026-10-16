@@ -102,6 +102,11 @@ In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/co
 `/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens sent and
 received (subagents included), and how many input tokens came from the prompt cache.
 
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
+of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
+tool calls needed approval and there was no terminal to ask, and 130 on Ctrl+C. So
+`jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
+
 ## What it does
 
 ### Safety
@@ -120,6 +125,8 @@ received (subagents included), and how many input tokens came from the prompt ca
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
   `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
   When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session.
+  With no terminal to ask in (a script, CI), such a call is refused instead, and the third in a task
+  stops it: `--yes`, or allow rules, let them run.
 - **Rules.** `~/.jig/settings.json` and the project's `.jig/settings.json` can list commands to always
   allow or always refuse:
 

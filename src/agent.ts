@@ -89,8 +89,11 @@ export interface Usage {
 
 /** How a run ended. */
 export interface RunResult {
-  /** Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours. */
-  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted";
+  /**
+   * Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours.
+   * "unapproved" is the CLI's: it stops a task whose tool calls keep needing an approval nobody can give.
+   */
+  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "unapproved";
   /**
    * Text of the final reply, after that of the replies it continues if they were cut off at the output limit.
    * At max_steps, the wrap-up's, if there was one (see AgentOptions.wrapUp).

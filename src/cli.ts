@@ -97,7 +97,25 @@ commands, hooks around tool calls, and MCP servers. A project's settings can onl
 loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
-Ctrl+C stops the current task (press it again to force quit).`;
+Ctrl+C stops the current task (press it again to force quit).
+
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
+of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
+declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), and 130 when
+interrupted.`;
+
+/** How a task ended: as the loop stopped, or "error" if it failed. */
+type Ending = RunResult["stop"] | "error";
+
+/**
+ * A one-shot run's exit code, by how its task ended, so a script can tell work the model finished from a
+ * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
+ * Any other ending, a failure included, is 1.
+ */
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, interrupted: 130 };
+
+// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
+const MAX_UNAPPROVED = 3;
 
 const SUBAGENT_MAX_STEPS = 30;
 // A review reads what the task names and the work touched, not the whole project, and the task's clock runs.
@@ -355,6 +373,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
+  let unapproved = 0; // the running task's calls that needed approval, with no terminal to ask
   // Things the model should know before the next request, like an /undo. Plan mode is announced when it
   // starts and ends: the system prompt can't change mid-conversation, so this rides on the user's message.
   const notes: string[] = [];
@@ -364,7 +383,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const decision = permissions.decide(tool, input);
     if (decision === "allow") return null;
     if (decision !== "ask") return decision.refuse;
-    if (!process.stdin.isTTY) return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    if (!process.stdin.isTTY) {
+      // The model would try call after call that can't run until its steps ran out. It may manage without
+      // one or two (a check it can skip), so the task stops at the third.
+      if (++unapproved >= MAX_UNAPPROVED) task?.abort();
+      return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    }
     const always = permissions.alwaysLabel(tool, input);
     const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
     if (answer === null) {
@@ -397,8 +421,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   };
   conversation.describe(context);
 
-  /** Runs `work` as the current task, so Ctrl+C stops it. */
-  async function asTask(work: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+  /** Runs `work` as the current task, so Ctrl+C stops it. Resolves to what `work` does, or to how it failed. */
+  async function asTask<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T | "interrupted" | "error"> {
     const controller = (task = new AbortController());
     const onSigint = () => {
       if (controller.signal.aborted) process.exit(130); // second Ctrl+C: give up waiting
@@ -407,19 +431,18 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     };
     process.on("SIGINT", onSigint);
     try {
-      await work(controller.signal);
-      return true;
+      return await work(controller.signal);
     } catch (err) {
       const message = controller.signal.aborted ? "Interrupted." : describeError(err);
       ui.error(message);
       stats?.failed(message);
-      return false;
+      return controller.signal.aborted ? "interrupted" : "error";
     } finally {
       process.off("SIGINT", onSigint);
     }
   }
 
-  function runTask(text: string, label = text): Promise<boolean> {
+  function runTask(text: string, label = text): Promise<Ending> {
     if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
       modelKnowsPlanMode = permissions.mode === "plan";
       notes.push(
@@ -432,23 +455,27 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
+    unapproved = 0;
     const started = Date.now();
     return asTask(async (signal) => {
       const result = await runAgent(conversation, agent, signal);
+      // Stopped by authorize, not by the user.
+      if (result.stop === "interrupted" && unapproved >= MAX_UNAPPROVED) result.stop = "unapproved";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
+      return result.stop;
     });
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
-  function runSkill(skill: Skill, task: string): Promise<boolean> {
+  function runSkill(skill: Skill, task: string): Promise<Ending> {
     const content = loadSkill(skill);
     conversation.pin(`skill:${skill.name}`, content);
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
 
   /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
-  function runSkillWriting(task: string, label: string): Promise<boolean> {
+  function runSkillWriting(task: string, label: string): Promise<Ending> {
     const writer = skills.find((skill) => skill.name === "skill-writer");
     if (!writer) return runTask(task, label);
     const content = loadSkill(writer);
@@ -562,7 +589,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
     const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText, memoryVerb ? `jig memory reflect ${given}` : taskText);
-    if (!(await run)) process.exitCode = 1;
+    process.exitCode = EXIT_CODES[await run] ?? 1;
     return;
   }
 
@@ -670,6 +697,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     model_context_window_exceeded: "The conversation no longer fits in the context window. Use /compact or /reset.",
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
+    unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
   // The model's wrap-up at the step limit wasn't streamed (it is asked for like a summary), so it is printed here.
