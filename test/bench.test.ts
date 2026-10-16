@@ -130,6 +130,7 @@ describe("an escalated attempt", () => {
       assert.deepEqual(parseTranscript(output).escalated, { model: "claude-sonnet-5-5", step: 2, tokensIn: 10, cacheRead: 0, tokensOut: 5 });
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.modelCalls, stats.escalated?.model, stats.escalated?.modelCalls], [2, "claude-sonnet-5-5", 1]);
+      assert.deepEqual(stats.events, { escalated: 1 });
     } finally {
       api.close();
     }
@@ -169,6 +170,7 @@ describe("a reviewed attempt", () => {
       assert.deepEqual(metrics.reviewed, { model: "claude-opus-5-5", step: 1, tokensIn: 10, cacheRead: 0, tokensOut: 5, verdict: "problems sent back" });
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.modelCalls, stats.subagentModelCalls, stats.reviewed?.model, stats.reviewed?.modelCalls], [2, 1, "claude-opus-5-5", 1]);
+      assert.deepEqual(stats.events, { review: 1, "review.problems": 1 });
       // sonnet's 20 tokens in and 10 out at its prices, opus's 10 and 5 at its own
       const own = estimateCost("claude-sonnet-5-5", { tokensIn: 20, cacheRead: 0, tokensOut: 10 })!;
       const reviewers = estimateCost("claude-opus-5-5", { tokensIn: 10, cacheRead: 0, tokensOut: 5 })!;

@@ -7,6 +7,7 @@ import type {
   ChatCompletionMessageParam,
 } from "openai/resources/chat/completions";
 import type { ReasoningEffort } from "openai/resources/shared";
+import { estimateTokens } from "./conversation.ts";
 import type { ModelTurn } from "./model.ts";
 import type { Tool } from "./tools/index.ts";
 import * as ui from "./ui.ts";
@@ -29,6 +30,9 @@ export interface ChatOptions {
 
 /** A reply that ended before it was finished: the stream stopped without saying why it was done. */
 export class ReplyBrokeOff extends Error {}
+
+/** Whether the user has heard that the server sends no token counts: once is enough, not at every reply. */
+let toldEstimated = false;
 
 /**
  * The conversation as chat messages. Thinking goes back as `reasoning_content`, which DeepSeek requires on
@@ -84,14 +88,15 @@ export async function chatTurn(
   client: OpenAI,
   options: ChatOptions,
   messages: MessageParam[],
-  { signal, quiet = false, summarize = false }: { signal?: AbortSignal; quiet?: boolean; summarize?: boolean },
+  { signal, quiet = false, summarize = false, alive }: { signal?: AbortSignal; quiet?: boolean; summarize?: boolean; alive?: () => void },
 ): Promise<ModelTurn> {
   const tools = toChatTools(options.tools);
+  const sent = toChatMessages(options.system, messages);
   if (!quiet) ui.status("thinking…");
   const stream = await client.chat.completions.create(
     {
       model: options.model,
-      messages: toChatMessages(options.system, messages),
+      messages: sent,
       // Tools stay declared when summarizing (the history refers to them); "none" stops new calls.
       ...(tools.length ? { tools, ...(summarize ? { tool_choice: "none" as const } : {}) } : {}),
       // DeepSeek takes low, high and max; OpenAI's models their own levels. Left out, the model's default.
@@ -102,6 +107,8 @@ export async function chatTurn(
     },
     { signal },
   );
+  // The reply has started: `alive`, called again at each chunk, lets model.ts stop one that goes quiet.
+  alive?.();
 
   let id = "";
   let model = "";
@@ -117,6 +124,7 @@ export async function chatTurn(
     showing = kind;
   };
   for await (const chunk of stream) {
+    alive?.();
     id ||= chunk.id;
     model ||= chunk.model;
     usage = chunk.usage ?? usage;
@@ -139,7 +147,10 @@ export async function chatTurn(
       }
     }
     for (const part of delta.tool_calls ?? []) {
-      const call = (calls[part.index] ??= { id: "", name: "", arguments: "" });
+      // Some servers leave out the index the spec requires: then a new id starts a call, and any other part
+      // continues the last one. Without this, calls[undefined] would hold the call and the reply would drop it.
+      const index = part.index ?? (part.id && !calls.some((call) => call.id === part.id) ? calls.length : Math.max(calls.length - 1, 0));
+      const call = (calls[index] ??= { id: "", name: "", arguments: "" });
       if (part.id) call.id = part.id;
       if (part.function?.name) {
         call.name += part.function.name;
@@ -154,6 +165,8 @@ export async function chatTurn(
   }
   if (!quiet && showing) ui.endBlock();
   if (!finish) throw new ReplyBrokeOff(id ? "the stream ended before the reply was finished" : "the API sent no reply");
+  // A reply that stopped to call tools but sent none isn't an answer: it is asked for again.
+  if (finish === "tool_calls" && !calls.length) throw new ReplyBrokeOff("the reply stopped for tool calls it didn't send");
 
   const content: ContentBlock[] = [];
   if (reasoning) content.push({ type: "thinking", thinking: reasoning, signature: "" });
@@ -168,6 +181,12 @@ export async function chatTurn(
 
   // The chat API counts cached tokens inside prompt_tokens; the Messages API counts them apart.
   const cached = usage?.prompt_tokens_details?.cached_tokens ?? (usage as { prompt_cache_hit_tokens?: number } | null)?.prompt_cache_hit_tokens ?? 0;
+  // A server that ignores include_usage sends no counts. Zero tokens would make the conversation look empty,
+  // so it would never be compacted: the counts are estimated from the text instead, and the user told once.
+  if (!usage && !toldEstimated) {
+    toldEstimated = true;
+    ui.notice("The API reports no token usage, so jig estimates it from the length of the text.");
+  }
   const stop = finish === "length" ? "max_tokens" : finish === "content_filter" ? "refusal" : calls.length ? "tool_use" : "end_turn";
   const message = {
     id: id || "chat",
@@ -178,10 +197,10 @@ export async function chatTurn(
     stop_reason: stop,
     stop_sequence: null,
     usage: {
-      input_tokens: (usage?.prompt_tokens ?? 0) - cached,
+      input_tokens: usage ? (usage.prompt_tokens ?? 0) - cached : estimateTokens(sent) + estimateTokens(tools),
       cache_read_input_tokens: cached,
       cache_creation_input_tokens: 0,
-      output_tokens: usage?.completion_tokens ?? 0,
+      output_tokens: usage ? (usage.completion_tokens ?? 0) : estimateTokens(content),
     },
   } as unknown as Anthropic.Beta.BetaMessage; // the fields jig reads; the rest of the type is Claude's
   return { message, malformed, offered: tools.map((tool) => tool.function.name) };

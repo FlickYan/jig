@@ -52,6 +52,8 @@ interface Task {
 interface RunContext {
   agent: string;
   jigDir?: string;
+  /** Whether that version of jig has --no-wrap-up, which every attempt then gets. */
+  noWrapUp: boolean;
   jigArgs: string[];
   model: string;
   logDir: string;
@@ -128,7 +130,10 @@ async function main(): Promise<void> {
   hideAnswers(join(logDir, "jig-home"));
   const jigArgs = values["jig-args"].split(/\s+/).filter(Boolean);
   const settings = { attempts: Number(values.attempts), maxSteps: Number(maxSteps), timeout: Number(values.timeout), jigArgs };
-  const run: RunContext = { agent, jigDir: jig?.dir, model: values.model, logDir, keep: values.keep, ...settings };
+  // At the step limit, which every evolve2 attempt reaches, jig asks the model for a wrap-up: one more call,
+  // which earlier versions don't make (nor have the flag for), so it is turned off to keep costs comparable.
+  const noWrapUp = !!jig && readFileSync(join(jig.dir, "src", "cli.ts"), "utf8").includes("--no-wrap-up");
+  const run: RunContext = { agent, jigDir: jig?.dir, noWrapUp, model: values.model, logDir, keep: values.keep, ...settings };
 
   const who = jig ? `jig ${jig.version} with ${values.model}` : `the ${agent} agent`;
   console.log(`Running ${who} on ${tasks.length} tasks × ${settings.attempts} attempt(s)\n`);
@@ -234,7 +239,7 @@ async function runAttempt(task: Task, attempt: number, run: RunContext): Promise
     let timedOut = false;
     if (run.agent === "jig") {
       const cli = join(run.jigDir!, "src/cli.ts");
-      const args = [cli, "-C", work, "--yes", "--max-steps", String(run.maxSteps), "--model", run.model, ...run.jigArgs, task.instruction];
+      const args = [cli, "-C", work, "--yes", "--max-steps", String(run.maxSteps), ...(run.noWrapUp ? ["--no-wrap-up"] : []), "--model", run.model, ...run.jigArgs, task.instruction];
       ({ output: transcript, timedOut } = await exec("node", args, { ...opts, env: jigEnv, timeout: run.timeout }));
     } else if (run.agent === "oracle") {
       await exec("bash", [join(taskDir, "solve.sh")], { ...opts, timeout: 120 });

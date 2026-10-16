@@ -11,7 +11,7 @@ import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Sandbox } from "../sandbox.ts";
-import type { Tool } from "./index.ts";
+import type { Tool, ToolContext } from "./index.ts";
 import { parseCommand } from "./shell.ts";
 import { type FileVersions, isInside, withoutKeys } from "./util.ts";
 
@@ -22,7 +22,7 @@ const MAX_TIMEOUT = 600;
 // head and tail too, but doesn't know where the whole output is.
 const SHOWN = 39_000;
 const MAX_SAVED = 100_000_000; // characters of output kept in files, in all
-const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
+export const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
 const STILL_RUNNING =
   "(The command has finished, but something it started in the background is still running with this output " +
   "open. jig didn't wait for it, so its later output isn't shown.)";
@@ -52,10 +52,10 @@ export const bashTool: Tool = {
   kind: "run",
   describe: ({ command }) => String(command),
 
-  async run(input, { cwd, signal, versions, sandbox, dirs = [], outputs }) {
+  async run(input, { cwd, signal, versions, sandbox, dirs = [], outputs, count }) {
     const { command, timeout = DEFAULT_TIMEOUT } = input as { command: string; timeout?: number };
     const seconds = Math.min(Math.max(timeout, 1), MAX_TIMEOUT);
-    const output = await runCommand(command, cwd, seconds, signal, sandbox, outputs);
+    const output = await runCommand(command, cwd, seconds, signal, sandbox, outputs, count);
     await recordViewedFiles(command, cwd, versions, dirs);
     return output;
   },
@@ -82,10 +82,27 @@ async function recordViewedFiles(command: string, cwd: string, versions: FileVer
 }
 
 /**
- * Runs a command; resolves to its output (its head and tail, if it is long) and how it ended, and rejects
- * only if it can't be started. Given `files`, the whole of a long output is kept in one of them.
+ * Why a task's signal stopped something, for its result: the words the task was stopped with (the CLI's, at
+ * --time-limit), or else `byUser`, since Ctrl+C gives none.
  */
-export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal, sandbox?: Sandbox, files?: OutputFiles): Promise<string> {
+export function whyStopped(signal: AbortSignal | undefined, byUser: string): string {
+  return typeof signal?.reason === "string" ? signal.reason : byUser;
+}
+
+/**
+ * Runs a command; resolves to its output (its head and tail, if it is long) and how it ended, and rejects
+ * only if it can't be started. Given `files`, the whole of a long output is kept in one of them, and given
+ * `count`, cutting it counts as the loop's own cut does (the loop's then has nothing left to cut).
+ */
+export function runCommand(
+  command: string,
+  cwd: string,
+  seconds: number,
+  signal?: AbortSignal,
+  sandbox?: Sandbox,
+  files?: OutputFiles,
+  count?: ToolContext["count"],
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
@@ -110,7 +127,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     child.stderr.setEncoding("utf8").on("data", collect);
 
     const timer = setTimeout(() => kill(`it timed out after ${seconds}s`), seconds * 1000);
-    const onAbort = () => kill("the user interrupted it");
+    const onAbort = () => kill(whyStopped(signal, "the user interrupted it"));
     signal?.addEventListener("abort", onAbort, { once: true });
     let lingering: NodeJS.Timeout | undefined;
     const settle = () => {
@@ -123,6 +140,7 @@ export function runCommand(command: string, cwd: string, seconds: number, signal
     const finish = (status: string, note = "") => {
       if (done) return;
       settle();
+      if (output.cut) count?.("output.truncated");
       resolve(`${output.shown().trimEnd() || "(no output)"}\n\n${note ? `${note}\n` : ""}${status}`);
     };
     const status = (code: number | null, killSignal: NodeJS.Signals | null) =>
@@ -175,6 +193,11 @@ class Output {
       chunk = chunk.slice(room);
     }
     this.tail = (this.tail + chunk).slice(-SHOWN / 2);
+  }
+
+  /** Whether there is more than the model will see, so only the head and tail are shown. */
+  get cut(): boolean {
+    return this.length > SHOWN;
   }
 
   /** The command has ended: nothing more goes to its file. */

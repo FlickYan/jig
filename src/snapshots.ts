@@ -63,11 +63,8 @@ export class Snapshots {
   undo(): Restored | undefined {
     const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
-    this.git("add", "--all", "."); // the index now describes the files as they are
     const restored: Restored = { changed: [], removed: [] };
-    const fields = this.git("diff", "--cached", "--name-status", "--no-renames", "-z", snapshot).split("\0");
-    for (let i = 0; i + 1 < fields.length; i += 2) {
-      const [status, path] = [fields[i], fields[i + 1]];
+    for (const [status, path] of this.diff(snapshot)) {
       if (status === "A") {
         removeFile(this.root, path);
         restored.removed.push(path);
@@ -78,6 +75,21 @@ export class Snapshots {
     if (restored.changed.length) this.git("checkout", snapshot, "--", ".");
     this.taken.pop();
     return restored;
+  }
+
+  /** The files changed, created or deleted since the latest snapshot, relative to the project; undefined without one. */
+  changed(): string[] | undefined {
+    const snapshot = this.taken.at(-1);
+    return snapshot ? this.diff(snapshot).map(([, path]) => path) : undefined;
+  }
+
+  /** How the files differ from a snapshot: git's status letter and the path, for each file that does. */
+  private diff(snapshot: string): [string, string][] {
+    this.git("add", "--all", "."); // the index now describes the files as they are
+    const fields = this.git("diff", "--cached", "--name-status", "--no-renames", "-z", snapshot).split("\0");
+    const changes: [string, string][] = [];
+    for (let i = 0; i + 1 < fields.length; i += 2) changes.push([fields[i], fields[i + 1]]);
+    return changes;
   }
 
   /** Snapshots copy the project's files, so refuse projects that would make them huge (big data files, say). */

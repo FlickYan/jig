@@ -8,16 +8,27 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { jigHome } from "./paths.ts";
 
-export const HOOK_EVENTS = ["PreToolUse", "PostToolUse"] as const;
+export const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"] as const;
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
-/** A command the settings run before or after tool calls (see hooks.ts). */
+/** A command the settings run before or after tool calls, or before a task ends (see hooks.ts). */
 export interface Hook {
   event: HookEvent;
-  /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default: all). */
+  /**
+   * Tool names it applies to, as a regular expression like "edit_file|write_file" (default, or "*": all).
+   * A Stop hook has no tool, so it has no use for one.
+   */
   matcher?: string;
-  /** Shell command; gets the tool call as JSON on stdin. */
+  /** Shell command; gets the tool call (or, for Stop, the task and the answer) as JSON on stdin. */
   command: string;
+}
+
+/**
+ * A hook's matcher as a regular expression for whole tool names. "*" means every tool, as in Claude Code,
+ * whose settings people copy: as a regular expression it is invalid, and threw on every tool call.
+ */
+export function hookMatcher(matcher?: string): RegExp {
+  return !matcher || matcher === "*" ? /^/ : new RegExp(`^(?:${matcher})$`);
 }
 
 /** An MCP server, started as a program that speaks MCP over stdio. */
@@ -57,14 +68,19 @@ export interface ProjectSettings {
 
 const empty = (): Settings => ({ allow: [], deny: [], hiddenPaths: [], hooks: [], mcpServers: {} });
 
-/** The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one. */
-export function readSettings(root: string): { user: Settings; project?: ProjectSettings } {
+/**
+ * The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one; and
+ * what in them jig left out, for the user.
+ */
+export function readSettings(root: string): { user: Settings; project?: ProjectSettings; warnings: string[] } {
+  const warnings: string[] = [];
   const userFile = join(jigHome(), "settings.json");
-  const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile) : empty();
+  const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile, warnings) : empty();
   const projectFile = join(root, ".jig", "settings.json");
-  if (!existsSync(projectFile)) return { user };
+  if (!existsSync(projectFile)) return { user, warnings };
   const text = readFileSync(projectFile, "utf8");
-  return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings: parse(text, projectFile) } };
+  const settings = parse(text, projectFile, warnings);
+  return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings }, warnings };
 }
 
 /**
@@ -118,7 +134,7 @@ export function trust(root: string, project: ProjectSettings): void {
   writeFileSync(trustFile(), `${JSON.stringify(trusted, null, 2)}\n`);
 }
 
-function parse(text: string, file: string): Settings {
+function parse(text: string, file: string, warnings: string[]): Settings {
   let data: Record<string, unknown>;
   try {
     data = JSON.parse(text);
@@ -148,11 +164,21 @@ function parse(text: string, file: string): Settings {
   }
   const hooks = (data.hooks ?? {}) as Record<string, unknown>;
   for (const [event, list] of Object.entries(hooks)) {
-    if (!HOOK_EVENTS.includes(event as HookEvent)) fail(`unknown hook event "${event}" (use ${HOOK_EVENTS.join(" or ")})`);
+    // Settings written for Claude Code can hook events jig doesn't have (SessionStart, UserPromptSubmit):
+    // those hooks are left out, not the whole file.
+    if (!HOOK_EVENTS.includes(event as HookEvent)) {
+      warnings.push(`${file}: jig has no hook event "${event}", so those hooks don't run (it has ${HOOK_EVENTS.join(", ")}).`);
+      continue;
+    }
     if (!Array.isArray(list)) fail(`"hooks.${event}" must be a list of {"matcher", "command"}`);
     for (const hook of list as Record<string, unknown>[]) {
       if (typeof hook?.command !== "string") fail(`every hook in "hooks.${event}" needs a "command"`);
       if (hook.matcher !== undefined && typeof hook.matcher !== "string") fail(`a hook's "matcher" must be a string`);
+      try {
+        hookMatcher(hook.matcher as string | undefined);
+      } catch (err) {
+        fail(`the hook matcher "${hook.matcher}" is not a valid regular expression (${(err as Error).message})`);
+      }
       settings.hooks.push({ event: event as HookEvent, matcher: hook.matcher as string | undefined, command: hook.command as string });
     }
   }

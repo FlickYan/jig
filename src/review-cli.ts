@@ -17,7 +17,7 @@ import { type Api, APIS, createModel, defaultApi, EFFORTS, type Effort } from ".
 import { type Problem, problemsOf, recheck, runningReviewPrompt, sentBackWithEvidence, verdictOf, workLog } from "./review.ts";
 import type { Sandbox } from "./sandbox.ts";
 import { SessionFile } from "./session.ts";
-import { Stats } from "./stats.ts";
+import { type Mechanism, Stats } from "./stats.ts";
 import { bashOnItsOwn, runCommand } from "./tools/bash.ts";
 import { withRequest } from "./tools/subagent.ts";
 
@@ -41,7 +41,7 @@ found, each with the command that showed it, and what to send back to the agent.
                               --effort as for jig
       --max-steps <n>         most model calls (default: 20)
       --time-limit <s>        seconds for the whole review, the re-runs included (default: 300)
-      --stats <file>          keep the review's model calls and tokens, as jig --stats does
+      --stats <file>          keep the review's model calls, tokens and mechanisms fired, as jig --stats does
   -o, --out <file>            write the verdict there (default: standard output, as its last line)`;
 
 // Of the time limit, what is kept for the verdict once the time for commands is up, and for the re-runs.
@@ -96,13 +96,14 @@ export async function reviewCommand(args: string[]): Promise<void> {
   // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy.
   const cwd = mkdtempSync(join(tmpdir(), "jig-review-"));
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
+  const count = stats && ((event: Mechanism) => stats.count(event));
   const system = reviewerSystem(values.workdir);
-  const callModel = createModel({ model, effort, api, baseURL: values["base-url"], quiet: true, system, tools: [bashOnItsOwn] });
+  const callModel = createModel({ model, effort, api, baseURL: values["base-url"], quiet: true, system, tools: [bashOnItsOwn], count });
   const metered = stats?.meter(callModel) ?? callModel;
   // The verdict asked for once the time or the steps ran out is asked at low effort: in milestone 29, over
   // chess-best-move's review flash thought for 145 to 269 seconds before a verdict at its own effort, and 70
   // to 187 at low; most other verdicts took under a minute either way.
-  const verdictModel = createModel({ model, effort: "low", api, baseURL: values["base-url"], quiet: true, system, tools: [bashOnItsOwn] });
+  const verdictModel = createModel({ model, effort: "low", api, baseURL: values["base-url"], quiet: true, system, tools: [bashOnItsOwn], count });
   const meteredVerdict = stats?.meter(verdictModel) ?? verdictModel;
   const secondsLeft = () => timeLimit - (Date.now() - started) / 1000;
   const session = SessionFile.create(cwd, model);
@@ -114,16 +115,16 @@ export async function reviewCommand(args: string[]): Promise<void> {
 
   const timeUp = new AbortController();
   const timer = setTimeout(() => timeUp.abort(), commandSeconds * 1000);
-  const options = { callModel: metered, tools: [bashOnItsOwn], cwd, maxSteps, compactAt: 0, authorize: async () => null, sandbox: exec, ui: progress };
+  const options = { callModel: metered, tools: [bashOnItsOwn], cwd, maxSteps, compactAt: 0, authorize: async () => null, sandbox: exec, count, ui: progress };
   const result = await runAgent(conversation, options, timeUp.signal).finally(() => clearTimeout(timer));
   stats?.finish(result);
   let text = result.stop === "end_turn" ? result.text : "";
-  // Out of steps or time, it gives its verdict on what it has checked (milestone 24's reviews used their
-  // steps up three times in five and gave none), within the time limit, since a verdict after it leaves none
-  // for the re-runs. A reply without a verdict (in milestone 29, a tool call written out as text) is answered
-  // once, while there is time.
-  if (result.stop === "max_steps" || result.stop === "interrupted") {
-    let request = withRequest(conversation.messages, outOf(result.stop === "max_steps" ? "steps" : "time"));
+  // Out of steps or time, or stopped for repeating itself, it gives its verdict on what it has checked
+  // (milestone 24's reviews used their steps up three times in five and gave none), within the time limit,
+  // since a verdict after it leaves none for the re-runs. A reply without a verdict (in milestone 29, a tool
+  // call written out as text) is answered once, while there is time.
+  if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "interrupted") {
+    let request = withRequest(conversation.messages, outOf(result.stop === "interrupted" ? "time" : "steps"));
     for (let ask = 0; ask < 2 && secondsLeft() > 5; ask++) {
       const signal = AbortSignal.timeout(secondsLeft() * 1000);
       const turn = await meteredVerdict(request, signal, { summarize: true }).catch((err: unknown) => {

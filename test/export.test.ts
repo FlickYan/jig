@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
+import { WRAP_UP } from "../src/agent.ts";
 import { exampleProblems, exportSession } from "../src/export.ts";
 import { redactSecrets } from "../src/secrets.ts";
 import { sessionsCommand } from "../src/sessions-cli.ts";
@@ -61,6 +62,14 @@ describe("exporting sessions as fine-tuning data", () => {
     const roles = exportSession(file)!.example.messages.map((m) => `${m.role}: ${m.content}`);
     assert.deepEqual(roles, ["system: You are a coding agent.", "user: First task.", "assistant: Done with the first.", "user: Second task.", "assistant: Done with the second."]);
     assert.equal(exportSession(await sessionFile([start, message("user", "Hello?")])), undefined);
+  });
+
+  it("doesn't count the report jig asks for at the step limit as a finished reply", async () => {
+    const outOfSteps = [message("assistant", [call("t1", "make")]), message("user", [result("t1", "1 failing")]), message("user", WRAP_UP), message("assistant", [{ type: "text", text: "Half done: make still fails." }])];
+    assert.equal(exportSession(await sessionFile([start, message("user", "Fix the build."), ...outOfSteps])), undefined);
+    const file = await sessionFile([start, message("user", "First task."), message("assistant", [{ type: "text", text: "Done with the first." }]), message("user", "Fix the build."), ...outOfSteps]);
+    const roles = exportSession(file)!.example.messages.map((m) => `${m.role}: ${m.content}`);
+    assert.deepEqual(roles, ["system: You are a coding agent.", "user: First task.", "assistant: Done with the first."]);
   });
 
   it("blanks out secrets in any message, keeping the JSON valid", async () => {

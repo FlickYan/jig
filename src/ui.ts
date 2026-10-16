@@ -2,7 +2,7 @@
 // result, notices, a status line while waiting, and the prompt for the user's input. Everything jig prints
 // goes through here, so lines and blocks don't run into each other.
 
-import * as readline from "node:readline/promises";
+import * as readline from "node:readline";
 import { styleText } from "node:util";
 import type { AgentUI } from "./agent.ts";
 
@@ -179,22 +179,167 @@ export function interrupted(): void {
   atLineStart = false;
 }
 
-/** Reads one line from the user. Returns null on Ctrl+C or Ctrl+D. */
-export async function ask(prompt: string): Promise<string | null> {
+/** What the user entered, and whether they pressed Ctrl+C instead of Enter. Null: Ctrl+D, or the input ended. */
+type Entry = { text: string; interrupted: boolean } | null;
+
+const MORE = dim("… "); // the prompt for a line that goes with the one above it
+
+/**
+ * The user's input, read by one readline interface for the whole session, so piped input isn't lost between
+ * prompts (an interface for each prompt read the whole pipe and kept only its first line) and the history
+ * carries over. At a terminal it takes the terminal over only while asking: between prompts it is paused and
+ * out of raw mode, so Ctrl+C during a task is the signal that stops it.
+ */
+export class Input {
+  private input: NodeJS.ReadStream;
+  private output: NodeJS.WriteStream;
+  private terminal: boolean; // readline edits the line: arrow keys, Up for the history
+  private rl: readline.Interface | undefined;
+  private history: string[] = []; // the tasks and commands entered, newest first, kept for the next interface too
+  private redraws: ((...args: unknown[]) => void)[] = [];
+  private answer: ((entry: Entry) => void) | undefined; // the read waiting for an entry
+  private keep = false; // whether that entry joins the history
+  private queued: string[] = []; // piped entries not asked for yet
+  private ended = false; // the piped input has ended
+  private closed = false; // the interface has closed: Ctrl+C or Ctrl+D, or the input ended
+  private pasting = false;
+  private pasted: string[] = []; // lines that go with the next one: a paste's, or ending in \
+
+  constructor(input: NodeJS.ReadStream, output: NodeJS.WriteStream) {
+    this.input = input;
+    this.output = output;
+    this.terminal = !!input.isTTY && !!output.isTTY;
+  }
+
+  /** The next entry. Only tasks and commands (`keep`) join the history, not the answers to questions. */
+  read(prompt: string, keep: boolean): Promise<Entry> {
+    return new Promise((resolve) => {
+      if (this.ended && !this.queued.length) return resolve(null);
+      const rl = this.open();
+      this.keep = keep;
+      this.answer = (entry) => {
+        this.answer = undefined;
+        this.listen(rl, false);
+        resolve(entry);
+      };
+      if (!this.terminal) {
+        this.output.write(prompt);
+        if (this.queued.length) this.answer({ text: this.queued.shift()!, interrupted: false });
+        else this.listen(rl, true);
+        return;
+      }
+      rl.setPrompt(prompt);
+      this.listen(rl, true);
+      rl.prompt();
+    });
+  }
+
+  private open(): readline.Interface {
+    if (this.rl) return this.rl;
+    const resizes = this.output.listeners("resize");
+    // A copy: readline adds to the array it is given, and only some lines stay (see "history" below).
+    const rl = readline.createInterface({ input: this.input, output: this.output, terminal: this.terminal, history: [...this.history] });
+    this.rl = rl;
+    this.closed = false;
+    // readline redraws its line when the terminal is resized, paused or not, which would write over what a
+    // task printed since: it hears of resizes only while asking (see listen).
+    this.redraws = this.output.listeners("resize").filter((listener) => !resizes.includes(listener)) as ((...args: unknown[]) => void)[];
+    rl.on("line", (line) => {
+      // At a terminal, only what is typed while jig asks counts: a line that came in with the one before it
+      // (pasted where the terminal doesn't mark pastes) mustn't answer the next question.
+      if (this.input.isTTY && !this.answer) return;
+      if (this.pasting || line.endsWith("\\")) {
+        this.pasted.push(this.pasting ? line : line.slice(0, -1));
+        if (this.terminal) {
+          rl.setPrompt(MORE);
+          rl.prompt();
+        }
+        return;
+      }
+      const text = [...this.pasted.splice(0), line].join("\n");
+      if (this.answer) this.answer({ text, interrupted: false });
+      else this.queued.push(text);
+    });
+    rl.on("history", (history: string[]) => {
+      // readline adds every line it reads. Only a task or command of one line stays, so Up brings back those,
+      // not a "y" or a line of a paste.
+      if (this.keep && !this.pasting && !this.pasted.length && !rl.line.endsWith("\\")) this.history = [...history];
+      else history.splice(0, history.length, ...this.history);
+    });
+    rl.on("SIGINT", () => {
+      const text = [...this.pasted.splice(0), rl.line].join("\n");
+      rl.write(null, { ctrl: true, name: "e" }); // past what was typed, which stays on the screen
+      this.output.write("\n");
+      this.answer?.({ text, interrupted: true });
+      rl.close(); // readline can't empty its line without erasing it: the next read opens a new interface
+    });
+    rl.on("close", () => {
+      this.closed = true;
+      if (this.terminal) this.rl = undefined; // Ctrl+C or Ctrl+D; the history goes on in the next one
+      else this.ended = true;
+      this.pasting = false;
+      this.pasted = [];
+      if (this.answer) this.output.write("\n"); // Ctrl+D, or the input ended, after the prompt
+      this.answer?.(null);
+    });
+    if (this.terminal) {
+      // The terminal marks a paste (see listen), and its lines go with the line after it, so a task and the
+      // error log pasted under it are one message, sent with Enter.
+      const onKey = (_: unknown, key?: readline.Key) => {
+        if (key?.name === "paste-start" || key?.name === "paste-end") this.pasting = key.name === "paste-start";
+      };
+      this.input.on("keypress", onKey);
+      rl.once("close", () => this.input.off("keypress", onKey));
+    }
+    return rl;
+  }
+
+  /** Reads the input, and at a terminal takes it over (raw mode, marked pastes, resizes), only while asking. */
+  private listen(rl: readline.Interface, on: boolean): void {
+    // Once closed (Ctrl+D, or the input ended) it stays paused, and Node 24 throws at pause() and resume().
+    // The terminal still has to be given back.
+    if (!this.closed) {
+      if (on) rl.resume();
+      else rl.pause();
+    }
+    if (!this.terminal) return;
+    this.input.setRawMode(on);
+    this.output.write(on ? "\x1b[?2004h" : "\x1b[?2004l"); // bracketed paste on or off
+    for (const redraw of this.redraws) {
+      this.output.off("resize", redraw);
+      if (on) this.output.on("resize", redraw);
+    }
+  }
+}
+
+let stdin: Input | undefined;
+const userInput = () => (stdin ??= new Input(process.stdin, process.stdout));
+
+async function read(prompt: string, keep: boolean, from: Input): Promise<Entry> {
   freshLine();
   clearStatus();
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const cancel = new AbortController();
-  rl.on("SIGINT", () => cancel.abort()); // Ctrl+C while typing
-  rl.on("close", () => cancel.abort()); // Ctrl+D, or stdin ended
-  try {
-    const answer = await rl.question(prompt, { signal: cancel.signal });
-    atLineStart = true; // the user pressed Enter
-    return answer;
-  } catch {
-    atLineStart = false; // the cursor is still after the prompt
-    return null;
-  } finally {
-    rl.close();
+  const entry = await from.read(prompt, keep);
+  atLineStart = true; // after Enter, or the new line Input starts at Ctrl+C or Ctrl+D
+  return entry;
+}
+
+/** Reads one line from the user (or a paste and the line after it). Returns null on Ctrl+C or Ctrl+D. */
+export async function ask(prompt: string, from = userInput()): Promise<string | null> {
+  const entry = await read(prompt, false, from);
+  return entry && !entry.interrupted ? entry.text : null;
+}
+
+/**
+ * Reads the next task or command at the session's prompt. Ctrl+C drops what was typed; at an empty prompt it
+ * says how to quit, and pressed again there it quits, as Ctrl+D does: null.
+ */
+export async function askTask(prompt: string, from = userInput()): Promise<string | null> {
+  for (let warned = false; ; ) {
+    const entry = await read(prompt, true, from);
+    if (entry && !entry.interrupted) return entry.text;
+    const empty = !entry?.text.trim();
+    if (!entry || (warned && empty)) return null;
+    warned = empty;
+    if (warned) println(dim("To quit, press Ctrl+C again, or Ctrl+D, or type /exit."));
   }
 }

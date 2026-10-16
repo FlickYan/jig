@@ -10,10 +10,10 @@ import { existsSync } from "node:fs";
 import { constants } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, type ToolHooks, type Usage } from "./agent.ts";
+import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
-import { runHooks } from "./hooks.ts";
+import { runHooks, runStopHooks } from "./hooks.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
@@ -33,7 +33,7 @@ import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
 import { type Restored, Snapshots } from "./snapshots.ts";
-import { type Share, Stats } from "./stats.ts";
+import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
 import { OutputFiles } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
@@ -67,11 +67,16 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>     most model calls per task (default: 50)
+      --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
+                          included, and --check and --reviewer don't start in its last quarter (default: none)
+      --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
+                          changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents      leave out the subagent tool
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
                           (from ${TOOL_NAMES.join(", ")}; default: all)
-      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far, and how often
+                          each of jig's mechanisms fired (retries, compactions, the wrap-up, ...)
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
@@ -93,11 +98,40 @@ jig sessions list | export lists sessions, or exports them as fine-tuning data (
 jig review reviews an agent's finished work by running it, in a copy (jig review --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
-commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
-loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
+commands, hooks around tool calls and before a task ends, and MCP servers. A project's settings can
+only run programs or loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without
+asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
-Ctrl+C stops the current task (press it again to force quit).`;
+Ctrl+C stops the current task (press it again to force quit). At the prompt it clears the line, and
+pressed twice on an empty one it quits. A paste of several lines is one message, sent with Enter, and a
+line ending in \\ goes on in the next. A session can also read its tasks and /commands from a pipe.
+
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
+of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
+declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
+made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, 7 when it reached --time-limit,
+and 130 when interrupted.`;
+
+/** How a task ended: as the loop stopped, or "error" if it failed. */
+type Ending = RunResult["stop"] | "error";
+
+/**
+ * A one-shot run's exit code, by how its task ended, so a script can tell work the model finished from a
+ * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
+ * Any other ending, a failure included, is 1.
+ */
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, interrupted: 130 };
+
+// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
+const MAX_UNAPPROVED = 3;
+
+// With --time-limit, the share of it, at the end, in which --check and the reviewer no longer start: what is
+// left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts into their time
+// limit, against 4 without it.
+const CHECK_SHARE = 0.25;
+// What a command, a hook or a tool call stopped at --time-limit is said to have been stopped by.
+const TIME_UP = "the time limit (--time-limit) was reached";
 
 const SUBAGENT_MAX_STEPS = 30;
 // A review reads what the task names and the work touched, not the whole project, and the task's clock runs.
@@ -188,6 +222,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       cwd: { type: "string", short: "C", default: "." },
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      "time-limit": { type: "string" },
+      "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
       tools: { type: "string" },
@@ -229,6 +265,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
   if (!Number.isInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer");
+  const timeLimit = values["time-limit"] === undefined ? undefined : Number(values["time-limit"]);
+  if (timeLimit !== undefined && !(timeLimit > 0 && timeLimit * 1000 < 2 ** 31)) throw new Error("--time-limit must be a positive number of seconds, under 24 days");
   const compactAt = Number(values["compact-at"]);
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
@@ -236,6 +274,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
   const toolNames = values.tools === undefined ? undefined : parseToolList(values.tools);
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
+  // Every model and loop below counts its mechanisms in the stats file as they fire, subagents' included.
+  const count = stats && ((event: Mechanism) => stats.count(event));
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
   const settings = await loadSettings(cwd);
@@ -271,6 +311,15 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const deny = [...settings.deny, ...[...mcp.renamed].filter(([, { was }]) => settings.deny.includes(was)).map(([name]) => name)];
   const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs });
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd, mcp.renamed) : undefined;
+  // The files the task changed, for the Stop hooks: by the snapshot taken before it, while /undo works.
+  const changedFiles = () => {
+    try {
+      return snapshots?.changed();
+    } catch {
+      return undefined;
+    }
+  };
+  const stopHooks = settings.hooks.some((hook) => hook.event === "Stop") ? stopHookRunner(settings.hooks, cwd, changedFiles) : undefined;
   let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
   // Memory: notes from earlier sessions (--no-memory leaves them out, for a with-and-without comparison).
   let memories = values.memory ? loadMemories(cwd) : [];
@@ -295,7 +344,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
-    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
+    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true);
   };
   const subagents: SubagentSetup = {
     callModel: newSubagentModel(),
@@ -311,6 +360,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     },
     sandbox,
     hooks,
+    count,
     ui: ui.subagentUI,
   };
   // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
@@ -319,7 +369,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (!reviewing) return undefined;
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     const api = (values.api ?? defaultApi(reviewing)) as Api;
-    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools }), true, { kind: "reviewed", model: reviewing });
+    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true, { kind: "reviewed", model: reviewing });
     return reviewer(reviewing, { ...subagents, tools: researchTools, callModel, maxSteps: REVIEW_MAX_STEPS });
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
@@ -351,9 +401,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // The same for the model that takes over, so the conversation carries over whole.
     const stronger = values.escalate;
     escalation = stronger
-      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, { kind: "escalated", model: stronger }) }
+      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools, count }), false, { kind: "escalated", model: stronger }) }
       : undefined;
-    return metered(createModel({ model, effort, api, baseURL, system, tools }));
+    return metered(createModel({ model, effort, api, baseURL, system, tools, count }));
   };
   // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
   const fromLast = values.continue || skillsVerb === "learn" || !!memoryVerb;
@@ -364,6 +414,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
+  let unapproved = 0; // the running task's calls that needed approval, with no terminal to ask
   // Things the model should know before the next request, like an /undo. Plan mode is announced when it
   // starts and ends: the system prompt can't change mid-conversation, so this rides on the user's message.
   const notes: string[] = [];
@@ -373,7 +424,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const decision = permissions.decide(tool, input);
     if (decision === "allow") return null;
     if (decision !== "ask") return decision.refuse;
-    if (!process.stdin.isTTY) return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    if (!process.stdin.isTTY) {
+      // The model would try call after call that can't run until its steps ran out. It may manage without
+      // one or two (a check it can skip), so the task stops at the third.
+      count?.("call.unapproved");
+      if (++unapproved >= MAX_UNAPPROVED) task?.abort();
+      return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    }
     const always = permissions.alwaysLabel(tool, input);
     const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
     if (answer === null) {
@@ -401,14 +458,18 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     sandbox,
     outputs,
     hooks,
+    // Not the subagents' or the reviewer's: their answers don't end the task.
+    stopHooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
+    wrapUp: values["wrap-up"],
+    count,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
   conversation.describe(context);
 
-  /** Runs `work` as the current task, so Ctrl+C stops it. */
-  async function asTask(work: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+  /** Runs `work` as the current task, so Ctrl+C stops it. Resolves to what `work` does, or to how it failed. */
+  async function asTask<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T | "interrupted" | "error"> {
     const controller = (task = new AbortController());
     const onSigint = () => {
       if (controller.signal.aborted) process.exit(130); // second Ctrl+C: give up waiting
@@ -417,19 +478,22 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     };
     process.on("SIGINT", onSigint);
     try {
-      await work(controller.signal);
-      return true;
+      return await work(controller.signal);
     } catch (err) {
       const message = controller.signal.aborted ? "Interrupted." : describeError(err);
       ui.error(message);
       stats?.failed(message);
-      return false;
+      return controller.signal.aborted ? "interrupted" : "error";
     } finally {
       process.off("SIGINT", onSigint);
     }
   }
 
-  function runTask(text: string, label = text): Promise<boolean> {
+  function runTask(text: string, label = text): Promise<Ending> {
+    // --time-limit counts from here, the snapshot included.
+    const begun = Date.now();
+    const deadline = timeLimit === undefined ? undefined : begun + timeLimit * 1000;
+    const checkUntil = timeLimit === undefined ? undefined : begun + timeLimit * 1000 * (1 - CHECK_SHARE);
     if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
       modelKnowsPlanMode = permissions.mode === "plan";
       notes.push(
@@ -442,23 +506,32 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
+    unapproved = 0;
     const started = Date.now();
     return asTask(async (signal) => {
-      const result = await runAgent(conversation, agent, signal);
+      // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
+      // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
+      const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
+      const result = await runAgent(conversation, { ...agent, checkUntil }, signal).finally(() => clearTimeout(timer));
+      // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
+      // after a Ctrl+C the task can still be stopping when the deadline passes.
+      if (result.stop === "interrupted" && unapproved >= MAX_UNAPPROVED) result.stop = "unapproved";
+      if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
+      return result.stop;
     });
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
-  function runSkill(skill: Skill, task: string): Promise<boolean> {
+  function runSkill(skill: Skill, task: string): Promise<Ending> {
     const content = loadSkill(skill);
     conversation.pin(`skill:${skill.name}`, content);
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
 
   /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
-  function runSkillWriting(task: string, label: string): Promise<boolean> {
+  function runSkillWriting(task: string, label: string): Promise<Ending> {
     const writer = skills.find((skill) => skill.name === "skill-writer");
     if (!writer) return runTask(task, label);
     const content = loadSkill(writer);
@@ -582,7 +655,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
     const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText, memoryVerb ? `jig memory reflect ${given}` : taskText);
-    if (!(await run)) process.exitCode = 1;
+    process.exitCode = EXIT_CODES[await run] ?? 1;
     return;
   }
 
@@ -601,7 +674,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
     ui.println();
-    const line = await ui.ask(ui.bold("> "));
+    const line = await ui.askTask(ui.bold("> "));
     if (line === null) break;
     const input = line.trim();
     if (input.startsWith("/")) {
@@ -618,7 +691,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
  * once the user trusts them, which is asked again whenever the file changes. Deny rules always apply.
  */
 async function loadSettings(cwd: string): Promise<Settings> {
-  const { user, project } = readSettings(cwd);
+  const { user, project, warnings } = readSettings(cwd);
+  for (const warning of warnings) ui.notice(warning);
   if (!project) return user;
   const asks = needsTrust(project.settings);
   const file = relative(cwd, project.path);
@@ -639,14 +713,24 @@ async function loadSettings(cwd: string): Promise<Settings> {
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
 function hookRunner(hooks: Hook[], cwd: string, renamed: McpServers["renamed"]): ToolHooks {
-  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2]) => {
-    const outcome = await runHooks(hooks, event, call, cwd, renamed.get(call.tool)?.was);
+  const run = async (event: Exclude<HookEvent, "Stop">, call: Parameters<typeof runHooks>[2], signal?: AbortSignal) => {
+    const outcome = await runHooks(hooks, event, call, cwd, { signal, was: renamed.get(call.tool)?.was });
     for (const warning of outcome.warnings) ui.notice(warning);
     return outcome;
   };
   return {
-    before: async (tool, input) => (await run("PreToolUse", { tool, input })).block ?? null,
-    after: async (tool, input, output) => (await run("PostToolUse", { tool, input, output })).feedback ?? null,
+    before: async (tool, input, signal) => (await run("PreToolUse", { tool, input }, signal)).block ?? null,
+    after: async (tool, input, output, signal) => (await run("PostToolUse", { tool, input, output }, signal)).feedback ?? null,
+  };
+}
+
+/** The settings' Stop hooks, before a task ends. Likewise, a broken one is reported and otherwise ignored. */
+function stopHookRunner(hooks: Hook[], cwd: string, changedFiles: () => string[] | undefined): AgentOptions["stopHooks"] {
+  return async ({ task, answer, active, session }, signal) => {
+    const stop = { task, last_message: answer, stop_hook_active: active, session_path: session, changed_files: changedFiles() };
+    const outcome = await runStopHooks(hooks, stop, cwd, { signal });
+    for (const warning of outcome.warnings) ui.notice(warning);
+    return outcome.block ?? null;
   };
 }
 
@@ -690,8 +774,13 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     model_context_window_exceeded: "The conversation no longer fits in the context window. Use /compact or /reset.",
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
+    loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
+    time_limit: "Stopped at the time limit (--time-limit).",
+    unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
+  // The model's wrap-up at the step limit wasn't streamed (it is asked for like a summary), so it is printed here.
+  if (result.stop === "max_steps" && result.text.trim()) ui.println(result.text.trim());
   if (note) ui.notice(note);
   // The benchmark runner (bench/run.ts) reads these lines, so keep their format.
   const tokens = (usage: Usage) => `${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`;

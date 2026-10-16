@@ -10,6 +10,7 @@ import { globTool } from "./glob.ts";
 import { grepTool } from "./grep.ts";
 import { readTool } from "./read.ts";
 import type { Sandbox } from "../sandbox.ts";
+import type { Mechanism } from "../stats.ts";
 import type { FileVersions } from "./util.ts";
 import { writeTool } from "./write.ts";
 
@@ -33,6 +34,8 @@ export interface ToolContext {
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */
   usage?: Usage;
+  /** Counts a mechanism that fired, as the loop does (see stats.ts): bash cuts a long output itself. */
+  count?(event: Mechanism): void;
 }
 
 export type ToolInput = Record<string, unknown>;

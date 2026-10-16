@@ -86,20 +86,39 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most model calls per task (default: 50)
+      --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
+      --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
       --tools <names>   give the model only some of jig's tools, e.g. --tools bash
       --hide-skill <name>  leave a skill out, as if it weren't installed (repeatable)
       --no-memory       leave out what jig remembers from earlier sessions
       --system-prompt <text>  use this system prompt instead of jig's own
-      --stats <file>    keep a JSON file with the model calls, tokens and tool calls so far
+      --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
 ```
 
 In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
 `/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens sent and
-received (subagents included), and how many input tokens came from the prompt cache.
+received (subagents included), and how many input tokens came from the prompt cache. Up brings back earlier
+tasks; a paste of several lines is one message, sent with Enter, and a line ending in `\` goes on in the
+next. Ctrl+C stops a task, and at the prompt clears the line; on an empty prompt it says how to quit, and
+pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line.
+
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
+of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
+tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
+same tool calls (see below), 7 at `--time-limit`, and 130 on Ctrl+C. So
+`jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
+
+`--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
+reason, steps, model calls, tokens (subagents' included), tool calls by name, seconds, and `events`, how
+often each of jig's mechanisms fired: retries (`retry.api`, `retry.brokeOff`, `retry.quiet`), compactions,
+the model asked again after a reply that wasn't an answer, calls that didn't run as asked (the permission
+policy's refusals among them, `call.refused`), hooks' blocks, `--check` and the reviewer (or either one
+skipped for time), `--escalate`, the stop for repeating and the wrap-up (`src/stats.ts` lists them).
+So a change to one can be seen to run at all, which in milestone 28 only reading the sessions showed.
 
 ## What it does
 
@@ -136,6 +155,8 @@ received (subagents included), and how many input tokens came from the prompt ca
   `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
   When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session. On a
   file change it approves file changes only: commands still ask, even ones the sandbox contains.
+  With no terminal to ask in (a script, CI), such a call is refused instead, and the third in a task
+  stops it: `--yes`, or allow rules, let them run.
 - **Rules.** `~/.jig/settings.json` and the project's `.jig/settings.json` can list commands to always
   allow or always refuse:
 
@@ -164,7 +185,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
   (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
   runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key
-  into the conversation and the logs, where a prompt injection could also reach it.
+  into the conversation and the logs, where a prompt injection could also reach it. Hooks don't get them either.
 - **Prompt injection.** The system prompt tells the model that text in files and command output is data,
   not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
   are what protect you when that isn't enough.
@@ -177,15 +198,24 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **Sessions.** Every message is appended to a JSON Lines file in `~/.jig/sessions/<project>/` the moment
   it exists, so nothing is lost on a crash or Ctrl+C. `jig -c` continues the most recent session,
   `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results
-  are answered as interrupted when a session is loaded, so the history is always valid.
+  are answered as interrupted when a session is loaded, so the history is always valid. Each line says
+  when it was written (`at`); a reply, how long its model call took, retries included (`ms`); and tool
+  results, how long each call took (`toolMs`), in milliseconds, so a session shows where the time went.
   A project's directory there, as in `~/.jig/memory/` and `~/.jig/snapshots/`, is named after its real path
   and a short hash of it: a symlink to a project shares its sessions, and `/a/my-app` and `/a/my/app` no
   longer do. The sessions, memories and snapshots under the older name, the path alone, move to the new
   one together the first time, if the sessions saved there all started in this project; if there are
   none, or one started in another project, they all stay where they were.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
-  estimated for tool output since). Past `--compact-at` it asks the model to summarize the conversation and
-  continues from that summary alone; `/compact` does it on demand and `/context` shows the numbers.
+  estimated for tool output since, and from the text's length when a server reports no usage). Past
+  `--compact-at` it asks the model to summarize the conversation and continues from that summary;
+  `/compact` does it on demand and `/context` shows the numbers. Mid-task, the task's own words and a
+  list of the file changes and commands so far follow the summary. When the API rejects a request as too
+  long for the model, jig compacts and asks again, once (not with `--compact-at 0`). The conversation is
+  then too long to summarize as well, so the summary is written from a copy with the tool output cut to
+  its start and end, the oldest first (`/compact` does the same when the API rejects its request). Past
+  `--compact-at`, a summary that fails doesn't end the task: it goes on as it is, and compaction is tried
+  again 3 steps later. After the API's rejection it does, since the conversation can't go on as it is.
 - **Long output.** Tool output over 40,000 characters (about 10k tokens) is cut from the middle, keeping
   its start and its end (errors and test summaries tend to be at the end). A command's whole output then
   goes to a file in the temp directory that only you can read, and the model is told where, so it can
@@ -264,18 +294,30 @@ received (subagents included), and how many input tokens came from the prompt ca
   come out with the same one (servers `db.prod` and `db prod`, say). Then each gets a short hash of its
   server's and its own name added, jig says so, and `/mcp` shows which server each is from; a deny rule
   or hook naming the name they shared applies to each.
-- **Hooks.** Commands that run around tool calls, configured like Claude Code's:
+- **Hooks.** Commands that run around tool calls, and before a task ends, configured like Claude Code's:
 
   ```json
   { "hooks": {
       "PreToolUse":  [{ "matcher": "bash", "command": "./scripts/check-command.sh" }],
-      "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }] } }
+      "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }],
+      "Stop":        [{ "command": "npm test 1>&2 || exit 2" }] } }
   ```
 
-  A hook gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
+  `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
+  gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
   stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
-  and otherwise ignored.
+  and otherwise ignored; a hook still running after 60 seconds is stopped, with everything it started.
+
+  A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
+  done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
+  task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
+  already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
+  Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task going: the model is
+  told the stderr or the reason, and works on. A task's Stop hooks send it back 3 times at most; after
+  that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
+  too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
+  doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
   touch) to a fresh agent loop with a context of its own. It gets the tools that only look, under `plan`
   mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the
@@ -355,22 +397,43 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/proposals.ts`](src/proposals.ts), [`src/secrets.ts`](src/secrets.ts) | Putting a proposal to the user; what jig refuses to write down because it looks like a secret |
 | [`skills/`](skills) | The skills that come with jig: `skill-writer`, which `/skills new` and `/learn` follow |
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
-| [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls |
+| [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls, and before a task ends |
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
 | [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments on Linux |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
-| [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
+| [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
-| [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens and tool calls, kept up to date as a task runs; the price table |
+| [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
-check its work against the task, and stops at the next such reply. Also on `--max-steps` model calls, on
-Ctrl+C, and when a safety classifier declines the request.
+check its work against the task, if a step is left for that, and stops at the next such reply. Also on
+`--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
+and none starts after; nor do `--check` and `--reviewer` in the last quarter of the time, since what they
+find might not get done), on
+Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
+answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
+or only thinking): it stays out of the history, and the model is asked once to go on.
+A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
+same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
+its step limit), and a call identical to an earlier one in the same reply, with only reads between them,
+isn't run (its result says which call it repeats).
+At `--max-steps`, jig makes one more call, in which the model can't call tools, asking what it changed,
+what it verified and how, and what is left, and prints the reply: the model's own report, not evidence.
+Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
+and `jig skills test` do, so that their steps and costs compare with earlier runs.
+A `Stop` hook can send the model back to work from its final answer, after `--check` and the reviewer,
+with a step left and 3 times a task at most (see Hooks).
+
+**What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
+5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at
+most, with a notice each time. Keep-alive comments, which DeepSeek sends while it holds a request under
+load, aren't parts. `JIG_STREAM_IDLE_MS` sets the 5 minutes, in milliseconds (0: no limit), for a model
+that can go longer than that without output.
 
 ## Results
 
@@ -455,8 +518,9 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 ```bash
 npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, memory, MCP
                     # (against a hand-written server), hooks, subagents, running headless (--add-dir,
-                    # --stats, a hung API), benchmark metrics, the evolve referee and the copies candidates
-                    # work in, exporting sessions, and the loop: no API calls
+                    # --stats, a hung API, a session piped in), the prompt (pastes, history, Ctrl+C),
+                    # benchmark metrics, the evolve referee and the copies candidates work in, exporting
+                    # sessions, and the loop: no API calls
 npm run typecheck
 ```
 

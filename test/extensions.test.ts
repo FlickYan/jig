@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions, type Usage } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
-import { runHooks } from "../src/hooks.ts";
+import { runHooks, runStopHooks } from "../src/hooks.ts";
 import { connectMcpServers, type McpServers } from "../src/mcp.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
@@ -299,6 +300,57 @@ describe("hooks", () => {
     }
   });
 
+  it('takes "*" for every tool, as Claude Code does', async () => {
+    const outcome = await runHooks([{ event: "PreToolUse", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(outcome.block, "the hook exited with code 2");
+  });
+
+  it("keeps jig's API keys out of a hook's environment", async () => {
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "sk-secret";
+    try {
+      const outcome = await runHooks(preEdit('echo "key: ${ANTHROPIC_API_KEY:-none}" >&2; exit 2'), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+      assert.equal(outcome.block, "key: none");
+    } finally {
+      process.env = env;
+    }
+  });
+
+  it("stops a hook that runs too long, or on Ctrl+C, with everything it started", async () => {
+    // The job in the background holds stderr open, so jig used to wait for it whatever the timeout.
+    const hooks = preEdit(`(sleep 0.5; touch "$JIG_PROJECT_DIR/survived") & sleep 30`);
+    const call = { tool: "edit_file", input: {} };
+    let started = Date.now();
+    const timedOut = await runHooks(hooks, "PreToolUse", call, dir, { timeout: 200 });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.match(timedOut.warnings.join(), /\(killed: it timed out after 0.2s\)/);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    started = Date.now();
+    // Two of them: after Ctrl+C the next hook doesn't start, since nothing could stop it once it had.
+    const interrupted = await runHooks([...hooks, ...hooks], "PreToolUse", call, dir, { signal: controller.signal });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.equal(interrupted.warnings.length, 1, "the second hook never started");
+    assert.match(interrupted.warnings[0], /\(killed: the user interrupted it\)/);
+    await new Promise((done) => setTimeout(done, 1000));
+    assert.ok(!existsSync(join(dir, "survived")), "the background jobs were stopped too");
+  });
+
+  it("doesn't wait for a job a hook leaves running in the background", async () => {
+    const started = Date.now();
+    const outcome = await runHooks(preEdit(`sleep 5 & echo "not now" >&2; exit 2`), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+    assert.equal(outcome.block, "not now");
+    assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
+  });
+
+  it("doesn't even wait a moment for a job that holds only a tool hook's stdout, which nothing reads", async () => {
+    // Waiting for a background job's last words takes a second; a tool hook's stdout has none to give.
+    const started = Date.now();
+    const outcome = await runHooks([{ event: "PostToolUse", command: "sleep 5 2>/dev/null &" }], "PostToolUse", { tool: "edit_file", input: {}, output: "ok" }, dir);
+    assert.deepEqual(outcome, { warnings: [] });
+    assert.ok(Date.now() - started < 800, `${Date.now() - started} ms`);
+  });
+
   it("passes on PostToolUse feedback, and only warns about a hook that fails", async () => {
     const hooks = [
       { event: "PostToolUse" as const, command: "echo 'lint: missing semicolon' >&2; exit 2" },
@@ -311,6 +363,32 @@ describe("hooks", () => {
     const pre = await runHooks(hooks, "PreToolUse", { tool: "bash", input: {} }, dir);
     assert.equal(pre.block, undefined);
     assert.match(pre.warnings.join(), /failed: broken/);
+  });
+
+  const stop = { task: "fix the tests", last_message: "Done.", stop_hook_active: false, changed_files: ["a.py"] };
+
+  it("keeps the task from ending when a Stop hook exits with code 2 or prints a block decision, and tells it the task", async () => {
+    const hooks = [
+      { event: "Stop" as const, command: `cat > "$JIG_PROJECT_DIR/stop.json"; echo "$JIG_EVENT: 2 tests failed" >&2; exit 2` },
+      { event: "Stop" as const, command: `echo '{"decision": "block", "reason": "lint: a.py:3 unused import"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'` },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [], block: "Stop: 2 tests failed\nlint: a.py:3 unused import\nthe hook gave no reason" });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "stop.json"), "utf8")), { event: "Stop", ...stop, cwd: dir });
+  });
+
+  it("lets the task end when the Stop hooks pass, or fail otherwise, and runs them only then", async () => {
+    const hooks = [
+      { event: "Stop" as const, matcher: "bash", command: "echo 'all 9 tests passed'" }, // output that isn't a decision, and a matcher, which doesn't apply
+      { event: "Stop" as const, command: `echo '{"decision": "approve"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'; exit 1` },
+      { event: "PreToolUse" as const, command: "exit 2" },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [`Hook "echo '{"decision": "block"}'; exit 1" failed: the hook exited with code 1`] });
+    const pre = await runHooks([{ event: "Stop", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(pre.block, undefined, "a Stop hook doesn't run around tool calls");
   });
 
   it("are applied around tool calls by the agent loop", async () => {
@@ -365,6 +443,15 @@ describe("subagents", () => {
     assert.equal(last.role, "user");
     assert.match(JSON.stringify(last.content), /tool_result.*run out of steps/, "the request rides on the tool results");
   });
+
+  it("report what they found when they are stopped for repeating themselves", async () => {
+    const seen: MessageParam[][] = [];
+    const again = Array.from({ length: 8 }, (_, i) => reply([toolUse(`s${i}`, "glob", { pattern: "*" })]));
+    const answer = await subagentTool(setup(fakeModel(again, seen), 10)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: loop.)");
+    assert.equal(seen.length, 6, "five steps, then the request for what it found");
+  });
 });
 
 describe("parallel tool calls", () => {
@@ -388,7 +475,8 @@ describe("parallel tool calls", () => {
   it("runs calls that only read at the same time, and the rest in order", async () => {
     for (const [kind, expected] of [["read", 3], ["edit", 1]] as const) {
       const { tool, stats } = slowTool(kind);
-      const calls = [toolUse("a", "slow", {}), toolUse("b", "slow", {}), toolUse("c", "slow", {})];
+      // Different inputs: a call identical to an earlier one in the reply wouldn't run.
+      const calls = [toolUse("a", "slow", { n: 1 }), toolUse("b", "slow", { n: 2 }), toolUse("c", "slow", { n: 3 })];
       const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
       await runAgent(conversation, agentOptions(fakeModel([reply(calls), reply([text("Done.")])]), { tools: [tool] }));
       assert.equal(stats.most, expected, kind);

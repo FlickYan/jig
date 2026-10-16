@@ -19,9 +19,10 @@ export function reviewer(model: string, setup: SubagentSetup): Reviewer {
       const conversation = new Conversation(undefined, [{ role: "user", content: reviewPrompt(task, answer, workLog(messages)) }]);
       const result = await runAgent(conversation, { ...setup, ui: setup.ui("review") }, signal);
       let text = result.stop === "end_turn" ? result.text : "";
-      // Out of steps, it is asked for its verdict on what it has checked (in milestone 24, three reviews in
-      // five used their steps up and gave none). Cut off for any other reason, it gives none.
-      if (result.stop === "max_steps") {
+      // Out of steps, or stopped for repeating itself, it is asked for its verdict on what it has checked (in
+      // milestone 24, three reviews in five used their steps up and gave none). Cut off for any other reason,
+      // it gives none.
+      if (result.stop === "max_steps" || result.stop === "loop") {
         const { message } = await setup.callModel(withRequest(conversation.messages, OUT_OF_STEPS), signal, { summarize: true });
         addUsage(result.usage, message.usage);
         text = message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
@@ -60,8 +61,20 @@ export function verdictOf(text: string): { verdict: ReviewVerdict; problems?: st
   if (!header) return { verdict: "none" };
   if (header[1] === "APPROVED") return { verdict: "approved" };
   const problems = text.slice(header.index + header[0].length).trim();
+  const first = problems.split("\n")[0];
+  // "PROBLEMS: None." and the like: a later APPROVED or PROBLEMS line, as a checklist has, gives the verdict.
+  // Without one, the work is approved only if that first line says nothing more: "None of the tests pass"
+  // is a problem.
+  if (NONE.test(first)) {
+    const later = verdictOf(problems.slice(first.length));
+    if (later.verdict !== "none") return later;
+    if (NO_PROBLEMS.test(first)) return { verdict: "approved" };
+  }
   return problems ? { verdict: "problems", problems } : { verdict: "none" };
 }
+
+const NONE = /^\W*(?:none|no (?:problems|issues)|nothing|n\/a)\b/i;
+const NO_PROBLEMS = /^\W*(?:none|no (?:problems|issues)|nothing|n\/a)(?: found| to report)?\W*$/i;
 
 const OUT_OF_STEPS = "You have run out of steps. Don't call any more tools: give your verdict now, on what you have checked, starting with APPROVED or PROBLEMS: as asked.";
 
