@@ -123,7 +123,9 @@ received (subagents included), and how many input tokens came from the prompt ca
   as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
   git directory's `config` or hooks, or a `.git` file or `commondir` that tells git where they are, which
   could make git run programs outside the sandbox. The git that `grep` and `glob` run to list files
-  runs with `core.fsmonitor` and hooks turned off, and without jig's API keys.
+  runs with `core.fsmonitor` and hooks turned off, and without jig's API keys. `grep` matches in a worker
+  thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially
+  long on some lines.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,

@@ -2,7 +2,7 @@
 // ignores. Paths come back relative to the project, ready for read_file.
 
 import { relative, resolve } from "node:path";
-import { globToRegExp, listFiles } from "./files.ts";
+import { firstVisible, globToRegExp, listFiles, relativeGlob } from "./files.ts";
 import type { Tool } from "./index.ts";
 import { resolveInRoot } from "./util.ts";
 
@@ -31,13 +31,17 @@ export const globTool: Tool = {
   async run(input, { cwd, dirs, hidden }) {
     const { pattern, path = "." } = input as { pattern: string; path?: string };
     const base = resolveInRoot(cwd, path, dirs);
-    const regex = globToRegExp(pattern);
+    const regex = globToRegExp(relativeGlob(pattern, base));
     // The pattern is relative to `path`; results are relative to the project, ready for read_file.
-    const matches = (await listFiles(cwd, path, dirs, hidden)).filter((file) => regex.test(relative(base, resolve(cwd, file))));
-    if (matches.length === 0) return "No files found.";
-    const shown = matches.slice(0, MAX_RESULTS);
-    if (matches.length > shown.length) {
-      shown.push(`\n(Showed ${shown.length} of ${matches.length} files. Use a narrower pattern or path.)`);
+    const { files, capped } = await listFiles(cwd, path, dirs, hidden);
+    const matches = files.filter((file) => regex.test(relative(base, resolve(cwd, file))));
+    const { files: shown, total } = await firstVisible(cwd, matches, MAX_RESULTS, hidden);
+    // Outside git the listing stops at a limit, and what wasn't found there may still exist.
+    const unlisted = capped && `the first ${files.length} files: the listing stops there`;
+    if (shown.length === 0) return unlisted ? `No files found in ${unlisted}. Narrow the search with path.` : "No files found.";
+    const notes = [total > shown.length && `Showed ${shown.length} of ${total} files.`, unlisted && `Looked only at ${unlisted}.`];
+    if (notes.some(Boolean)) {
+      shown.push(`\n(${notes.filter(Boolean).join(" ")} ${unlisted ? "Narrow the search with path." : "Use a narrower pattern or path."})`);
     }
     return shown.join("\n");
   },

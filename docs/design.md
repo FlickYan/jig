@@ -21,7 +21,15 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   CRLF endings.
 - **Search that respects `.gitignore`.** `grep` and `glob` list files with `git ls-files` when the project
   is a git repository (so ignored files are skipped for free), and walk the directory otherwise. They are
-  plain Node, with no dependency on ripgrep being installed.
+  plain Node, with no dependency on ripgrep being installed. Everything git tracks is listed, and a nested
+  repository (a submodule, a clone) through its own git; the built-in list of directories not worth
+  searching (`node_modules`, `build`, `target`, ...) is only for what git doesn't track. A search that
+  doesn't look at every file says so: `grep` reads 20,000 files at most, the first by name, and a walk
+  outside git stops there too. The cut used to be silent: in a large repository, grep said "No matches."
+  for code that was there. `grep` matches in a worker thread that Ctrl+C stops, as do 30 seconds on one
+  file: a regular expression can take exponentially long on some lines, and in jig's own thread nothing
+  can stop it. The limit is for one file because a whole search can take that long just reading, from a
+  cold disk in a fresh container.
 - **Streamed tool input is checked twice.** For Claude, tool input streams as it is generated
   (`eager_input_streaming`), so the API no longer validates it. The SDK's lenient parser can turn
   `"say "hi" now"` into `"say "`, which would silently write a truncated file. jig re-parses the raw JSON
