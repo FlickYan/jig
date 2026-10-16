@@ -126,6 +126,10 @@ received (subagents included), and how many input tokens came from the prompt ca
   runs with `core.fsmonitor` and hooks turned off, and without jig's API keys. `grep` matches in a worker
   thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially
   long on some lines.
+  `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or UTF-16 file the model is told to
+  use a command, and `read_file` says when what it shows isn't UTF-8. `read_file` reads a file a chunk at a
+  time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. A file over
+  537 MB, V8's longest string, is too big for `edit_file` and `write_file`, and they say to use a command.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,

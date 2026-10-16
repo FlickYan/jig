@@ -2,9 +2,9 @@
 // points at the nearest thing the file does hold (leftover line numbers, other indentation, a first line
 // that matches), so the model can fix its next try in one step. A file's Windows line endings are kept.
 
-import { readFile, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
-import { assertFile, lineCount, numbered, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
+import { assertFile, lineCount, numbered, readUTF8, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
 
 export const editTool: Tool = {
   definition: {
@@ -43,7 +43,7 @@ export const editTool: Tool = {
     // No read-before-edit check here, unlike write_file: an exact, unique match of old_string already
     // shows the model knows the text it replaces, and can't overwrite anything it hasn't seen. In the
     // benchmark the check refused 22 edits across five runs, and every refusal was a false alarm.
-    const text = await readFile(file, "utf8");
+    const text = await readUTF8(file, path);
 
     // The model writes \n line endings. In a file that uses \r\n, match in either style, and always write
     // new lines the file's way (a one-line old_string matches as-is, but its replacement can add lines).

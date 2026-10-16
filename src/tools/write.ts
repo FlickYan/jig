@@ -1,10 +1,10 @@
 // write_file: creates a file, or replaces one whole. A file it overwrites must have been read as it is now
 // (FileVersions), so the model can't replace what it hasn't seen; a file's Windows line endings are kept.
 
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Tool } from "./index.ts";
-import { lineCount, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
+import { lineCount, readUTF8, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
 
 export const writeTool: Tool = {
   definition: {
@@ -35,8 +35,10 @@ export const writeTool: Tool = {
     let note = "";
     if (existing) {
       await versions.assertCurrent(file, path);
+      // A file that isn't UTF-8 is refused: the model saw its other characters as �, and would write them so.
+      const current = await readUTF8(file, path);
       // Keep a file's Windows line endings when the new content doesn't choose any itself.
-      if (!content.includes("\r\n") && usesCRLF(await readFile(file, "utf8"))) {
+      if (!content.includes("\r\n") && usesCRLF(current)) {
         text = toCRLF(content);
         note = ", kept its CRLF line endings";
       }

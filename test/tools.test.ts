@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, symlink, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
@@ -60,6 +61,29 @@ describe("read_file", () => {
   it("refuses paths outside the working directory", async () => {
     await assert.rejects(read("../secret.txt"), /outside the working directory/);
     await assert.rejects(read("/etc/hosts"), /outside the working directory/);
+  });
+
+  it("reads a page of a huge file without loading the whole file", async () => {
+    // A sparse gigabyte, text at the start: past the longest string V8 can make, and half a 2 GB container.
+    await writeFile(join(cwd, "huge.log"), Array.from({ length: 2000 }, (_, i) => `line ${i + 1}\n`).join(""));
+    await setSize(join(cwd, "huge.log"), 2 ** 30);
+    const rss = process.memoryUsage().rss;
+    const out = await read("huge.log", { offset: 2, limit: 3 });
+    assert.ok(process.memoryUsage().rss - rss < 100e6, "it keeps only a chunk and the page in memory");
+    assert.equal(out, "     2\tline 2\n     3\tline 3\n     4\tline 4\n\n(Showed lines 2-4 of at least 2001 (the file is 1074 MB, too big to count to the end). Use offset=5 to continue.)");
+  });
+
+  it("counts all of a huge file when the page ends at its end", async () => {
+    // Past the 50 MB counted once the page is full, but the page took the read to the end: the count is exact.
+    await writeFile(join(cwd, "tail.log"), Array.from({ length: 2000 }, (_, i) => `line ${i + 1}\n`).join(""));
+    await setSize(join(cwd, "tail.log"), 2 ** 26);
+    await appendFile(join(cwd, "tail.log"), "\nlast\n");
+    assert.equal(await read("tail.log", { offset: 2002, limit: 1 }), "  2002\tlast\n");
+  });
+
+  it("cuts long lines, even in the middle of a character", async () => {
+    await writeFile(join(cwd, "min.js"), `${"€".repeat(100_000)}\r\nend\n`);
+    assert.equal(await read("min.js"), `     1\t${"€".repeat(2000)}… [line truncated]\n     2\tend\n`);
   });
 });
 
@@ -144,6 +168,44 @@ describe("edit_file", () => {
     await assert.rejects(edit("if x:\n    return 1", "if x:\n    return 3", "code.py"), /Lines 2-3 match it except for whitespace/);
     await assert.rejects(edit("     2\t    if x:", "y", "code.py"), /line numbers, which read_file only adds/);
     await assert.rejects(edit("def f():\n    return 9", "z", "code.py"), /first line matches line 1/);
+  });
+
+  it("refuses a file too big to hold as text, as write_file does, before reading it", async () => {
+    // Sparse, with text at the start. Read whole, it can't become a string, which once got it called not UTF-8.
+    await writeFile(join(cwd, "app.log"), Array.from({ length: 2000 }, (_, i) => `line ${i + 1}\n`).join(""));
+    await setSize(join(cwd, "app.log"), constants.MAX_STRING_LENGTH + 1);
+    await read("app.log", { limit: 1 });
+    await assert.rejects(edit("line 1\n", "line one\n", "app.log"), /^Error: app\.log is 537 MB, too big .*bash/);
+    await assert.rejects(write("app.log", "line one\n"), /^Error: app\.log is 537 MB, too big/);
+    assert.match(await read("app.log", { limit: 1 }), /^ {5}1\tline 1\n/);
+  });
+});
+
+describe("files that aren't UTF-8", () => {
+  const latin1 = Buffer.from("name = 'café'\nx = 1\n", "latin1");
+  const utf16 = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("x = 1\r\n", "utf16le")]);
+
+  it("are shown with a warning but not changed, so bytes far from a change can't turn into �", async () => {
+    await writeFile(join(cwd, "latin1.py"), latin1);
+    assert.match(await read("latin1.py"), /^ {5}1\tname = 'caf\uFFFD'\n {5}2\tx = 1\n\n\(latin1\.py isn't all UTF-8: .*bash/);
+    await assert.rejects(edit("x = 1", "x = 2", "latin1.py"), /^Error: latin1\.py isn't UTF-8 .*bash/);
+    await assert.rejects(write("latin1.py", "name = 'caf\uFFFD'\nx = 2\n"), /^Error: latin1\.py isn't UTF-8/);
+    assert.deepEqual(await readFile(join(cwd, "latin1.py")), latin1);
+  });
+
+  it("include UTF-16, which the file tools refuse, saying what to use instead", async () => {
+    await writeFile(join(cwd, "notes.txt"), utf16);
+    await assert.rejects(read("notes.txt"), /^Error: notes\.txt is UTF-16 text, .*iconv/);
+    await assert.rejects(edit("x = 1", "x = 2", "notes.txt"), /^Error: notes\.txt is UTF-16 text/);
+    await bashTool.run({ command: "cat notes.txt" }, ctx); // which counts as reading it
+    await assert.rejects(write("notes.txt", "x = 2\n"), /^Error: notes\.txt is UTF-16 text/);
+    assert.deepEqual(await readFile(join(cwd, "notes.txt")), utf16);
+  });
+
+  it("don't include UTF-8 with a byte order mark, which an edit keeps", async () => {
+    await givenFile("bom.txt", "\uFEFFx = 1\n");
+    await edit("x = 1", "x = 2", "bom.txt");
+    assert.deepEqual(await readFile(join(cwd, "bom.txt")), Buffer.from("\uFEFFx = 2\n"));
   });
 });
 

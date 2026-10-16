@@ -18,7 +18,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   refused 22 edits, all false alarms, so M4 narrowed it.
 - **Line endings are the file's business.** The model writes `\n`; in a file that uses `\r\n`, edits are
   matched and written with `\r\n` (including lines an edit adds), and `write_file` keeps an existing file's
-  CRLF endings.
+  CRLF endings. Encodings are not converted: `edit_file` and `write_file` change only UTF-8 files.
+  Decoding a Latin-1 file as UTF-8 and writing it back turned each `é` in it into `�`, also in lines the
+  edit never touched, and writing in the file's own 8-bit encoding would mean guessing which one it is. So
+  for those, and for UTF-16, the error says to use a command.
 - **Search that respects `.gitignore`.** `grep` and `glob` list files with `git ls-files` when the project
   is a git repository (so ignored files are skipped for free), and walk the directory otherwise. They are
   plain Node, with no dependency on ripgrep being installed. Everything git tracks is listed, and a nested

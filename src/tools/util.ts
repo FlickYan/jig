@@ -1,5 +1,6 @@
+import { constants } from "node:buffer";
 import type { Stats } from "node:fs";
-import { lstat, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
@@ -158,6 +159,61 @@ export class FileVersions {
 
 function versionOf(info: Stats): string {
   return `${info.mtimeMs}:${info.size}`;
+}
+
+/**
+ * A file's text, for edit_file and write_file to change. Only UTF-8 is read: decoded as UTF-8, another
+ * encoding's characters outside ASCII become U+FFFD, and writing the text back would put U+FFFD in their
+ * place all through the file, also in lines the change never touched (an é in a Latin-1 file, say). So a
+ * file in another encoding is refused, and the model is told to change it with a command. So is a file
+ * with more bytes than V8's longest string, before it is read: it may not fit in one, and reading it
+ * whole could take all of a container's memory.
+ */
+export async function readUTF8(abs: string, path: string): Promise<string> {
+  const { size } = await stat(abs);
+  if (size > constants.MAX_STRING_LENGTH) {
+    throw new Error(
+      `${path} is ${Math.round(size / 1e6)} MB, too big for the file tools to change. ` +
+        "Change it with bash instead, e.g. with sed.",
+    );
+  }
+  const bytes = await readFile(abs);
+  if (isUTF16(bytes)) throw utf16Error(path);
+  const text = decodeUTF8(bytes);
+  if (text === undefined) {
+    throw new Error(
+      `${path} isn't UTF-8 (it may be Latin-1 or Windows-1252), and the file tools only write UTF-8: its other ` +
+        "characters outside ASCII would change too. Change it with bash instead, e.g. with sed, or iconv to convert it.",
+    );
+  }
+  return text;
+}
+
+/**
+ * Bytes as UTF-8 text, or undefined if they aren't valid UTF-8. A byte order mark stays in the text, so
+ * that writing it back keeps the mark. `partial` is for bytes cut off mid-text: a character they end
+ * halfway through is left out rather than taken as invalid.
+ */
+export function decodeUTF8(bytes: Uint8Array, partial = false): string | undefined {
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes, { stream: partial });
+  } catch (err) {
+    // Other errors, such as text too long for a string, say nothing about the encoding.
+    if ((err as { code?: string }).code === "ERR_ENCODING_INVALID_ENCODED_DATA") return undefined;
+    throw err;
+  }
+}
+
+/** Whether bytes start with UTF-16's byte order mark, little- or big-endian. */
+export function isUTF16(bytes: Uint8Array): boolean {
+  return (bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff);
+}
+
+export function utf16Error(path: string): Error {
+  return new Error(
+    `${path} is UTF-16 text, and the file tools only handle UTF-8. Use bash instead: iconv -f UTF-16 -t UTF-8 ` +
+      "shows it, and a script that reads and writes it as UTF-16 can change it.",
+  );
 }
 
 /** Converts line endings to Windows style (\r\n). */
