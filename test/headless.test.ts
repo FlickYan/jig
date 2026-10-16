@@ -678,6 +678,58 @@ describe("a one-shot run with no terminal", () => {
   });
 });
 
+describe("an interactive session fed through stdin", () => {
+  const args = ["--no-sandbox", "--model", "claude-haiku-4-5"];
+  /** What a request's last message says, as JSON. */
+  const last = (request: Record<string, unknown>) => JSON.stringify((request.messages as { content: unknown }[]).at(-1)!.content);
+
+  it("runs every line, tasks and slash commands, in order", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Hello there." }]);
+    try {
+      const { code, output } = await runJig(args, { api, cwd: project, stdin: "say hi\n/context\nsay bye\n/exit\n" });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 2, output);
+      assert.match(output, /The conversation takes up about \d+ tokens/);
+      assert.deepEqual((api.requests[1].messages as { role: string }[]).map((message) => message.role), ["user", "assistant", "user"]);
+      assert.match(last(api.requests[1]), /say bye/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("undoes a task and tells the model, announces plan mode, and starts a new session at /reset", async () => {
+    const api = await fakeMessagesApi((request) => (last(request).includes("Write notes.txt.") ? [{ tool: "write_file", input: { path: "notes.txt", content: "draft\n" } }] : [{ text: "Done." }]));
+    try {
+      const stdin = ["Write notes.txt.", "/undo", "What changed?", "/mode plan", "Plan the parser.", "/context", "/reset", "/context", "After the reset."].join("\n");
+      const { code, output } = await runJig(args, { api, cwd: project, stdin });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 5, output);
+      await assert.rejects(readFile(join(project, "notes.txt")), { code: "ENOENT" });
+      assert.match(output, /Put back 0 files and removed 1 the task had created\.\n {2}removed {2}notes\.txt/);
+      assert.match(last(api.requests[2]), /Note from jig: The user undid your changes from their previous request[\s\S]*What changed\?/);
+      assert.match(last(api.requests[3]), /Note from jig: Plan mode is on[\s\S]*Plan the parser\./);
+      const [before, after] = [...output.matchAll(/Saved in (\S+)/g)].map((match) => match[1]);
+      assert.ok(before && after && before !== after, output);
+      assert.equal((api.requests[4].messages as unknown[]).length, 1, "a new conversation");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("joins a line ending in \\ to the next, so one message can span lines", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const stdin = "the build fails with this error:\\\nTypeError: x is undefined\\\n    at main (app.js:3)\n";
+      const { code, output } = await runJig(args, { api, cwd: project, stdin });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 1, output);
+      assert.match(last(api.requests[0]), /the build fails with this error:\\nTypeError: x is undefined\\n {4}at main \(app\.js:3\)/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a hook configured as for Claude Code", () => {
   it('runs around every call with the matcher "*", without jig\'s API key', async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo listed" } }] : [{ text: "Done." }]));

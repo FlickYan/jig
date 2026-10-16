@@ -101,7 +101,10 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
 
 In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
 `/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens sent and
-received (subagents included), and how many input tokens came from the prompt cache.
+received (subagents included), and how many input tokens came from the prompt cache. Up brings back earlier
+tasks; a paste of several lines is one message, sent with Enter, and a line ending in `\` goes on in the
+next. Ctrl+C stops a task, and at the prompt clears the line; on an empty prompt it says how to quit, and
+pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line.
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
@@ -360,7 +363,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
-| [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews |
+| [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
@@ -475,8 +478,9 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 ```bash
 npm test            # the tools, permissions, sandbox, snapshots, search, context, skills, memory, MCP
                     # (against a hand-written server), hooks, subagents, running headless (--add-dir,
-                    # --stats, a hung API), benchmark metrics, the evolve referee and the copies candidates
-                    # work in, exporting sessions, and the loop: no API calls
+                    # --stats, a hung API, a session piped in), the prompt (pastes, history, Ctrl+C),
+                    # benchmark metrics, the evolve referee and the copies candidates work in, exporting
+                    # sessions, and the loop: no API calls
 npm run typecheck
 ```
 

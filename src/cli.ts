@@ -101,7 +101,9 @@ only run programs or loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1
 asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
-Ctrl+C stops the current task (press it again to force quit).
+Ctrl+C stops the current task (press it again to force quit). At the prompt it clears the line, and
+pressed twice on an empty one it quits. A paste of several lines is one message, sent with Enter, and a
+line ending in \\ goes on in the next. A session can also read its tasks and /commands from a pipe.
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
@@ -648,7 +650,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
     ui.println();
-    const line = await ui.ask(ui.bold("> "));
+    const line = await ui.askTask(ui.bold("> "));
     if (line === null) break;
     const input = line.trim();
     if (input.startsWith("/")) {
