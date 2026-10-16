@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -78,6 +78,25 @@ describe("--add-dir", () => {
   it("tells the model about it", () => {
     assert.match(systemPrompt(project, { dirs: [outside] }), new RegExp(`The file tools also work in: ${outside}`));
     assert.doesNotMatch(systemPrompt(project), /also work in/);
+  });
+});
+
+describe("hiddenPaths", () => {
+  it("reach the file tools too, not only the sandbox", async () => {
+    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    await writeFile(join(home, "settings.json"), JSON.stringify({ hiddenPaths: [outside] }));
+    await symlink(join(outside, "nginx", "nginx.conf"), join(project, "nginx.conf"));
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "read_file", input: { path: "nginx.conf" } }] : [{ text: "Done." }],
+    );
+    try {
+      await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Read nginx.conf."], { api, cwd: project, env: { JIG_HOME: home } });
+      const results = JSON.stringify(api.requests[1].messages);
+      assert.match(results, /nginx\.conf is hidden by the user's settings/);
+      assert.doesNotMatch(results, /listen 8080/);
+    } finally {
+      api.close();
+    }
   });
 });
 

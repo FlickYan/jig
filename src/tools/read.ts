@@ -3,7 +3,7 @@
 
 import { readFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
-import { assertFile, resolveInRoot } from "./util.ts";
+import { assertFile, assertVisible, resolveInRoot } from "./util.ts";
 
 const DEFAULT_LIMIT = 2000; // lines per call
 const MAX_LINE_CHARS = 2000; // minified files have enormous lines
@@ -31,9 +31,10 @@ export const readTool: Tool = {
   kind: "read",
   describe: ({ path, offset }) => (offset ? `${path}:${offset}` : String(path)),
 
-  async run(input, { cwd, versions, dirs }) {
+  async run(input, { cwd, versions, dirs, hidden }) {
     const { path, offset = 1, limit = DEFAULT_LIMIT } = input as { path: string; offset?: number; limit?: number };
     const file = resolveInRoot(cwd, path, dirs);
+    await assertVisible(file, path, hidden);
     const info = await assertFile(file, path); // taken before reading, so a change during the read shows up later
     const bytes = await readFile(file);
     if (bytes.subarray(0, 8192).includes(0)) throw new Error(`${path} looks like a binary file; not reading it.`);

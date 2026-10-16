@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { before, describe, it } from "node:test";
@@ -83,6 +83,20 @@ describe("grep", () => {
   it("explains a bad regular expression", async () => {
     const ctx = await project(false);
     await assert.rejects(grepTool.run({ pattern: "(unclosed" }, ctx), /Invalid regular expression/);
+  });
+
+  it("follows links out of the project, but not into a hidden path", async () => {
+    const ctx = await project(true);
+    const secrets = await mkdtemp(join(tmpdir(), "jig-hidden-"));
+    await writeFile(join(secrets, "key.txt"), "hello secret\n");
+    await symlink(join(secrets, "key.txt"), join(ctx.cwd, "key.txt"));
+    await symlink(secrets, join(ctx.cwd, "secrets"));
+    assert.equal(await grepTool.run({ pattern: "secret" }, ctx), "key.txt:1: hello secret");
+    ctx.hidden = [secrets];
+    assert.equal(await grepTool.run({ pattern: "secret" }, ctx), "No matches.");
+    await assert.rejects(grepTool.run({ pattern: "secret", path: "secrets" }, ctx), /secrets is hidden by the user's settings/);
+    await assert.rejects(globTool.run({ pattern: "*", path: "secrets" }, ctx), /hidden by the user's settings/);
+    assert.doesNotMatch(await globTool.run({ pattern: "**" }, ctx), /key\.txt|secrets/);
   });
 });
 

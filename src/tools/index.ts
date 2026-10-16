@@ -25,6 +25,8 @@ export interface ToolContext {
   sandbox?: Sandbox;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
+  /** Paths the settings hide (hiddenPaths): the file tools refuse them, wherever a symlink leads. */
+  hidden?: string[];
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */

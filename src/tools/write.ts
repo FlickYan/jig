@@ -4,7 +4,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Tool } from "./index.ts";
-import { lineCount, resolveInRoot, toCRLF, usesCRLF } from "./util.ts";
+import { lineCount, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
 
 export const writeTool: Tool = {
   definition: {
@@ -25,9 +25,9 @@ export const writeTool: Tool = {
   kind: "edit",
   describe: ({ path, content }) => `${path} (${lineCount(String(content))})`,
 
-  async run(input, { cwd, versions, dirs }) {
+  async run(input, { cwd, versions, dirs, hidden }) {
     const { path, content } = input as { path: string; content: string };
-    const file = resolveInRoot(cwd, path, dirs);
+    const file = await resolveForChange(cwd, path, dirs, hidden);
     const existing = await stat(file).catch(() => null);
     if (existing?.isDirectory()) throw new Error(`${path} is a directory.`);
 

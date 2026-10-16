@@ -39,8 +39,8 @@ export interface Settings {
   network?: boolean;
   /**
    * Paths sandboxed commands can't read: secrets (~/.ssh, ~/.aws), or answers a benchmark keeps on the
-   * same machine. Absolute, or starting with ~/. jig's own file tools only reach the project and --add-dir
-   * directories in any case.
+   * same machine. Absolute, or starting with ~/. jig's own file tools refuse them too, even through a
+   * symlink in the project.
    */
   hiddenPaths: string[];
   hooks: Hook[];

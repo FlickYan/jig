@@ -291,6 +291,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     tools: researchTools,
     cwd,
     dirs,
+    hidden: settings.hiddenPaths,
     maxSteps: SUBAGENT_MAX_STEPS,
     compactAt: compactLimit,
     async authorize(tool, input) {
@@ -382,6 +383,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     tools,
     cwd,
     dirs,
+    hidden: settings.hiddenPaths,
     maxSteps,
     compactAt: compactLimit,
     authorize,

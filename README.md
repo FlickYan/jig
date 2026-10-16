@@ -114,6 +114,12 @@ received (subagents included), and how many input tokens came from the prompt ca
   project or send data out, in the default `edits` mode commands run without asking. On Linux the sandbox
   needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where it can't
   run, jig says why, and commands ask first. `--no-sandbox` turns it off.
+- **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
+  sandbox, so they keep to the project and the `--add-dir` directories on their own. A change goes by where
+  its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
+  as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
+  git directory's `config` or hooks, or a `.git` file or `commondir` that tells git where they are, which
+  could make git run programs outside the sandbox.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,

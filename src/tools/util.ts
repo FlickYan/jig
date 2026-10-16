@@ -1,11 +1,11 @@
 import type { Stats } from "node:fs";
-import { stat } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, realpath, stat } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 /**
  * Resolves a path from the model against the project root and refuses anything outside it and the
- * directories added with --add-dir. The check is lexical, so a symlink inside can still lead out; the
- * sandbox is what actually confines commands.
+ * directories added with --add-dir. The check is lexical, so a symlink inside can still lead out: reading
+ * may follow one (commands can read anything too), and resolveForChange checks changes by real path.
  */
 export function resolveInRoot(root: string, path: string, dirs: string[] = []): string {
   const abs = resolve(root, path);
@@ -15,6 +15,83 @@ export function resolveInRoot(root: string, path: string, dirs: string[] = []): 
   }
   return abs;
 }
+
+/**
+ * resolveInRoot for a file write_file or edit_file will change, checked again by where it really leads.
+ * These tools run in jig's own process, out of the sandbox's reach, so a symlink in the project (a cloned
+ * repository can hold one, a command can make one) would otherwise take a change to any file the user
+ * can write, without a question in edits mode. A git directory's config and hooks are refused too, and
+ * the files that tell git where they are: git runs the programs they name, outside the sandbox. A command
+ * left running in the background could still swap a link between this check and the write.
+ */
+export async function resolveForChange(root: string, path: string, dirs: string[] = [], hidden: string[] = []): Promise<string> {
+  const abs = resolveInRoot(root, path, dirs);
+  const real = await realTarget(abs);
+  if (!real) throw new Error(`${path} leads through a broken symlink. Change the file it should point to instead.`);
+  if (await isHidden(real, hidden)) throw hiddenError(path); // first, so the message doesn't say where it is
+  const allowed = await Promise.all([root, ...dirs].map((dir) => realTarget(dir)));
+  if (!allowed.some((dir) => dir && isInside(dir, real))) {
+    const also = dirs.length ? ` and in ${dirs.join(", ")}` : "";
+    throw new Error(`${path} leads through a symlink to ${real}, outside the working directory (${root}). File tools only change files inside it${also}.`);
+  }
+  if (isGitControl(real)) {
+    throw new Error(`${path} is a git directory's config or a hook, or tells git where they are, which can make git run programs outside the sandbox. The file tools don't change these; if the change is needed, ask the user to make it.`);
+  }
+  return abs;
+}
+
+/** Refuses a path the settings hide (hiddenPaths), wherever its symlinks lead: the sandbox hides it from commands. */
+export async function assertVisible(abs: string, path: string, hidden: string[] = []): Promise<void> {
+  if (!hidden.length) return;
+  const real = await realTarget(abs);
+  if (real && (await isHidden(real, hidden))) throw hiddenError(path);
+}
+
+/** Where the hidden paths really are, to check many files against (see listFiles). */
+export async function realHiddenPaths(hidden: string[]): Promise<string[]> {
+  return (await Promise.all(hidden.map((path) => realTarget(path)))).filter((path) => path !== undefined);
+}
+
+async function isHidden(real: string, hidden: string[]): Promise<boolean> {
+  return (await realHiddenPaths(hidden)).some((path) => isInside(path, real));
+}
+
+function hiddenError(path: string): Error {
+  return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
+}
+
+/**
+ * Where a path really leads, every symlink resolved. A path that doesn't exist yet leads where it would be
+ * created: its nearest existing ancestor's real path, plus the rest. Undefined for a broken link, since
+ * writing through one creates whatever it points to, and that can't be resolved here.
+ */
+async function realTarget(abs: string): Promise<string | undefined> {
+  let existing = abs;
+  while (!(await lstat(existing).catch(() => null)) && dirname(existing) !== existing) existing = dirname(existing);
+  const real = await realpath(existing).catch(() => undefined);
+  return real && join(real, relative(existing, abs));
+}
+
+/**
+ * Whether a real path is a git directory's config or one of its hooks, or a file that tells git where to
+ * find them: a .git file (a worktree's or a submodule's pointer to its git directory, or one planted where
+ * there was none) and commondir. A submodule's (under .git/modules) and a worktree's (under .git/worktrees)
+ * count too. Any of them can make git run a program (core.fsmonitor, a pre-commit hook) the next time the
+ * user or jig runs git, and grep and glob run git outside the sandbox. A bare repository's are left alone:
+ * setting up a server's hooks can be the task.
+ */
+function isGitControl(real: string): boolean {
+  const parts = real.toLowerCase().split(sep); // macOS's file systems usually ignore case
+  const at = parts.indexOf(".git");
+  if (at === -1) return false;
+  const rest = parts.slice(at + 1);
+  if (!rest.length) return true;
+  if (rest[0] === "modules" || rest[0] === "worktrees") return rest.includes("hooks") || GIT_CONFIG.includes(rest.at(-1) ?? "");
+  return rest[0] === "hooks" || (rest.length === 1 && GIT_CONFIG.includes(rest[0]));
+}
+
+/** The files in a git directory that hold its config or say where it is. */
+const GIT_CONFIG = ["config", "config.worktree", "commondir"];
 
 /** Whether an absolute path is root itself or below it. */
 export function isInside(root: string, abs: string): boolean {

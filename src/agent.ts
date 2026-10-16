@@ -36,6 +36,8 @@ export interface AgentOptions {
   sandbox?: Sandbox;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
+  /** Paths the settings hide (hiddenPaths), which the file tools refuse too. */
+  hidden?: string[];
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
@@ -260,7 +262,7 @@ async function handleToolCall(
   let output: string;
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
-    const context = { cwd: opts.cwd, dirs: opts.dirs, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage };
+    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage };
     output = truncate(await tool.run(input, context));
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));

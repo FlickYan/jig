@@ -69,6 +69,14 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   Each command gets its own namespace, so a server one command starts is out of reach of the next; on
   macOS it isn't. Killing a command's process group still reaches everything inside, and
   `--die-with-parent` takes the sandbox down if jig dies.
+- **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach,
+  so they check paths themselves: against the project and the `--add-dir` directories, and a change
+  again by where its path really leads. Without that, a symlink (a cloned repository can carry one, a
+  command can make one) let an audit's edit reach `~/.bashrc`, with no question in `edits` mode.
+  Reading still follows links out, since commands can read anything anyway; refusing would protect only
+  the hidden paths, which are checked by real path instead, and would break linked packages. A git
+  directory's `config` and hooks are never changed, since git runs the programs they name outside the
+  sandbox.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

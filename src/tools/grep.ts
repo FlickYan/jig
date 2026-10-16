@@ -37,7 +37,7 @@ export const grepTool: Tool = {
   describe: ({ pattern, path, include }) =>
     [String(pattern), path && `in ${path}`, include && `(${include})`].filter(Boolean).join(" "),
 
-  async run(input, { cwd, dirs }) {
+  async run(input, { cwd, dirs, hidden }) {
     const { pattern, path = ".", include, ignore_case } = input as {
       pattern: string;
       path?: string;
@@ -54,7 +54,7 @@ export const grepTool: Tool = {
 
     const shown: string[] = [];
     let total = 0;
-    for (const file of await listFiles(cwd, path, dirs)) {
+    for (const file of await listFiles(cwd, path, dirs, hidden)) {
       // Like ripgrep: a glob without "/" matches file names in any directory.
       if (includeRegex && !includeRegex.test(include!.includes("/") ? file : basename(file))) continue;
       // Size first: reading a big file only to skip it is how a search of a whole container ran out of
