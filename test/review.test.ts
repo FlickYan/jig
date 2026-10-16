@@ -25,6 +25,25 @@ describe("a review's verdict", () => {
     assert.deepEqual(verdictOf("The work looks fine to me."), { verdict: "none" }, "no verdict: nothing is sent back");
     assert.deepEqual(verdictOf("PROBLEMS:"), { verdict: "none" });
   });
+
+  it("is approved when the PROBLEMS line says there are none", () => {
+    assert.deepEqual(verdictOf("PROBLEMS: None."), { verdict: "approved" });
+    assert.deepEqual(verdictOf("**PROBLEMS:**\n- No problems found."), { verdict: "approved" });
+    const checklist = "Requirement 1: out.txt exists - ok\nRequirement 2: it holds the total - ok\nPROBLEMS: none found\n\nAPPROVED";
+    assert.deepEqual(verdictOf(checklist), { verdict: "approved" });
+    assert.deepEqual(problemsOf("PROBLEMS: N/A"), [], "nothing for `jig review` to re-check");
+    // Only a first line that says nothing else: one that goes on names a problem.
+    assert.deepEqual(verdictOf("PROBLEMS: x fails"), { verdict: "problems", problems: "x fails" });
+    assert.deepEqual(verdictOf("PROBLEMS: None of the tests pass."), { verdict: "problems", problems: "None of the tests pass." });
+  });
+
+  it("takes a later APPROVED or PROBLEMS line after one that says there are none", () => {
+    assert.deepEqual(verdictOf("PROBLEMS: No issues found.\n\nAPPROVED"), { verdict: "approved" });
+    const checklist = "Requirement 1: out.txt exists - ok\nRequirement 2: it holds the total - ok\nPROBLEMS: None - all requirements are met.\n\nAPPROVED";
+    assert.deepEqual(verdictOf(checklist), { verdict: "approved" });
+    const perRequirement = "1. out.txt exists\nPROBLEMS: none\n2. it holds the total\nPROBLEMS: x fails";
+    assert.deepEqual(verdictOf(perRequirement), { verdict: "problems", problems: "x fails" });
+  });
 });
 
 describe("the work log a reviewer gets", () => {

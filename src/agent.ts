@@ -41,8 +41,8 @@ export interface AgentOptions {
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
-   * Sent once, the first time the model stops, so it checks its work before the task ends. For one-shot
-   * runs, where nobody is there to look at the result and ask for more.
+   * Sent once, the first time the model stops with a step left, so it checks its work before the task ends.
+   * For one-shot runs, where nobody is there to look at the result and ask for more.
    */
   review?: string;
   /** A stronger model that takes over the steps left once a test command the model ran fails (--escalate). */
@@ -232,7 +232,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
           // A review that failed leaves the work as it is: it was only a check.
           opts.ui.notice(`The review failed (${err instanceof Error ? err.message : String(err)}), so the work stands as it is.`);
         }
-      } else if (opts.review && !reviewed && reply.stop_reason === "end_turn") {
+      } else if (opts.review && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
+        // Or by the model itself, once, likewise with a step left: asked on the last, it couldn't reply, and
+        // the answer it gave would be lost.
         reviewed = true;
         opts.ui.notice("Checking the work before finishing.");
         conversation.push({ role: "user", content: opts.review });

@@ -83,6 +83,13 @@ describe("checking the work before finishing (one-shot runs)", () => {
     const result = await runAgent(never.conversation, never.options);
     assert.deepEqual([result.steps, result.text], [1, "Done."]);
   });
+
+  it("doesn't ask on the last step, where no step is left to check: the answer stands", async () => {
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([text("All done.")])], { review: REVIEW, maxSteps: 2 });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "All done.", 2]);
+    assert.equal(messages.at(-1)?.role, "assistant", "the session ends on the answer, not on an unanswered request");
+  });
 });
 
 describe("runAgent", () => {
