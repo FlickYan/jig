@@ -42,6 +42,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   kept word for word after the summary, and the model must read files again before editing them.
 - **Every tool call gets a result.** Even calls that never ran (declined, interrupted, cut off at
   `max_tokens`, invalid input) get an error result, so the next request is always valid.
+- **Only a reply with something in it joins the history.** A reply with no text and no tool call (empty,
+  or only thinking) would be an assistant message the API rejects in every later request. It is left out,
+  and a note after the last user message asks the model to go on: two user messages in a row, which the
+  Messages API merges into one turn, as with compaction's summary request.
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
   runner's worker processes die too. Commands get no stdin, so an interactive prompt gets end-of-file
   instead of hanging the agent.

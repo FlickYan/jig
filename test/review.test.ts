@@ -97,11 +97,15 @@ describe("the reviewer", () => {
     assert.equal(review.usage.input, 200, "the four steps and the verdict");
   });
 
-  it("sends nothing back when it approves or is cut off", async () => {
+  it("sends nothing back when it approves or stays cut off, and finishes a verdict that was cut off", async () => {
     const approves = await reviewer("strong", await setupWith([turn("APPROVED")], [])).review(work);
     assert.deepEqual([approves.verdict, approves.feedback], ["approved", undefined]);
-    const cut = await reviewer("strong", await setupWith([turn("PROBLEMS:\n- out.txt is miss", "max_tokens")], [])).review(work);
+    const cutOff = (text: string) => turn(text, "max_tokens");
+    const cut = await reviewer("strong", await setupWith([cutOff("PROBLEMS:\n- out.txt is miss"), cutOff("ing\n- the"), cutOff(" date")], [])).review(work);
     assert.deepEqual([cut.verdict, cut.feedback], ["none", undefined]);
+    const finished = await reviewer("strong", await setupWith([cutOff("PROBLEMS:\n- out.txt is miss"), turn("ing")], [])).review(work);
+    assert.equal(finished.verdict, "problems");
+    assert.match(finished.feedback!, /:\n\n- out\.txt is missing\n\nIt can be wrong/);
   });
 });
 

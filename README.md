@@ -331,7 +331,9 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
 check its work against the task, and stops at the next such reply. Also on `--max-steps` model calls, on
-Ctrl+C, and when a safety classifier declines the request.
+Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
+answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
+or only thinking): it stays out of the history, and the model is asked once to go on.
 
 ## Results
 

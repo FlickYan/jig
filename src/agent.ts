@@ -83,7 +83,7 @@ export interface Usage {
 export interface RunResult {
   /** Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours. */
   stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted";
-  /** Text of the final reply. */
+  /** Text of the final reply, after that of the replies it continues if they were cut off at the output limit. */
   text: string;
   steps: number;
   /** Every model call's tokens, the escalation's included. */
@@ -109,6 +109,11 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   const result = (stop: RunResult["stop"], steps: number, text = ""): RunResult => ({ stop, text, steps, usage, ...(escalated && { escalated }), ...(review && { reviewed: review }) });
   // Whether the work was checked (by --check's request or a reviewer): it is, at most once a run.
   let reviewed = false;
+  // Replies that weren't answers: whether the model was asked again after one with no text or tool call,
+  // how many cut off at the output limit it was asked to continue, and the text of those so far.
+  let askedAgain = false;
+  let continued = 0;
+  let unfinished = "";
   // The task is the message the run starts from; a reviewer sees it and what the run did after it (all
   // there is, if a compaction has replaced it with a summary).
   const taskMessage = conversation.messages.at(-1);
@@ -122,6 +127,8 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     try {
       if (opts.compactAt > 0 && conversation.tokens > opts.compactAt) {
         addUsage(usage, await compactConversation(conversation, opts, signal));
+        // A cut-off reply is only in the summary now, so the next reply can't continue it: it stands alone.
+        unfinished = "";
       }
       const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
       ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
@@ -136,18 +143,44 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     // decline is not a real answer, so it stays out of the history.
     if (reply.stop_reason === "refusal") return result("refusal", step);
 
+    const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
+    // The reply's text, after that of the replies it continues if they were cut off at the output limit.
+    const answer = unfinished + replyText(reply);
+    unfinished = "";
+    // A reply with neither text nor a tool call (empty, or only thinking) answers nothing, and as a message
+    // it would make every later request invalid: the API rejects an assistant message with no content. So
+    // it stays out of the history, and the model is asked once a run to go on.
+    if (calls.length === 0 && !replyText(reply).trim()) {
+      conversation.tokens = contextSize(reply.usage) - reply.usage.output_tokens; // the request, without the reply
+      if (!askedAgain && step < opts.maxSteps && (reply.stop_reason === "end_turn" || reply.stop_reason === "max_tokens")) {
+        askedAgain = true;
+        opts.ui.notice("The model replied without text or a tool call; asking it to go on.");
+        conversation.push({ role: "user", content: reply.stop_reason === "max_tokens" ? CUT_OFF_BEFORE_ANSWER : EMPTY_REPLY });
+        continue;
+      }
+      opts.ui.notice("The model replied without text or a tool call, so the task ends without an answer.");
+      return result(reply.stop_reason ?? "end_turn", step, answer);
+    }
+
     conversation.push({ role: "assistant", content: reply.content });
     conversation.tokens = contextSize(reply.usage); // measured: the whole request plus this reply
-    const calls = reply.content.filter((block): block is ToolUse => block.type === "tool_use");
     // A reply with no tool calls is the final answer, unless the work is still to be checked.
     if (calls.length === 0) {
+      // Cut off at the output limit: what it holds is valid history, so the model is asked for the rest.
+      if (reply.stop_reason === "max_tokens" && continued < MAX_CONTINUATIONS && step < opts.maxSteps) {
+        continued++;
+        unfinished = answer;
+        opts.ui.notice("The reply was cut off at the output limit; asking the model to continue.");
+        conversation.push({ role: "user", content: CONTINUE });
+        continue;
+      }
       // By a second model, once, while there are steps left to act on what it finds.
       if (opts.reviewer && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
         reviewed = true;
         const { model } = opts.reviewer;
         opts.ui.notice(`${model} is reviewing the work.`);
         try {
-          const found = await opts.reviewer.review({ task, answer: replyText(reply), messages: sinceTask() }, signal);
+          const found = await opts.reviewer.review({ task, answer, messages: sinceTask() }, signal);
           addUsages(usage, found.usage);
           if (signal?.aborted) return result("interrupted", step);
           review = { model, step, verdict: found.verdict, usage: found.usage };
@@ -169,7 +202,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         conversation.push({ role: "user", content: opts.review });
         continue;
       }
-      return result(reply.stop_reason ?? "end_turn", step, replyText(reply));
+      return result(reply.stop_reason ?? "end_turn", step, answer);
     }
 
     // Every tool call gets a result, even ones that never run, or the next request is invalid.
@@ -205,13 +238,22 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   return result("max_steps", opts.maxSteps);
 }
 
+/** What the model is told after a reply that wasn't an answer, and how often a cut-off one is continued. */
+const EMPTY_REPLY = "Your last reply was empty: continue the task, calling a tool or giving your answer.";
+const CUT_OFF_BEFORE_ANSWER = "Your last reply was cut off at the output limit before any text or tool call: continue the task, more briefly, calling a tool or giving your answer.";
+const CONTINUE = "Your reply was cut off at the output limit; continue from where it stopped, more briefly.";
+const MAX_CONTINUATIONS = 2;
+const NOT_AN_ANSWER = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER, CONTINUE];
+
 /**
  * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
  * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.
+ * The loop's note after a reply that wasn't an answer is no request: kept, it would point at a reply the
+ * model can no longer see, so it goes into the summary too.
  */
 async function compactConversation(conversation: Conversation, opts: AgentOptions, signal?: AbortSignal) {
   const last = conversation.messages.at(-1);
-  const isRequest = last?.role === "user" && typeof last.content === "string";
+  const isRequest = last?.role === "user" && typeof last.content === "string" && !NOT_AN_ANSWER.includes(last.content);
   opts.ui.notice(`Compacting the conversation (${formatTokens(conversation.tokens)} tokens)…`);
   const compacted = await compact(conversation, opts.callModel, { signal, keep: isRequest ? [last] : [], continueTask: !isRequest });
   if (!compacted) return { input_tokens: 0, output_tokens: 0 } as Anthropic.Beta.BetaUsage;

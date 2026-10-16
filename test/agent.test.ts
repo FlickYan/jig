@@ -8,6 +8,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { failedTestRun, runAgent, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import type { ModelTurn } from "../src/model.ts";
+import { toChatMessages } from "../src/openai.ts";
 import { TOOLS, type Tool } from "../src/tools/index.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
@@ -16,6 +17,7 @@ type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 const text = (t: string) => ({ type: "text", text: t, citations: null }) as Block;
 const toolUse = (id: string, name: string, input: unknown) => ({ type: "tool_use", id, name, input }) as Block;
+const thinking = (t: string) => ({ type: "thinking", thinking: t, signature: "sig" }) as Block;
 
 function reply(content: Block[], stopReason?: Anthropic.Beta.BetaStopReason, malformed = new Map<string, string>()): ModelTurn {
   const stop_reason = stopReason ?? (content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn");
@@ -24,11 +26,15 @@ function reply(content: Block[], stopReason?: Anthropic.Beta.BetaStopReason, mal
   return { message: message as Anthropic.Beta.BetaMessage, malformed };
 }
 
-/** Test setup: a fake model that plays back scripted replies and records how long the history was at each call. */
+/**
+ * Test setup: a fake model that plays back scripted replies and records how long the history was at each
+ * call. Asked for a summary, it gives one.
+ */
 function setup(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}) {
   const historyLengths: number[] = [];
   const options: AgentOptions = {
-    callModel: async (messages) => {
+    callModel: async (messages, _signal, { summarize } = {}) => {
+      if (summarize) return reply([text("SUMMARY: half the plan is written.")]);
       historyLengths.push(messages.length);
       const next = replies.shift();
       if (!next) throw new Error("the fake model ran out of replies");
@@ -183,6 +189,87 @@ describe("runAgent", () => {
     await runAgent(conversation, options);
     assert.ok(!existsSync(join(cwd, "half.txt")));
     assert.match(String(resultsIn(messages[2])[0].content), /output limit/);
+  });
+
+  it("leaves an empty reply out of the history and asks the model once to go on", async () => {
+    const notices: string[] = [];
+    const { options, conversation, messages, historyLengths } = setup([reply([]), reply([text("Done.")])], {
+      ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
+    });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Done.", 2]);
+    assert.deepEqual(historyLengths, [1, 2]);
+    assert.deepEqual(messages[1], { role: "user", content: "Your last reply was empty: continue the task, calling a tool or giving your answer." });
+    assert.deepEqual(messages.map((m) => m.role), ["user", "user", "assistant"]);
+    assert.deepEqual(notices, ["The model replied without text or a tool call; asking it to go on."]);
+  });
+
+  it("ends the run on a second empty reply, or one at the last step, with a valid history", async () => {
+    const notices: string[] = [];
+    const twice = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([]), reply([text(" \n")])], {
+      ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
+    });
+    const result = await runAgent(twice.conversation, twice.options);
+    assert.deepEqual([result.stop, result.text.trim(), result.steps], ["end_turn", "", 3]);
+    assert.deepEqual(twice.messages.map((m) => m.role), ["user", "assistant", "user", "user"]);
+    assert.equal(notices.at(-1), "The model replied without text or a tool call, so the task ends without an answer.");
+    // Every assistant message holds something to send back, in either API's format.
+    assert.ok(twice.messages.every((m) => m.role === "user" || (m.content as Block[]).some((b) => b.type === "tool_use" || (b.type === "text" && b.text.trim()))));
+    assert.ok(toChatMessages("", twice.messages).every((m) => m.role !== "assistant" || m.content || m.tool_calls));
+    const last = setup([reply([])], { maxSteps: 1 });
+    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.steps]), ["end_turn", 1]);
+    assert.equal(last.messages.length, 1);
+  });
+
+  it("handles a reply with only thinking like an empty one", async () => {
+    const { options, conversation, messages } = setup([reply([thinking("It is done.")]), reply([thinking("So"), text("Done.")])]);
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Done.", 2]);
+    assert.deepEqual(messages.map((m) => m.role), ["user", "user", "assistant"]);
+    // Thinking that ran into the output limit gets told so.
+    const cut = setup([reply([thinking("Let me think about every case")], "max_tokens"), reply([text("Done.")])]);
+    assert.equal((await runAgent(cut.conversation, cut.options)).text, "Done.");
+    assert.match(String(cut.messages[1].content), /^Your last reply was cut off at the output limit before any text or tool call/);
+  });
+
+  it("asks for the rest of a reply cut off at the output limit, and returns the whole answer", async () => {
+    const notices: string[] = [];
+    const { options, conversation, messages } = setup([reply([text("The plan: first, ")], "max_tokens"), reply([text("then second.")])], {
+      ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
+    });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "The plan: first, then second.", 2]);
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user", "assistant"]);
+    assert.deepEqual(messages[2], { role: "user", content: "Your reply was cut off at the output limit; continue from where it stopped, more briefly." });
+    assert.deepEqual(notices, ["The reply was cut off at the output limit; asking the model to continue."]);
+    // Once it has finished that answer, the next one stands on its own.
+    const checked = setup([reply([text("Done, ")], "max_tokens"), reply([text("all of it.")]), reply([text("Checked.")])], { review: "Check your work." });
+    assert.equal((await runAgent(checked.conversation, checked.options)).text, "Checked.");
+  });
+
+  it("continues a cut-off reply twice at most, and not on the last step", async () => {
+    const cutOff = (t: string) => reply([text(t)], "max_tokens");
+    const thrice = setup([cutOff("a"), cutOff("b"), cutOff("c"), reply([text("never asked for")])]);
+    const result = await runAgent(thrice.conversation, thrice.options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["max_tokens", "abc", 3]);
+    assert.equal(thrice.messages.length, 6);
+    const last = setup([cutOff("a")], { maxSteps: 1 });
+    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.text, r.steps]), ["max_tokens", "a", 1]);
+  });
+
+  it("lets the reply after a compaction stand alone: the summary took in the one it would have continued", async () => {
+    const { options, conversation, messages, historyLengths } = setup([reply([text("The plan: first, ")], "max_tokens"), reply([text("The plan: first, then second.")])], { compactAt: 100 });
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "The plan: first, then second.", 2]);
+    // The note asking for the rest went into the summary too, so it doesn't point at text the model can't see.
+    assert.deepEqual(historyLengths, [1, 1]);
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant"]);
+    assert.match(String(messages[0].content), /SUMMARY: half the plan is written\.\n\nContinue the task from where it stopped\.$/);
+    // The same for the note after an empty reply.
+    const empty = setup([reply([]), reply([text("Done.")])], { compactAt: 99 });
+    assert.equal((await runAgent(empty.conversation, empty.options)).text, "Done.");
+    assert.deepEqual(empty.messages.map((m) => m.role), ["user", "assistant"]);
+    assert.match(String(empty.messages[0].content), /Continue the task from where it stopped\.$/);
   });
 
   it("stops at the step limit with a valid history", async () => {
