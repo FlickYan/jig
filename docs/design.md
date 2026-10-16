@@ -8,8 +8,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   expand `$&` and `$1` inside the new code.
 - **Errors are written for the model.** A failed tool call returns an error that says how to fix it. When
   `old_string` doesn't match, jig looks for the nearest thing in the file: leftover line numbers from
-  `read_file`, the same lines with different indentation (shown exactly as they are), or where its first
-  line appears. The next attempt usually succeeds.
+  `read_file`, the same lines with different indentation (shown exactly as they are), failing that the
+  same text with other spacing, even within a line, or where its first line appears. Where it is only
+  part of a line, the error shows just that part: told to copy the whole line, a model that kept
+  `new_string` to the part would delete the rest. Lines shown only for context are cut as `read_file`
+  cuts them, so one line of minified code can't fill the conversation. When it occurs more than once, the
+  error says on which lines. The next attempt usually succeeds.
 - **Read before overwrite.** jig remembers each file's modification time and size as of the model's last
   read (`read_file`, or printing it with `cat`, `head` or `tail`). `write_file` refuses to replace a file the
   model hasn't read, or one that changed since (a formatter, a command or the user edited it), so it never

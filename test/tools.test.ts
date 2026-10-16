@@ -132,9 +132,19 @@ describe("edit_file", () => {
     assert.equal(await readFile(join(cwd, "code.js"), "utf8"), "x();\nx();\n");
   });
 
+  it("says on which lines an ambiguous match starts", async () => {
+    await givenFile("code.js", "x();\ny();\nif (a) x();\n\nx(); x();\n");
+    await assert.rejects(edit("x();", "z();"), {
+      message: "old_string occurs 4 times in code.js (starting at lines 1, 3, 5), but must occur exactly once. Include more surrounding lines to make it unique.",
+    });
+    // The same lines in a file with Windows line endings, and at most 10 of them.
+    await givenFile("win.js", "x();\r\n".repeat(12));
+    await assert.rejects(edit("x();\n", "z();\n", "win.js"), /\(starting at lines 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, \.\.\.\), but/);
+  });
+
   it("counts overlapping matches as ambiguous", async () => {
     await givenFile("code.js", "aaa");
-    await assert.rejects(edit("aa", "b"), /occurs 2 times/);
+    await assert.rejects(edit("aa", "b"), /occurs 2 times in code\.js \(starting at line 1\)/);
   });
 
   it("inserts new_string literally, even with $& or $1 in it", async () => {
@@ -168,6 +178,58 @@ describe("edit_file", () => {
     await assert.rejects(edit("if x:\n    return 1", "if x:\n    return 3", "code.py"), /Lines 2-3 match it except for whitespace/);
     await assert.rejects(edit("     2\t    if x:", "y", "code.py"), /line numbers, which read_file only adds/);
     await assert.rejects(edit("def f():\n    return 9", "z", "code.py"), /first line matches line 1/);
+  });
+
+  it("points at part of a line that matches except for spacing", async () => {
+    const code = "def f(alpha, beta):\n    result = compute(alpha, beta)\n    return result\n";
+    await givenFile("m.py", code);
+    // Only the part to copy: told to copy the whole line, with new_string kept to the part, a model would
+    // delete `result = `.
+    await assert.rejects(edit("compute(alpha,  beta)", "compute(beta, alpha)", "m.py"), {
+      message: "old_string was not found in m.py. Part of line 2 matches it except for whitespace. Copy that part exactly; new_string replaces just that part:\ncompute(alpha, beta)",
+    });
+    // The end of one line and the start of the next, with a space left out and one added.
+    await assert.rejects(edit("compute(alpha,beta)\n    return  result", "x", "m.py"), {
+      message: "old_string was not found in m.py. Part of lines 2-3 matches it except for whitespace. Copy that part exactly; new_string replaces just that part:\ncompute(alpha, beta)\n    return result",
+    });
+    // A whole line, spaced differently, is a whole line to copy.
+    await assert.rejects(edit("result = compute(alpha,beta)", "x", "m.py"), /Line 2 matches it except for whitespace \(indentation or spacing\)\. Copy it exactly:\n {5}2\t {4}result/);
+    assert.equal(await readFile(join(cwd, "m.py"), "utf8"), code);
+    await edit("compute(alpha, beta)", "compute(beta, alpha)", "m.py");
+    assert.equal(await readFile(join(cwd, "m.py"), "utf8"), code.replace("compute(alpha, beta)", "compute(beta, alpha)"));
+
+    // The part takes in the indentation when old_string has some, as new_string then probably does too.
+    await givenFile("ind.py", "def f():\n    x = g(1, 2)  # two\n");
+    await assert.rejects(edit("    x = g(1,  2)", "    x = g(1, 3)", "ind.py"), /part:\n {4}x = g\(1, 2\)$/);
+    await assert.rejects(edit("x = g(1,  2)", "x = g(1, 3)", "ind.py"), /part:\nx = g\(1, 2\)$/);
+
+    await givenFile("two.py", "a = f(x, 1)\nb = f(x, 2)\nc = f(x, 1)\n");
+    await assert.rejects(edit("f(x,1)", "g(x)", "two.py"), /Ignoring whitespace it matches 2 places \(starting at lines 1, 3\)/);
+    // Whole lines with other indentation come first: part of line 2 would match too, ignoring spaces.
+    await givenFile("ret.py", "  return x\n  return x2\n");
+    await assert.rejects(edit("\treturn x", "y", "ret.py"), {
+      message: "old_string was not found in ret.py. Line 1 matches it except for whitespace (indentation or spacing). Copy it exactly:\n     1\t  return x",
+    });
+  });
+
+  it("cuts long lines as read_file would, but not what it says to copy", async () => {
+    // A megabyte of minified code on one line. Shown whole, one spacing typo could fill the conversation.
+    await givenFile("min.js", `${"f(); ".repeat(200_000)}function g(a, b){}${"h();".repeat(1000)}\n`);
+    await assert.rejects(edit("function g(a,  b)", "x", "min.js"), /Part of line 1 matches it .* just that part:\nfunction g\(a, b\)$/);
+    const long = `x = [${"1, ".repeat(5000)}2]`;
+    await givenFile("data.py", `${long}\ny = [\n${long}`);
+    await assert.rejects(edit("2]\ny = [  ", "x", "data.py"), /Part of lines 1-2 matches it .* just that part:\n2\]\ny = \[$/);
+    // Lines shown only to look at are cut, as read_file cuts them.
+    await assert.rejects(edit("y = [\nz", "x", "data.py"), {
+      message:
+        "old_string was not found in data.py. Its first line matches line 2, but the lines after it differ. The file there reads:\n" +
+        `     2\ty = [\n     3\tx = [${"1, ".repeat(665)}… [line truncated]`,
+    });
+    // A long line to copy is shown whole, or it couldn't be copied. old_string held all of it already.
+    await givenFile("wide.py", `${long}\n`);
+    await assert.rejects(edit(long.replace("1, 1", "1,  1"), "x", "wide.py"), {
+      message: `old_string was not found in wide.py. Line 1 matches it except for whitespace (indentation or spacing). Copy it exactly:\n     1\t${long}`,
+    });
   });
 
   it("refuses a file too big to hold as text, as write_file does, before reading it", async () => {

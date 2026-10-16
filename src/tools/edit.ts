@@ -1,6 +1,7 @@
 // edit_file: replaces a string that must occur exactly once in the file. When it doesn't match, the error
-// points at the nearest thing the file does hold (leftover line numbers, other indentation, a first line
-// that matches), so the model can fix its next try in one step. A file's Windows line endings are kept.
+// points at the nearest thing the file does hold (leftover line numbers, other indentation or spacing, a
+// first line that matches), and when it matches more than once, it says where, so the model can fix its
+// next try in one step. A file's Windows line endings are kept.
 
 import { writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
@@ -55,8 +56,8 @@ export const editTool: Tool = {
     if (count === 0) throw new Error(explainMissing(path, text, oldText));
     if (count > 1) {
       throw new Error(
-        `old_string occurs ${count} times in ${path}, but must occur exactly once. ` +
-          "Include more surrounding lines to make it unique.",
+        `old_string occurs ${count} times in ${path} (starting at ${listLines(matchLines(text, search))}), ` +
+          "but must occur exactly once. Include more surrounding lines to make it unique.",
       );
     }
     const at = text.indexOf(search);
@@ -75,9 +76,28 @@ function countOccurrences(text: string, search: string): number {
   return count;
 }
 
+/** The lines that matches start on, each once, so the model can tell which context sets its own apart. */
+function matchLines(text: string, search: string): number[] {
+  const lines: number[] = [];
+  let line = 1;
+  let newline = text.indexOf("\n");
+  for (let i = text.indexOf(search); i !== -1; i = text.indexOf(search, i + 1)) {
+    for (; newline !== -1 && newline < i; newline = text.indexOf("\n", newline + 1)) line++;
+    if (lines.at(-1) !== line) lines.push(line);
+  }
+  return lines;
+}
+
+/** "line 3", or "lines 3, 8, 12": at most 10, since a short string can occur on hundreds of lines. */
+function listLines(lines: number[]): string {
+  if (lines.length === 1) return `line ${lines[0]}`;
+  return `lines ${lines.slice(0, 10).join(", ")}${lines.length > 10 ? ", ..." : ""}`;
+}
+
 /**
  * Why old_string did not match, pointing at the nearest thing in the file so the model can fix its next
- * attempt in one step: leftover line numbers, different indentation, or where its first line appears.
+ * attempt in one step: leftover line numbers, different indentation or spacing, or where its first line
+ * appears.
  */
 function explainMissing(path: string, text: string, oldText: string): string {
   const missing = `old_string was not found in ${path}.`;
@@ -90,29 +110,113 @@ function explainMissing(path: string, text: string, oldText: string): string {
   while (wanted.length > 1 && wanted.at(-1) === "") wanted.pop();
   while (wanted.length > 1 && wanted[0] === "") wanted.shift();
 
-  const starts: number[] = []; // where old_string would match if whitespace didn't count
-  for (let i = 0; i + wanted.length <= fileLines.length; i++) {
-    if (wanted.every((line, j) => fileLines[i + j].trim() === line)) starts.push(i);
+  // Where old_string would match if whitespace didn't count: first as whole lines with other indentation.
+  let starts = linesWhere(fileLines, wanted, (line, want) => line.trim() === want);
+  const last = wanted.length - 1;
+  const squeezed = wanted.map(squeeze);
+  const loose = starts.length === 0 && wanted.some((line) => line !== "");
+  if (loose) {
+    // Failing that, with any spacing at all, and its first and last lines may be parts of lines (the end
+    // of one, the start of the other, or any part of a single line), as when it began mid-line. Each line
+    // is squeezed as it is compared: a squeezed copy of the whole file tripled the memory a miss took.
+    starts = linesWhere(fileLines, squeezed, (fileLine, want, j) => {
+      const line = squeeze(fileLine);
+      if (last === 0) return line.includes(want);
+      return j === 0 ? line.endsWith(want) : j === last ? line.startsWith(want) : line === want;
+    });
   }
   if (starts.length === 1) {
+    const [start] = starts;
+    if (loose && (squeeze(fileLines[start]) !== squeezed[0] || squeeze(fileLines[start + last]) !== squeezed[last])) {
+      // Only part of a line matches. Told to copy the whole line, a model that kept new_string to the
+      // part would delete the rest of the line. So the error shows just the part, about as long as
+      // old_string.
+      const lines = last === 0 ? `line ${start + 1}` : `lines ${start + 1}-${start + wanted.length}`;
+      return (
+        `${missing} Part of ${lines} matches it except for whitespace. Copy that part exactly; new_string ` +
+        `replaces just that part:\n${part(fileLines, start, squeezed, oldLines)}`
+      );
+    }
+    // Shown whole, however long: they are to be copied, and old_string held them already, whitespace aside.
+    const span = last === 0 ? `Line ${start + 1} matches` : `Lines ${start + 1}-${start + wanted.length} match`;
     return (
-      `${missing} Lines ${starts[0] + 1}-${starts[0] + wanted.length} match it except for whitespace ` +
-      `(indentation or spacing). Copy them exactly:\n${numbered(fileLines, starts[0], wanted.length)}`
+      `${missing} ${span} it except for whitespace (indentation or spacing). ` +
+      `Copy ${last === 0 ? "it" : "them"} exactly:\n${numbered(fileLines.slice(start, start + wanted.length), start)}`
     );
   }
   if (starts.length > 1) {
-    const where = starts.map((start) => start + 1).join(", ");
-    return `${missing} Ignoring whitespace it matches ${starts.length} places (starting at lines ${where}), so the indentation differs and more context is needed.`;
+    const where = listLines(starts.map((start) => start + 1));
+    return `${missing} Ignoring whitespace it matches ${starts.length} places (starting at ${where}), so the whitespace differs and more context is needed.`;
   }
   const first = wanted.find((line) => line !== "");
   const at = first === undefined ? -1 : fileLines.findIndex((line) => line.trim() === first);
-  if (at !== -1) {
+  if (first !== undefined && at !== -1) {
     return (
       `${missing} Its first line matches line ${at + 1}, but the lines after it differ. The file there reads:\n` +
-      numbered(fileLines, at, Math.min(wanted.length + 2, 15))
+      excerpt(fileLines, at, Math.min(wanted.length + 2, 15))
     );
   }
   return `${missing} It must match exactly, including whitespace and indentation. Read the file again to see its current content.`;
+}
+
+/** The file lines at which every wanted line, in turn, fits. */
+function linesWhere(
+  fileLines: string[],
+  wanted: string[],
+  fits: (line: string, want: string, j: number) => boolean,
+): number[] {
+  const starts: number[] = [];
+  for (let i = 0; i + wanted.length <= fileLines.length; i++) {
+    if (wanted.every((want, j) => fits(fileLines[i + j], want, j))) starts.push(i);
+  }
+  return starts;
+}
+
+function squeeze(line: string): string {
+  return line.replace(/\s+/g, "");
+}
+
+/** Where `line` holds the character at `n` in squeeze(line). */
+function unsqueezed(line: string, n: number): number {
+  let at = n;
+  for (const space of line.matchAll(/\s+/g)) {
+    if (space.index > at) break;
+    at += space[0].length;
+  }
+  return at;
+}
+
+/**
+ * The text in the file that old_string stands for, other spacing aside: its lines are `wanted`, squeezed,
+ * and the first of them is in the file at line `start`. It runs from the first character that matches
+ * to the last, and takes in the file's whitespace on either side where old_string has some there too,
+ * as with indentation, which new_string probably repeats.
+ */
+function part(fileLines: string[], start: number, wanted: string[], oldLines: string[]): string {
+  const last = wanted.length - 1;
+  const [first, end] = [fileLines[start], fileLines[start + last]];
+  const at = last === 0 ? squeeze(first).indexOf(wanted[0]) : squeeze(first).length - wanted[0].length;
+  let from = unsqueezed(first, at);
+  let to = unsqueezed(end, (last === 0 ? at : 0) + wanted[last].length - 1) + 1;
+  if (/^\s/.test(oldLines.find((line) => line.trim()) ?? "")) from = first.slice(0, from).trimEnd().length;
+  if (/\s$/.test(oldLines.findLast((line) => line.trim()) ?? "")) to = end.length - end.slice(to).trimStart().length;
+  if (last === 0) return first.slice(from, to);
+  return [first.slice(from), ...fileLines.slice(start + 1, start + last), end.slice(0, to)].join("\n");
+}
+
+/** read_file's limit on a line, which an error keeps to as well: minified code can hold megabytes on one. */
+const MAX_LINE_CHARS = 2000;
+
+/**
+ * File lines shown around where old_string's first line matches, numbered as read_file shows them. A line
+ * longer than read_file shows is cut to that length, as one gigantic line could otherwise fill the
+ * conversation.
+ */
+function excerpt(fileLines: string[], start: number, count: number): string {
+  const lines = fileLines
+    .slice(start, start + count)
+    .map((line) => (line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}… [line truncated]` : line));
+  return numbered(lines, start);
 }
 
 function prefixLines(text: string, prefix: string): string[] {

@@ -239,10 +239,7 @@ export function lineCount(text: string): string {
   return `${n} line${n === 1 ? "" : "s"}`;
 }
 
-/** Lines of a file in read_file's format: line numbers, a tab, the text. */
-export function numbered(lines: string[], first: number, count: number): string {
-  return lines
-    .slice(first, first + count)
-    .map((line, i) => `${String(first + i + 1).padStart(6)}\t${line}`)
-    .join("\n");
+/** Lines of a file in read_file's format: line numbers, a tab, the text. The first is at index `first` in the file. */
+export function numbered(lines: string[], first: number): string {
+  return lines.map((line, i) => `${String(first + i + 1).padStart(6)}\t${line}`).join("\n");
 }
