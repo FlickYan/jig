@@ -17,6 +17,7 @@ import { globTool } from "../src/tools/glob.ts";
 import { grepTool } from "../src/tools/grep.ts";
 import { TOOLS, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
+import { subagentTool } from "../src/tools/subagent.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
@@ -127,6 +128,45 @@ describe("a Messages API reply", () => {
       const tools = TOOLS.filter((tool) => ["read_file", "bash"].includes(tool.definition.name));
       const { offered } = await createModel({ model: "claude-haiku-4-5", system: "", tools, baseURL: api.url })([{ role: "user", content: "hi" }]);
       assert.deepEqual(offered, ["read_file", "bash"]);
+    } finally {
+      process.env = env;
+      api.close();
+    }
+  });
+
+  // An unescaped quote: the SDK's lenient parse cuts the command short to "echo hi > ran.txt; echo ".
+  const broken = '{"command": "echo hi > ran.txt; echo "done""}';
+
+  it("checks streamed tool input strictly, also when quiet (subagents, reviewers)", async () => {
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: broken, id: "t1" }]);
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    try {
+      const tools = TOOLS.filter((tool) => tool.definition.name === "bash");
+      for (const quiet of [false, true]) {
+        const { malformed } = await createModel({ model: "claude-haiku-4-5", system: "", tools, baseURL: api.url, quiet })([{ role: "user", content: "hi" }]);
+        assert.deepEqual([...malformed], [["t1", broken]], `quiet: ${quiet}`);
+      }
+    } finally {
+      process.env = env;
+      api.close();
+    }
+  });
+
+  it("keeps a subagent from running a call whose input is malformed, and tells it why", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: broken }] : [{ text: "Nothing ran." }]));
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "test-key";
+    try {
+      const tools = TOOLS.filter((tool) => tool.definition.name === "bash");
+      const callModel = createModel({ model: "claude-haiku-4-5", system: "", tools, baseURL: api.url, quiet: true });
+      const ui = () => ({ toolCall() {}, toolResult() {}, notice() {} });
+      const subagent = subagentTool({ callModel, tools, cwd: project, maxSteps: 5, compactAt: 0, authorize: async () => null, ui });
+      assert.equal(await subagent.run({ description: "look", prompt: "Look around." }, context()), "Nothing ran.");
+      const [, , results] = api.requests[1].messages as { content: { content: string; is_error?: boolean }[] }[];
+      assert.equal(results.content[0].is_error, true);
+      assert.match(results.content[0].content, /INVALID_JSON/);
+      await assert.rejects(readFile(join(project, "ran.txt")), { code: "ENOENT" });
     } finally {
       process.env = env;
       api.close();

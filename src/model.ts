@@ -265,6 +265,10 @@ async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, si
   if (!quiet) ui.status("thinking…");
   try {
     for await (const event of stream) {
+      // Kept even when quiet: a subagent's or a reviewer's calls run too, so they are checked like any other.
+      if (event.type === "content_block_delta" && event.delta.type === "input_json_delta") {
+        rawInputs.set(event.index, (rawInputs.get(event.index) ?? "") + event.delta.partial_json);
+      }
       if (quiet) continue;
       if (event.type === "content_block_start") {
         const block = event.content_block;
@@ -274,9 +278,6 @@ async function streamTurn(client: Anthropic, params: BetaMessageStreamParams, si
         const delta = event.delta;
         if (delta.type === "text_delta") ui.text(delta.text);
         else if (delta.type === "thinking_delta") ui.thinking(delta.thinking);
-        else if (delta.type === "input_json_delta") {
-          rawInputs.set(event.index, (rawInputs.get(event.index) ?? "") + delta.partial_json);
-        }
       } else if (event.type === "content_block_stop") {
         ui.endBlock();
       }

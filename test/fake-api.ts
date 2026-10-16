@@ -7,7 +7,8 @@ import { join } from "node:path";
 
 // A stand-in for the Messages API, for tests that run jig's CLI end to end.
 
-export type Block = { text: string } | { tool: string; input: object; id?: string };
+/** A text block, or a tool call. Input given as a string is streamed as it is, so it can be malformed JSON. */
+export type Block = { text: string } | { tool: string; input: object | string; id?: string };
 
 /** A streamed Messages API reply made of text and tool calls. */
 export function messagesReply(blocks: Block[]): string {
@@ -19,7 +20,7 @@ export function messagesReply(blocks: Block[]): string {
       body += event("content_block_delta", { index, delta: { type: "text_delta", text: block.text } });
     } else {
       body += event("content_block_start", { index, content_block: { type: "tool_use", id: block.id ?? `call_${index}_${block.tool}`, name: block.tool, input: {} } });
-      body += event("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: JSON.stringify(block.input) } });
+      body += event("content_block_delta", { index, delta: { type: "input_json_delta", partial_json: typeof block.input === "string" ? block.input : JSON.stringify(block.input) } });
     }
     body += event("content_block_stop", { index });
   });
