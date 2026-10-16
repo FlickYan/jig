@@ -188,6 +188,10 @@ describe("settings", () => {
     assert.throws(() => readSettings(dir), /"deny" must be a list of commands/);
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { BeforeEverything: [] } }));
     assert.throws(() => readSettings(dir), /unknown hook event "BeforeEverything"/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "(", command: "true" }] } }));
+    assert.throws(() => readSettings(dir), /\.jig\/settings\.json: the hook matcher "\(" is not a valid regular expression \(Invalid regular expression: .*\)$/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "*", command: "true" }] } }));
+    assert.equal(readSettings(dir).project?.settings.hooks[0].matcher, "*", "* is every tool, as in Claude Code");
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ mcpServers: { db: { args: [] } } }));
     assert.throws(() => readSettings(dir), /MCP server "db" needs a "command"/);
   });

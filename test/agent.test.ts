@@ -8,7 +8,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import { failedTestRun, runAgent, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import type { ModelTurn } from "../src/model.ts";
-import { TOOLS } from "../src/tools/index.ts";
+import { TOOLS, type Tool } from "../src/tools/index.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -213,6 +213,94 @@ describe("runAgent", () => {
     const [slow, next] = resultsIn(messages[2]);
     assert.match(String(slow.content), /interrupted/);
     assert.match(String(next.content), /Not run/);
+  });
+
+  it("doesn't run a call when Ctrl+C comes while the hooks check it", async () => {
+    // Ctrl+C kills a hook, which only warns, so the hooks let the call through: the loop has to notice.
+    const controller = new AbortController();
+    const before = async () => {
+      controller.abort();
+      return null;
+    };
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "bash", { command: "touch ran.txt" })])], { hooks: { before, after: async () => null } });
+    const result = await runAgent(conversation, options, controller.signal);
+    assert.equal(result.stop, "interrupted");
+    const [call] = resultsIn(messages[2]);
+    assert.deepEqual([call.is_error, call.content], [true, "Not run: the user interrupted."]);
+    assert.ok(!existsSync(join(cwd, "ran.txt")));
+  });
+});
+
+describe("a check around a tool call that throws", () => {
+  const crash = (what: string) => async (): Promise<never> => {
+    throw new Error(`${what} crashed`);
+  };
+
+  it("fails only the calls a hook was checking, and the run goes on", async () => {
+    const { options, conversation, messages } = setup(
+      [reply([toolUse("a", "read_file", { path: "x.txt" }), toolUse("b", "glob", { pattern: "*" })]), reply([text("Done.")])],
+      { hooks: { before: crash("the hook"), after: async () => null } },
+    );
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.text], ["end_turn", "Done."]);
+    assert.deepEqual(messages.map((m) => m.role), ["user", "assistant", "user", "assistant"]);
+    for (const [i, id] of ["a", "b"].entries()) {
+      const answer = resultsIn(messages[2])[i];
+      assert.deepEqual([answer.tool_use_id, answer.is_error, answer.content], [id, true, "Not run: the PreToolUse hooks failed: the hook crashed"]);
+    }
+  });
+
+  it("doesn't run a call whose permission check throws; a PostToolUse hook that throws leaves the result as it is", async () => {
+    const notices: string[] = [];
+    const { options, conversation, messages } = setup(
+      [reply([toolUse("w", "write_file", { path: "w.txt", content: "x" }), toolUse("e", "bash", { command: "echo ran" })]), reply([text("Done.")])],
+      {
+        authorize: async (tool) => (tool.kind === "edit" ? crash("the permission check")() : null),
+        hooks: { before: async () => null, after: crash("the linter") },
+        ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
+      },
+    );
+    assert.equal((await runAgent(conversation, options)).text, "Done.");
+    const [write, bash] = resultsIn(messages[2]);
+    assert.deepEqual([write.is_error, write.content], [true, "Not run: the permission check failed: the permission check crashed"]);
+    assert.ok(!existsSync(join(cwd, "w.txt")));
+    assert.deepEqual([bash.is_error, bash.content], [undefined, "ran\n\nExit code: 0"]);
+    assert.deepEqual(notices, ["The PostToolUse hooks failed: the linter crashed"]);
+  });
+
+  it("still runs a call the tool can't describe", async () => {
+    const odd: Tool = {
+      definition: { name: "odd", description: "", input_schema: { type: "object", properties: {} } },
+      kind: "read",
+      describe: () => {
+        throw new Error("no words for it");
+      },
+      run: async () => "ran",
+    };
+    const shown: string[] = [];
+    const { options, conversation, messages } = setup([reply([toolUse("o", "odd", { n: 1 })]), reply([text("Done.")])], {
+      tools: [...TOOLS, odd],
+      ui: { toolCall: (_name, description) => shown.push(description), toolResult() {}, notice() {} },
+    });
+    await runAgent(conversation, options);
+    assert.deepEqual(shown, ['{"n":1}']);
+    assert.equal(resultsIn(messages[2])[0].content, "ran");
+  });
+
+  it("answers the calls left open when handling them fails anyway, before the error ends the run", async () => {
+    let calls = 0;
+    const ui = {
+      toolCall() {
+        if (++calls === 2) throw new Error("the terminal is gone");
+      },
+      toolResult() {},
+      notice() {},
+    };
+    const { options, conversation, messages } = setup([reply([toolUse("a", "bash", { command: "echo one" }), toolUse("b", "bash", { command: "echo two" })])], { ui });
+    await assert.rejects(runAgent(conversation, options), /the terminal is gone/);
+    const [a, b] = resultsIn(messages[2]);
+    assert.deepEqual([a.tool_use_id, a.content], ["a", "one\n\nExit code: 0"]);
+    assert.deepEqual([b.tool_use_id, b.is_error, b.content], ["b", true, "No result: jig failed while handling this call (the terminal is gone)."]);
   });
 });
 

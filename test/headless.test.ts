@@ -308,3 +308,21 @@ describe("a one-shot run that continues the last session", () => {
     }
   });
 });
+
+describe("a hook configured as for Claude Code", () => {
+  it('runs around every call with the matcher "*", without jig\'s API key', async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo listed" } }] : [{ text: "Done." }]));
+    try {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const hook = { matcher: "*", command: 'echo "$JIG_TOOL ${ANTHROPIC_API_KEY:-without a key}" >> "$JIG_PROJECT_DIR/hooked.txt"' };
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { PreToolUse: [hook] } }));
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "list the files"], { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      assert.equal(await readFile(join(project, "hooked.txt"), "utf8"), "bash without a key\n");
+      const [, , results] = api.requests[1].messages as { content: { type: string; content: string }[] }[];
+      assert.match(results.content[0].content, /^listed\n\nExit code: 0$/);
+    } finally {
+      api.close();
+    }
+  });
+});

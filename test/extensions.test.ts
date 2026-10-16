@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -226,6 +227,49 @@ describe("hooks", () => {
       const outcome = await runHooks(preEdit("exit 2"), "PreToolUse", { tool, input: {} }, dir);
       assert.equal(outcome.block, undefined, tool);
     }
+  });
+
+  it('takes "*" for every tool, as Claude Code does', async () => {
+    const outcome = await runHooks([{ event: "PreToolUse", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(outcome.block, "the hook exited with code 2");
+  });
+
+  it("keeps jig's API keys out of a hook's environment", async () => {
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "sk-secret";
+    try {
+      const outcome = await runHooks(preEdit('echo "key: ${ANTHROPIC_API_KEY:-none}" >&2; exit 2'), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+      assert.equal(outcome.block, "key: none");
+    } finally {
+      process.env = env;
+    }
+  });
+
+  it("stops a hook that runs too long, or on Ctrl+C, with everything it started", async () => {
+    // The job in the background holds stderr open, so jig used to wait for it whatever the timeout.
+    const hooks = preEdit(`(sleep 0.5; touch "$JIG_PROJECT_DIR/survived") & sleep 30`);
+    const call = { tool: "edit_file", input: {} };
+    let started = Date.now();
+    const timedOut = await runHooks(hooks, "PreToolUse", call, dir, { timeout: 200 });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.match(timedOut.warnings.join(), /\(killed: it timed out after 0.2s\)/);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    started = Date.now();
+    // Two of them: after Ctrl+C the next hook doesn't start, since nothing could stop it once it had.
+    const interrupted = await runHooks([...hooks, ...hooks], "PreToolUse", call, dir, { signal: controller.signal });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.equal(interrupted.warnings.length, 1, "the second hook never started");
+    assert.match(interrupted.warnings[0], /\(killed: the user interrupted it\)/);
+    await new Promise((done) => setTimeout(done, 1000));
+    assert.ok(!existsSync(join(dir, "survived")), "the background jobs were stopped too");
+  });
+
+  it("doesn't wait for a job a hook leaves running in the background", async () => {
+    const started = Date.now();
+    const outcome = await runHooks(preEdit(`sleep 5 & echo "not now" >&2; exit 2`), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+    assert.equal(outcome.block, "not now");
+    assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
   });
 
   it("passes on PostToolUse feedback, and only warns about a hook that fails", async () => {

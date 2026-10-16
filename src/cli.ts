@@ -615,14 +615,14 @@ async function loadSettings(cwd: string): Promise<Settings> {
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
 function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
-  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2]) => {
-    const outcome = await runHooks(hooks, event, call, cwd);
+  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2], signal?: AbortSignal) => {
+    const outcome = await runHooks(hooks, event, call, cwd, { signal });
     for (const warning of outcome.warnings) ui.notice(warning);
     return outcome;
   };
   return {
-    before: async (tool, input) => (await run("PreToolUse", { tool, input })).block ?? null,
-    after: async (tool, input, output) => (await run("PostToolUse", { tool, input, output })).feedback ?? null,
+    before: async (tool, input, signal) => (await run("PreToolUse", { tool, input }, signal)).block ?? null,
+    after: async (tool, input, output, signal) => (await run("PostToolUse", { tool, input, output }, signal)).feedback ?? null,
   };
 }
 

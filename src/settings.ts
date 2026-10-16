@@ -14,10 +14,18 @@ export type HookEvent = (typeof HOOK_EVENTS)[number];
 /** A command the settings run before or after tool calls (see hooks.ts). */
 export interface Hook {
   event: HookEvent;
-  /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default: all). */
+  /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default, or "*": all). */
   matcher?: string;
   /** Shell command; gets the tool call as JSON on stdin. */
   command: string;
+}
+
+/**
+ * A hook's matcher as a regular expression for whole tool names. "*" means every tool, as in Claude Code,
+ * whose settings people copy: as a regular expression it is invalid, and threw on every tool call.
+ */
+export function hookMatcher(matcher?: string): RegExp {
+  return !matcher || matcher === "*" ? /^/ : new RegExp(`^(?:${matcher})$`);
 }
 
 /** An MCP server, started as a program that speaks MCP over stdio. */
@@ -153,6 +161,11 @@ function parse(text: string, file: string): Settings {
     for (const hook of list as Record<string, unknown>[]) {
       if (typeof hook?.command !== "string") fail(`every hook in "hooks.${event}" needs a "command"`);
       if (hook.matcher !== undefined && typeof hook.matcher !== "string") fail(`a hook's "matcher" must be a string`);
+      try {
+        hookMatcher(hook.matcher as string | undefined);
+      } catch (err) {
+        fail(`the hook matcher "${hook.matcher}" is not a valid regular expression (${(err as Error).message})`);
+      }
       settings.hooks.push({ event: event as HookEvent, matcher: hook.matcher as string | undefined, command: hook.command as string });
     }
   }

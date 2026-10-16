@@ -18,7 +18,7 @@ const DEFAULT_TIMEOUT = 120; // seconds
 const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
 const MAX_TIMEOUT = 600;
 const MAX_CAPTURE = 5_000_000; // characters; a command printing more than this is killed
-const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
+export const LINGER_MS = 1000; // how long to wait, once the shell has exited, for a background job's last output
 const STILL_RUNNING =
   "(The command has finished, but something it started in the background is still running with this output " +
   "open. jig didn't wait for it, so its later output isn't shown.)";
@@ -77,14 +77,18 @@ async function recordViewedFiles(command: string, cwd: string, versions: FileVer
   }
 }
 
+/** jig's environment without its API keys: what the commands the model runs, and the user's hooks, get. */
+export function envWithoutKeys(): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
+}
+
 /** Runs a command; resolves to its output and how it ended, and rejects only if it can't be started. */
 export function runCommand(command: string, cwd: string, seconds: number, signal?: AbortSignal, sandbox?: Sandbox): Promise<string> {
   return new Promise((resolve, reject) => {
     const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
-    const env = Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
-    const child = spawn(program, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(program, args, { cwd, env: envWithoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let killedBecause = "";
     let done = false;

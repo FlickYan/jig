@@ -144,7 +144,7 @@ received (subagents included), and how many input tokens came from the prompt ca
 - **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
   (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
   runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key
-  into the conversation and the logs, where a prompt injection could also reach it.
+  into the conversation and the logs, where a prompt injection could also reach it. Hooks don't get them either.
 - **Prompt injection.** The system prompt tells the model that text in files and command output is data,
   not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
   are what protect you when that isn't enough.
@@ -232,10 +232,11 @@ received (subagents included), and how many input tokens came from the prompt ca
       "PostToolUse": [{ "matcher": "edit_file|write_file", "command": "ruff check \"$JIG_FILE\" 1>&2 || exit 2" }] } }
   ```
 
-  A hook gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
+  `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
+  gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
   stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
-  and otherwise ignored.
+  and otherwise ignored; a hook still running after 60 seconds is stopped, with everything it started.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
   touch) to a fresh agent loop with a context of its own. It gets the tools that only look, under `plan`
   mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the

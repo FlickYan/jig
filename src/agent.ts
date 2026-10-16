@@ -65,10 +65,10 @@ export type ReviewVerdict = "approved" | "problems" | "none";
 
 /** The user's hooks, as the loop sees them (the CLI builds them from the settings). */
 export interface ToolHooks {
-  /** Before a call runs: resolves to why it is blocked, or null. */
-  before(tool: string, input: ToolInput): Promise<string | null>;
+  /** Before a call runs: resolves to why it is blocked, or null. Ctrl+C (`signal`) stops the hooks. */
+  before(tool: string, input: ToolInput, signal?: AbortSignal): Promise<string | null>;
   /** After a call ran: resolves to feedback for the model about the result, or null. */
-  after(tool: string, input: ToolInput, output: string): Promise<string | null>;
+  after(tool: string, input: ToolInput, output: string, signal?: AbortSignal): Promise<string | null>;
 }
 
 /** Tokens, summed over a run's model calls. */
@@ -179,8 +179,18 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     // run at the same time. Anything else runs in order, since one call may depend on another's effect.
     const readOnly = calls.every((call) => opts.tools.find((t) => t.definition.name === call.name)?.kind === "read");
     const results: ToolResult[] = [];
-    if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
-    else for (const call of calls) results.push(await handle(call));
+    try {
+      if (readOnly) results.push(...(await Promise.all(calls.map(handle))));
+      else for (const call of calls) results.push(await handle(call));
+    } catch (err) {
+      // handleToolCall turns failures into results, so only a bug in jig gets here. The error still ends
+      // the task, but the calls left open get a result first, so the conversation can go on afterwards.
+      const answered = new Set(results.map((result) => result.tool_use_id));
+      const content = `No result: jig failed while handling this call (${errorMessage(err)}).`;
+      const open = calls.filter((call) => !answered.has(call.id)).map((call): ToolResult => ({ type: "tool_result", tool_use_id: call.id, content, is_error: true }));
+      conversation.push({ role: "user", content: [...results, ...open] });
+      throw err;
+    }
     conversation.push({ role: "user", content: results }); // all results for one reply go in one message
 
     // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
@@ -251,24 +261,52 @@ async function handleToolCall(
   }
 
   const input = call.input as ToolInput;
-  opts.ui.toolCall(call.name, tool.describe(input), call.id);
-  // Hooks first, as in Claude Code: no point asking the user about a call a hook would block anyway.
-  const blocked = await opts.hooks?.before(call.name, input);
-  if (blocked) return fail(`Blocked by a hook: ${blocked}`);
-  const refusal = await opts.authorize(tool, input);
-  if (refusal) return fail(refusal);
+  opts.ui.toolCall(call.name, describe(tool, input), call.id);
+  // The hooks and the permission check can throw too: a bug, or a path with a NUL byte, which a hook's
+  // environment can't hold. The call then gets an error result, since an unanswered call would make every
+  // later request invalid, and it doesn't run, since nothing has said it may.
+  let checking = "the PreToolUse hooks";
+  try {
+    // Hooks first, as in Claude Code: no point asking the user about a call a hook would block anyway.
+    const blocked = await opts.hooks?.before(call.name, input, signal);
+    if (blocked) return fail(`Blocked by a hook: ${blocked}`);
+    if (signal?.aborted) return fail("Not run: the user interrupted.");
+    checking = "the permission check";
+    const refusal = await opts.authorize(tool, input);
+    if (refusal) return fail(refusal);
+  } catch (err) {
+    return fail(`Not run: ${checking} failed: ${errorMessage(err)}`);
+  }
   let output: string;
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
     const context = { cwd: opts.cwd, dirs: opts.dirs, versions: conversation.versions, signal, sandbox: opts.sandbox, pin, usage };
     output = truncate(await tool.run(input, context));
   } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
+    return fail(errorMessage(err));
   }
-  const feedback = await opts.hooks?.after(call.name, input, output);
-  if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+  try {
+    const feedback = await opts.hooks?.after(call.name, input, output, signal);
+    if (feedback) output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+  } catch (err) {
+    // The call has run, so its result stands; the user hears that the hooks couldn't check it.
+    opts.ui.notice(`The PostToolUse hooks failed: ${errorMessage(err)}`);
+  }
   opts.ui.toolResult(output, false, call.id);
   return { type: "tool_result", tool_use_id: call.id, content: output };
+}
+
+/** A call as the terminal shows it. Only shown, so a tool that can't describe its input shows the input. */
+function describe(tool: Tool, input: ToolInput): string {
+  try {
+    return tool.describe(input);
+  } catch {
+    return JSON.stringify(input);
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
 /** How much of an invalid call's input goes back to the model: its start, and what came just before the error. */
