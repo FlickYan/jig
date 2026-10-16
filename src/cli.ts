@@ -32,7 +32,7 @@ import { terminalApprover } from "./proposals.ts";
 import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
-import { Snapshots } from "./snapshots.ts";
+import { type Restored, Snapshots } from "./snapshots.ts";
 import { type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
 import { OutputFiles } from "./tools/bash.ts";
@@ -486,7 +486,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   function undo(): void {
-    const restored = snapshots?.undo();
+    let restored: Restored | undefined;
+    try {
+      restored = snapshots?.undo();
+    } catch (err) {
+      // A git failure (a lock another git left, say) is no reason to end the session.
+      return ui.notice(`Couldn't undo (the snapshot is kept for another /undo): ${(err as Error).message.split("\n")[0]}`);
+    }
     if (!restored) return ui.notice(snapshots ? "Nothing to undo." : "/undo is off: the project couldn't be snapshotted.");
     const { changed, removed } = restored;
     if (!changed.length && !removed.length) return ui.notice("The last task didn't change any files.");

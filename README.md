@@ -156,7 +156,10 @@ received (subagents included), and how many input tokens came from the prompt ca
   `~/.jig/snapshots/` (so it works in any folder and never touches the project's own git history), and
   `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
   command. `/undo` again goes one task further back. Projects with more than 200 MB of files that aren't
-  ignored aren't snapshotted.
+  ignored aren't snapshotted: the size is checked before every task, and a project that grows past it (a
+  task downloads a dataset, say) turns `/undo` off for the rest of the session. Snapshots are never
+  signed and run no hooks, whatever your git config says. When git fails (a lock another git left, say),
+  `/undo` says why and keeps the snapshot, so you can try again.
 - **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
   (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
   runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key

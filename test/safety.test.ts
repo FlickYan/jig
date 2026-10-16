@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
+import { projectKey } from "../src/paths.ts";
 import { createSandbox, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
@@ -178,6 +179,73 @@ describe("snapshots", () => {
     snapshots.undo();
     assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
     assert.equal(existsSync(join(dir, ".git")), false);
+  });
+
+  it("checks the size before every snapshot, counting the files already snapshotted", async () => {
+    await writeFile(join(dir, "a.bin"), Buffer.alloc(800_000));
+    const snapshots = new Snapshots(dir, 1_000_000);
+    snapshots.take("t1");
+    await writeFile(join(dir, "b.bin"), Buffer.alloc(800_000)); // a dataset the task downloaded, say
+    assert.throws(() => snapshots.take("t2"), /2 MB of files that aren't ignored, more than the 1 MB/);
+    assert.equal(snapshots.undo(), undefined, "undoing to t1 would undo the next task too");
+  });
+
+  it("sizes a symlink as git stores it, not what it points to", async () => {
+    const project = join(dir, "project");
+    await mkdir(join(project, "data"), { recursive: true });
+    await writeFile(join(project, "data", "a.txt"), "1");
+    await writeFile(join(dir, "big.bin"), Buffer.alloc(3_000_000)); // outside the project
+    const snapshots = new Snapshots(project, 1_000_000);
+    snapshots.take("t1");
+    // A task links in a big file from elsewhere, makes a link that loops, and puts a file where a directory was.
+    await symlink(join(dir, "big.bin"), join(project, "big.bin"));
+    await symlink("loop", join(project, "loop"));
+    await rm(join(project, "data"), { recursive: true });
+    await writeFile(join(project, "data"), "2");
+    snapshots.take("t2");
+    snapshots.take("t3");
+    snapshots.undo();
+    snapshots.undo();
+    assert.deepEqual(snapshots.undo(), { changed: ["data/a.txt"], removed: ["big.bin", "data", "loop"] });
+    assert.equal(await readFile(join(project, "data", "a.txt"), "utf8"), "1");
+    assert.equal(existsSync(join(dir, "big.bin")), true, "what a link points to is left alone");
+  });
+
+  it("doesn't sign its commits or run hooks, whatever the user's git config says", async () => {
+    const hooks = join(dir, "global-hooks");
+    await mkdir(hooks);
+    await writeFile(join(hooks, "post-commit"), `#!/bin/sh\ntouch ${join(dir, "hook-ran")}\n`);
+    await chmod(join(hooks, "post-commit"), 0o755);
+    // A signer that fails, like an SSH key in a locked password manager.
+    await writeFile(join(dir, "gitconfig"), `[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n[core]\n\thooksPath = ${hooks}\n`);
+    process.env.GIT_CONFIG_GLOBAL = join(dir, "gitconfig");
+    try {
+      const project = join(dir, "project");
+      await mkdir(project);
+      await writeFile(join(project, "a.txt"), "1");
+      const snapshots = new Snapshots(project);
+      snapshots.take("t");
+      await writeFile(join(project, "a.txt"), "2");
+      snapshots.undo();
+      assert.equal(await readFile(join(project, "a.txt"), "utf8"), "1");
+      assert.equal(existsSync(join(dir, "hook-ran")), false);
+    } finally {
+      delete process.env.GIT_CONFIG_GLOBAL;
+    }
+  });
+
+  it("says what went wrong when git fails, and keeps the snapshot to undo again", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    await writeFile(join(dir, "a.txt"), "2");
+    // Left behind by a git that was killed, or held by another jig in the same project.
+    const lock = join(process.env.JIG_HOME!, "snapshots", projectKey(dir), "index.lock");
+    await writeFile(lock, "");
+    assert.throws(() => snapshots.undo(), { message: /^fatal: Unable to create '.*index\.lock': File exists/ });
+    await rm(lock);
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
   });
 });
 

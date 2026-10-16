@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { jigHome, projectKey } from "./paths.ts";
-import { isInside } from "./tools/util.ts";
+import { isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_PROJECT_BYTES = 200_000_000;
 // Never snapshot these, even in a project without a .gitignore.
@@ -22,14 +22,16 @@ export interface Restored {
 export class Snapshots {
   private readonly root: string;
   private readonly gitDir: string;
+  private readonly maxBytes: number;
   private readonly taken: string[] = []; // commits, oldest first
 
-  constructor(root: string) {
+  constructor(root: string, maxBytes = MAX_PROJECT_BYTES) {
     this.root = root;
     this.gitDir = join(jigHome(), "snapshots", projectKey(root));
+    this.maxBytes = maxBytes;
   }
 
-  /** Records the project's current files. Throws if the project is too big to snapshot. */
+  /** Records the project's current files. Throws if the project is too big to snapshot, or git fails. */
   take(label: string): void {
     if (this.root === homedir() || this.root === "/") throw new Error("jig doesn't snapshot your home directory or /");
     if (!existsSync(this.gitDir)) {
@@ -41,8 +43,9 @@ export class Snapshots {
       const home = relative(this.root, jigHome());
       const excludes = isInside(this.root, jigHome()) && home ? [...EXCLUDES, `/${home}/`] : EXCLUDES;
       writeFileSync(join(this.gitDir, "info", "exclude"), `${excludes.join("\n")}\n`);
-      this.checkSize();
     }
+    // Before every snapshot, not just the first: a project can grow past the limit later (a dataset, say).
+    this.checkSize();
     this.git("add", "--all", ".");
     this.git("-c", "user.name=jig", "-c", "user.email=jig@localhost", "commit", "-q", "--allow-empty", "--no-verify", "-m", label);
     this.taken.push(this.git("rev-parse", "HEAD").trim());
@@ -54,10 +57,11 @@ export class Snapshots {
 
   /**
    * Puts the project's files back the way they were in the latest snapshot and forgets it, so the next
-   * call goes one task further back. Returns undefined when there is no snapshot left.
+   * call goes one task further back. Returns undefined when there is no snapshot left. Throws if git fails
+   * (a lock another git left, say), and keeps the snapshot so that the next call can try again.
    */
   undo(): Restored | undefined {
-    const snapshot = this.taken.pop();
+    const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
     this.git("add", "--all", "."); // the index now describes the files as they are
     const restored: Restored = { changed: [], removed: [] };
@@ -72,29 +76,49 @@ export class Snapshots {
       }
     }
     if (restored.changed.length) this.git("checkout", snapshot, "--", ".");
+    this.taken.pop();
     return restored;
   }
 
   /** Snapshots copy the project's files, so refuse projects that would make them huge (big data files, say). */
   private checkSize(): void {
     let bytes = 0;
-    for (const path of this.git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean)) {
-      bytes += statSync(join(this.root, path), { throwIfNoEntry: false })?.size ?? 0;
+    // What the next snapshot would hold: the files in the last one (--cached) and the new ones (--others).
+    // lstat, since git stores a symlink as the path it points to: a link to a big file outside the project
+    // adds only that path, and a link that loops is no error.
+    for (const path of this.git("ls-files", "--cached", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean)) {
+      try {
+        bytes += lstatSync(join(this.root, path), { throwIfNoEntry: false })?.size ?? 0; // deleted since the last one
+      } catch {
+        // ENOTDIR: a file has replaced its directory, and lstat throws for that whatever throwIfNoEntry says
+      }
     }
-    if (bytes > MAX_PROJECT_BYTES) {
+    if (bytes > this.maxBytes) {
+      // Earlier snapshots go too: going back to one now would also undo the coming task, which has none.
       rmSync(this.gitDir, { recursive: true, force: true });
+      this.taken.length = 0;
       const mb = (n: number) => `${Math.round(n / 1e6)} MB`;
-      throw new Error(`the project has ${mb(bytes)} of files that aren't ignored, more than the ${mb(MAX_PROJECT_BYTES)} jig snapshots`);
+      throw new Error(`the project has ${mb(bytes)} of files that aren't ignored, more than the ${mb(this.maxBytes)} jig snapshots`);
     }
   }
 
   private git(...args: string[]): string {
-    return execFileSync("git", [`--git-dir=${this.gitDir}`, `--work-tree=${this.root}`, ...args], {
-      cwd: this.root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 64 * 1024 * 1024,
-    });
+    // The user's git config applies here too, but its signing and hooks are for their own commits: a
+    // signer that prompts or fails would stop every snapshot, and a global post-commit hook would run on it.
+    const options = [...SAFE_GIT, "-c", "commit.gpgsign=false", `--git-dir=${this.gitDir}`, `--work-tree=${this.root}`];
+    try {
+      return execFileSync("git", [...options, ...args], {
+        cwd: this.root,
+        env: withoutKeys(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        maxBuffer: 64 * 1024 * 1024,
+      });
+    } catch (err) {
+      // What git said, rather than execFileSync's "Command failed:" and the whole command line.
+      const said = (err as { stderr?: string }).stderr?.trim();
+      throw said ? new Error(said) : err;
+    }
   }
 }
 
