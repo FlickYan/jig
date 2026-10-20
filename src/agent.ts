@@ -9,7 +9,7 @@ import { type CallModel, tooLong } from "./model.ts";
 import { workLog } from "./review.ts";
 import type { Sandbox } from "./sandbox.ts";
 import type { Mechanism } from "./stats.ts";
-import { type OutputFiles, whyStopped } from "./tools/bash.ts";
+import { type OutputFiles, whyStopped, withoutOutputFileNames } from "./tools/bash.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -387,8 +387,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     // The same calls with the same results, step after step: what the model sees doesn't change, so neither
     // will what it does, and it would spend the steps left on them (milestone 27's trained model made the
     // same call 5 or more times in a row in 25 of 69 attempts). The results count, so polling that gets
-    // somewhere isn't stopped.
-    const thisStep = JSON.stringify(calls.map((_, i) => [keys[i], results[i].content, results[i].is_error]));
+    // somewhere isn't stopped. A long output's file has a new name each time, which doesn't count.
+    const same = (content: ToolResult["content"]) => (typeof content === "string" ? withoutOutputFileNames(content) : content);
+    const thisStep = JSON.stringify(calls.map((_, i) => [keys[i], same(results[i].content), results[i].is_error]));
     sameSteps = thisStep === lastStep ? sameSteps + 1 : 1;
     lastStep = thisStep;
     if (sameSteps >= SAME_STEPS) {
@@ -560,8 +561,13 @@ async function handleToolCall(
   let output: string;
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
-    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count: opts.count };
+    // What the tool counts is counted once it has returned, here: from inside a tool (bash counts in a
+    // child process's event handler), a counter that throws would leave the call unanswered.
+    const counted: Mechanism[] = [];
+    const count = (event: Mechanism) => void counted.push(event);
+    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
     const whole = await tool.run(input, context);
+    for (const event of counted) opts.count?.(event);
     output = truncate(whole);
     if (output !== whole) opts.count?.("output.truncated");
   } catch (err) {

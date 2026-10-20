@@ -4,6 +4,7 @@
 
 import { basename, extname, relative, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
+import { whyStopped } from "./bash.ts";
 import { firstVisible, globToRegExp, listFiles, relativeGlob, searchLimits } from "./files.ts";
 import type { SearchJob, SearchResult } from "./grep-worker.ts";
 import type { Tool } from "./index.ts";
@@ -112,7 +113,7 @@ function search(job: Omit<SearchJob, "progress">, signal?: AbortSignal): Promise
       if (now !== step) [step, since] = [now, Date.now()];
       else if (step >= 0 && Date.now() - since >= searchLimits.seconds * 1000) finish(stuck(job.files, step));
     }, searchLimits.seconds * 100);
-    const onAbort = () => finish(new Error("grep stopped: the user interrupted it."));
+    const onAbort = () => finish(new Error(`grep stopped: ${whyStopped(signal, "the user interrupted it")}.`));
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
     worker.on("message", (result: SearchResult) => finish(null, result));

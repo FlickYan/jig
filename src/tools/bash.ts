@@ -226,6 +226,15 @@ interface OutputFile {
 }
 
 /**
+ * A result with the names of its output files left out. Every run of a command gets a file of its own, so
+ * two runs that printed the same have results that differ only in the name, and the loop, which stops a
+ * model getting the same results step after step, would never see them as the same.
+ */
+export function withoutOutputFileNames(text: string): string {
+  return text.replace(/jig-output-[0-9a-f]{12}\.log/g, "jig-output.log");
+}
+
+/**
  * Where the whole of a long output goes, so the model can search it instead of running the command again:
  * files in the temp directory, which commands can read, sandboxed or not, and other users can't. They hold
  * `limit` characters in all, the oldest making room for new ones, and jig removes them when it exits.

@@ -5,8 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { failedTestRun, MAX_STOP_BLOCKS, runAgent, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
+import { failedTestRun, MAX_STOP_BLOCKS, runAgent, SAME_STEPS, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
+import { OutputFiles } from "../src/tools/bash.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { toChatMessages } from "../src/openai.ts";
 import { TOOLS, type Tool } from "../src/tools/index.ts";
@@ -885,5 +886,26 @@ describe("counting the loop's mechanisms (--stats)", () => {
     assert.deepEqual(await counted([reply([toolUse("t1", "write_file", { path: "x.txt", content: "x" })]), reply([text("ok")])], plan), ["call.refused"]);
     assert.deepEqual(await counted([reply([toolUse("t1", "write_file", { path: "half.txt", content: "tru" })], "max_tokens"), reply([text("ok")])]), ["call.cutOff"]);
     assert.deepEqual(await counted([reply([bash("t1", "seq 100000")]), reply([text("ok")])]), ["output.truncated"]);
+  });
+
+  it("stops a model repeating a command whose long output goes to a new file each time", async () => {
+    const outputs = new OutputFiles();
+    try {
+      const again = Array.from({ length: SAME_STEPS + 1 }, (_, i) => reply([bash(`t${i}`, "seq 1 20000")]));
+      assert.deepEqual(await counted(again, { outputs }), [...Array(SAME_STEPS).fill("output.truncated"), "loop"]);
+    } finally {
+      outputs.remove();
+    }
+  });
+
+  it("answers the call even when counting what it did fails", async () => {
+    const count = () => {
+      throw new Error("the stats file can't be written");
+    };
+    const { options, conversation } = setup([reply([bash("t1", "seq 100000")]), reply([text("Done.")])], { count });
+    assert.equal((await runAgent(conversation, options)).text, "Done.");
+    const results = conversation.messages.flatMap((m) => (Array.isArray(m.content) ? m.content : [])).filter((b) => b.type === "tool_result");
+    assert.equal(results.length, 1);
+    assert.match(JSON.stringify(results[0]), /the stats file can't be written/);
   });
 });

@@ -266,6 +266,13 @@ describe("grep's limits", () => {
     await assert.rejects(grepTool.run({ pattern: SLOW_PATTERN }, { ...ctx, signal: controller.signal }), /the user interrupted/);
     assert.ok(Date.now() - started < 5000);
   });
+
+  it("says what stopped it, when it wasn't the user (--time-limit)", async () => {
+    const ctx = await project(false, { "slow.txt": SLOW_LINE });
+    const controller = new AbortController();
+    setTimeout(() => controller.abort("the time limit (--time-limit) was reached"), 200);
+    await assert.rejects(grepTool.run({ pattern: SLOW_PATTERN }, { ...ctx, signal: controller.signal }), /grep stopped: the time limit \(--time-limit\) was reached\./);
+  });
 });
 
 describe("glob", () => {

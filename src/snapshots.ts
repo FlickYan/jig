@@ -77,10 +77,18 @@ export class Snapshots {
     return restored;
   }
 
-  /** The files changed, created or deleted since the latest snapshot, relative to the project; undefined without one. */
+  /**
+   * The files changed, created or deleted since the latest snapshot, relative to the project; undefined
+   * without one. It only looks: adding the files first, as undo does, would copy whatever the task created
+   * into the snapshots, however big, past the size check every snapshot makes.
+   */
   changed(): string[] | undefined {
     const snapshot = this.taken.at(-1);
-    return snapshot ? this.diff(snapshot).map(([, path]) => path) : undefined;
+    if (!snapshot) return undefined;
+    // The index is the snapshot's: tracked files that differ or are gone, then the files that are new.
+    const tracked = this.git("diff", "--name-only", "--no-renames", "-z", snapshot).split("\0");
+    const created = this.git("ls-files", "--others", "--exclude-standard", "-z").split("\0");
+    return [...new Set([...tracked, ...created].filter(Boolean))].sort();
   }
 
   /** How the files differ from a snapshot: git's status letter and the path, for each file that does. */

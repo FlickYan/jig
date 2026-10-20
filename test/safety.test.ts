@@ -177,6 +177,10 @@ describe("snapshots", () => {
     await rm(join(dir, "gone.txt"));
     await writeFile(join(dir, "new.txt"), "n\n");
     assert.deepEqual(snapshots.changed(), ["gone.txt", "keep.txt", "new.txt"]);
+    // Listing them stores nothing: a file the task made (a big one, say) isn't copied into the snapshots.
+    const gitDir = join(process.env.JIG_HOME!, "snapshots", projectKey(dir));
+    const blob = execFileSync("git", ["hash-object", join(dir, "new.txt")], { encoding: "utf8" }).trim();
+    assert.throws(() => execFileSync("git", [`--git-dir=${gitDir}`, "cat-file", "-e", blob], { stdio: "ignore" }));
     assert.deepEqual(snapshots.undo(), { changed: ["gone.txt", "keep.txt"], removed: ["new.txt"] });
     assert.equal(await readFile(join(dir, "gone.txt"), "utf8"), "x\n");
   });
