@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
@@ -359,6 +359,9 @@ async function repoWithSubmodule(base: string): Promise<string> {
 }
 
 describe("snapshots", () => {
+  /** git on the snapshots of the project in dir. */
+  const snapshotGit = (...args: string[]) => git(dir, `--git-dir=${join(process.env.JIG_HOME!, "snapshots", projectKey(dir))}`, `--work-tree=${dir}`, ...args);
+
   it("undo puts back changed and deleted files and removes new ones, one task at a time", async () => {
     await writeFile(join(dir, "keep.txt"), "v1\n");
     await writeFile(join(dir, "doomed.txt"), "precious\n");
@@ -454,6 +457,93 @@ describe("snapshots", () => {
     assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: ["b.txt"] });
     assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
     assert.equal(existsSync(join(dir, "b.txt")), false);
+  });
+
+  it("leaves nested repositories out, and never runs a program their git config names", async () => {
+    // A repository in the project, such as a sandboxed command can make, with a clean filter: git runs it
+    // outside the sandbox to see whether an edited file in it changed, if it looks there at all.
+    const nested = join(dir, "vendor", "x");
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(dir, "a.txt"), "1");
+    await writeFile(join(nested, "f.txt"), "1");
+    git(nested, "init", "-q");
+    git(nested, "add", "f.txt");
+    git(nested, "commit", "-qm", "first");
+    // Older versions of jig stored it in their snapshots, as a gitlink, and the index still has it.
+    new Snapshots(dir).take("older jig");
+    snapshotGit("add", "--all", ".");
+    const ran = join(dir, "filter-ran");
+    git(nested, "config", "filter.x.clean", `touch ${ran}; cat`);
+    await writeFile(join(nested, ".git", "info", "attributes"), "* filter=x\n");
+    await writeFile(join(nested, "f.txt"), "2"); // the same size, so git would have to read it
+
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+    assert.doesNotMatch(snapshotGit("ls-files", "--stage"), /^160000/m, "the snapshot holds no gitlink");
+    await writeFile(join(dir, "a.txt"), "2");
+    snapshotGit("add", "vendor/x"); // as git add stores one a command makes while a snapshot is taken
+    assert.deepEqual(snapshots.changed(), ["a.txt"]);
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.equal(await readFile(join(nested, "f.txt"), "utf8"), "2", "files in a nested repository are left alone");
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+  });
+
+  it("keeps names that aren't UTF-8 as git wrote them, so such a repository is left out too", { skip: process.platform === "darwin" && "macOS takes only UTF-8 names" }, async () => {
+    // A command picks the names. Decoded as UTF-8, 0xff turns into U+FFFD and no longer names the file: git
+    // would store the repository and then run its filter, and /undo would leave such a file behind.
+    const named = (prefix: string) => Buffer.concat([Buffer.from(join(dir, prefix)), Buffer.from([0xff])]);
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t1");
+    const nested = join(dir, "vendor");
+    await mkdir(nested);
+    await writeFile(join(nested, "f.txt"), "1");
+    git(nested, "init", "-q");
+    git(nested, "add", "f.txt");
+    git(nested, "commit", "-qm", "first");
+    const ran = join(dir, "filter-ran");
+    git(nested, "config", "filter.x.clean", `touch ${ran}; cat`);
+    await writeFile(join(nested, ".git", "info", "attributes"), "* filter=x\n");
+    await writeFile(join(nested, "f.txt"), "2");
+    await rename(nested, named("vendor-"));
+    await writeFile(named("new-"), "n");
+    snapshotGit("add", "--all", "."); // as git add stores one a command makes while a snapshot is taken
+
+    assert.deepEqual(snapshots.changed(), ["new-�"]);
+    snapshots.take("t2");
+    assert.doesNotMatch(snapshotGit("ls-files", "--stage"), /^160000/m, "the snapshot holds no gitlink");
+    await writeFile(join(dir, "a.txt"), "2");
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["new-�"] });
+    assert.equal(existsSync(named("new-")), false);
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+  });
+
+  it("doesn't say it put back a file in a submodule, which it leaves alone", async () => {
+    const repo = await repoWithSubmodule(dir);
+    const snapshots = new Snapshots(repo);
+    snapshots.take("t");
+    await writeFile(join(repo, "libs", "s", "a.txt"), "2\n");
+    assert.deepEqual(snapshots.changed(), []);
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: [] });
+    assert.equal(await readFile(join(repo, "libs", "s", "a.txt"), "utf8"), "2\n");
+  });
+
+  it("undo removes what a task created around a repository it made, and leaves the repository", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    const clone = join(dir, "b", "clone");
+    await mkdir(clone, { recursive: true });
+    git(clone, "init", "-q"); // with no commit yet, which git can't store as a gitlink
+    await writeFile(join(clone, "f.txt"), "f");
+    await writeFile(join(dir, "a-new.txt"), "n"); // listed before the repository
+    await writeFile(join(dir, "b", "z.txt"), "z"); // and after it
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["a-new.txt", "b/z.txt"] });
+    assert.equal(existsSync(join(dir, "a-new.txt")), false);
+    assert.equal(existsSync(join(clone, "f.txt")), true);
+    snapshots.take("the next task");
   });
 
   it("sizes a symlink as git stores it, not what it points to", async () => {

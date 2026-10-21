@@ -191,7 +191,9 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 - **Undo.** Before each task, jig snapshots the project's files into a private git repository in
   `~/.jig/snapshots/` (so it works in any folder and never touches the project's own git history), and
   `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
-  command. `/undo` again goes one task further back. Projects with more than 200 MB of files that aren't
+  command. `/undo` again goes one task further back. Files inside a nested repository (a submodule, a
+  clone) aren't snapshotted, so `/undo` leaves them as they are: to look at them, git would run programs
+  that repository's config names. Projects with more than 200 MB of files that aren't
   ignored aren't snapshotted: the size is checked before every task, and a project that grows past it (a
   task downloads a dataset, say) turns `/undo` off for the rest of the session. Snapshots are never
   signed and run no hooks, whatever your git config says. When git fails (a lock another git left, say),
