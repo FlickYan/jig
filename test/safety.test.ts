@@ -279,7 +279,55 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.deepEqual(sandbox.gitChanges!(), []);
       await inSub("rm .git && git init -q");
       assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      // Only the start of a file is read, so a long one that changes past it is told by its size.
+      await inSub("rm -rf .git && printf '%070000d' 0 > .git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      await inSub("echo 1 >> .git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
     } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("says when a command made that .git a named pipe or a link to /dev/zero, without reading it", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const sub = join(repo, "sub");
+    await mkdir(sub);
+    // Reading a named pipe waits for a writer, and /dev/zero never ends: either hung jig after the task.
+    const commands: Record<string, string> = { "Make a pipe.": "mkfifo .git", "Make a link.": "rm .git && ln -s /dev/zero .git" };
+    const api = await fakeMessagesApi((request) => {
+      const task = (request.messages as { content: unknown }[]).at(-1)!.content;
+      return typeof task === "string" ? [{ tool: "bash", input: { command: commands[task] } }] : [{ text: "Done." }];
+    });
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5"], { api, cwd: sub, stdin: "Make a pipe.\nMake a link.\n", timeout: 20_000 });
+      assert.equal(code, 0, output);
+      const dotGit = join(await realpath(sub), ".git");
+      assert.equal(output.split(`A command created or changed ${dotGit}, `).length - 1, 2, output);
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("starts in a repository where a command left named pipes or links to themselves in a worktree's or a submodule's git directory", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    // None was there to be locked when that command ran, so neither sandbox stopped it.
+    const gitDir = join(repo, ".git");
+    for (const dir of ["worktrees/w", "modules/m", "modules/l"]) await mkdir(join(gitDir, dir), { recursive: true });
+    for (const name of ["m", "l"]) await writeFile(join(gitDir, "modules", name, "HEAD"), "ref: refs/heads/main\n");
+    execFileSync("mkfifo", [join(gitDir, "worktrees", "w", "gitdir"), join(gitDir, "modules", "m", "config")]);
+    // Looking at a config that links to itself throws ELOOP, which stopped jig starting.
+    await symlink("config", join(gitDir, "modules", "l", "config"));
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo ran" } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo, timeout: 20_000 });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests[1].messages), /ran\\n/);
+    } finally {
+      api.close();
       await rm(repo, { recursive: true, force: true });
     }
   });
@@ -695,6 +743,21 @@ describe("settings", () => {
     assert.equal(readSettings(dir).project?.settings.hooks[0].matcher, "*", "* is every tool, as in Claude Code");
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ mcpServers: { db: { args: [] } } }));
     assert.throws(() => readSettings(dir), /MCP server "db" needs a "command"/);
+  });
+
+  it("refuses a project's settings file that isn't a regular file, rather than waiting on it", async () => {
+    // A command can leave a named pipe there, which jig would wait on for good, its deny rules unread.
+    await mkdir(join(dir, ".jig"));
+    execFileSync("mkfifo", [join(dir, ".jig", "settings.json")]);
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: dir, timeout: 20_000 });
+      assert.equal(code, 1, output);
+      assert.match(output, /\.jig\/settings\.json isn't a regular file \(a named pipe, say\), so jig doesn't read it/);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
   });
 
   it("takes Stop hooks, behind the project's trust, and leaves out events jig doesn't have, with a warning", async () => {

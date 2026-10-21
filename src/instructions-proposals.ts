@@ -1,10 +1,10 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { type Approve, notApproved } from "./proposals.ts";
 import { findSecret } from "./secrets.ts";
 import type { Tool } from "./tools/index.ts";
-import { isInside, resolveForChange } from "./tools/util.ts";
+import { isInside, readRegularFile, resolveForChange } from "./tools/util.ts";
 
 // Context that every agent working on a project should have, a convention or a rule, belongs in its
 // AGENTS.md rather than in jig's memory: it travels with the repository and other agents read it too.
@@ -51,7 +51,9 @@ export function proposeInstructionsTool(approve: Approve): Tool {
       // config. Checked again once approved, since a command left running could make one meanwhile.
       const check = () => resolveForChange(ctx.cwd, file, ctx.dirs, ctx.hidden);
       await check();
-      const current = existsSync(path) ? readFileSync(path, "utf8") : "";
+      // Only a regular file: a named pipe a command made in its place would have jig wait on it forever.
+      const current = existsSync(path) ? readRegularFile(path) : "";
+      if (current === undefined) throw new Error(`${file} isn't a regular file (a named pipe, say), so it can't be edited.`);
       let next: string;
       let diff: string;
       if (old) {

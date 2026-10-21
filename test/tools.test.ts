@@ -11,7 +11,7 @@ import { bashTool, OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
 import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
-import { FileVersions } from "../src/tools/util.ts";
+import { FileVersions, readRegularFile } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
 
 let ctx: ToolContext;
@@ -361,6 +361,20 @@ describe("a git directory's config and hooks", () => {
     await assert.rejects(write("sub/.git", "gitdir: planted\n"), /tells git where they are/);
     assert.equal(await readFile(join(cwd, ".git"), "utf8"), "gitdir: ../main/.git/worktrees/wt\n");
     assert.equal(await write(".gitignore", "node_modules/\n"), "Created .gitignore (1 line).");
+  });
+});
+
+describe("files jig reads itself, outside the sandbox", () => {
+  it("are read only if regular, and only as far as asked", async () => {
+    await writeFile(join(cwd, "notes.md"), "ab€cd"); // € takes 3 bytes in UTF-8
+    assert.equal(readRegularFile(join(cwd, "notes.md")), "ab€cd");
+    assert.equal(readRegularFile(join(cwd, "notes.md"), 3), "ab", "a character cut in half is left out");
+    // Reading a named pipe would wait for a writer, and /dev/zero never ends: neither is opened.
+    execFileSync("mkfifo", [join(cwd, "pipe")]);
+    await symlink("/dev/zero", join(cwd, "zero"));
+    // A link to itself leads nowhere, as a cloned repository can have one: stat throws ELOOP for it, not ENOENT.
+    await symlink("loop", join(cwd, "loop"));
+    for (const path of ["pipe", "zero", ".", "missing", "notes.md/x", "loop", "loop/x"]) assert.equal(readRegularFile(join(cwd, path)), undefined, path);
   });
 });
 
