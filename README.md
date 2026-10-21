@@ -153,7 +153,7 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
-  `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
+  `glob`, and commands that only read inside the project (`ls`, `cat`, `sed -n 10,20p`, `git diff`, ...).
   When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session. On a
   file change it approves file changes only: commands still ask, even ones the sandbox contains.
   With no terminal to ask in (a script, CI), such a call is refused instead, and the third in a task
@@ -220,10 +220,11 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 - **Long output.** Tool output over 40,000 characters (about 10k tokens) is cut from the middle, keeping
   its start and its end (errors and test summaries tend to be at the end). A command's whole output then
   goes to a file in the temp directory that only you can read, and the model is told where, so it can
-  search what it didn't see instead of running the command again (though not in plan mode, whose commands
-  may only read inside the project). The files hold 100 million characters at most, the oldest making
-  room, and jig deletes them when it exits. However much a command prints, jig keeps only its start and
-  end in memory, so the command runs to the end.
+  search what it didn't see instead of running the command again. Commands that only read one of these
+  files while jig keeps it (`grep -n`, `sed -n 10,20p`, `tail`, ...) count as reading inside the project,
+  so they don't ask, in plan mode too; other files with names like theirs don't count. The files hold 100
+  million characters at most, the oldest making room, and jig deletes them when it exits. However much a
+  command prints, jig keeps only its start and end in memory, so the command runs to the end.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
   User memories (how you like to work) hold in every project; project memories (facts about a project
   that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,

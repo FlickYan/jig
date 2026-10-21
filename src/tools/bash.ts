@@ -285,6 +285,14 @@ export class OutputFiles {
     }
   }
 
+  /**
+   * The files jig keeps now, by path. The permission policy lets commands that only read look at these, as
+   * the note tells the model to; not other files with names like theirs, which a command can make.
+   */
+  paths(): string[] {
+    return this.files.map((file) => file.path);
+  }
+
   /** Done with a file: its command has ended. */
   close(file: OutputFile): void {
     try {

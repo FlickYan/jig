@@ -290,8 +290,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
   const contained = !!sandbox && !network;
-  // The whole of a command's output too long to show, for the model to search. Only the main loop's: the
-  // subagents work under plan mode's rules, which don't let commands read outside the project.
+  // The whole of a command's output too long to show, for the model to search: the main loop's policy lets
+  // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
+  // policy doesn't know them, so their results don't point to a file their commands couldn't read.
   const outputs = new OutputFiles();
   process.on("exit", () => outputs.remove()); // on a forced quit (a second Ctrl+C) too
   // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
@@ -311,7 +312,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const error of mcp.errors) ui.notice(error);
   // A deny rule or hook that names a tool still holds once a clash of names has added a hash to it.
   const deny = [...settings.deny, ...[...mcp.renamed].filter(([, { was }]) => settings.deny.includes(was)).map(([name]) => name)];
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs });
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs, outputs });
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd, mcp.renamed) : undefined;
   // The files the task changed, for the Stop hooks: by the snapshot taken before it, while /undo works.
   const changedFiles = () => {

@@ -124,6 +124,57 @@ describe("a command's long output", () => {
     }
   });
 
+  it("can be read as the note says without asking, in plan mode too", async () => {
+    // These reads used to count as reads outside the project: plan mode refused them, and with no terminal
+    // to ask in, the third ended the task.
+    await writeFile(join(project, "big.txt"), Array.from({ length: 20000 }, (_, i) => (i === 10000 ? "NEEDLE" : `line ${i}`)).join("\n"));
+    const reads = (path: string) => [`grep -n NEEDLE ${path}`, `sed -n 10000,10001p ${path}`, `head -n 1 ${path}`, `tail -n 1 ${path}`, `wc -l ${path}`];
+    let path = "";
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as { content: unknown }[];
+      if (messages.length === 1) return [{ tool: "bash", input: { command: "cat big.txt" } }];
+      if (messages.length > 3) return [{ text: "Done." }];
+      path = /The whole output is in (\S+):/.exec(JSON.stringify(messages[2].content))?.[1] ?? "";
+      return reads(path).map((command) => ({ tool: "bash", input: { command } }));
+    });
+    try {
+      for (const mode of ["plan", "edits"]) {
+        const { code, output } = await runJig(["--no-sandbox", "--mode", mode, "--model", "claude-haiku-4-5", "Find the needle."], { api, cwd: project });
+        assert.equal(code, 0, output);
+        const results = (api.requests.at(-1)!.messages as { content: { content: string }[] }[])[4].content.map((result) => result.content);
+        // BSD wc (macOS) pads the count with spaces, GNU wc doesn't.
+        assert.equal(results.pop()!.trimStart(), `19999 ${path}\n\nExit code: 0`, mode);
+        assert.deepEqual(results, [
+          "10001:NEEDLE\n\nExit code: 0",
+          "line 9999\nNEEDLE\n\nExit code: 0",
+          "line 0\n\nExit code: 0",
+          "line 19999\n\nExit code: 0",
+        ], mode);
+      }
+    } finally {
+      api.close();
+    }
+  });
+
+  it("isn't kept for a subagent, so its result doesn't point to a file the subagent may not read", async () => {
+    await writeFile(join(project, "big.txt"), Array.from({ length: 20000 }, (_, i) => `line ${i}`).join("\n"));
+    const subagent = (messages: { content: unknown }[]) => JSON.stringify(messages[0].content).includes("Look in big.txt.");
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as { content: unknown }[];
+      if (messages.length > 1) return [{ text: "Done." }];
+      if (subagent(messages)) return [{ tool: "bash", input: { command: "cat big.txt" } }];
+      return [{ tool: "subagent", input: { description: "look", prompt: "Look in big.txt." } }];
+    });
+    try {
+      const { code, output } = await runJig(["--no-sandbox", "--model", "claude-haiku-4-5", "Find the needle."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      const [, , result] = api.requests.map((request) => request.messages as { content: unknown }[]).find((messages) => subagent(messages) && messages.length === 3)!;
+      assert.match(JSON.stringify(result.content), /\[\.\.\. \d+ characters truncated \.\.\.\]/);
+    } finally {
+      api.close();
+    }
+  });
+
   it("is removed when a signal ends jig too, as closing its terminal does", async () => {
     for (const signal of ["SIGHUP", "SIGTERM"] as const) {
       let path = "";
