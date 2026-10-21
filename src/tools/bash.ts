@@ -1,6 +1,7 @@
 // bash: runs a command in a fresh shell, in the sandbox when there is one and in a process group of its
-// own, so a timeout or Ctrl+C stops everything it started; jig's API keys are kept out of its environment.
-// The model gets the output and the exit code; a job left in the background keeps running, as in a terminal.
+// own, so a timeout, Ctrl+C or jig's exit stops everything it started; jig's API keys are kept out of its
+// environment. The model gets the output and the exit code; a job left in the background keeps running, as
+// in a terminal.
 // A long output is cut from the middle, and the whole of it goes to a file the model can search.
 
 import { spawn } from "node:child_process";
@@ -89,6 +90,26 @@ export function whyStopped(signal: AbortSignal | undefined, byUser: string): str
   return typeof signal?.reason === "string" ? signal.reason : byUser;
 }
 
+// The process groups of the commands running now, for killCommands.
+const running = new Set<number>();
+
+/**
+ * Kills the commands still running, with everything they started, as Ctrl+C does: for jig's exit. Each
+ * command has a session of its own, which closing the terminal doesn't reach, and apart from bubblewrap's
+ * --die-with-parent (the Linux sandbox) nothing else would stop it with jig.
+ */
+export function killCommands(): void {
+  for (const group of running) killGroup(group);
+}
+
+function killGroup(group: number): void {
+  try {
+    process.kill(-group, "SIGKILL");
+  } catch {
+    // the process group has already exited
+  }
+}
+
 /**
  * Runs a command; resolves to its output (its head and tail, if it is long) and how it ended, and rejects
  * only if it can't be started. Given `files`, the whole of a long output is kept in one of them, and given
@@ -108,16 +129,14 @@ export function runCommand(
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
     const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const group = child.pid; // none if it couldn't be started
+    if (group) running.add(group);
     const output = new Output(files);
     let killedBecause = "";
     let done = false;
     const kill = (reason: string) => {
       killedBecause ||= reason;
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        // the process group has already exited
-      }
+      killGroup(group!);
     };
     const collect = (chunk: string) => {
       if (done) return; // a background job's output, after the call has returned
@@ -132,6 +151,7 @@ export function runCommand(
     let lingering: NodeJS.Timeout | undefined;
     const settle = () => {
       done = true;
+      if (group) running.delete(group); // a job it left in the background keeps running, as in a terminal
       output.close();
       clearTimeout(timer);
       clearTimeout(lingering);

@@ -35,7 +35,7 @@ import { skillsCommand } from "./skills-cli.ts";
 import { type Restored, Snapshots } from "./snapshots.ts";
 import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
-import { OutputFiles } from "./tools/bash.ts";
+import { killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -294,9 +294,15 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
   // policy doesn't know them, so their results don't point to a file their commands couldn't read.
   const outputs = new OutputFiles();
-  process.on("exit", () => outputs.remove()); // on a forced quit (a second Ctrl+C) too
+  // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, and a command still running is
+  // killed as Ctrl+C kills it: only bubblewrap's sandbox would take it down with jig.
+  process.on("exit", () => {
+    killCommands();
+    outputs.remove();
+  });
   // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
-  // leave the files behind: they end it with an ordinary exit instead, and the exit code a shell would give.
+  // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
+  // shell would give.
   for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
@@ -435,10 +441,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
     }
     const always = permissions.alwaysLabel(tool, input);
-    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
+    // The task stopping (at --time-limit) closes the question unanswered, so it doesn't wait past the limit.
+    const signal = task?.signal;
+    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `, signal);
     if (answer === null) {
       task?.abort(); // Ctrl+C at the prompt stops the whole task
-      return "Not run: the user stopped the task.";
+      return `Not run: ${whyStopped(signal, "the user stopped the task")}.`;
     }
     const choice = answer.trim().toLowerCase();
     if (always && choice.startsWith("a")) {

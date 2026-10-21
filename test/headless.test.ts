@@ -197,6 +197,25 @@ describe("a command's long output", () => {
   });
 });
 
+describe("a signal that ends jig", () => {
+  it("kills the command still running, which without the sandbox would outlive it", async () => {
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) {
+      // The command signals jig, then waits for the test's word to leave a file behind.
+      const command = `kill -${signal} $PPID; until [ -e go-${signal} ]; do sleep 0.05; done; touch outlived-${signal}`;
+      const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
+      try {
+        const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Fix the parser."], { api, cwd: project });
+        await writeFile(join(project, `go-${signal}`), ""); // first, so a command that outlived jig doesn't wait forever
+        await new Promise((done) => setTimeout(done, 500));
+        assert.equal(code, 128 + constants.signals[signal]);
+        assert.equal(existsSync(join(project, `outlived-${signal}`)), false, `the command outlived jig after ${signal}`);
+      } finally {
+        api.close();
+      }
+    }
+  });
+});
+
 describe("--stats", () => {
   const turn = (content: Anthropic.Beta.BetaContentBlock[]): ModelTurn => ({
     message: {
