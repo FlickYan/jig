@@ -147,9 +147,15 @@ describe("changing installed skills", () => {
     await writeFile(join(outside, "bashrc"), "# the user's shell\n");
   });
 
+  /** What the last `jig skills ...` printed. */
+  let printed: string[] = [];
+  /** What marks the lines jig skills prints. */
+  const markers = ["beta", "skill's name", "Not updating", "changed: "];
+
   /** Runs `jig skills ...` in the project, answering yes to every question. */
   async function jig(...args: string[]): Promise<void> {
-    const { stop } = collectNotices("beta"); // what it prints, kept out of the test report
+    const { notices, stop } = collectNotices(...markers); // what it prints, kept out of the test report
+    printed = notices;
     try {
       await skillsCommand([...args, "-C", dir, "--yes"]);
     } finally {
@@ -167,7 +173,7 @@ describe("changing installed skills", () => {
   it("aren't added, updated or removed through a link out of the project", async () => {
     // add --project, when .jig leads out of the project.
     await symlink(outside, join(dir, ".jig"));
-    await assert.rejects(jig("add", source, "--project", "--force"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
+    await assert.rejects(jig("add", source, "--project", "--force"), /\.jig\/skills\/beta leads outside the project, to .*jig-skills-outside-\w+\/skills\/beta, so jig won't change it/);
     await assertUntouched();
 
     // update and remove, when .jig/skills does, once the skill is installed.
@@ -175,23 +181,31 @@ describe("changing installed skills", () => {
     await jig("add", source, "--project");
     await rm(join(dir, ".jig", "skills"), { recursive: true });
     await symlink(join(outside, "skills"), join(dir, ".jig", "skills"));
-    await assert.rejects(jig("update"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
-    await assert.rejects(jig("remove", "beta"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: beta\.$/);
+    assert.match(printed.join("\n"), /\.jig\/skills\/beta leads outside the project, to .*jig-skills-outside-\w+\/skills\/beta, so jig won't change it/);
+    await assert.rejects(jig("remove", "beta"), /\.jig\/skills\/beta leads outside the project, to .*jig-skills-outside-\w+\/skills\/beta, so jig won't change it/);
     await assertUntouched();
 
     // When the skill's own folder is the link.
     await rm(join(dir, ".jig", "skills"));
     await mkdir(join(dir, ".jig", "skills"));
     await symlink(join(outside, "skills", "beta"), join(dir, ".jig", "skills", "beta"));
-    await assert.rejects(jig("update"), /leads through a symlink/);
-    await assert.rejects(jig("remove", "beta"), /leads through a symlink/);
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: beta\.$/);
+    assert.match(printed.join("\n"), /\.jig\/skills\/beta leads outside the project/);
+    await assert.rejects(jig("remove", "beta"), /\.jig\/skills\/beta leads outside the project/);
     await assertUntouched();
+
+    // When it is a broken link, which jig can't follow to check: the message says what to do.
+    await rm(join(dir, ".jig", "skills", "beta"));
+    await symlink(join(outside, "gone"), join(dir, ".jig", "skills", "beta"));
+    await assert.rejects(jig("remove", "beta"), /\.jig\/skills\/beta leads through a broken symlink, so jig won't change it\. A command may have put it there; if so, delete it\./);
+    assert.ok(!existsSync(join(outside, "gone")));
 
     // When the lockfile is: nothing is installed, as its entry couldn't be written.
     await rm(join(dir, ".jig", "skills", "beta"));
     await rm(join(dir, ".jig", "skills-lock.json"));
     await symlink(join(outside, "bashrc"), join(dir, ".jig", "skills-lock.json"));
-    await assert.rejects(jig("add", source, "--project"), /\.jig\/skills-lock\.json leads through a symlink to .*bashrc, outside the working directory/);
+    await assert.rejects(jig("add", source, "--project"), /\.jig\/skills-lock\.json leads outside the project, to .*bashrc, so jig won't change it/);
     assert.ok(!existsSync(join(dir, ".jig", "skills", "beta")));
     await assertUntouched();
 
@@ -200,7 +214,7 @@ describe("changing installed skills", () => {
     await mkdir(join(dir, ".git", "hooks"), { recursive: true });
     await mkdir(join(dir, ".jig"));
     await symlink(join("..", ".git", "hooks"), join(dir, ".jig", "skills"));
-    await assert.rejects(jig("add", source, "--project"), /git directory's config or a hook/);
+    await assert.rejects(jig("add", source, "--project"), /\.jig\/skills\/beta leads into a git directory, to .*\.git\/hooks\/beta, so jig won't change it/);
     assert.deepEqual(await readdir(join(dir, ".git", "hooks")), []);
   });
 
@@ -230,9 +244,10 @@ describe("changing installed skills", () => {
     for (const linked of ["modules", "worktrees"]) {
       await rm(join(dir, ".jig", "skills"), { force: true });
       await symlink(join("..", ".git", linked), join(dir, ".jig", "skills"));
-      await assert.rejects(jig("update"), /\.jig\/skills\/beta leads to .*, in a git directory/);
-      await assert.rejects(jig("remove", "beta"), /in a git directory/);
-      await assert.rejects(jig("add", source, "--project", "--force"), /in a git directory/);
+      await assert.rejects(jig("update"), /^Error: Not updated, as said above: beta\.$/);
+      assert.match(printed.join("\n"), /\.jig\/skills\/beta leads into a git directory, to .*\.git\/\w+\/beta, so jig won't change it/);
+      await assert.rejects(jig("remove", "beta"), /into a git directory/);
+      await assert.rejects(jig("add", source, "--project", "--force"), /into a git directory/);
       assert.deepEqual(await gitDirs(), before);
     }
   });
@@ -247,10 +262,52 @@ describe("changing installed skills", () => {
       await mkdir(dirname(lock), { recursive: true });
       await writeFile(lock, JSON.stringify({ version: 1, skills: { [name]: { source, path: source, installed: "2026-10-01T00:00:00.000Z" } } }));
       await assert.rejects(jig("remove", name), /isn't a skill's name/);
-      await assert.rejects(jig("update", name), /isn't a skill's name/);
+      await assert.rejects(jig("update", name), /Not updated, as said above/);
+      assert.match(printed.join("\n"), /isn't a skill's name/);
       await assertUntouched();
       await rm(lock);
     }
+  });
+
+  it("are updated when the project's lockfile holds entries jig refuses or can't fetch", async () => {
+    // A command can write the project's lockfile, which is read first: entries there that jig won't change,
+    // or can't fetch or read, are skipped, and don't keep the user's own skills from updating.
+    await jig("add", source);
+    await writeFile(join(source, "SKILL.md"), "---\nname: beta\ndescription: Does beta better. Use when asked to beta.\n---\n\nNew steps.\n");
+    await mkdir(join(dir, ".jig", "skills"), { recursive: true });
+    await symlink(join(outside, "skills", "beta"), join(dir, ".jig", "skills", "beta"));
+    const entry = { source, path: source, installed: "2026-10-01T00:00:00.000Z" };
+    const skills = {
+      Bad_Name: entry,
+      beta: entry,
+      gone: { ...entry, path: join(dir, "nowhere") },
+      odd: null,
+      remote: { ...entry, source: "team/skills", url: `file://${join(dir, "no-repository")}`, path: "gone" },
+    };
+    await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify({ version: 1, skills }));
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: Bad_Name, beta, gone, odd, remote\.$/);
+    const said = printed.join("\n");
+    assert.match(said, /Not updating Bad_Name: "Bad_Name" in .* isn't a skill's name/);
+    assert.match(said, /Not updating beta: \.jig\/skills\/beta leads outside the project, to .*jig-skills-outside-\w+\/skills\/beta, so jig won't change it/);
+    assert.match(said, /Not updating gone: .*nowhere isn't a folder\./);
+    assert.match(said, /Not updating odd: its lockfile entry doesn't say where to fetch it from\./);
+    assert.match(said, /Not updating remote: Couldn't fetch team\/skills: /);
+    assert.match(said, /Updated beta\./);
+    assert.match(await readFile(join(process.env.JIG_HOME!, "skills", "beta", "SKILL.md"), "utf8"), /New steps/);
+    await assertUntouched();
+
+    // Having no one to ask still stops it, as it does add and remove: it isn't taken for a skill to skip.
+    await writeFile(join(source, "SKILL.md"), "---\nname: beta\ndescription: Does beta better. Use when asked to beta.\n---\n\nNewer steps.\n");
+    const { stop } = collectNotices(...markers);
+    const tty = process.stdin.isTTY;
+    process.stdin.isTTY = false;
+    try {
+      await assert.rejects(skillsCommand(["update", "-C", dir]), /^Error: There is no one to ask \(no terminal\); pass --yes to go ahead\.$/);
+    } finally {
+      process.stdin.isTTY = tty;
+      stop();
+    }
+    assert.match(await readFile(join(process.env.JIG_HOME!, "skills", "beta", "SKILL.md"), "utf8"), /New steps/);
   });
 });
 
@@ -312,10 +369,37 @@ describe("proposing a skill", () => {
     await writeFile(join(outside, "skills", "release-notes", "work.txt"), "the user's own\n");
     await symlink(outside, join(dir, ".jig"));
     for (const decision of ["project", "proposal"] as const) {
-      await assert.rejects(proposeSkillTool(async () => decision).run({ ...proposal }, context()), /\.jig\/.*release-notes leads through a symlink to .*, outside the working directory/);
+      await assert.rejects(proposeSkillTool(async () => decision).run({ ...proposal }, context()), /\.jig\/.*release-notes leads outside the project, to .*, so jig won't change it/);
     }
     assert.equal(await readFile(join(outside, "skills", "release-notes", "work.txt"), "utf8"), "the user's own\n");
     assert.ok(!existsSync(join(outside, "proposals")));
+  });
+
+  it("isn't saved in a git directory, whose own files a skill's would replace", async () => {
+    // A submodule named like the skill: with .jig/skills, or .jig/proposals/skills, linked to .git/modules,
+    // the skill's folder would be the submodule's git directory, and its files would replace git's own,
+    // such as the config, whose core.fsmonitor the user's next git status runs outside the sandbox.
+    const lib = join(dir, "lib");
+    await mkdir(lib);
+    await writeFile(join(lib, "a.txt"), "a\n");
+    git(lib, "init", "-q");
+    git(lib, "add", "a.txt");
+    git(lib, "commit", "-qm", "lib");
+    git(dir, "init", "-q");
+    git(dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "release-notes");
+    const gitDir = join(dir, ".git", "modules", "release-notes");
+    const before = [(await readdir(gitDir)).sort(), await readFile(join(gitDir, "config"), "utf8")];
+    await mkdir(join(dir, ".jig", "proposals"), { recursive: true });
+    await symlink(join("..", ".git", "modules"), join(dir, ".jig", "skills"));
+    await symlink(join("..", "..", ".git", "modules"), join(dir, ".jig", "proposals", "skills"));
+    const config = { config: "[core]\n\tfsmonitor = touch pwned\n" };
+    for (const decision of ["project", "proposal"] as const) {
+      await assert.rejects(
+        proposeSkillTool(async () => decision).run({ ...proposal, files: config }, context()),
+        /\.jig\/.*skills\/release-notes leads into a git directory, to .*\.git\/modules\/release-notes, so jig won't change it/,
+      );
+    }
+    assert.deepEqual([(await readdir(gitDir)).sort(), await readFile(join(gitDir, "config"), "utf8")], before);
   });
 });
 

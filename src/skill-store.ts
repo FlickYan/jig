@@ -5,7 +5,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
-import { realTarget, resolveForChange } from "./tools/util.ts";
+import { assertVisible, isInside, realTarget } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -175,29 +175,38 @@ function writeLock(scope: InstallScope, project: string, skills: Record<string, 
 }
 
 /**
- * A skill's folder, checked before jig replaces or removes it, and the lockfile with it. jig changes them
- * itself, outside the sandbox, and a project's .jig is within a command's reach: a symlink a command put
- * there (.jig, .jig/skills, a skill's folder, the lockfile) would take the change out of the project. So in
- * the project they go by where they really lead, as write_file's changes do, and stay out of any .git
- * directory: write_file's check is for one file, but a skill's folder is replaced whole, so with
- * .jig/skills linked to .git/modules, a skill named like a submodule would put its files in place of that
- * submodule's config and hooks. In either scope the name must be a skill's name, since the lockfile's
- * names come from a file commands can write: "../.." would be the project itself.
+ * Refuses a path in the project that jig is about to replace or remove itself, outside the sandbox: a
+ * skill's folder (installed, or one the model wrote) or the lockfile. A project's .jig is within a
+ * command's reach, and a symlink a command put there (.jig, .jig/skills, a skill's folder, the lockfile)
+ * would take the change out of the project. So the path goes by where it really leads, as write_file's
+ * changes do, and stays out of any .git directory: write_file's check is for one file, but a skill's
+ * folder is replaced whole, so with .jig/skills linked to .git/modules, a skill named like a submodule
+ * would put its files in place of that submodule's config and hooks. The messages are jig's own, not
+ * write_file's, as the user reads them too.
+ */
+export async function assertInProject(project: string, path: string, hidden: string[] = []): Promise<void> {
+  const shown = relative(project, path);
+  const real = await realTarget(path);
+  if (!real) throw new Error(`${shown} leads through a broken symlink, so jig won't change it. A command may have put it there; if so, delete it.`);
+  await assertVisible(path, shown, hidden);
+  const root = await realTarget(project);
+  if (!root || !isInside(root, real)) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
+  // Without case, as isGitControl: macOS's file systems usually ignore it.
+  if (real.toLowerCase().split(sep).includes(".git")) {
+    throw new Error(`${shown} leads into a git directory, to ${real}, so jig won't change it: a skill's files there could take the place of git's own, such as a submodule's config. A command may have put a link there.`);
+  }
+}
+
+/**
+ * A skill's folder, checked before jig replaces or removes it, and in the project the lockfile with it
+ * (see assertInProject). In either scope the name must be a skill's name, since the lockfile's names come
+ * from a file commands can write: "../.." would be the project itself.
  */
 export async function skillDirForChange(scope: InstallScope, project: string, name: string): Promise<string> {
   const dir = join(skillsDir(scope, project), name);
   const lock = lockPath(scope, project);
   if (nameProblems(name).length) throw new Error(`"${name}" in ${lock} isn't a skill's name, so jig won't change ${dir}. A command may have put it there.`);
-  if (scope === "project") {
-    for (const path of [dir, lock]) {
-      await resolveForChange(project, relative(project, path));
-      const real = (await realTarget(path)) ?? path;
-      if (real.toLowerCase().split(sep).includes(".git")) {
-        // Without case, as isGitControl: macOS's file systems usually ignore it.
-        throw new Error(`${relative(project, path)} leads to ${real}, in a git directory, so jig won't change it: a skill's files there could take the place of git's own, such as a submodule's config. A command may have put a link there.`);
-      }
-    }
-  }
+  if (scope === "project") for (const path of [dir, lock]) await assertInProject(project, path);
   return dir;
 }
 
@@ -247,6 +256,9 @@ export async function removeSkill(skill: Installed, project: string): Promise<vo
 
 /** The source of an installed skill, to fetch it again: the same repository folder at the same ref. */
 export function lockedSource(entry: LockEntry): SkillSource {
+  // The project's lockfile is a file commands can write, so an entry may not be one jig wrote.
+  const fields = [entry?.source, entry?.path, entry?.url ?? "", entry?.ref ?? ""];
+  if (!fields.every((field) => typeof field === "string")) throw new Error("its lockfile entry doesn't say where to fetch it from.");
   return entry.url ? { spec: entry.source, url: entry.url, path: entry.path, ...(entry.ref && { ref: entry.ref }) } : { spec: entry.source, path: entry.path };
 }
 

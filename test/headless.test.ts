@@ -21,7 +21,7 @@ import { readTool } from "../src/tools/read.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
-import { fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
+import { fakeMessagesApi, messagesReply, runJig, systemText } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
@@ -971,6 +971,45 @@ describe("an interactive session fed through stdin", () => {
       const [before, after] = [...output.matchAll(/Saved in (\S+)/g)].map((match) => match[1]);
       assert.ok(before && after && before !== after, output);
       assert.equal((api.requests[4].messages as unknown[]).length, 1, "a new conversation");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("leaves out an AGENTS.md or a skill that is a named pipe, a link to /dev/zero or a link to itself, rather than waiting on it", async () => {
+    // As a command, or a cloned repository, can leave them: a named pipe waits for a writer, and /dev/zero never ends.
+    const skills = join(project, ".jig", "skills");
+    for (const name of ["piped", "zeroed", "notes/references"]) await mkdir(join(skills, name), { recursive: true });
+    execFileSync("mkfifo", [join(project, "AGENTS.md"), join(skills, "piped", "SKILL.md")]);
+    await symlink("/dev/zero", join(skills, "zeroed", "SKILL.md"));
+    await writeFile(join(skills, "notes", "SKILL.md"), "---\nname: notes\ndescription: Taking notes.\n---\nWrite them down.\n");
+    await symlink("/dev/zero", join(skills, "notes", "references", "zero.md"));
+    // A link to itself, as a skill's folder or its SKILL.md, is skipped like a missing one: it stopped jig starting.
+    await mkdir(join(project, ".claude", "skills"), { recursive: true });
+    await symlink("looped", join(project, ".claude", "skills", "looped"));
+    const calls = [
+      { tool: "skill", input: { name: "notes", file: "references/zero.md" } },
+      { tool: "propose_instructions", input: { new_string: "Take notes." } },
+      { tool: "bash", input: { command: "rm .jig/skills/notes/SKILL.md && mkfifo .jig/skills/notes/SKILL.md && mkdir .jig/skills/circular && ln -s SKILL.md .jig/skills/circular/SKILL.md" } },
+      { tool: "skill", input: { name: "notes" } },
+    ];
+    let step = 0;
+    const api = await fakeMessagesApi(() => (step < calls.length ? [calls[step++]] : [{ text: "Done." }]));
+    try {
+      const stdin = "Take notes.\n/reset\nAgain.\n";
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"], { api, cwd: project, stdin, timeout: 20_000 });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 6, output);
+      const system = systemText(api.requests[0] as { system?: string });
+      assert.match(system, /<skill name="notes">/);
+      assert.doesNotMatch(system, /piped|zeroed|looped|<instructions/);
+      assert.match(last(api.requests[1]), /The skill \\"notes\\" has no file references\/zero\.md\./);
+      assert.match(last(api.requests[2]), /AGENTS\.md isn't a regular file \(a named pipe, say\), so it can't be edited\./);
+      assert.match(last(api.requests[4]), /The skill \\"notes\\" no longer has a SKILL\.md file\./);
+      // /reset finds the instructions and skills again: the skill whose SKILL.md is now a named pipe is gone,
+      // and the one whose SKILL.md is now a link to itself is skipped.
+      assert.match(output, /Started a new conversation\.\n/);
+      assert.doesNotMatch(systemText(api.requests[5] as { system?: string }), /<skill name="notes">|circular/);
     } finally {
       api.close();
     }

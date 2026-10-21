@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
-import { isGitControl, isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { isGitControl, isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
@@ -29,6 +29,7 @@ export interface GitControl {
 }
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
+const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are: it holds a path, or a little config
 
 /**
  * Commands run in the operating system's own sandbox, the way Codex and Claude Code sandbox them:
@@ -127,7 +128,9 @@ function dotGitFile(project: string): string | undefined {
 /** A linked worktree's .git file, which its gitdir file names. */
 function worktreeDotGit(tree: string): string | undefined {
   try {
-    return dotGitIn(dirname(resolve(tree, readFileSync(join(tree, "gitdir"), "utf8").trim())));
+    // A command can make a worktree's directory, with a named pipe for its gitdir.
+    const gitdir = readRegularFile(join(tree, "gitdir"), GIT_FILE_BYTES);
+    return gitdir === undefined ? undefined : dotGitIn(dirname(resolve(tree, gitdir.trim())));
   } catch {
     return undefined;
   }
@@ -140,11 +143,14 @@ function worktreeDotGit(tree: string): string | undefined {
  */
 function checkoutDotGit(module: string): string | undefined {
   try {
+    // git would wait on a config that is a named pipe, as a command can leave in a submodule's directory it
+    // made. Inside the try, as a link to itself there makes stat throw (ELOOP).
+    if (!statSync(join(module, "config")).isFile()) return undefined;
     const args = [...SAFE_GIT, "config", "--file", join(module, "config"), "--get", "core.worktree"];
     const tree = execFileSync("git", args, { env: withoutKeys(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return dotGitIn(resolve(module, tree.replace(/\n$/, "")));
   } catch {
-    return undefined; // no checkout, or one git doesn't know of
+    return undefined; // no config to read, no checkout, or one git doesn't know of
   }
 }
 
@@ -182,11 +188,18 @@ function gitWatch({ locked }: GitControl, project: string): () => string[] {
     });
 }
 
-/** What is at a path, to tell whether it changed: where it really is, and a file's text. Undefined if nothing is. */
+/**
+ * What is at a path, to tell whether it changed: where it really is, its kind (by its mode), and a regular
+ * file's size and the start of its text. Undefined if nothing is. Only a regular file is read: a command
+ * can put a named pipe there, or a link to /dev/zero, and reading either hung jig after the task. Those,
+ * and a directory, are told apart by their kind alone.
+ */
 function contents(path: string): string | undefined {
   try {
     const real = realpathSync(path);
-    return statSync(real).isDirectory() ? `${real}${sep}` : `${real}\n${readFileSync(real, "utf8")}`;
+    const info = statSync(real);
+    const file = info.isFile() ? [info.size, readRegularFile(real, GIT_FILE_BYTES)] : [];
+    return JSON.stringify([real, info.mode & constants.S_IFMT, ...file]);
   } catch {
     return undefined;
   }

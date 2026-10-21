@@ -2,10 +2,10 @@
 // guidance, the environment, and what the project and the user add (AGENTS.md files, skills, memory).
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, relative } from "node:path";
-import { SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
 const FILE_TOOLS = ["read_file", "grep", "glob", "write_file", "edit_file"];
@@ -19,6 +19,7 @@ export interface Instructions {
 /**
  * The project's instructions for agents: AGENTS.md (or CLAUDE.md where there is none) in each directory
  * from the repository root down to the working directory, outermost first so the more specific come last.
+ * One that isn't a regular file (a named pipe a command made, say) is left out, unread.
  */
 export function loadInstructions(cwd: string): Instructions[] {
   const here = realpathSync(cwd);
@@ -31,7 +32,8 @@ export function loadInstructions(cwd: string): Instructions[] {
   return dirs.flatMap((dir) => {
     const path = ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).find((file) => existsSync(file));
     if (!path) return [];
-    let text = readFileSync(path, "utf8").trim();
+    // Enough bytes for the characters kept: UTF-8 takes 3 bytes a character at most.
+    let text = readRegularFile(path, 4 * MAX_INSTRUCTIONS_CHARS)?.trim() ?? "";
     if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
     return text ? [{ path: relative(here, path), text }] : [];
   });

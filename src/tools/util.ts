@@ -1,5 +1,5 @@
 import { constants } from "node:buffer";
-import type { Stats } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, type Stats, statSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -125,6 +125,41 @@ export async function assertFile(abs: string, path: string): Promise<Stats> {
   if (!info) throw new Error(`File not found: ${path}`);
   if (info.isDirectory()) throw new Error(`${path} is a directory. Use glob or bash (e.g. ls) to see what is in it.`);
   return info;
+}
+
+/**
+ * A regular file's text, at most its first `max` bytes, or undefined if the path leads to anything else, or
+ * nowhere. jig reads some files outside the sandbox that a command, or a cloned repository, can put in
+ * place: AGENTS.md, skills, the settings, git's files that say where its config is. A named pipe there
+ * would block the read until something wrote to it, and a link to a device such as /dev/zero would never
+ * end, and either would hang jig until it was killed. So only a regular file is opened, without waiting,
+ * and checked again once open, in case something else took its place in between.
+ */
+export function readRegularFile(path: string, max = Infinity): string | undefined {
+  // Any path stat fails on leads nowhere: throwIfNoEntry covers only a missing one, and a link to itself
+  // (ELOOP), which a cloned repository can hold, or a folder jig can't search (EACCES) would throw.
+  try {
+    if (!statSync(path).isFile()) return undefined;
+  } catch {
+    return undefined;
+  }
+  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) return undefined;
+    const size = info.size;
+    const bytes = Buffer.alloc(Math.min(size, max));
+    let read = 0;
+    while (read < bytes.length) {
+      const n = readSync(fd, bytes, read, bytes.length - read, read);
+      if (n === 0) break; // it got shorter meanwhile
+      read += n;
+    }
+    // A character the cut ends halfway through is left out, rather than shown as U+FFFD.
+    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(0, read), { stream: read < size });
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

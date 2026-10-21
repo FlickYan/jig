@@ -8,7 +8,7 @@ import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { jigHome } from "./paths.ts";
 import type { Tool } from "./tools/index.ts";
-import { isInside } from "./tools/util.ts";
+import { isInside, readRegularFile } from "./tools/util.ts";
 
 /** An Agent Skill (agentskills.io): a directory with a SKILL.md of instructions, and maybe scripts and references. */
 export interface Skill {
@@ -48,7 +48,8 @@ export interface DiscoverOptions {
  * The skills available in a project: under the project's skill directories, then the user's, then jig's
  * own. A project skill wins over a user skill of the same name, and either over one of jig's. Like the
  * integration guide suggests, problems are warnings, not errors; only a skill without a description is
- * skipped, since the model couldn't know when to use it.
+ * skipped, since the model couldn't know when to use it. So is one whose SKILL.md isn't a regular file:
+ * a project's skills are within a command's reach, and a named pipe there would hang jig (see readRegularFile).
  */
 export function discoverSkills(root: string, home = homedir(), { builtin = BUILTIN_SKILLS, hidden = [] }: DiscoverOptions = {}): { skills: Skill[]; warnings: string[] } {
   const skills = new Map<string, Skill>();
@@ -62,8 +63,9 @@ export function discoverSkills(root: string, home = homedir(), { builtin = BUILT
   for (const [dir, scope] of places.filter(([d]) => existsSync(d) && statSync(d).isDirectory())) {
     for (const entry of readdirSync(dir).sort()) {
       const skillDir = join(dir, entry);
-      if (!existsSync(join(skillDir, "SKILL.md"))) continue;
-      const { name = entry, description } = frontmatter(readFileSync(join(skillDir, "SKILL.md"), "utf8"));
+      const text = readRegularFile(join(skillDir, "SKILL.md"));
+      if (text === undefined) continue;
+      const { name = entry, description } = frontmatter(text);
       if (hidden.includes(name)) continue;
       if (!description) {
         warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md has no description.`);
@@ -166,10 +168,10 @@ export function skillTool(skills: Skill[]): Tool {
       const skill = skills.find((s) => s.name === name)!;
       if (file) {
         const path = join(skill.dir, file);
-        if (!isInside(skill.dir, path) || !existsSync(path) || statSync(path).isDirectory()) {
-          throw new Error(`The skill "${name}" has no file ${file}.`);
-        }
-        return readFileSync(path, "utf8").slice(0, MAX_FILE_CHARS);
+        // Enough bytes for the characters kept: UTF-8 takes 3 bytes a character at most.
+        const text = isInside(skill.dir, path) ? readRegularFile(path, 4 * MAX_FILE_CHARS) : undefined;
+        if (text === undefined) throw new Error(`The skill "${name}" has no file ${file}.`);
+        return text.slice(0, MAX_FILE_CHARS);
       }
       const content = loadSkill(skill);
       ctx.pin?.(`skill:${name}`, content); // keep the instructions through compaction
@@ -181,7 +183,9 @@ export function skillTool(skills: Skill[]): Tool {
 
 /** A skill's instructions as the model sees them: the SKILL.md body, where it lives, and what else is there. */
 export function loadSkill(skill: Skill): string {
-  const body = readFileSync(join(skill.dir, "SKILL.md"), "utf8").replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
+  const text = readRegularFile(join(skill.dir, "SKILL.md"));
+  if (text === undefined) throw new Error(`The skill "${skill.name}" no longer has a SKILL.md file.`);
+  const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
   const files = listSkillFiles(skill.dir).filter((file) => file !== "SKILL.md");
   const resources = files.length
     ? `\n<skill_resources>\n${files.slice(0, MAX_RESOURCES).join("\n")}${files.length > MAX_RESOURCES ? "\n…" : ""}\n</skill_resources>`

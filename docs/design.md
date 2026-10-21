@@ -122,11 +122,18 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
   sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
   earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
-  write. So a named pipe elsewhere is replaced too. `jig skills add`, `update` and `remove` go by real
-  path in the project as well, and take only a skill's name from the lockfile, which commands can write:
+  write. So a named pipe elsewhere is replaced too. What jig reads itself (AGENTS.md, skills, the
+  settings, the git files the sandbox watches) it opens only if it is a regular file, without waiting:
+  in a review, a command's `mkfifo .git`, where jig ran in a subdirectory, had jig wait after the task
+  until it was killed, and a link to `/dev/zero` read without end. `jig skills add`, `update` and
+  `remove` go by real path in the project as well, and take only a skill's name from the lockfile,
+  which commands can write:
   a name of `../..` made `remove` delete the project. They also change nothing in a `.git` directory. They
   replace a skill's folder whole, and the check for `config` and hooks looks at one file: in a review,
   `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a submodule's config.
+  A skill the model wrote replaced its folder whole too, and is held to the same. `update` skips an entry
+  it refuses, or can't fetch or install, and updates the rest: one entry a command wrote, with a bad name,
+  a missing path or no fields at all, used to stop it before the user's own skills.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig

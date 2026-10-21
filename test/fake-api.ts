@@ -89,11 +89,12 @@ sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
  * Runs jig's CLI against a fake API, in `cwd`, with its own JIG_HOME unless `env` gives one. With `terminal`,
  * its input and output are a pseudo-terminal that python3 makes and no one types at (`stdin` goes unread), and
  * the output comes without the terminal's escape codes and carriage returns. Still waiting for an answer after
- * 20 seconds, jig is hung up on, so a test fails rather than hangs.
+ * 20 seconds, jig is hung up on, so a test fails rather than hangs. With `timeout`, jig is killed after that
+ * many milliseconds, for a test of a hang where it would run no signal handler (code null).
  */
 export async function runJig(
   args: string[],
-  { api, cwd, env = {}, stdin = "", terminal = false }: { api: FakeApi; cwd: string; env?: NodeJS.ProcessEnv; stdin?: string; terminal?: boolean },
+  { api, cwd, env = {}, stdin = "", terminal = false, timeout }: { api: FakeApi; cwd: string; env?: NodeJS.ProcessEnv; stdin?: string; terminal?: boolean; timeout?: number },
 ): Promise<{ code: number | null; output: string }> {
   const home = env.JIG_HOME ?? (await mkdtemp(join(tmpdir(), "jig-home-")));
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");
@@ -101,7 +102,7 @@ export async function runJig(
   const child = spawn(program, rest, {
     cwd,
     env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", NO_COLOR: "1", ...env, JIG_HOME: home },
-    timeout: terminal ? 20_000 : undefined,
+    ...(timeout ? { timeout, killSignal: "SIGKILL" } : { timeout: terminal ? 20_000 : undefined }),
   });
   let output = "";
   child.stdout.setEncoding("utf8").on("data", (chunk) => (output += chunk));

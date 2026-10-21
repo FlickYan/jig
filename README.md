@@ -158,9 +158,14 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   to), and the `--stats` file is written anew and renamed into place, which replaces a link instead of
   writing through it (a linked folder on the way to it is still followed). A path in `/dev` or `/proc`,
   such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to, not replaced; a named
-  pipe anywhere else is replaced. What `jig skills add`, `update` and `remove` change in the project goes
+  pipe anywhere else is replaced. What jig reads from the project to work in it (AGENTS.md, skills, the
+  settings, the git files the sandbox watches) it reads only if it is a regular file: a named pipe a
+  command made there would have jig wait until it was killed, and a link to `/dev/zero` never ends. Such
+  an AGENTS.md or skill is left out, a settings file is refused, and a git file is reported by what it is.
+  What `jig skills add`, `update` and `remove` change in the project, and a skill the model wrote, go
   by real path too, and never into a `.git` directory, where a skill's folder could be a submodule's git
   directory; they refuse a name in the lockfile that isn't a skill's name: commands can write it.
+  `update` says why it skips an entry it refuses or can't fetch, updates the rest, and exits non-zero.
   The git that `grep` and `glob` run to list files
   runs with `core.fsmonitor` and hooks turned off, and without jig's API keys. `grep` matches in a worker
   thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially

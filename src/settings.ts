@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { jigHome } from "./paths.ts";
+import { readRegularFile } from "./tools/util.ts";
 
 export const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"] as const;
 export type HookEvent = (typeof HOOK_EVENTS)[number];
@@ -78,7 +79,10 @@ export function readSettings(root: string): { user: Settings; project?: ProjectS
   const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile, warnings) : empty();
   const projectFile = join(root, ".jig", "settings.json");
   if (!existsSync(projectFile)) return { user, warnings };
-  const text = readFileSync(projectFile, "utf8");
+  // A command can put a named pipe in its place, which jig would wait on forever. It is refused rather than
+  // left out, which would drop its deny rules without a word.
+  const text = readRegularFile(projectFile);
+  if (text === undefined) throw new Error(`${projectFile} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
   const settings = parse(text, projectFile, warnings);
   return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings }, warnings };
 }

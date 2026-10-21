@@ -14,6 +14,7 @@ import {
   removeSkill,
   skillDirForChange,
   skillsDir,
+  type Fetched,
   type InstallScope,
   type SkillInfo,
 } from "./skill-store.ts";
@@ -161,11 +162,18 @@ async function update(project: string, names: string[], confirm: (question: stri
   const unknown = names.filter((name) => !installed.some((skill) => skill.name === name));
   if (unknown.length) throw new Error(`Not installed with jig skills add: ${unknown.join(", ")}.`);
   if (!installed.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
+  const skipped: string[] = [];
   for (const skill of installed) {
-    await skillDirForChange(skill.scope, project, skill.name); // refused before it is fetched, or anyone asked
-    const source = lockedSource(skill.entry);
-    const fetched = fetchSource(source);
+    // A skill jig refuses, or can't fetch or install, is skipped with the reason, and the rest are still
+    // updated: a command can write the project's lockfile, which is read first, and an entry it put there
+    // (a name or a link jig refuses, a source that isn't there, an entry that isn't one) mustn't keep the
+    // user's own skills from updating. Having no one to ask still stops it, as it does add and remove.
+    let fetched: Fetched | undefined;
+    let asking = false;
     try {
+      await skillDirForChange(skill.scope, project, skill.name); // refused before it is fetched, or anyone asked
+      const source = lockedSource(skill.entry);
+      fetched = fetchSource(source);
       const [dir] = findSkills(fetched.dir, 0);
       if (!dir) {
         ui.notice(`${skill.name}: ${skill.entry.source} no longer has the skill's folder (${skill.entry.path}); left as it is.`);
@@ -183,13 +191,21 @@ async function update(project: string, names: string[], confirm: (question: stri
       const info = describeSkill(dir);
       showSkill(info);
       ui.println(ui.dim(`  changed: ${[...changed, ...added.map((f) => `+${f}`), ...removed.map((f) => `-${f}`)].join(", ")}`));
-      if (!(await confirm(`Update ${skill.name}? [y/N] `))) continue;
+      asking = true;
+      const yes = await confirm(`Update ${skill.name}? [y/N] `);
+      asking = false;
+      if (!yes) continue;
       await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });
       ui.notice(`Updated ${skill.name}.`);
+    } catch (err) {
+      if (asking) throw err;
+      ui.notice(`Not updating ${skill.name}: ${err instanceof Error ? err.message : String(err)}`);
+      skipped.push(skill.name);
     } finally {
-      fetched.cleanup();
+      fetched?.cleanup();
     }
   }
+  if (skipped.length) throw new Error(`Not updated, as said above: ${skipped.join(", ")}.`);
 }
 
 function short(text: string, max: number): string {
