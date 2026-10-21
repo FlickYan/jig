@@ -547,10 +547,11 @@ async function handleToolCall(
   let checking = "the PreToolUse hooks";
   try {
     // Hooks first, as in Claude Code: no point asking the user about a call a hook would block anyway.
+    // What a hook says can be a whole test log, so it is cut like a tool's output.
     const blocked = await opts.hooks?.before(call.name, input, signal);
     if (blocked) {
       opts.count?.("hook.blocked");
-      return fail(`Blocked by a hook: ${blocked}`);
+      return fail(`Blocked by a hook: ${truncate(blocked)}`);
     }
     if (signal?.aborted) return fail(`Not run: ${whyStopped(signal, "the user interrupted")}.`);
     checking = "the permission check";
@@ -583,7 +584,7 @@ async function handleToolCall(
     const feedback = await opts.hooks?.after(call.name, input, output, signal);
     if (feedback) {
       opts.count?.("hook.feedback");
-      output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${feedback}`;
+      output = `${output.trimEnd()}\n\nA hook checked this result and reported:\n${truncate(feedback)}`;
     }
   } catch (err) {
     // The call has run, so its result stands; the user hears that the hooks couldn't check it.

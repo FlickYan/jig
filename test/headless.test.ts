@@ -892,14 +892,17 @@ describe("an interactive session fed through stdin", () => {
     }
   });
 
-  it("joins a line ending in \\ to the next, so one message can span lines", async () => {
+  it("takes a line ending in \\ as it is, so a command after it still runs", async () => {
+    // Joining it to the next, as at a terminal, sent "/context" to the model as part of the task.
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
-      const stdin = "the build fails with this error:\\\nTypeError: x is undefined\\\n    at main (app.js:3)\n";
+      const stdin = "list the files in build\\\n/context\nsay hi\n/exit\n";
       const { code, output } = await runJig(args, { api, cwd: project, stdin });
       assert.equal(code, 0, output);
-      assert.equal(api.requests.length, 1, output);
-      assert.match(last(api.requests[0]), /the build fails with this error:\\nTypeError: x is undefined\\n {4}at main \(app\.js:3\)/);
+      assert.equal(api.requests.length, 2, output);
+      assert.equal(last(api.requests[0]), JSON.stringify("list the files in build\\"));
+      assert.match(output, /The conversation takes up about \d+ tokens/);
+      assert.match(last(api.requests[1]), /say hi/);
     } finally {
       api.close();
     }

@@ -407,6 +407,23 @@ describe("hooks", () => {
     assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nlint: all clear$/);
     assert.deepEqual([bash.is_error, bash.content], [true, "Blocked by a hook: no commands today"]);
   });
+
+  it("have what they tell the model cut, as a tool's output is", async () => {
+    // A hook that prints a whole test log mustn't put megabytes into one result.
+    await writeFile(join(dir, "a.txt"), "hello\n");
+    const log = "FAIL test_parse\n".repeat(10_000);
+    const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
+    const model = fakeModel([
+      reply([toolUse("t1", "read_file", { path: "a.txt" }), toolUse("t2", "bash", { command: "echo hi" })]),
+      reply([text("Done.")]),
+    ]);
+    const hooks = { before: async (tool: string) => (tool === "bash" ? log : null), after: async () => log };
+    await runAgent(conversation, agentOptions(model, { hooks }));
+    const [read, bash] = conversation.messages[2].content as ToolResult[];
+    assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nFAIL test_parse\n[\s\S]*characters truncated/);
+    assert.match(String(bash.content), /^Blocked by a hook: FAIL test_parse\n[\s\S]*characters truncated/);
+    for (const result of [read, bash]) assert.ok(String(result.content).length < 41_000, `${String(result.content).length} characters`);
+  });
 });
 
 describe("subagents", () => {

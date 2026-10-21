@@ -255,12 +255,12 @@ export class Input {
       // At a terminal, only what is typed while jig asks counts: a line that came in with the one before it
       // (pasted where the terminal doesn't mark pastes) mustn't answer the next question.
       if (this.input.isTTY && !this.answer) return;
-      if (this.pasting || line.endsWith("\\")) {
+      // A line ending in \ goes on in the next only at a terminal, as pastes are marked only there. Piped, each
+      // line is an entry as it is: a task ending in a path like C:\build\ mustn't take the /command after it.
+      if (this.pasting || (this.terminal && line.endsWith("\\"))) {
         this.pasted.push(this.pasting ? line : line.slice(0, -1));
-        if (this.terminal) {
-          rl.setPrompt(MORE);
-          rl.prompt();
-        }
+        rl.setPrompt(MORE);
+        rl.prompt();
         return;
       }
       const text = [...this.pasted.splice(0), line].join("\n");

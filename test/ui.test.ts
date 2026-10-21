@@ -41,6 +41,15 @@ describe("the input at a terminal", () => {
     assert.equal(shown.split("… ").length, 3, "a prompt for each line after the first");
   });
 
+  it("joins a line ending in \\ to the next, so one message can span lines", async () => {
+    const term = terminal();
+    const answer = askTask("> ", term.input);
+    await term.type("the build fails with this error:\\\r");
+    await term.type("TypeError: x is undefined\\\r    at main (app.js:3)\r");
+    assert.equal(await answer, "the build fails with this error:\nTypeError: x is undefined\n    at main (app.js:3)");
+    assert.equal((await term.shown()).split("… ").length, 3, "a prompt for each line after the first");
+  });
+
   it("brings back earlier tasks with Up, but not answers to questions or the lines of a paste", async () => {
     const term = terminal();
     const entered = async (read: Promise<string | null>, keys: string) => (await term.type(keys), read);
@@ -126,6 +135,15 @@ describe("piped input", () => {
     const read = [];
     for (let i = 0; i < 4; i++) read.push(await askTask("> ", from));
     assert.deepEqual(read, ["say hi", "/context", "say bye", null]);
+  });
+
+  it("takes a line ending in \\ as it is, so the command after it still runs", async () => {
+    const lines = new PassThrough();
+    const from = new Input(lines as unknown as NodeJS.ReadStream, new PassThrough().resume() as unknown as NodeJS.WriteStream);
+    lines.end("list the files in C:\\build\\\n/undo\n");
+    const read = [];
+    for (let i = 0; i < 3; i++) read.push(await askTask("> ", from));
+    assert.deepEqual(read, ["list the files in C:\\build\\", "/undo", null]);
   });
 
   it("answers a question with null when the task stops meanwhile, and still gives the next prompt the next line", async () => {

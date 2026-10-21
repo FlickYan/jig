@@ -104,7 +104,8 @@ In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/co
 received (subagents included), and how many input tokens came from the prompt cache. Up brings back earlier
 tasks; a paste of several lines is one message, sent with Enter, and a line ending in `\` goes on in the
 next. Ctrl+C stops a task, and at the prompt clears the line; on an empty prompt it says how to quit, and
-pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line.
+pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line,
+one ending in `\` too.
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
@@ -308,8 +309,9 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
   gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
-  stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
-  and otherwise ignored; a hook still running after 60 seconds is stopped, with everything it started.
+  stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut as tool output
+  is (see Long output). Any other failure is shown to you and otherwise ignored; a hook still running after
+  60 seconds is stopped, with everything it started.
 
   A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
