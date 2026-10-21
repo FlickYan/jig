@@ -25,10 +25,10 @@ type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 const text = (t: string) => ({ type: "text", text: t, citations: null }) as Block;
 const toolUse = (id: string, name: string, input: unknown) => ({ type: "tool_use", id, name, input }) as Block;
-const reply = (content: Block[]): ModelTurn => ({
+const reply = (content: Block[], stopReason?: Anthropic.Beta.BetaStopReason): ModelTurn => ({
   message: {
     content,
-    stop_reason: content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn",
+    stop_reason: stopReason ?? (content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn"),
     usage: { input_tokens: 100, output_tokens: 10 },
   } as Anthropic.Beta.BetaMessage,
   malformed: new Map(),
@@ -36,10 +36,10 @@ const reply = (content: Block[]): ModelTurn => ({
 const quietUI = { toolCall() {}, toolResult() {}, notice() {} };
 
 /** A fake model that plays back scripted replies (a summary for summary requests) and records what it was sent. */
-function fakeModel(replies: ModelTurn[], seen: MessageParam[][] = []): CallModel {
+function fakeModel(replies: ModelTurn[], seen: MessageParam[][] = [], summary = [text("SUMMARY: so far, so good.")]): CallModel {
   return async (messages, _signal, options) => {
     seen.push(structuredClone(messages));
-    if (options?.summarize) return reply([text("SUMMARY: so far, so good.")]);
+    if (options?.summarize) return reply(summary);
     const next = replies.shift();
     if (!next) throw new Error("the fake model ran out of replies");
     return next;
@@ -498,6 +498,36 @@ describe("subagents", () => {
 
     assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: loop.)");
     assert.equal(seen.length, 6, "five steps, then the request for what it found");
+  });
+
+  it("report what they found when they reply twice with nothing, and are told only that", async () => {
+    const seen: MessageParam[][] = [];
+    const model = fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([]), reply([])], seen);
+    const answer = await subagentTool(setup(model)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: empty.)");
+    // The loop's note after the first empty reply asked it to go on: the request takes its place.
+    const request = JSON.stringify(seen.at(-1));
+    assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: reply now with what you found so far/);
+    assert.doesNotMatch(request, /continue the task|run out of steps/);
+  });
+
+  it("keep the text they gave before replying twice with nothing, when their report has none", async () => {
+    const seen: MessageParam[][] = [];
+    // Empty, then text cut off at the output limit, then empty when asked to continue it: the run holds that text.
+    const model = fakeModel([reply([]), reply([text("PARTIAL: the needle is in hay")], "max_tokens"), reply([])], seen, []);
+    const answer = await subagentTool(setup(model)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "PARTIAL: the needle is in hay\n\n(The subagent stopped early: empty.)");
+    assert.equal(seen.length, 4, "three steps, then the request for what it found");
+  });
+
+  it("are asked only for what they found when an empty reply on the last step runs their steps out", async () => {
+    const seen: MessageParam[][] = [];
+    const answer = await subagentTool(setup(fakeModel([reply([]), reply([])], seen), 2)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: max_steps.)");
+    assert.deepEqual(seen.at(-1), [{ role: "user", content: [{ type: "text", text: "Look around." }, { type: "text", text: "You have run out of steps. Don't call any more tools: reply now with what you found so far, and what you didn't get to." }] }]);
   });
 });
 

@@ -442,6 +442,8 @@ const CUT_OFF_BEFORE_ANSWER = "Your last reply was cut off at the output limit b
 const CONTINUE = "Your reply was cut off at the output limit; continue from where it stopped, more briefly.";
 const MAX_CONTINUATIONS = 2;
 const NOT_AN_ANSWER = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER, CONTINUE];
+/** The notes after a reply left out of the history. One that is last when a run stops was never answered. */
+export const AFTER_EMPTY = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER];
 
 /**
  * What the model is asked once the steps have run out mid-task (see AgentOptions.wrapUp). Its reply is a
