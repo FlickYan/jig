@@ -141,10 +141,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   can it keep a submodule's checkout in place short of fixing every directory above it in the project.
   So on Linux a command can still create a `commondir` or `config.worktree`, or put another checkout in
   a submodule's place, and jig warns after the task and when a session ends; Seatbelt refuses them (a
-  symlink in a checkout's place gets the warning). A job a command leaves in the background can still do
-  it after jig has looked, and after a one-shot run nothing looks again. Commands can still make a
-  repository of their own (a submodule whose git directory is in its checkout is one), so jig's git
-  doesn't rely on any of this.
+  symlink in a checkout's place gets the warning). With jig started in a subdirectory of a repository,
+  a `.git` a command makes there is the one the user's git there finds; making a repository can be the
+  task, so neither sandbox refuses it, and jig warns of it the same way. A job a command leaves in the
+  background can still do it after jig has looked, and after a one-shot run nothing looks again.
+  Commands can still make a repository of their own (a submodule whose git directory is in its checkout
+  is one), so jig's git doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

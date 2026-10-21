@@ -14,15 +14,14 @@ export interface Sandbox {
   wrap(command: string): { program: string; args: string[] };
   /**
    * Those of the files telling git where its config is that commands created or changed since the last call.
-   * On Linux the sandbox can't keep a missing one from being created (see gitWatch), so jig says so after a task.
+   * On Linux the sandbox can't keep a missing one from being created, and neither sandbox refuses a .git made
+   * in the project when jig runs in a subdirectory of the repository (see gitWatch), so jig says so after a task.
    */
   gitChanges?(): string[];
 }
 
 /** What the sandbox keeps commands from changing in a repository (see gitControl). */
 export interface GitControl {
-  /** The git directory: commands can write in it, to commit, but not these. */
-  git: string;
   /** Config, hooks and the files that say where they are, whether they exist or not. */
   locked: string[];
   /** The git directory and the directories between it and those, which can't be moved aside either. */
@@ -58,7 +57,7 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
     process.platform === "darwin"
       ? seatbelt(writable, network, where, unreadable, guarded)
       : bubblewrap(writable, network, where, unreadable, guarded);
-  return guarded ? { ...sandbox, gitChanges: gitWatch(guarded) } : sandbox;
+  return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project) } : sandbox;
 }
 
 /**
@@ -86,7 +85,7 @@ export function gitControl(project: string, repo = gitDirs(project)): GitControl
   for (const path of locked) {
     for (let dir = dirname(path); dir !== common && isInside(common, dir); dir = dirname(dir)) fixed.add(dir);
   }
-  return { git: common, locked, fixed: [...fixed].sort((a, b) => a.length - b.length) }; // a directory before those in it
+  return { locked, fixed: [...fixed].sort((a, b) => a.length - b.length) }; // a directory before those in it
 }
 
 /** The git directories of submodules under a modules directory: by name, which can hold slashes, and theirs. */
@@ -164,10 +163,15 @@ function dotGitIn(tree: string): string | undefined {
  * every directory above it in the project: moved aside, it can be replaced by a repository with a config
  * of the command's own. Seatbelt refuses a new commondir or .git alike, short of a symlink in a checkout's
  * place, which shows here as a .git with another real path. One that is removed isn't reported: git then
- * reads no config there.
+ * reads no config there. When jig runs in a subdirectory of the repository, a .git a command makes in
+ * the project is reported too: the user's git there would then take its config from where that leads.
+ * Neither sandbox refuses it, since making a repository there (git init) can be the task.
  */
-function gitWatch({ locked }: GitControl): () => string[] {
-  const watched = locked.filter((path) => basename(path) === ".git" || (basename(path) !== "hooks" && !existsSync(path)));
+function gitWatch({ locked }: GitControl, project: string): () => string[] {
+  const dotGit = join(project, ".git"); // if there is none, jig runs in a subdirectory of the repository
+  const watched = [...new Set([...locked, ...(existsSync(dotGit) ? [] : [dotGit])])].filter(
+    (path) => basename(path) === ".git" || (basename(path) !== "hooks" && !existsSync(path)),
+  );
   const seen = new Map(watched.map((path) => [path, contents(path)]));
   return () =>
     watched.filter((path) => {

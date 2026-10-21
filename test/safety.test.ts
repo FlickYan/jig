@@ -263,16 +263,39 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
-  it("warns after a task in which a command made a commondir", { skip: process.platform === "darwin" && "Seatbelt refuses to make it" }, async () => {
+  it("says when a command made a .git in the subdirectory of a repository it runs in", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      const sub = join(repo, "sub");
+      await mkdir(sub);
+      const sandbox = createSandbox(sub, { network: false })!;
+      const inSub = (command: string) => runCommand(command, sub, 20, undefined, sandbox);
+      // The user's git in the subdirectory would then use the config of the git directory it names. Making a
+      // repository can be the task (git init), so neither sandbox refuses it, but the sandbox tells, once.
+      assert.equal(await inSub(`echo "gitdir: ${tmpdir()}" > .git && echo planted`), "planted\n\nExit code: 0");
+      const dotGit = join(await realpath(sub), ".git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      await inSub("rm .git && git init -q");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command made a commondir or a config.worktree", { skip: process.platform === "darwin" && "Seatbelt refuses to make them" }, async () => {
     const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
     git(repo, "init", "-q");
-    const command = `echo ${tmpdir()} > .git/commondir`;
+    const command = `echo ${tmpdir()} > .git/commondir && printf "[core]\\n" > .git/config.worktree`;
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
     try {
       const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo });
       assert.equal(code, 0);
-      const commondir = join(await realpath(repo), ".git", "commondir");
-      assert.match(output, new RegExp(`A command created or changed ${commondir}, .*: git would now read its config from elsewhere`));
+      const gitDir = join(await realpath(repo), ".git");
+      assert.match(output, new RegExp(`A command created or changed ${join(gitDir, "commondir")}, .*: git would now read its config from elsewhere`));
+      // A config.worktree doesn't send git elsewhere: it adds to the config.
+      assert.match(output, new RegExp(`A command created or changed ${join(gitDir, "config.worktree")}, .*: git can read more config from it,`));
     } finally {
       api.close();
       await rm(repo, { recursive: true, force: true });
@@ -302,7 +325,7 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
 
 describe("the macOS sandbox's profile", () => {
   it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
-    const git = { git: "/p/.git", locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"] };
+    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"] };
     const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], git);
     const locked = profile.indexOf('(deny file-write* (literal "/p/.git/config") (subpath "/p/.git/hooks"))');
     assert.ok(locked > profile.indexOf('(allow file-write* (subpath "/p")'), "after the rule it overrides, since the last rule wins");

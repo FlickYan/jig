@@ -526,10 +526,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return ending;
   }
 
-  /** Says which files telling git where its config is commands changed, where the sandbox couldn't stop them. */
+  /** Says which files telling git where its config is commands changed, where the sandbox doesn't stop them. */
   function warnOfGitChanges(): void {
     for (const path of sandbox?.gitChanges?.() ?? []) {
-      ui.notice(`A command created or changed ${path}, which the sandbox couldn't prevent: git would now read its config from elsewhere, and a config can name programs for git to run. Check it before you run git in this repository.`);
+      // A commondir or a .git sends git to another git directory's config; a config.worktree adds to the config.
+      const effect = basename(path) === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere";
+      ui.notice(`A command created or changed ${path}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
     }
   }
 

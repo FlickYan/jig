@@ -133,7 +133,10 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   or `config.worktree` that isn't there can't be made read-only without creating it (an empty
   `commondir` breaks git), and a submodule's checkout can be moved aside and another put in its place,
   so if a command does either, jig warns after the task and when a session ends: git would then read its
-  config from elsewhere, so check the file before you run git there. A job a command leaves running in
+  config from elsewhere (or more of it, from a `config.worktree`), so check the file before you run git
+  there. Started in a subdirectory of a repository, jig warns the same way, on macOS as well, when a
+  command makes a `.git` in it, which your git there would then use: making a repository can be the
+  task, so neither sandbox refuses it. A job a command leaves running in
   the background can still do it after jig has looked, and after a one-shot run nothing looks again.
   On macOS, localhost stays open; on Linux each command gets an empty
   network of its own, so a test can still start a server and talk to it, but only within one command.
