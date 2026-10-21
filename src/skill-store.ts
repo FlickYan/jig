@@ -2,9 +2,10 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
-import { frontmatterFields, listSkillFiles, skillProblems, userSkillsDir } from "./skills.ts";
+import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
+import { realTarget, resolveForChange } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -173,12 +174,39 @@ function writeLock(scope: InstallScope, project: string, skills: Record<string, 
   writeFileSync(path, `${JSON.stringify({ version: 1, skills: sorted }, null, 2)}\n`);
 }
 
+/**
+ * A skill's folder, checked before jig replaces or removes it, and the lockfile with it. jig changes them
+ * itself, outside the sandbox, and a project's .jig is within a command's reach: a symlink a command put
+ * there (.jig, .jig/skills, a skill's folder, the lockfile) would take the change out of the project. So in
+ * the project they go by where they really lead, as write_file's changes do, and stay out of any .git
+ * directory: write_file's check is for one file, but a skill's folder is replaced whole, so with
+ * .jig/skills linked to .git/modules, a skill named like a submodule would put its files in place of that
+ * submodule's config and hooks. In either scope the name must be a skill's name, since the lockfile's
+ * names come from a file commands can write: "../.." would be the project itself.
+ */
+export async function skillDirForChange(scope: InstallScope, project: string, name: string): Promise<string> {
+  const dir = join(skillsDir(scope, project), name);
+  const lock = lockPath(scope, project);
+  if (nameProblems(name).length) throw new Error(`"${name}" in ${lock} isn't a skill's name, so jig won't change ${dir}. A command may have put it there.`);
+  if (scope === "project") {
+    for (const path of [dir, lock]) {
+      await resolveForChange(project, relative(project, path));
+      const real = (await realTarget(path)) ?? path;
+      if (real.toLowerCase().split(sep).includes(".git")) {
+        // Without case, as isGitControl: macOS's file systems usually ignore it.
+        throw new Error(`${relative(project, path)} leads to ${real}, in a git directory, so jig won't change it: a skill's files there could take the place of git's own, such as a submodule's config. A command may have put a link there.`);
+      }
+    }
+  }
+  return dir;
+}
+
 /** Copies a fetched skill into place and records it in the lockfile. Returns where it went. */
-export function installSkill(info: SkillInfo, source: SkillSource, fetched: Fetched, { scope, project, force = false }: { scope: InstallScope; project: string; force?: boolean }): string {
+export async function installSkill(info: SkillInfo, source: SkillSource, fetched: Fetched, { scope, project, force = false }: { scope: InstallScope; project: string; force?: boolean }): Promise<string> {
   if (info.problems.length) throw new Error(`The skill in ${info.dir} doesn't follow the Agent Skills format: ${info.problems.join(" ")}`);
-  const target = join(skillsDir(scope, project), info.name);
+  const target = await skillDirForChange(scope, project, info.name);
   if (existsSync(target) && !force) throw new Error(`There is already a skill "${info.name}" in ${target} (--force replaces it).`);
-  rmSync(target, { recursive: true, force: true });
+  rmSync(target, { recursive: true, force: true }); // a link in its place is removed, not what it leads to
   mkdirSync(dirname(target), { recursive: true });
   cpSync(info.dir, target, { recursive: true, filter: (path) => basename(path) !== ".git" });
   const lock = readLock(scope, project);
@@ -210,8 +238,8 @@ export function installedSkills(project: string): Installed[] {
 }
 
 /** Uninstalls a skill added with `jig skills add`: its folder and its lockfile entry. */
-export function removeSkill(skill: Installed, project: string): void {
-  rmSync(skill.dir, { recursive: true, force: true });
+export async function removeSkill(skill: Installed, project: string): Promise<void> {
+  rmSync(await skillDirForChange(skill.scope, project, skill.name), { recursive: true, force: true });
   const lock = readLock(skill.scope, project);
   delete lock[skill.name];
   writeLock(skill.scope, project, lock);

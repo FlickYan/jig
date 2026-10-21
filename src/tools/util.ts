@@ -66,7 +66,7 @@ function hiddenError(path: string): Error {
  * created: its nearest existing ancestor's real path, plus the rest. Undefined for a broken link, since
  * writing through one creates whatever it points to, and that can't be resolved here.
  */
-async function realTarget(abs: string): Promise<string | undefined> {
+export async function realTarget(abs: string): Promise<string | undefined> {
   let existing = abs;
   while (!(await lstat(existing).catch(() => null)) && dirname(existing) !== existing) existing = dirname(existing);
   const real = await realpath(existing).catch(() => undefined);

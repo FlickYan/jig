@@ -121,7 +121,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
   sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
   earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
-  write. So a named pipe elsewhere is replaced too. `jig skills add`, `update` and `remove` don't check yet.
+  write. So a named pipe elsewhere is replaced too. `jig skills add`, `update` and `remove` go by real
+  path in the project as well, and take only a skill's name from the lockfile, which commands can write:
+  a name of `../..` made `remove` delete the project. They also change nothing in a `.git` directory. They
+  replace a skill's folder whole, and the check for `config` and hooks looks at one file: in a review,
+  `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a submodule's config.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig

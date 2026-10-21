@@ -12,6 +12,7 @@ import {
   lockedSource,
   parseSource,
   removeSkill,
+  skillDirForChange,
   skillsDir,
   type InstallScope,
   type SkillInfo,
@@ -71,8 +72,9 @@ export async function skillsCommand(args: string[]): Promise<void> {
     if (rest.length !== 1) throw new Error("Usage: jig skills remove <name>");
     const skill = installedSkills(project).find((s) => s.name === rest[0]);
     if (!skill) throw new Error(`No skill "${rest[0]}" was installed with jig skills add. (Skills you wrote yourself are folders: delete the folder.)`);
+    await skillDirForChange(skill.scope, project, skill.name); // refused before anyone is asked
     if (!(await confirm(`Remove the skill "${skill.name}" (${skill.dir})? [y/N] `))) return ui.notice("Kept it.");
-    removeSkill(skill, project);
+    await removeSkill(skill, project);
     return ui.notice(`Removed ${skill.name}.`);
   }
   if (command === "update") return update(project, rest, confirm);
@@ -136,9 +138,10 @@ async function add(spec: string, { project, scope, only, ref, path, force, confi
     const valid = infos.filter((info) => !info.problems.length);
     if (!valid.length) throw new Error("None of these skills follows the Agent Skills format, so nothing was installed.");
     const where = skillsDir(scope, project);
+    for (const info of valid) await skillDirForChange(scope, project, info.name); // refused before anyone is asked
     const what = valid.length === 1 ? `the skill "${valid[0].name}"` : `these ${valid.length} skills`;
     if (!(await confirm(`Install ${what} into ${where}? [y/N] `))) return ui.notice("Nothing installed.");
-    for (const info of valid) ui.notice(`Installed ${info.name} in ${installSkill(info, source, fetched, { scope, project, force })}.`);
+    for (const info of valid) ui.notice(`Installed ${info.name} in ${await installSkill(info, source, fetched, { scope, project, force })}.`);
     if (valid.some((info) => info.scripts.length)) ui.println(ui.dim("Its scripts run only when the model runs them, in the sandbox and under your permission mode."));
   } finally {
     fetched.cleanup();
@@ -159,6 +162,7 @@ async function update(project: string, names: string[], confirm: (question: stri
   if (unknown.length) throw new Error(`Not installed with jig skills add: ${unknown.join(", ")}.`);
   if (!installed.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
   for (const skill of installed) {
+    await skillDirForChange(skill.scope, project, skill.name); // refused before it is fetched, or anyone asked
     const source = lockedSource(skill.entry);
     const fetched = fetchSource(source);
     try {
@@ -180,7 +184,7 @@ async function update(project: string, names: string[], confirm: (question: stri
       showSkill(info);
       ui.println(ui.dim(`  changed: ${[...changed, ...added.map((f) => `+${f}`), ...removed.map((f) => `-${f}`)].join(", ")}`));
       if (!(await confirm(`Update ${skill.name}? [y/N] `))) continue;
-      installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });
+      await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });
       ui.notice(`Updated ${skill.name}.`);
     } finally {
       fetched.cleanup();

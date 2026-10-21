@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { beforeEach, describe, it } from "node:test";
 import { evalFileTargets, testSkill } from "../src/skill-evals.ts";
 import { proposeSkillTool, type SkillProposal } from "../src/skill-proposals.ts";
 import { compareSkills, describeSkill, fetchSource, findSkills, installedSkills, installSkill, lockedSource, parseSource, readLock, removeSkill } from "../src/skill-store.ts";
+import { skillsCommand } from "../src/skills-cli.ts";
 import { BUILTIN_SKILLS, discoverSkills, frontmatter, skillProblems } from "../src/skills.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { collectNotices } from "./notices.ts";
@@ -78,10 +79,10 @@ describe("installing skills", () => {
       assert.deepEqual(found[0].scripts, ["scripts/run.sh"]);
       assert.equal(found[0].license, "see LICENSE.txt");
       assert.ok(!existsSync(join(fetched.root, "docs")), "a sparse clone leaves out what wasn't asked for");
-      const target = installSkill(found[0], source, fetched, { scope: "project", project: dir });
+      const target = await installSkill(found[0], source, fetched, { scope: "project", project: dir });
       assert.equal(target, join(dir, ".jig", "skills", "alpha"));
       assert.equal(await readFile(join(target, "scripts", "run.sh"), "utf8"), "echo alpha");
-      assert.throws(() => installSkill(found[0], source, fetched, { scope: "project", project: dir }), /already a skill "alpha".*--force/);
+      await assert.rejects(installSkill(found[0], source, fetched, { scope: "project", project: dir }), /already a skill "alpha".*--force/);
     } finally {
       fetched.cleanup();
     }
@@ -96,7 +97,7 @@ describe("installing skills", () => {
     const repo = await skillRepository();
     const source = parseSource(`file://${repo}`, { path: "skills/beta" });
     const first = fetchSource(source);
-    installSkill(describeSkill(first.dir), source, first, { scope: "user", project: dir });
+    await installSkill(describeSkill(first.dir), source, first, { scope: "user", project: dir });
     first.cleanup();
     await writeFile(join(repo, "skills", "beta", "SKILL.md"), "---\nname: beta\ndescription: Does beta better. Use when asked to beta.\n---\n\nNew steps.\n");
     await writeFile(join(repo, "skills", "beta", "notes.md"), "more");
@@ -109,13 +110,13 @@ describe("installing skills", () => {
     const again = fetchSource(lockedSource(installed.entry));
     try {
       assert.deepEqual(compareSkills(installed.dir, again.dir), { added: ["notes.md"], removed: [], changed: ["SKILL.md"] });
-      installSkill(describeSkill(again.dir), lockedSource(installed.entry), again, { scope: "user", project: dir, force: true });
+      await installSkill(describeSkill(again.dir), lockedSource(installed.entry), again, { scope: "user", project: dir, force: true });
     } finally {
       again.cleanup();
     }
     assert.equal(readLock("user", dir).beta.commit, git(repo, "rev-parse", "HEAD"));
     assert.match(await readFile(join(installed.dir, "SKILL.md"), "utf8"), /New steps/);
-    removeSkill(installedSkills(dir)[0], dir);
+    await removeSkill(installedSkills(dir)[0], dir);
     assert.ok(!existsSync(installed.dir));
     assert.deepEqual(readLock("user", dir), {});
   });
@@ -129,6 +130,127 @@ describe("installing skills", () => {
     assert.match(skillProblems(misplaced).join(" "), /doesn't match its directory/);
     assert.match(skillProblems(await writeSkill(dir, "wordy", "x".repeat(1025))).join(" "), /longer than 1024/);
     assert.throws(() => fetchSource(parseSource(join(dir, "missing"))), /isn't a folder/);
+  });
+});
+
+describe("changing installed skills", () => {
+  // jig skills runs outside the sandbox, while a project's .jig is within a command's reach: a symlink a
+  // command planted there, or a name it wrote into the lockfile, would otherwise let jig delete and replace
+  // folders of the user's.
+  let source: string;
+  let outside: string;
+  beforeEach(async () => {
+    source = await writeSkill(join(dir, "source"), "beta");
+    outside = await mkdtemp(join(tmpdir(), "jig-skills-outside-"));
+    await mkdir(join(outside, "skills", "beta"), { recursive: true });
+    await writeFile(join(outside, "skills", "beta", "work.txt"), "the user's own\n");
+    await writeFile(join(outside, "bashrc"), "# the user's shell\n");
+  });
+
+  /** Runs `jig skills ...` in the project, answering yes to every question. */
+  async function jig(...args: string[]): Promise<void> {
+    const { stop } = collectNotices("beta"); // what it prints, kept out of the test report
+    try {
+      await skillsCommand([...args, "-C", dir, "--yes"]);
+    } finally {
+      stop();
+    }
+  }
+
+  async function assertUntouched(): Promise<void> {
+    assert.deepEqual((await readdir(outside)).sort(), ["bashrc", "skills"]);
+    assert.deepEqual(await readdir(join(outside, "skills", "beta")), ["work.txt"]);
+    assert.equal(await readFile(join(outside, "skills", "beta", "work.txt"), "utf8"), "the user's own\n");
+    assert.equal(await readFile(join(outside, "bashrc"), "utf8"), "# the user's shell\n");
+  }
+
+  it("aren't added, updated or removed through a link out of the project", async () => {
+    // add --project, when .jig leads out of the project.
+    await symlink(outside, join(dir, ".jig"));
+    await assert.rejects(jig("add", source, "--project", "--force"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
+    await assertUntouched();
+
+    // update and remove, when .jig/skills does, once the skill is installed.
+    await rm(join(dir, ".jig"));
+    await jig("add", source, "--project");
+    await rm(join(dir, ".jig", "skills"), { recursive: true });
+    await symlink(join(outside, "skills"), join(dir, ".jig", "skills"));
+    await assert.rejects(jig("update"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
+    await assert.rejects(jig("remove", "beta"), /\.jig\/skills\/beta leads through a symlink to .*, outside the working directory/);
+    await assertUntouched();
+
+    // When the skill's own folder is the link.
+    await rm(join(dir, ".jig", "skills"));
+    await mkdir(join(dir, ".jig", "skills"));
+    await symlink(join(outside, "skills", "beta"), join(dir, ".jig", "skills", "beta"));
+    await assert.rejects(jig("update"), /leads through a symlink/);
+    await assert.rejects(jig("remove", "beta"), /leads through a symlink/);
+    await assertUntouched();
+
+    // When the lockfile is: nothing is installed, as its entry couldn't be written.
+    await rm(join(dir, ".jig", "skills", "beta"));
+    await rm(join(dir, ".jig", "skills-lock.json"));
+    await symlink(join(outside, "bashrc"), join(dir, ".jig", "skills-lock.json"));
+    await assert.rejects(jig("add", source, "--project"), /\.jig\/skills-lock\.json leads through a symlink to .*bashrc, outside the working directory/);
+    assert.ok(!existsSync(join(dir, ".jig", "skills", "beta")));
+    await assertUntouched();
+
+    // Nor into a git directory's hooks, which git would run outside the sandbox.
+    await rm(join(dir, ".jig"), { recursive: true });
+    await mkdir(join(dir, ".git", "hooks"), { recursive: true });
+    await mkdir(join(dir, ".jig"));
+    await symlink(join("..", ".git", "hooks"), join(dir, ".jig", "skills"));
+    await assert.rejects(jig("add", source, "--project"), /git directory's config or a hook/);
+    assert.deepEqual(await readdir(join(dir, ".git", "hooks")), []);
+  });
+
+  it("aren't changed in a git directory, whose own files a skill's would replace", async () => {
+    // A submodule's git directory and a linked worktree's, both named beta: with .jig/skills linked to
+    // .git/modules or .git/worktrees, the skill beta's folder would be one of them, and its files would
+    // take the place of the submodule's config or the worktree's commondir, which the sandbox locks.
+    const lib = join(dir, "lib");
+    await mkdir(lib);
+    await writeFile(join(lib, "a.txt"), "a\n");
+    git(lib, "init", "-q");
+    git(lib, "add", "a.txt");
+    git(lib, "commit", "-qm", "lib");
+    git(dir, "init", "-q");
+    git(dir, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "beta");
+    git(dir, "commit", "-qm", "with a submodule");
+    git(dir, "worktree", "add", "-q", "--detach", join(dir, "trees", "beta"));
+    const gitDirs = async () => [
+      (await readdir(join(dir, ".git", "modules", "beta"))).sort(),
+      await readFile(join(dir, ".git", "modules", "beta", "config"), "utf8"),
+      (await readdir(join(dir, ".git", "worktrees", "beta"))).sort(),
+      await readFile(join(dir, ".git", "worktrees", "beta", "commondir"), "utf8"),
+    ];
+    const before = await gitDirs();
+    await mkdir(join(dir, ".jig"));
+    await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify({ version: 1, skills: { beta: { source, path: source, installed: "2026-10-01T00:00:00.000Z" } } }));
+    for (const linked of ["modules", "worktrees"]) {
+      await rm(join(dir, ".jig", "skills"), { force: true });
+      await symlink(join("..", ".git", linked), join(dir, ".jig", "skills"));
+      await assert.rejects(jig("update"), /\.jig\/skills\/beta leads to .*, in a git directory/);
+      await assert.rejects(jig("remove", "beta"), /in a git directory/);
+      await assert.rejects(jig("add", source, "--project", "--force"), /in a git directory/);
+      assert.deepEqual(await gitDirs(), before);
+    }
+  });
+
+  it("take only a skill's name from a lockfile, which commands can write", async () => {
+    // A name that, joined to the skills folder, is the folder outside: in the project's lockfile, and in the user's.
+    for (const [skills, lock] of [
+      [join(dir, ".jig", "skills"), join(dir, ".jig", "skills-lock.json")],
+      [join(process.env.JIG_HOME!, "skills"), join(process.env.JIG_HOME!, "skills-lock.json")],
+    ]) {
+      const name = relative(skills, outside);
+      await mkdir(dirname(lock), { recursive: true });
+      await writeFile(lock, JSON.stringify({ version: 1, skills: { [name]: { source, path: source, installed: "2026-10-01T00:00:00.000Z" } } }));
+      await assert.rejects(jig("remove", name), /isn't a skill's name/);
+      await assert.rejects(jig("update", name), /isn't a skill's name/);
+      await assertUntouched();
+      await rm(lock);
+    }
   });
 });
 
