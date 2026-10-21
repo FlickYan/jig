@@ -113,10 +113,11 @@ export interface RunResult {
   /**
    * Why the loop ended: the last reply's stop_reason (end_turn, max_tokens, refusal, ...), or one of ours.
    * "loop": the model made the same calls and got the same results, SAME_STEPS steps in a row.
+   * "empty": asked to go on after a reply with no text or tool call, it gave another, so there is no answer.
    * "unapproved" is the CLI's: it stops a task whose tool calls keep needing an approval nobody can give.
    * So is "time_limit": it stops a task at --time-limit.
    */
-  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "loop" | "unapproved" | "time_limit";
+  stop: Anthropic.Beta.BetaStopReason | "max_steps" | "interrupted" | "loop" | "empty" | "unapproved" | "time_limit";
   /**
    * Text of the final reply, after that of the replies it continues if they were cut off at the output limit.
    * At max_steps, the wrap-up's, if there was one (see AgentOptions.wrapUp).
@@ -248,8 +249,13 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         conversation.push({ role: "user", content: reply.stop_reason === "max_tokens" ? CUT_OFF_BEFORE_ANSWER : EMPTY_REPLY });
         continue;
       }
+      // A reply cut off, or out of context, ends the run with that reason. One that simply stopped isn't a
+      // finished task, nor an answer for --check, the reviewer or the Stop hooks to check: the run ends as
+      // "empty", or on the last step as out of steps, with the wrap-up any other last step gets.
+      const stop = reply.stop_reason && reply.stop_reason !== "end_turn" ? reply.stop_reason : "empty";
+      if (stop === "empty" && step === opts.maxSteps) break;
       opts.ui.notice("The model replied without text or a tool call, so the task ends without an answer.");
-      return result(reply.stop_reason ?? "end_turn", step, answer);
+      return result(stop, step, answer);
     }
 
     conversation.push({ role: "assistant", content: reply.content }, { ms });

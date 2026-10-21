@@ -109,7 +109,8 @@ pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task o
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
 tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
-same tool calls (see below), 7 at `--time-limit`, and 130 on Ctrl+C. So
+same tool calls (see below), 7 at `--time-limit`, 8 when the model gave a second reply with no text or
+tool call (see below), and 130 on Ctrl+C. So
 `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
 
 `--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
@@ -417,7 +418,9 @@ and none starts after; nor do `--check` and `--reviewer` in the last quarter of 
 find might not get done), on
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
-or only thinking): it stays out of the history, and the model is asked once to go on.
+or only thinking): it stays out of the history, and the model is asked once to go on. A second one ends
+the task as `empty`, with no answer for `--check`, the reviewer or a Stop hook to check; one on the last
+step ends it out of steps.
 A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
 same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
 its step limit), and a call identical to an earlier one in the same reply, with only reads between them,

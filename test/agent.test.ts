@@ -231,21 +231,44 @@ describe("runAgent", () => {
     assert.deepEqual(notices, ["The model replied without text or a tool call; asking it to go on."]);
   });
 
-  it("ends the run on a second empty reply, or one at the last step, with a valid history", async () => {
+  it("ends the run on a second empty reply as empty, not finished, with a valid history", async () => {
     const notices: string[] = [];
     const twice = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([]), reply([text(" \n")])], {
       ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) },
     });
     const result = await runAgent(twice.conversation, twice.options);
-    assert.deepEqual([result.stop, result.text.trim(), result.steps], ["end_turn", "", 3]);
+    assert.deepEqual([result.stop, result.text.trim(), result.steps], ["empty", "", 3]);
     assert.deepEqual(twice.messages.map((m) => m.role), ["user", "assistant", "user", "user"]);
     assert.equal(notices.at(-1), "The model replied without text or a tool call, so the task ends without an answer.");
     // Every assistant message holds something to send back, in either API's format.
     assert.ok(twice.messages.every((m) => m.role === "user" || (m.content as Block[]).some((b) => b.type === "tool_use" || (b.type === "text" && b.text.trim()))));
     assert.ok(toChatMessages("", twice.messages).every((m) => m.role !== "assistant" || m.content || m.tool_calls));
+    // A reply that says why it stopped short ends the run with that reason, as before.
+    const cut = setup([reply([thinking("Every case")], "max_tokens"), reply([thinking("Every case, again")], "max_tokens")]);
+    assert.equal((await runAgent(cut.conversation, cut.options)).stop, "max_tokens");
+  });
+
+  it("ends the run out of steps on an empty reply at the last step, and asks for the wrap-up as at any other", async () => {
     const last = setup([reply([])], { maxSteps: 1 });
-    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.steps]), ["end_turn", 1]);
+    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.steps]), ["max_steps", 1]);
     assert.equal(last.messages.length, 1);
+    const wrapped = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([thinking("Nothing to add.")])], { maxSteps: 2, wrapUp: true });
+    const result = await runAgent(wrapped.conversation, wrapped.options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["max_steps", 2, "SUMMARY: half the plan is written."]);
+    assert.deepEqual(wrapped.summaries.map((messages) => messages.at(-1)), [{ role: "user", content: WRAP_UP }]);
+  });
+
+  it("checks no work on an empty end: there is no answer for --check, the reviewer or the Stop hooks", async () => {
+    let checks = 0;
+    const usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+    const reviewer: Reviewer = { model: "strong", review: async () => (checks++, { verdict: "problems", feedback: "PROBLEMS: nothing was done.", usage }) };
+    const stopHooks = async () => (checks++, "tests fail");
+    for (const overrides of [{ review: "Check your work." }, { reviewer }, { stopHooks }]) {
+      const { options, conversation, messages } = setup([reply([]), reply([thinking("Done, I think.")])], overrides);
+      assert.deepEqual(await runAgent(conversation, options).then((r) => [r.stop, r.steps]), ["empty", 2]);
+      assert.ok(!messages.some((m) => m.content === "Check your work."));
+    }
+    assert.equal(checks, 0);
   });
 
   it("handles a reply with only thinking like an empty one", async () => {
@@ -253,6 +276,8 @@ describe("runAgent", () => {
     const result = await runAgent(conversation, options);
     assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Done.", 2]);
     assert.deepEqual(messages.map((m) => m.role), ["user", "user", "assistant"]);
+    const twice = setup([reply([thinking("It is done.")]), reply([thinking("It really is.")])]);
+    assert.equal((await runAgent(twice.conversation, twice.options)).stop, "empty");
     // Thinking that ran into the output limit gets told so.
     const cut = setup([reply([thinking("Let me think about every case")], "max_tokens"), reply([text("Done.")])]);
     assert.equal((await runAgent(cut.conversation, cut.options)).text, "Done.");

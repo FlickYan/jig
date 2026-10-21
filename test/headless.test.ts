@@ -572,6 +572,25 @@ describe("a one-shot run's exit code", () => {
     }
   });
 
+  it("is 8 when the model gives a second reply with no text or tool call, which no Stop hook checks", async () => {
+    const api = await fakeMessagesApi(() => []);
+    try {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const ran = join(outside, "stop-hook-ran");
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { Stop: [{ command: `touch ${JSON.stringify(ran)}; exit 2` }] } }));
+      const file = join(outside, "stats.json");
+      const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(code, 8, output);
+      assert.equal(api.requests.length, 2);
+      assert.match(output, /asking it to go on\.\nThe model replied without text or a tool call, so the task ends without an answer\.\n2 steps · /);
+      assert.equal(existsSync(ran), false, "there is no answer to check");
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.stop, stats.events], ["empty", { "reply.empty": 1 }]);
+    } finally {
+      api.close();
+    }
+  });
+
   it("is 130 after Ctrl+C", async () => {
     let pid = 0;
     const server = createServer((req) => {
@@ -598,7 +617,7 @@ describe("a one-shot run's exit code", () => {
 
   it("is listed in --help", () => {
     const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" }).replace(/\s+/g, " ");
-    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, 7 when it reached --time-limit, and 130 when interrupted\./);
+    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, 7 when it reached --time-limit, 8 when the model gave a second reply with no text or tool call, and 130 when interrupted\./);
   });
 });
 
@@ -724,6 +743,29 @@ describe("a one-shot run with no terminal", () => {
       assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it\. Run jig with --yes/);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.events], ["unapproved", { "call.unapproved": 3, "call.refused": 3 }]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("tells the model why the calls after the third in its reply didn't run: not that the user interrupted", async () => {
+    // Two calls a reply: the third call stops the task, and the fourth, in the same reply, doesn't run.
+    const api = await fakeMessagesApi((request) => {
+      const length = (request.messages as unknown[]).length;
+      return length < 4 ? ["a", "b"].map((name) => ({ tool: "bash", input: { command: `touch made-${length}-${name}` } })) : [{ text: "Done." }];
+    });
+    try {
+      const env = { JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const first = await runJig([...args, "Fix the parser."], { api, cwd: project, env });
+      assert.equal(first.code, 5, first.output);
+      // Continued with --yes, as a script might do next, the model sees what each call was answered.
+      const second = await runJig([...args, "--yes", "--continue", "Go on."], { api, cwd: project, env });
+      assert.equal(second.code, 0, second.output);
+      const results = (api.requests[2].messages as { content: { content?: string }[] }[])[4].content.map((result) => result.content);
+      assert.deepEqual(results, [
+        "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.",
+        "Not run: 3 tool calls needed approval, and with no terminal there is no one to give it (see --yes).",
+      ]);
     } finally {
       api.close();
     }

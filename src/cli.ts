@@ -111,7 +111,7 @@ A task given on the command line exits with 0 when the model finished, 1 on an e
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
 declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
 made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, 7 when it reached --time-limit,
-and 130 when interrupted.`;
+8 when the model gave a second reply with no text or tool call, and 130 when interrupted.`;
 
 /** How a task ended: as the loop stopped, or "error" if it failed. */
 type Ending = RunResult["stop"] | "error";
@@ -121,10 +121,12 @@ type Ending = RunResult["stop"] | "error";
  * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
  * Any other ending, a failure included, is 1.
  */
-const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, interrupted: 130 };
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, empty: 8, interrupted: 130 };
 
-// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
+// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize),
+// and what the calls left in the reply are said to have been stopped by.
 const MAX_UNAPPROVED = 3;
+const NO_APPROVER = `${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it (see --yes)`;
 
 // With --time-limit, the share of it, at the end, in which --check and the reviewer no longer start: what is
 // left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts into their time
@@ -428,7 +430,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       // The model would try call after call that can't run until its steps ran out. It may manage without
       // one or two (a check it can skip), so the task stops at the third.
       count?.("call.unapproved");
-      if (++unapproved >= MAX_UNAPPROVED) task?.abort();
+      if (++unapproved >= MAX_UNAPPROVED) task?.abort(NO_APPROVER);
       return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
     }
     const always = permissions.alwaysLabel(tool, input);
@@ -515,7 +517,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const result = await runAgent(conversation, { ...agent, checkUntil }, signal).finally(() => clearTimeout(timer));
       // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
       // after a Ctrl+C the task can still be stopping when the deadline passes.
-      if (result.stop === "interrupted" && unapproved >= MAX_UNAPPROVED) result.stop = "unapproved";
+      if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";
       if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
@@ -775,6 +777,7 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
     loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
+    empty: "", // the loop has said so
     time_limit: "Stopped at the time limit (--time-limit).",
     unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
   };
