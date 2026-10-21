@@ -63,41 +63,36 @@ export class Snapshots {
   undo(): Restored | undefined {
     const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
-    const restored: Restored = { changed: [], removed: [] };
-    for (const [status, path] of this.diff(snapshot)) {
-      if (status === "A") {
-        removeFile(this.root, path);
-        restored.removed.push(path);
-      } else {
-        restored.changed.push(path);
-      }
-    }
-    if (restored.changed.length) this.git("checkout", snapshot, "--", ".");
+    // Compare with this snapshot's files: an earlier /undo left the index at the later one it went back to.
+    // --reset keeps what git knows of the files that match, so it needn't read them all again, and doesn't
+    // mind files edited since.
+    this.git("read-tree", "--reset", snapshot);
+    const { tracked, created } = this.changes(snapshot);
+    for (const path of created) removeFile(this.root, path);
+    if (tracked.length) this.git("checkout", snapshot, "--", ".");
     this.taken.pop();
-    return restored;
+    return { changed: tracked, removed: created };
   }
 
-  /**
-   * The files changed, created or deleted since the latest snapshot, relative to the project; undefined
-   * without one. It only looks: adding the files first, as undo does, would copy whatever the task created
-   * into the snapshots, however big, past the size check every snapshot makes.
-   */
+  /** The files changed, created or deleted since the latest snapshot, relative to the project; undefined without one. */
   changed(): string[] | undefined {
     const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
-    // The index is the snapshot's: tracked files that differ or are gone, then the files that are new.
-    const tracked = this.git("diff", "--name-only", "--no-renames", "-z", snapshot).split("\0");
-    const created = this.git("ls-files", "--others", "--exclude-standard", "-z").split("\0");
-    return [...new Set([...tracked, ...created].filter(Boolean))].sort();
+    const { tracked, created } = this.changes(snapshot);
+    return [...new Set([...tracked, ...created])].sort();
   }
 
-  /** How the files differ from a snapshot: git's status letter and the path, for each file that does. */
-  private diff(snapshot: string): [string, string][] {
-    this.git("add", "--all", "."); // the index now describes the files as they are
-    const fields = this.git("diff", "--cached", "--name-status", "--no-renames", "-z", snapshot).split("\0");
-    const changes: [string, string][] = [];
-    for (let i = 0; i + 1 < fields.length; i += 2) changes.push([fields[i], fields[i + 1]]);
-    return changes;
+  /**
+   * How the files differ from a snapshot the index holds: tracked files that differ or are gone, and the
+   * files that are new. It only looks: adding the files first would copy whatever the task created into
+   * the snapshots, however big, past the size check every snapshot makes.
+   */
+  private changes(snapshot: string): { tracked: string[]; created: string[] } {
+    const list = (...args: string[]) => this.git(...args).split("\0").filter(Boolean);
+    return {
+      tracked: list("diff", "--name-only", "--no-renames", "-z", snapshot),
+      created: list("ls-files", "--others", "--exclude-standard", "-z"),
+    };
   }
 
   /** Snapshots copy the project's files, so refuse projects that would make them huge (big data files, say). */

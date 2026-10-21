@@ -430,6 +430,32 @@ describe("snapshots", () => {
     assert.equal(snapshots.undo(), undefined, "undoing to t1 would undo the next task too");
   });
 
+  it("undo stores nothing the task created, so a big file can't get past the size check", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir, 1_000_000);
+    snapshots.take("t");
+    await writeFile(join(dir, "data.bin"), Buffer.alloc(2_000_000, 1)); // a dataset the task downloaded, say
+    const blob = execFileSync("git", ["hash-object", join(dir, "data.bin")], { encoding: "utf8" }).trim();
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["data.bin"] });
+    assert.equal(existsSync(join(dir, "data.bin")), false);
+    const gitDir = join(process.env.JIG_HOME!, "snapshots", projectKey(dir));
+    assert.throws(() => execFileSync("git", [`--git-dir=${gitDir}`, "cat-file", "-e", blob], { stdio: "ignore" }));
+  });
+
+  it("undo goes another task back after you edit a file in between", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t1");
+    await writeFile(join(dir, "a.txt"), "2");
+    await writeFile(join(dir, "b.txt"), "b");
+    snapshots.take("t2");
+    snapshots.undo();
+    await writeFile(join(dir, "a.txt"), "edited by hand");
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: ["b.txt"] });
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
+    assert.equal(existsSync(join(dir, "b.txt")), false);
+  });
+
   it("sizes a symlink as git stores it, not what it points to", async () => {
     const project = join(dir, "project");
     await mkdir(join(project, "data"), { recursive: true });
