@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join, resolve, sep } from "node:path";
 import { isGitControl, isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
@@ -12,6 +12,21 @@ export interface Sandbox {
   limits: string;
   /** The program and arguments that run `command` in bash inside the sandbox. */
   wrap(command: string): { program: string; args: string[] };
+  /**
+   * Those of the files telling git where its config is that commands created or changed since the last call.
+   * On Linux the sandbox can't keep a missing one from being created (see gitWatch), so jig says so after a task.
+   */
+  gitChanges?(): string[];
+}
+
+/** What the sandbox keeps commands from changing in a repository (see gitControl). */
+export interface GitControl {
+  /** The git directory: commands can write in it, to commit, but not these. */
+  git: string;
+  /** Config, hooks and the files that say where they are, whether they exist or not. */
+  locked: string[];
+  /** The git directory and the directories between it and those, which can't be moved aside either. */
+  fixed: string[];
 }
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
@@ -19,7 +34,7 @@ const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 /**
  * Commands run in the operating system's own sandbox, the way Codex and Claude Code sandbox them:
  * Seatbelt on macOS, bubblewrap on Linux. Either way they can read anything, but write only inside the
- * project, its git directory (not its config or hooks), the directories added with --add-dir and the
+ * project, its git directory (not what gitControl lists), the directories added with --add-dir and the
  * temp directories, and without `network` they have no IP network (Unix sockets stay open). Unlike a
  * container, this keeps the user's own toolchain (python, node, compilers) working with no setup. The
  * `hidden` paths they can't read at all. Returns undefined where there is no sandbox; sandboxProblem says why.
@@ -30,19 +45,147 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
   const unreadable = hidden.filter((path) => existsSync(path)).map((path) => realpathSync(path));
   const added = dirs.map((dir) => realpathSync(dir));
   const temp = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"].filter((dir) => existsSync(dir));
-  const git = gitDir(project);
-  const writable = [project, git, ...added, realpathSync(tmpdir()), ...temp].filter(
+  const repo = gitDirs(project);
+  const writable = [project, repo?.common, ...added, realpathSync(tmpdir()), ...temp].filter(
     (dir, i, all): dir is string => !!dir && !all.slice(0, i).some((other) => other && isInside(other, dir)),
   );
   const where = `inside the project${added.length ? `, ${added.join(", ")}` : ""} and the temp directories`;
   // git runs the programs a repository's config and hooks name, outside the sandbox: the user's git after
   // the session (a shell prompt may run it at every line), and jig's own if jig didn't turn them off. So
-  // commands can't change them. A bare repository's are left alone, as the file tools leave them: setting
-  // up a server's hooks can be the task.
-  const guarded = git && isGitControl(join(git, "config")) ? git : undefined;
-  return process.platform === "darwin"
-    ? seatbelt(writable, network, where, unreadable, guarded)
-    : bubblewrap(writable, network, where, unreadable, guarded);
+  // commands can't change them, or the files that say where they are.
+  const guarded = gitControl(project, repo);
+  const sandbox =
+    process.platform === "darwin"
+      ? seatbelt(writable, network, where, unreadable, guarded)
+      : bubblewrap(writable, network, where, unreadable, guarded);
+  return guarded ? { ...sandbox, gitChanges: gitWatch(guarded) } : sandbox;
+}
+
+/**
+ * What in a repository tells git which programs to run, for the sandbox to keep commands from changing:
+ * the config and hooks of its git directory and of its submodules' (under modules/, nested ones too), and
+ * the files that say where those are. That is a commondir or config.worktree in any of them, every linked
+ * worktree's own commondir, gitdir and config.worktree (not only this one's: the user runs git in the
+ * others too), and the .git file of every worktree and submodule checkout. As isGitControl has it for the
+ * file tools. Undefined outside a repository, and for a bare one, left alone as the file tools leave it:
+ * setting up a server's hooks can be the task.
+ */
+export function gitControl(project: string, repo = gitDirs(project)): GitControl | undefined {
+  if (!repo || !isGitControl(join(repo.common, "config"))) return undefined;
+  const { common, own } = repo;
+  const inGitDir = (dir: string) => [
+    ...["config", "config.worktree", "commondir", "hooks"].map((name) => join(dir, name)),
+    ...worktrees(dir).flatMap((tree) => ["commondir", "gitdir", "config.worktree"].map((name) => join(tree, name))),
+  ];
+  // A linked worktree's submodules have their git directories in its own (worktrees/<name>/modules).
+  const modules = [...new Set([common, own, ...worktrees(common)])].flatMap((dir) => submodules(join(dir, "modules")));
+  const dotGits = [dotGitFile(project), ...worktrees(common).map(worktreeDotGit), ...modules.map(checkoutDotGit)];
+  const locked = [...[common, ...modules].flatMap(inGitDir), ...new Set(dotGits.filter((path) => path !== undefined))];
+  // Moved aside, a directory holding them could be replaced by one with files of a command's own.
+  const fixed = new Set([common]);
+  for (const path of locked) {
+    for (let dir = dirname(path); dir !== common && isInside(common, dir); dir = dirname(dir)) fixed.add(dir);
+  }
+  return { git: common, locked, fixed: [...fixed].sort((a, b) => a.length - b.length) }; // a directory before those in it
+}
+
+/** The git directories of submodules under a modules directory: by name, which can hold slashes, and theirs. */
+function submodules(dir: string): string[] {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory())
+    .flatMap((entry) => {
+      const path = join(dir, entry.name);
+      return existsSync(join(path, "HEAD")) ? [path, ...submodules(join(path, "modules"))] : submodules(path);
+    });
+}
+
+/** A git directory's linked worktrees' own directories, under its worktrees/. */
+function worktrees(dir: string): string[] {
+  try {
+    return readdirSync(join(dir, "worktrees"), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => join(dir, "worktrees", entry.name));
+  } catch {
+    return [];
+  }
+}
+
+/** The .git git finds from the project if it is a file: a linked worktree's or a submodule's pointer to its git directory. */
+function dotGitFile(project: string): string | undefined {
+  for (let dir = project; ; dir = dirname(dir)) {
+    const info = lstatSync(join(dir, ".git"), { throwIfNoEntry: false });
+    if (info) return info.isFile() ? join(dir, ".git") : undefined;
+    if (dirname(dir) === dir) return undefined;
+  }
+}
+
+/** A linked worktree's .git file, which its gitdir file names. */
+function worktreeDotGit(tree: string): string | undefined {
+  try {
+    return dotGitIn(dirname(resolve(tree, readFileSync(join(tree, "gitdir"), "utf8").trim())));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A submodule checkout's .git file, from where the submodule's config says its checkout is (core.worktree,
+ * relative to its git directory). The user's git status in the superproject runs git in the checkout,
+ * so a .git file there pointing elsewhere would have it run a config of a command's own.
+ */
+function checkoutDotGit(module: string): string | undefined {
+  try {
+    const args = [...SAFE_GIT, "config", "--file", join(module, "config"), "--get", "core.worktree"];
+    const tree = execFileSync("git", args, { env: withoutKeys(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    return dotGitIn(resolve(module, tree.replace(/\n$/, "")));
+  } catch {
+    return undefined; // no checkout, or one git doesn't know of
+  }
+}
+
+/** A work tree's .git by its real path (Seatbelt sees no other), unless it is a directory: then it is a repository of its own. */
+function dotGitIn(tree: string): string | undefined {
+  const path = join(existsSync(tree) ? realpathSync(tree) : tree, ".git");
+  return lstatSync(path, { throwIfNoEntry: false })?.isDirectory() ? undefined : path;
+}
+
+/**
+ * Which of the files that tell git where its config is commands created or changed, since the last call:
+ * those that weren't there when the sandbox was made, and the .git files. bubblewrap can only make a path
+ * read-only by binding something over it, and binding one that isn't there creates it, empty: an empty
+ * commondir would break git. So the sandbox can't stop a command creating one, and git would then take
+ * its config from wherever it points. Nor can it keep a submodule's checkout in place without fixing
+ * every directory above it in the project: moved aside, it can be replaced by a repository with a config
+ * of the command's own. Seatbelt refuses a new commondir or .git alike, short of a symlink in a checkout's
+ * place, which shows here as a .git with another real path. One that is removed isn't reported: git then
+ * reads no config there.
+ */
+function gitWatch({ locked }: GitControl): () => string[] {
+  const watched = locked.filter((path) => basename(path) === ".git" || (basename(path) !== "hooks" && !existsSync(path)));
+  const seen = new Map(watched.map((path) => [path, contents(path)]));
+  return () =>
+    watched.filter((path) => {
+      const now = contents(path);
+      if (now === undefined || now === seen.get(path)) return false;
+      seen.set(path, now);
+      return true;
+    });
+}
+
+/** What is at a path, to tell whether it changed: where it really is, and a file's text. Undefined if nothing is. */
+function contents(path: string): string | undefined {
+  try {
+    const real = realpathSync(path);
+    return statSync(real).isDirectory() ? `${real}${sep}` : `${real}\n${readFileSync(real, "utf8")}`;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Why there is no sandbox on this machine, or undefined if there is one. */
@@ -52,7 +195,7 @@ export function sandboxProblem(): string | undefined {
   return `jig has no sandbox for ${process.platform} yet`;
 }
 
-function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: string): Sandbox {
+function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl): Sandbox {
   const profile = seatbeltProfile(writable, network, hidden, git);
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
@@ -62,7 +205,7 @@ function seatbelt(writable: string[], network: boolean, where: string, hidden: s
 }
 
 /** The Seatbelt profile: where commands can write, whether they reach the network, what they can't read. */
-export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: string): string {
+export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl): string {
   return [
     "(version 1)",
     "(allow default)",
@@ -70,12 +213,13 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     `(allow file-write* ${writable.map((dir) => `(subpath ${quote(dir)})`).join(" ")}`,
     '  (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/tty") (regex #"^/dev/fd/"))',
     ...(network ? [] : ["(deny network-outbound (remote ip))", '(allow network-outbound (remote ip "localhost:*"))']),
-    // After the rule that lets the git directory be written, so they win over it. The directory itself
-    // can't be moved aside either, or another with a config of the command's own could take its place.
+    // After the rule that lets the git directory be written, so they win over it. Unlike bubblewrap's, they
+    // hold for files that aren't there yet. The directories holding them can't be moved aside either, or
+    // others with files of the command's own could take their place.
     ...(git
       ? [
-          `(deny file-write* (literal ${quote(join(git, "config"))}) (subpath ${quote(join(git, "hooks"))}))`,
-          `(deny file-write-unlink (literal ${quote(git)}))`,
+          `(deny file-write* ${git.locked.map((path) => `(${basename(path) === "hooks" ? "subpath" : "literal"} ${quote(path)})`).join(" ")})`,
+          `(deny file-write-unlink ${git.fixed.map((dir) => `(literal ${quote(dir)})`).join(" ")})`,
         ]
       : []),
     // Last, so that it wins over the rules before it: reading and writing alike.
@@ -92,19 +236,16 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
  * machine's process IDs, and can signal the user's other processes: in a PID namespace of their own, a
  * job a command leaves running in the background would die with its shell.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: string): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl): Sandbox {
   const bwrap = findProgram("bwrap")!;
-  // The git directory bound once more, so it is a mount point a command can't move aside, then its config
-  // and hooks read-only: those that exist, since binding a path that doesn't would create it.
-  const locked = git ? [join(git, "config"), join(git, "hooks")].filter((path) => existsSync(path)) : [];
-  const args = [
+  // An empty directory over each hidden directory, and an empty file over each hidden file.
+  const hiding = hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path]));
+  const args = () => [
     "--ro-bind", "/", "/",
     "--dev", "/dev",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
-    ...(git ? ["--bind", git, git] : []),
-    ...locked.flatMap((path) => ["--ro-bind", path, path]),
-    // An empty directory over each hidden directory, and an empty file over each hidden file.
-    ...hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path])),
+    ...(git ? gitBinds(git) : []),
+    ...hiding,
     ...(network ? [] : ["--unshare-net"]),
     "--die-with-parent", // if jig is killed, so are its commands
   ];
@@ -114,13 +255,36 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
     limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}.`,
-    wrap: (command) => ({ program: bwrap, args: [...args, "--", "/bin/bash", "-c", command] }),
+    wrap: (command) => ({ program: bwrap, args: [...args(), "--", "/bin/bash", "-c", command] }),
   };
 }
 
+/**
+ * bubblewrap's arguments for what gitControl found, worked out for each command: binding a path that is no
+ * longer there fails the command, and the user may remove a worktree or a submodule during the session.
+ */
+function gitBinds({ locked, fixed }: GitControl): string[] {
+  // A hooks directory that isn't there is made, empty as git's default one, so that it can be bound read-only.
+  for (const path of locked) {
+    if (basename(path) !== "hooks" || existsSync(path)) continue;
+    try {
+      mkdirSync(path);
+    } catch {
+      // If jig can't, commands, which run as the same user, can't either; nor where its git directory is gone.
+    }
+  }
+  // The git directory and those between it and what is locked bound once more, so they are mount points a
+  // command can't move aside; then what is locked, read-only. Only what exists: binding a path that doesn't
+  // would create it (gitWatch looks out for those).
+  return [
+    ...fixed.filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
+    ...locked.filter((path) => existsSync(path)).flatMap((path) => ["--ro-bind", path, path]),
+  ];
+}
+
 /** For the model: why changing the git config or a hook fails. */
-function gitNote(git?: string): string {
-  return git ? ". The repository's git config and hooks are read-only: if one needs changing, ask the user" : "";
+function gitNote(git?: GitControl): string {
+  return git ? ". The repository's git config and hooks are read-only, its submodules' too: if one needs changing, ask the user" : "";
 }
 
 /** For the model: that some paths are hidden, so their denials make sense (not which: they may be answers). */
@@ -147,16 +311,21 @@ function findProgram(name: string): string | undefined {
   return (process.env.PATH ?? "").split(delimiter).map((dir) => join(dir, name)).find((path) => existsSync(path));
 }
 
-/** The repository's git directory when it is outside the project (jig started in a subdirectory). */
-function gitDir(project: string): string | undefined {
+/**
+ * The repository's git directories: the common one, which may be outside the project (jig started in a
+ * subdirectory, or in a linked worktree), and the work tree's own (a linked worktree's, under the common
+ * one's worktrees/).
+ */
+function gitDirs(project: string): { common: string; own: string } | undefined {
   try {
-    const dir = execFileSync("git", [...SAFE_GIT, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    const out = execFileSync("git", [...SAFE_GIT, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir"], {
       cwd: project,
       env: withoutKeys(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    return realpathSync(dir);
+    });
+    const [common, own] = out.trim().split("\n").map((dir) => realpathSync(dir));
+    return { common, own };
   } catch {
     return undefined;
   }

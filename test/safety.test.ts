@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
-import { createSandbox, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
+import { createSandbox, gitControl, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
 
 let dir: string;
 beforeEach(async () => {
@@ -125,17 +126,237 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       await rm(repo, { recursive: true, force: true });
     }
   });
+
+  it("makes a repository's missing hooks directory, so that it is read-only too", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q", "--template="); // no hooks directory, as an empty init.templateDir leaves it too
+      const sandbox = createSandbox(repo, { network: false })!;
+      assert.match(await runCommand("mkdir -p .git/hooks; echo 'touch planted' > .git/hooks/post-commit", repo, 20, undefined, sandbox), /Exit code: [1-9]/);
+      assert.equal(existsSync(join(repo, ".git", "hooks", "post-commit")), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps submodules' git config and hooks read-only, and their git directories in place", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const sub = join(repo, ".git", "modules", "libs", "s"); // a name with a slash is a directory in modules/
+      const config = await readFile(join(sub, "config"), "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // The user's git status in the repository runs git in the submodule, and so its fsmonitor.
+      assert.match(await inRepo('git -C libs/s config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inRepo('echo "touch planted" > .git/modules/libs/s/hooks/post-commit'), /Exit code: [1-9]/);
+      assert.match(await inRepo("mv .git/modules .git/modules-moved"), /Exit code: [1-9]/);
+      assert.match(await inRepo("mv .git/modules/libs .git/modules/libs-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(sub, "config"), "utf8"), config);
+      assert.equal(existsSync(join(sub, "hooks", "post-commit")), false);
+      const commit = "cd libs/s && echo 2 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inRepo(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a submodule checkout's .git file read-only, and says when a command put another checkout in its place", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const dotGit = join(await realpath(repo), "libs", "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // The user's git status in the repository runs git in the checkout, with the config its .git leads to.
+      assert.match(await inRepo(`echo "gitdir: ${tmpdir()}" > libs/s/.git`), /Exit code: [1-9]/);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      // Seatbelt refuses the new .git. bubblewrap can't keep the checkout in place, so the sandbox tells, once.
+      await inRepo("mv libs/s libs/s-moved && mkdir libs/s && git init -q libs/s");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps every linked worktree's files read-only, from the main worktree and from another one", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const main = join(base, "main");
+      await mkdir(main);
+      git(main, "init", "-q");
+      git(main, "commit", "-q", "--allow-empty", "-m", "first");
+      for (const name of ["wt1", "wt2"]) git(main, "worktree", "add", "-q", "--detach", join(base, name));
+      const worktrees = join(await realpath(main), ".git", "worktrees");
+      // The user's git in wt1 or wt2 would read the config of a git directory a commondir there points to.
+      const sandbox = createSandbox(main, { network: false })!;
+      const inMain = (command: string) => runCommand(command, main, 20, undefined, sandbox);
+      assert.match(await inMain(`echo ${tmpdir()} > .git/worktrees/wt1/commondir`), /Exit code: [1-9]/);
+      assert.match(await inMain("mv .git/worktrees .git/worktrees-moved"), /Exit code: [1-9]/);
+      assert.match(await inMain("mv .git/worktrees/wt1 .git/worktrees/wt1-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(worktrees, "wt1", "commondir"), "utf8"), "../..\n");
+      // A worktree made in the session is the command's own, and can go again.
+      const made = join(tmpdir(), `jig-sandbox-worktree-${process.pid}`);
+      assert.equal(await inMain(`git worktree add -q --detach ${made} && git worktree remove ${made} && echo removed`), "removed\n\nExit code: 0");
+      const fromWt1 = createSandbox(join(base, "wt1"), { network: false })!;
+      const inWt1 = (command: string) => runCommand(command, join(base, "wt1"), 20, undefined, fromWt1);
+      assert.match(await inWt1(`echo ${tmpdir()} > ${join(worktrees, "wt2", "commondir")}`), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(worktrees, "wt2", "commondir"), "utf8"), "../..\n");
+      // Seatbelt refuses a config.worktree that isn't there; bubblewrap can't, so the sandbox tells.
+      const config = join(worktrees, "wt2", "config.worktree");
+      await inWt1(`printf "[core]\\n" > ${config}`);
+      assert.deepEqual(fromWt1.gitChanges!(), existsSync(config) ? [config] : []);
+      // The user removes a worktree during the session: commands still run, without binding what is gone.
+      git(main, "worktree", "remove", "--force", join(base, "wt2"));
+      assert.equal(await inMain("echo still"), "still\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a linked worktree's .git file and its files in the git directory read-only", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const main = join(base, "main");
+      const worktree = join(base, "wt");
+      await mkdir(main);
+      git(main, "init", "-q");
+      git(main, "commit", "-q", "--allow-empty", "-m", "first");
+      git(main, "worktree", "add", "-q", "--detach", worktree);
+      const own = join(main, ".git", "worktrees", "wt");
+      const sandbox = createSandbox(worktree, { network: false })!;
+      const inWorktree = (command: string) => runCommand(command, worktree, 20, undefined, sandbox);
+      // Either would have the user's git in the worktree read the config of a git directory the command made.
+      assert.match(await inWorktree(`echo "gitdir: ${tmpdir()}" > .git`), /Exit code: [1-9]/);
+      assert.match(await inWorktree(`echo ${tmpdir()} > ${join(own, "commondir")}`), /Exit code: [1-9]/);
+      assert.match(await inWorktree(`mv ${join(main, ".git", "worktrees")} ${join(main, ".git", "worktrees-moved")}`), /Exit code: [1-9]/);
+      assert.match(await readFile(join(worktree, ".git"), "utf8"), /worktrees\/wt/);
+      assert.equal(await readFile(join(own, "commondir"), "utf8"), "../..\n");
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inWorktree(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a config.worktree read-only, and says when a command made a commondir where there was none", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      await writeFile(join(repo, ".git", "config.worktree"), "");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      assert.match(await inRepo('printf "[core]\\n\\tfsmonitor = touch planted\\n" >> .git/config.worktree'), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config.worktree"), "utf8"), "");
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      // Seatbelt refuses it. bubblewrap can't: binding a path that isn't there creates it, and an empty
+      // commondir breaks git. So the sandbox tells, once, that the user's git would read another config.
+      await inRepo(`echo ${tmpdir()} > .git/commondir`);
+      const commondir = join(await realpath(repo), ".git", "commondir");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(commondir) ? [commondir] : []);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command made a commondir", { skip: process.platform === "darwin" && "Seatbelt refuses to make it" }, async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const command = `echo ${tmpdir()} > .git/commondir`;
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo });
+      assert.equal(code, 0);
+      const commondir = join(await realpath(repo), ".git", "commondir");
+      assert.match(output, new RegExp(`A command created or changed ${commondir}, .*: git would now read its config from elsewhere`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns at the end of a session of a commondir made after the last task, as a job a command left running can", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const commondir = join(await realpath(repo), ".git", "commondir");
+    const api = await fakeMessagesApi((request) => {
+      if ((request.messages as unknown[]).length === 1) return [{ text: "Done." }];
+      // The /compact after the task, when no task is running: here the test makes the file, as such a job would.
+      writeFileSync(commondir, `${tmpdir()}\n`);
+      return [{ text: "The user asked to tidy up, and nothing needed it." }];
+    });
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5"], { api, cwd: repo, stdin: "Tidy up.\n/compact\n" });
+      assert.equal(code, 0, output);
+      assert.match(output, new RegExp(`Compacted [^\\n]*\\n[\\s\\S]*A command created or changed ${commondir}, `));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("the macOS sandbox's profile", () => {
   it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
-    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], "/p/.git");
+    const git = { git: "/p/.git", locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"] };
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], git);
     const locked = profile.indexOf('(deny file-write* (literal "/p/.git/config") (subpath "/p/.git/hooks"))');
     assert.ok(locked > profile.indexOf('(allow file-write* (subpath "/p")'), "after the rule it overrides, since the last rule wins");
     assert.match(profile, /^\(deny file-write-unlink \(literal "\/p\/\.git"\)\)$/m);
     assert.doesNotMatch(seatbeltProfile(["/p"], false, []), /\.git/);
   });
+
+  it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      for (const name of ["wt", "wt2"]) git(repo, "worktree", "add", "-q", "--detach", join(base, name));
+      const [real, wt, wt2] = [await realpath(repo), await realpath(join(base, "wt")), await realpath(join(base, "wt2"))];
+      const profile = seatbeltProfile([wt, join(real, ".git")], false, [], gitControl(wt)!);
+      const dotGit = join(real, ".git");
+      const rule = (kind: string, path: string) => `(${kind} "${path}")`;
+      const denied = profile.split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      const own = ["commondir", "gitdir", "config.worktree"].flatMap((name) => [`worktrees/wt/${name}`, `worktrees/wt2/${name}`]);
+      const files = ["config", "config.worktree", "commondir", ...own, "modules/libs/s/config", "modules/libs/s/commondir"];
+      for (const path of files) assert.ok(denied.includes(rule("literal", join(dotGit, path))), `${path} is read-only`);
+      for (const path of ["hooks", "modules/libs/s/hooks"]) assert.ok(denied.includes(rule("subpath", join(dotGit, path))), `${path} is read-only`);
+      for (const path of [join(wt, ".git"), join(wt2, ".git"), join(real, "libs", "s", ".git")]) {
+        assert.ok(denied.includes(rule("literal", path)), `${path}, a worktree's or a submodule checkout's .git file, is read-only`);
+      }
+      const fixed = profile.split("\n").find((line) => line.startsWith("(deny file-write-unlink "))!;
+      for (const dir of ["", "worktrees", "worktrees/wt", "worktrees/wt2", "modules", "modules/libs", "modules/libs/s"]) {
+        assert.ok(fixed.includes(rule("literal", join(dotGit, dir))), `${dir || ".git"} stays in place`);
+      }
+      assert.equal(gitControl(base), undefined, "outside a repository");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
 });
+
+/** git with an identity, and allowed to clone a submodule from a local path. */
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@localhost", "-c", "protocol.file.allow=always", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** A repository in `base`/repo with one commit and a submodule at libs/s. */
+async function repoWithSubmodule(base: string): Promise<string> {
+  const [repo, sub] = [join(base, "repo"), join(base, "sub")];
+  for (const dir of [repo, sub]) {
+    await mkdir(dir);
+    git(dir, "init", "-q");
+    await writeFile(join(dir, "a.txt"), "1\n");
+    git(dir, "add", "a.txt");
+    git(dir, "commit", "-qm", "first");
+  }
+  git(repo, "submodule", "add", "-q", sub, "libs/s");
+  git(repo, "commit", "-qm", "submodule");
+  return repo;
+}
 
 describe("snapshots", () => {
   it("undo puts back changed and deleted files and removes new ones, one task at a time", async () => {

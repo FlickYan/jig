@@ -489,7 +489,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   }
 
-  function runTask(text: string, label = text): Promise<Ending> {
+  async function runTask(text: string, label = text): Promise<Ending> {
     // --time-limit counts from here, the snapshot included.
     const begun = Date.now();
     const deadline = timeLimit === undefined ? undefined : begun + timeLimit * 1000;
@@ -508,7 +508,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     conversation.push({ role: "user", content: message });
     unapproved = 0;
     const started = Date.now();
-    return asTask(async (signal) => {
+    const ending = await asTask(async (signal) => {
       // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
       // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
       const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
@@ -521,6 +521,16 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       report(result, Date.now() - started, maxSteps);
       return result.stop;
     });
+    // However the task ended: a command may have run before it failed or was stopped.
+    warnOfGitChanges();
+    return ending;
+  }
+
+  /** Says which files telling git where its config is commands changed, where the sandbox couldn't stop them. */
+  function warnOfGitChanges(): void {
+    for (const path of sandbox?.gitChanges?.() ?? []) {
+      ui.notice(`A command created or changed ${path}, which the sandbox couldn't prevent: git would now read its config from elsewhere, and a config can name programs for git to run. Check it before you run git in this repository.`);
+    }
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
@@ -683,6 +693,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       await runTask(input);
     }
   }
+  // Once more: a job a command left running in the background may have changed one since the last task.
+  warnOfGitChanges();
 }
 
 /**

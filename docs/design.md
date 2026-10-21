@@ -113,10 +113,22 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig
-  runs git with fsmonitor and hooks turned off and without its API keys. The sandbox also keeps the
-  project's git config and hooks read-only, and its git directory in place, for the user's own git after
-  the session. That can't cover every way: a command can still point git at another git directory (a
-  `commondir` file does) or make a repository of its own, so jig's git doesn't rely on it.
+  runs git with fsmonitor and hooks turned off and without its API keys. The sandbox also keeps
+  read-only, for the user's own git after the session, the repository's git config and hooks and its
+  submodules', and the files that point git at a git directory (every worktree's and submodule
+  checkout's `.git` file, and every worktree's `commondir`, not only the one jig runs in: the user runs
+  git in the others too) or add config (`config.worktree`); and the directories holding them in the git
+  directory in place, since one moved aside could be replaced. So `git worktree remove`, and `git rm` or
+  `git mv` of a submodule, fail in the sandbox for one that was there when the session began. bubblewrap
+  can only make a path read-only by binding something over it, which creates a missing one: a missing
+  hooks directory is created, empty as git's default one, but an empty `commondir` would break git. Nor
+  can it keep a submodule's checkout in place short of fixing every directory above it in the project.
+  So on Linux a command can still create a `commondir` or `config.worktree`, or put another checkout in
+  a submodule's place, and jig warns after the task and when a session ends; Seatbelt refuses them (a
+  symlink in a checkout's place gets the warning). A job a command leaves in the background can still do
+  it after jig has looked, and after a one-shot run nothing looks again. Commands can still make a
+  repository of their own (a submodule whose git directory is in its checkout is one), so jig's git
+  doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

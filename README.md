@@ -126,9 +126,16 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 
 - **Sandbox.** Commands run in the operating system's sandbox, as in Codex and Claude Code: Seatbelt on
   macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but write
-  only inside the project, its git directory (not its config or hooks, which name programs git runs),
-  the directories added with `--add-dir` and the temp directories, and they can't reach the network
-  (`--allow-network` lifts that). On macOS, localhost stays open; on Linux each command gets an empty
+  only inside the project, its git directory (not its config or hooks, which name programs git runs, nor
+  its submodules', nor the files that tell git where they are: every worktree's and submodule checkout's
+  `.git` file, `commondir`, `config.worktree`), the directories added with `--add-dir` and the temp
+  directories, and they can't reach the network (`--allow-network` lifts that). On Linux, a `commondir`
+  or `config.worktree` that isn't there can't be made read-only without creating it (an empty
+  `commondir` breaks git), and a submodule's checkout can be moved aside and another put in its place,
+  so if a command does either, jig warns after the task and when a session ends: git would then read its
+  config from elsewhere, so check the file before you run git there. A job a command leaves running in
+  the background can still do it after jig has looked, and after a one-shot run nothing looks again.
+  On macOS, localhost stays open; on Linux each command gets an empty
   network of its own, so a test can still start a server and talk to it, but only within one command.
   Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
   within reach. And commands share the machine's processes, so they can see yours and signal them.
