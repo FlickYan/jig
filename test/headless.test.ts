@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { constants, tmpdir } from "node:os";
@@ -210,6 +210,50 @@ describe("--stats", () => {
     }
     for (const victim of victims) assert.equal(await readFile(victim, "utf8"), "the user's own\n");
     assert.deepEqual((await readdir(project)).sort(), ["hard.json", "stats.json"], "no temporary file is left behind");
+  });
+
+  it("leaves no new file behind when it can't be renamed into place", async () => {
+    const file = join(project, "stats.json");
+    const stats = new Stats(file, "test-model");
+    await rm(file);
+    await mkdir(file); // as a command could
+    assert.throws(() => stats.count("compaction"), /EISDIR/);
+    assert.throws(() => stats.count("compaction"), /EISDIR/);
+    assert.deepEqual(await readdir(project), ["stats.json"]);
+  });
+
+  it("replaces a link to a device too, even one that was there before jig started", async () => {
+    // A job an earlier run's command left in the background can make one after that run's last write.
+    // Written through, a link to /dev/full would fail every write, and one to a disk would get the JSON.
+    const file = join(project, "stats.json");
+    await symlink("/dev/null", file);
+    const stats = new Stats(file, "test-model");
+    stats.count("compaction");
+    assert.ok((await lstat(file)).isFile(), "a file of its own now");
+    assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { compaction: 1 });
+  });
+
+  it("is written to a path in /dev or /proc, /dev/stdout say, rather than replaced by a file", async () => {
+    // A shell's redirect to a file, as in `--stats /dev/stdout > log.txt`, reached through the descriptor:
+    // jig can't make its temporary file beside /proc/self/fd/3, so if this breaks it fails rather than
+    // replacing anything in /dev. macOS has no /proc, but its /dev/fd/3 is the same descriptor.
+    const fd = process.platform === "linux" ? "/proc/self/fd/3" : "/dev/fd/3";
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+      const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1" };
+      const jig = [process.execPath, cli, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", fd, "Say done."];
+      const child = spawn("sh", ["-c", '"$@" 3> stats.json', "sh", ...jig], { cwd: project, env });
+      let output = "";
+      child.stdout.on("data", (chunk) => (output += chunk));
+      child.stderr.on("data", (chunk) => (output += chunk));
+      child.stdin.end();
+      assert.equal(await new Promise((done) => child.on("close", done)), 0, output);
+      assert.match(await readFile(join(project, "stats.json"), "utf8"), /"stop": "end_turn"/);
+      assert.deepEqual(await readdir(project), ["stats.json"], "no temporary file is left behind");
+    } finally {
+      api.close();
+    }
   });
 });
 

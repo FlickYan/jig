@@ -117,7 +117,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   `ln -sf` sent the `--stats` file and an approved AGENTS.md edit to a file outside it. Those edits and
   the skills the model writes now go by real path, and the stats file, rewritten all through a run, is
   written anew and renamed into place, since a rename replaces a link where a write follows it (a linked
-  folder on the way to it is still followed). `jig skills add`, `update` and `remove` don't check yet.
+  folder on the way to it is still followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is still
+  written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
+  sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
+  earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
+  write. So a named pipe elsewhere is replaced too. `jig skills add`, `update` and `remove` don't check yet.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig

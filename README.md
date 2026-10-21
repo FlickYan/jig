@@ -151,8 +151,10 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   could make git run programs outside the sandbox. An approved AGENTS.md edit, and a skill the model
   wrote saved in the project, go by real path too (the question names the file an AGENTS.md link leads
   to), and the `--stats` file is written anew and renamed into place, which replaces a link instead of
-  writing through it (a linked folder on the way to it is still followed). `jig skills add`, `update` and
-  `remove` don't check yet: in a project whose `.jig` is a link, they write where it leads.
+  writing through it (a linked folder on the way to it is still followed). A path in `/dev` or `/proc`,
+  such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to, not replaced; a named
+  pipe anywhere else is replaced. `jig skills add`, `update` and `remove` don't check yet: in a project
+  whose `.jig` is a link, they write where it leads.
   The git that `grep` and `glob` run to list files
   runs with `core.fsmonitor` and hooks turned off, and without jig's API keys. `grep` matches in a worker
   thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially

@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { renameSync, writeFileSync } from "node:fs";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { addUsage, type RunResult, type Usage } from "./agent.ts";
 import type { CallModel } from "./model.ts";
 
@@ -74,6 +74,8 @@ export type Mechanism =
  */
 export class Stats {
   private readonly path: string;
+  /** The path is in /dev or /proc, /dev/stdout say, so it is written to as it is. */
+  private readonly direct: boolean;
   private readonly started = Date.now();
   private readonly data: {
     model: string;
@@ -96,6 +98,9 @@ export class Stats {
 
   constructor(path: string, model: string) {
     this.path = path;
+    // By where the path is, not by what is there: a command, even one an earlier run left in the background,
+    // can put a link to a device or a named pipe anywhere it can write, but not in /dev or /proc.
+    this.direct = /^\/(dev|proc)\//.test(path);
     this.data = {
       model,
       stop: null,
@@ -153,12 +158,24 @@ export class Stats {
    * Written to a new file beside it, then renamed over it. jig writes it outside the sandbox, often in the
    * project, where a command can put a symlink or a hard link in its place: writing to that would change a
    * file of the user's, while a rename replaces the link itself. A reader never sees half a file either.
-   * Only the file itself: a directory on the way to it is still followed.
+   * Only the file itself: a directory on the way to it is still followed. A path in /dev or /proc, /dev/stdout
+   * or a process substitution's /dev/fd/63 say, is written to as it is: jig can't make a file there, or
+   * as root mustn't replace /dev/stdout with one. A named pipe anywhere else is replaced, as a link is.
    */
   private write(): void {
     this.data.seconds = Math.round((Date.now() - this.started) / 100) / 10;
+    const json = `${JSON.stringify(this.data, null, 2)}\n`;
+    if (this.direct) {
+      writeFileSync(this.path, json);
+      return;
+    }
     const temp = `${this.path}.${randomBytes(4).toString("hex")}.tmp`;
-    writeFileSync(temp, `${JSON.stringify(this.data, null, 2)}\n`, { flag: "wx" }); // "wx": never through a file already there
-    renameSync(temp, this.path);
+    writeFileSync(temp, json, { flag: "wx" }); // "wx": never through a file already there
+    try {
+      renameSync(temp, this.path);
+    } catch (error) {
+      rmSync(temp, { force: true }); // or each failed write would leave one behind
+      throw error;
+    }
   }
 }
