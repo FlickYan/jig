@@ -810,7 +810,7 @@ describe("a one-shot run with no terminal", () => {
       const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project });
       assert.equal(code, 5, output);
       assert.equal(api.requests.length, 3);
-      assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it\. Run jig with --yes/);
+      assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it \(see --yes\)\. Rules in jig's settings can allow them too\./);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.events], ["unapproved", { "call.unapproved": 3, "call.refused": 3 }]);
     } finally {

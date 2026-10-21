@@ -243,12 +243,33 @@ describe("jig review", () => {
     assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\./);
   });
 
+  it("asks for the verdict, as when the steps run out, when the reviewer replies twice with nothing", async () => {
+    // A command, then empty replies, until it is asked for its verdict (the request that allows no tool).
+    const empty = (request: Record<string, unknown>): Reply =>
+      request.tool_choice ? [{ text: "APPROVED" }] : (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [];
+    const { verdict, requests } = await review(empty);
+    assert.deepEqual([verdict.verdict, verdict.stop, verdict.steps, requests.length], ["approved", "empty", 3, 4]);
+    assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\./);
+  });
+
   it("answers a verdict request's reply that has no verdict once, as when a model writes a tool call out as text", async () => {
     const call = '<｜DSML｜function_calls><｜DSML｜invoke name="bash">ls</｜DSML｜invoke></｜DSML｜function_calls>';
     const { verdict, requests } = await review([call, "APPROVED"], ["--max-steps", "1"]);
     assert.equal(verdict.verdict, "approved");
     assert.equal(requests.length, 3, "the loop's one step, and the verdict asked for twice");
     assert.match(JSON.stringify(requests[2].messages), /DSML.*That reply has no verdict, and no tool runs now/);
+  });
+
+  it("leaves an empty reply to the verdict request out of the next request, which the API would reject", async () => {
+    // A command, then empty replies, the first to the verdict request too.
+    let asks = 0;
+    const empty = (request: Record<string, unknown>): Reply =>
+      request.tool_choice ? (asks++ === 0 ? [] : [{ text: "APPROVED" }]) : (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [];
+    const { verdict, requests } = await review(empty);
+    assert.deepEqual([verdict.verdict, verdict.stop, requests.length], ["approved", "empty", 5]);
+    const sent = requests.flatMap((request) => request.messages as MessageParam[]);
+    assert.ok(sent.every((message) => message.role === "user" || message.content.length > 0), "no assistant message without content");
+    assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps.*Your last reply was empty, and no tool runs now\./);
   });
 
   it("asks only twice when no verdict comes", async () => {

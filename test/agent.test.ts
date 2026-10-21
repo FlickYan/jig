@@ -248,14 +248,19 @@ describe("runAgent", () => {
     assert.equal((await runAgent(cut.conversation, cut.options)).stop, "max_tokens");
   });
 
-  it("ends the run out of steps on an empty reply at the last step, and asks for the wrap-up as at any other", async () => {
-    const last = setup([reply([])], { maxSteps: 1 });
+  it("ends the run out of steps on an empty reply at the last step, says so, and asks for the wrap-up as at any other", async () => {
+    const notices: string[] = [];
+    const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+    const last = setup([reply([])], { maxSteps: 1, ui });
     assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.steps]), ["max_steps", 1]);
     assert.equal(last.messages.length, 1);
-    const wrapped = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([thinking("Nothing to add.")])], { maxSteps: 2, wrapUp: true });
+    assert.deepEqual(notices.splice(0), ["The model replied without text or a tool call on the last step."]);
+    const wrapped = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([thinking("Nothing to add.")])], { maxSteps: 2, wrapUp: true, ui });
     const result = await runAgent(wrapped.conversation, wrapped.options);
     assert.deepEqual([result.stop, result.steps, result.text], ["max_steps", 2, "SUMMARY: half the plan is written."]);
     assert.deepEqual(wrapped.summaries.map((messages) => messages.at(-1)), [{ role: "user", content: WRAP_UP }]);
+    // The user hears why the last step did nothing before the request for the wrap-up.
+    assert.deepEqual(notices, ["The model replied without text or a tool call on the last step.", "Out of steps: asking the model where the work stands."]);
   });
 
   it("checks no work on an empty end: there is no answer for --check, the reviewer or the Stop hooks", async () => {

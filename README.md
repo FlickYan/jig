@@ -425,8 +425,9 @@ and `--reviewer` in the last quarter of the time, since what they find might not
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
 or only thinking): it stays out of the history, and the model is asked once to go on. A second one ends
-the task as `empty`, with no answer for `--check`, the reviewer or a Stop hook to check; one on the last
-step ends it out of steps.
+the task as `empty`, with no answer for `--check`, the reviewer or a Stop hook to check, and one on the
+last step ends it out of steps; if that reply was cut off at the output limit, the task ends as cut off
+(exit 3) instead.
 A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
 same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
 its step limit), and a call identical to an earlier one in the same reply, with only reads between them,

@@ -253,7 +253,10 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       // finished task, nor an answer for --check, the reviewer or the Stop hooks to check: the run ends as
       // "empty", or on the last step as out of steps, with the wrap-up any other last step gets.
       const stop = reply.stop_reason && reply.stop_reason !== "end_turn" ? reply.stop_reason : "empty";
-      if (stop === "empty" && step === opts.maxSteps) break;
+      if (stop === "empty" && step === opts.maxSteps) {
+        opts.ui.notice("The model replied without text or a tool call on the last step.");
+        break;
+      }
       opts.ui.notice("The model replied without text or a tool call, so the task ends without an answer.");
       return result(stop, step, answer);
     }
