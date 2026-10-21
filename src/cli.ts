@@ -35,7 +35,7 @@ import { skillsCommand } from "./skills-cli.ts";
 import { type Restored, Snapshots } from "./snapshots.ts";
 import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
-import { OutputFiles } from "./tools/bash.ts";
+import { killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -111,7 +111,7 @@ A task given on the command line exits with 0 when the model finished, 1 on an e
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
 declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
 made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, 7 when it reached --time-limit,
-and 130 when interrupted.`;
+8 when the model gave a second reply with no text or tool call, and 130 when interrupted.`;
 
 /** How a task ended: as the loop stopped, or "error" if it failed. */
 type Ending = RunResult["stop"] | "error";
@@ -121,10 +121,12 @@ type Ending = RunResult["stop"] | "error";
  * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
  * Any other ending, a failure included, is 1.
  */
-const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, interrupted: 130 };
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, empty: 8, interrupted: 130 };
 
-// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize).
+// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize),
+// and why it stopped, as the calls left in the reply and the user are told.
 const MAX_UNAPPROVED = 3;
+const NO_APPROVER = `${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it (see --yes)`;
 
 // With --time-limit, the share of it, at the end, in which --check and the reviewer no longer start: what is
 // left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts into their time
@@ -288,12 +290,19 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
   const contained = !!sandbox && !network;
-  // The whole of a command's output too long to show, for the model to search. Only the main loop's: the
-  // subagents work under plan mode's rules, which don't let commands read outside the project.
+  // The whole of a command's output too long to show, for the model to search: the main loop's policy lets
+  // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
+  // policy doesn't know them, so their results don't point to a file their commands couldn't read.
   const outputs = new OutputFiles();
-  process.on("exit", () => outputs.remove()); // on a forced quit (a second Ctrl+C) too
+  // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, and a command still running is
+  // killed as Ctrl+C kills it: only bubblewrap's sandbox would take it down with jig.
+  process.on("exit", () => {
+    killCommands();
+    outputs.remove();
+  });
   // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
-  // leave the files behind: they end it with an ordinary exit instead, and the exit code a shell would give.
+  // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
+  // shell would give.
   for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   let snapshots: Snapshots | undefined = new Snapshots(cwd);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
@@ -309,7 +318,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const error of mcp.errors) ui.notice(error);
   // A deny rule or hook that names a tool still holds once a clash of names has added a hash to it.
   const deny = [...settings.deny, ...[...mcp.renamed].filter(([, { was }]) => settings.deny.includes(was)).map(([name]) => name)];
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs });
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs, outputs });
   const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd, mcp.renamed) : undefined;
   // The files the task changed, for the Stop hooks: by the snapshot taken before it, while /undo works.
   const changedFiles = () => {
@@ -428,14 +437,16 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       // The model would try call after call that can't run until its steps ran out. It may manage without
       // one or two (a check it can skip), so the task stops at the third.
       count?.("call.unapproved");
-      if (++unapproved >= MAX_UNAPPROVED) task?.abort();
+      if (++unapproved >= MAX_UNAPPROVED) task?.abort(NO_APPROVER);
       return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
     }
     const always = permissions.alwaysLabel(tool, input);
-    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
+    // The task stopping (at --time-limit) closes the question unanswered, so it doesn't wait past the limit.
+    const signal = task?.signal;
+    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `, signal);
     if (answer === null) {
       task?.abort(); // Ctrl+C at the prompt stops the whole task
-      return "Not run: the user stopped the task.";
+      return `Not run: ${whyStopped(signal, "the user stopped the task")}.`;
     }
     const choice = answer.trim().toLowerCase();
     if (always && choice.startsWith("a")) {
@@ -515,7 +526,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       const result = await runAgent(conversation, { ...agent, checkUntil }, signal).finally(() => clearTimeout(timer));
       // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
       // after a Ctrl+C the task can still be stopping when the deadline passes.
-      if (result.stop === "interrupted" && unapproved >= MAX_UNAPPROVED) result.stop = "unapproved";
+      if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";
       if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
@@ -789,8 +800,9 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
     loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
+    empty: "", // the loop has said so
     time_limit: "Stopped at the time limit (--time-limit).",
-    unapproved: `Stopped: ${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it. Run jig with --yes, or allow them with rules in jig's settings.`,
+    unapproved: `Stopped: ${NO_APPROVER}. Rules in jig's settings can allow them too.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
   // The model's wrap-up at the step limit wasn't streamed (it is asked for like a summary), so it is printed here.

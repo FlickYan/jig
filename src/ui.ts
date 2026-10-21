@@ -211,14 +211,21 @@ export class Input {
     this.terminal = !!input.isTTY && !!output.isTTY;
   }
 
-  /** The next entry. Only tasks and commands (`keep`) join the history, not the answers to questions. */
-  read(prompt: string, keep: boolean): Promise<Entry> {
+  /**
+   * The next entry. Only tasks and commands (`keep`) join the history, not the answers to questions. Once
+   * `signal` aborts (the task stopped, at --time-limit say), the read ends as at Ctrl+C.
+   */
+  read(prompt: string, keep: boolean, signal?: AbortSignal): Promise<Entry> {
     return new Promise((resolve) => {
       if (this.ended && !this.queued.length) return resolve(null);
+      if (signal?.aborted) return resolve({ text: "", interrupted: true });
       const rl = this.open();
       this.keep = keep;
+      const onAbort = () => this.interrupt(rl);
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.answer = (entry) => {
         this.answer = undefined;
+        signal?.removeEventListener("abort", onAbort);
         this.listen(rl, false);
         resolve(entry);
       };
@@ -248,12 +255,12 @@ export class Input {
       // At a terminal, only what is typed while jig asks counts: a line that came in with the one before it
       // (pasted where the terminal doesn't mark pastes) mustn't answer the next question.
       if (this.input.isTTY && !this.answer) return;
-      if (this.pasting || line.endsWith("\\")) {
+      // A line ending in \ goes on in the next only at a terminal, as pastes are marked only there. Piped, each
+      // line is an entry as it is: a task ending in a path like C:\build\ mustn't take the /command after it.
+      if (this.pasting || (this.terminal && line.endsWith("\\"))) {
         this.pasted.push(this.pasting ? line : line.slice(0, -1));
-        if (this.terminal) {
-          rl.setPrompt(MORE);
-          rl.prompt();
-        }
+        rl.setPrompt(MORE);
+        rl.prompt();
         return;
       }
       const text = [...this.pasted.splice(0), line].join("\n");
@@ -266,13 +273,7 @@ export class Input {
       if (this.keep && !this.pasting && !this.pasted.length && !rl.line.endsWith("\\")) this.history = [...history];
       else history.splice(0, history.length, ...this.history);
     });
-    rl.on("SIGINT", () => {
-      const text = [...this.pasted.splice(0), rl.line].join("\n");
-      rl.write(null, { ctrl: true, name: "e" }); // past what was typed, which stays on the screen
-      this.output.write("\n");
-      this.answer?.({ text, interrupted: true });
-      rl.close(); // readline can't empty its line without erasing it: the next read opens a new interface
-    });
+    rl.on("SIGINT", () => this.interrupt(rl));
     rl.on("close", () => {
       this.closed = true;
       if (this.terminal) this.rl = undefined; // Ctrl+C or Ctrl+D; the history goes on in the next one
@@ -292,6 +293,17 @@ export class Input {
       rl.once("close", () => this.input.off("keypress", onKey));
     }
     return rl;
+  }
+
+  /** Ends the read waiting for an entry as interrupted: Ctrl+C, or the task stopping. */
+  private interrupt(rl: readline.Interface): void {
+    const text = [...this.pasted.splice(0), rl.line].join("\n");
+    if (this.terminal) rl.write(null, { ctrl: true, name: "e" }); // past what was typed, which stays on the screen
+    this.output.write("\n");
+    this.answer?.({ text, interrupted: true });
+    // readline can't empty its line without erasing it: the next read opens a new interface. A pipe's stays
+    // open, for the lines still to come.
+    if (this.terminal) rl.close();
   }
 
   /** Reads the input, and at a terminal takes it over (raw mode, marked pastes, resizes), only while asking. */
@@ -315,17 +327,20 @@ export class Input {
 let stdin: Input | undefined;
 const userInput = () => (stdin ??= new Input(process.stdin, process.stdout));
 
-async function read(prompt: string, keep: boolean, from: Input): Promise<Entry> {
+async function read(prompt: string, keep: boolean, from: Input, signal?: AbortSignal): Promise<Entry> {
   freshLine();
   clearStatus();
-  const entry = await from.read(prompt, keep);
+  const entry = await from.read(prompt, keep, signal);
   atLineStart = true; // after Enter, or the new line Input starts at Ctrl+C or Ctrl+D
   return entry;
 }
 
-/** Reads one line from the user (or a paste and the line after it). Returns null on Ctrl+C or Ctrl+D. */
-export async function ask(prompt: string, from = userInput()): Promise<string | null> {
-  const entry = await read(prompt, false, from);
+/**
+ * Reads one line from the user (or a paste and the line after it). Returns null on Ctrl+C or Ctrl+D, or once
+ * `signal` aborts: a question asked during a task doesn't keep it waiting past --time-limit.
+ */
+export async function ask(prompt: string, signal?: AbortSignal, from = userInput()): Promise<string | null> {
+  const entry = await read(prompt, false, from, signal);
   return entry && !entry.interrupted ? entry.text : null;
 }
 

@@ -124,6 +124,57 @@ describe("a command's long output", () => {
     }
   });
 
+  it("can be read as the note says without asking, in plan mode too", async () => {
+    // These reads used to count as reads outside the project: plan mode refused them, and with no terminal
+    // to ask in, the third ended the task.
+    await writeFile(join(project, "big.txt"), Array.from({ length: 20000 }, (_, i) => (i === 10000 ? "NEEDLE" : `line ${i}`)).join("\n"));
+    const reads = (path: string) => [`grep -n NEEDLE ${path}`, `sed -n 10000,10001p ${path}`, `head -n 1 ${path}`, `tail -n 1 ${path}`, `wc -l ${path}`];
+    let path = "";
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as { content: unknown }[];
+      if (messages.length === 1) return [{ tool: "bash", input: { command: "cat big.txt" } }];
+      if (messages.length > 3) return [{ text: "Done." }];
+      path = /The whole output is in (\S+):/.exec(JSON.stringify(messages[2].content))?.[1] ?? "";
+      return reads(path).map((command) => ({ tool: "bash", input: { command } }));
+    });
+    try {
+      for (const mode of ["plan", "edits"]) {
+        const { code, output } = await runJig(["--no-sandbox", "--mode", mode, "--model", "claude-haiku-4-5", "Find the needle."], { api, cwd: project });
+        assert.equal(code, 0, output);
+        const results = (api.requests.at(-1)!.messages as { content: { content: string }[] }[])[4].content.map((result) => result.content);
+        // BSD wc (macOS) pads the count with spaces, GNU wc doesn't.
+        assert.equal(results.pop()!.trimStart(), `19999 ${path}\n\nExit code: 0`, mode);
+        assert.deepEqual(results, [
+          "10001:NEEDLE\n\nExit code: 0",
+          "line 9999\nNEEDLE\n\nExit code: 0",
+          "line 0\n\nExit code: 0",
+          "line 19999\n\nExit code: 0",
+        ], mode);
+      }
+    } finally {
+      api.close();
+    }
+  });
+
+  it("isn't kept for a subagent, so its result doesn't point to a file the subagent may not read", async () => {
+    await writeFile(join(project, "big.txt"), Array.from({ length: 20000 }, (_, i) => `line ${i}`).join("\n"));
+    const subagent = (messages: { content: unknown }[]) => JSON.stringify(messages[0].content).includes("Look in big.txt.");
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as { content: unknown }[];
+      if (messages.length > 1) return [{ text: "Done." }];
+      if (subagent(messages)) return [{ tool: "bash", input: { command: "cat big.txt" } }];
+      return [{ tool: "subagent", input: { description: "look", prompt: "Look in big.txt." } }];
+    });
+    try {
+      const { code, output } = await runJig(["--no-sandbox", "--model", "claude-haiku-4-5", "Find the needle."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      const [, , result] = api.requests.map((request) => request.messages as { content: unknown }[]).find((messages) => subagent(messages) && messages.length === 3)!;
+      assert.match(JSON.stringify(result.content), /\[\.\.\. \d+ characters truncated \.\.\.\]/);
+    } finally {
+      api.close();
+    }
+  });
+
   it("is removed when a signal ends jig too, as closing its terminal does", async () => {
     for (const signal of ["SIGHUP", "SIGTERM"] as const) {
       let path = "";
@@ -139,6 +190,31 @@ describe("a command's long output", () => {
         assert.equal(code, 128 + constants.signals[signal]);
         assert.ok(path, "the result says where the whole output is");
         assert.equal(existsSync(path), false, `${signal} left ${path} behind`);
+      } finally {
+        api.close();
+      }
+    }
+  });
+});
+
+describe("a signal that ends jig", () => {
+  it("kills the command still running, which without the sandbox would outlive it, but not a job an earlier one left in the background", async () => {
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) {
+      // The first command leaves a job in the background and finishes; the second signals jig. Each then waits
+      // for the test's word to leave a file behind. The job should run on, as in a terminal.
+      const wait = `until [ -e go-${signal} ]; do sleep 0.05; done`;
+      const job = `(${wait}; touch left-${signal}) >/dev/null 2>&1 &`;
+      const command = `kill -${signal} $PPID; ${wait}; touch outlived-${signal}`;
+      const api = await fakeMessagesApi((request) => [{ tool: "bash", input: { command: (request.messages as unknown[]).length === 1 ? job : command } }]);
+      try {
+        const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Fix the parser."], { api, cwd: project });
+        await writeFile(join(project, `go-${signal}`), ""); // first, so a command that outlived jig doesn't wait forever
+        const left = join(project, `left-${signal}`);
+        for (let i = 0; i < 50 && !existsSync(left); i++) await new Promise((done) => setTimeout(done, 100));
+        await new Promise((done) => setTimeout(done, 500)); // then a moment for the command, had it outlived jig
+        assert.equal(code, 128 + constants.signals[signal]);
+        assert.equal(existsSync(join(project, `outlived-${signal}`)), false, `the command outlived jig after ${signal}`);
+        assert.equal(existsSync(left), true, `jig's exit after ${signal} killed the job left in the background`);
       } finally {
         api.close();
       }
@@ -634,6 +710,25 @@ describe("a one-shot run's exit code", () => {
     }
   });
 
+  it("is 8 when the model gives a second reply with no text or tool call, which no Stop hook checks", async () => {
+    const api = await fakeMessagesApi(() => []);
+    try {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const ran = join(outside, "stop-hook-ran");
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { Stop: [{ command: `touch ${JSON.stringify(ran)}; exit 2` }] } }));
+      const file = join(outside, "stats.json");
+      const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(code, 8, output);
+      assert.equal(api.requests.length, 2);
+      assert.match(output, /asking it to go on\.\nThe model replied without text or a tool call, so the task ends without an answer\.\n2 steps · /);
+      assert.equal(existsSync(ran), false, "there is no answer to check");
+      const stats = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual([stats.stop, stats.events], ["empty", { "reply.empty": 1 }]);
+    } finally {
+      api.close();
+    }
+  });
+
   it("is 130 after Ctrl+C", async () => {
     let pid = 0;
     const server = createServer((req) => {
@@ -660,7 +755,7 @@ describe("a one-shot run's exit code", () => {
 
   it("is listed in --help", () => {
     const help = execFileSync(process.execPath, [cli, "--help"], { encoding: "utf8" }).replace(/\s+/g, " ");
-    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, 7 when it reached --time-limit, and 130 when interrupted\./);
+    assert.match(help, /exits with 0 when the model finished, 1 on an error, 2 when it ran out of steps \(--max-steps\), 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool calls needed approval and there was no terminal to ask \(see --yes\), 6 when the model made the same tool calls, with the same results, 5 steps in a row, 7 when it reached --time-limit, 8 when the model gave a second reply with no text or tool call, and 130 when interrupted\./);
   });
 });
 
@@ -678,6 +773,22 @@ describe("a one-shot run with --time-limit", () => {
       assert.equal(api.requests.length, 1);
       assert.match(output, /Killed: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n1 step · /);
       assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "time_limit");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("closes a question asking to allow a call at the limit, unanswered, and refuses the call with the reason", async () => {
+    // In ask mode at a terminal, where no one answers: the question used to wait past the limit.
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: "touch made" } }]);
+    try {
+      const started = Date.now();
+      const asking = ["--no-sandbox", "--mode", "ask", "--model", "claude-haiku-4-5", "--time-limit", "1", "Fix the parser."];
+      const { code, output } = await runJig(asking, { api, cwd: project, terminal: true });
+      assert.equal(code, 7, output);
+      assert.ok(Date.now() - started < 10_000, "it didn't wait for an answer");
+      assert.match(output, /Allow\? \[y\]es \/ \[n\]o[^\n]*: \n {2}✗ Not run: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n1 step · /);
+      assert.equal(existsSync(join(project, "made")), false);
     } finally {
       api.close();
     }
@@ -783,9 +894,32 @@ describe("a one-shot run with no terminal", () => {
       const { code, output } = await runJig([...args, "--stats", file, "Fix the parser."], { api, cwd: project });
       assert.equal(code, 5, output);
       assert.equal(api.requests.length, 3);
-      assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it\. Run jig with --yes/);
+      assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it \(see --yes\)\. Rules in jig's settings can allow them too\./);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.events], ["unapproved", { "call.unapproved": 3, "call.refused": 3 }]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("tells the model why the calls after the third in its reply didn't run: not that the user interrupted", async () => {
+    // Two calls a reply: the third call stops the task, and the fourth, in the same reply, doesn't run.
+    const api = await fakeMessagesApi((request) => {
+      const length = (request.messages as unknown[]).length;
+      return length < 4 ? ["a", "b"].map((name) => ({ tool: "bash", input: { command: `touch made-${length}-${name}` } })) : [{ text: "Done." }];
+    });
+    try {
+      const env = { JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const first = await runJig([...args, "Fix the parser."], { api, cwd: project, env });
+      assert.equal(first.code, 5, first.output);
+      // Continued with --yes, as a script might do next, the model sees what each call was answered.
+      const second = await runJig([...args, "--yes", "--continue", "Go on."], { api, cwd: project, env });
+      assert.equal(second.code, 0, second.output);
+      const results = (api.requests[2].messages as { content: { content?: string }[] }[])[4].content.map((result) => result.content);
+      assert.deepEqual(results, [
+        "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.",
+        "Not run: 3 tool calls needed approval, and with no terminal there is no one to give it (see --yes).",
+      ]);
     } finally {
       api.close();
     }
@@ -842,14 +976,17 @@ describe("an interactive session fed through stdin", () => {
     }
   });
 
-  it("joins a line ending in \\ to the next, so one message can span lines", async () => {
+  it("takes a line ending in \\ as it is, so a command after it still runs", async () => {
+    // Joining it to the next, as at a terminal, sent "/context" to the model as part of the task.
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
-      const stdin = "the build fails with this error:\\\nTypeError: x is undefined\\\n    at main (app.js:3)\n";
+      const stdin = "list the files in build\\\n/context\nsay hi\n/exit\n";
       const { code, output } = await runJig(args, { api, cwd: project, stdin });
       assert.equal(code, 0, output);
-      assert.equal(api.requests.length, 1, output);
-      assert.match(last(api.requests[0]), /the build fails with this error:\\nTypeError: x is undefined\\n {4}at main \(app\.js:3\)/);
+      assert.equal(api.requests.length, 2, output);
+      assert.equal(last(api.requests[0]), JSON.stringify("list the files in build\\"));
+      assert.match(output, /The conversation takes up about \d+ tokens/);
+      assert.match(last(api.requests[1]), /say hi/);
     } finally {
       api.close();
     }

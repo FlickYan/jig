@@ -119,12 +119,13 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const result = await runAgent(conversation, options, timeUp.signal).finally(() => clearTimeout(timer));
   stats?.finish(result);
   let text = result.stop === "end_turn" ? result.text : "";
-  // Out of steps or time, or stopped for repeating itself, it gives its verdict on what it has checked
-  // (milestone 24's reviews used their steps up three times in five and gave none), within the time limit,
-  // since a verdict after it leaves none for the re-runs. A reply without a verdict (in milestone 29, a tool
-  // call written out as text) is answered once, while there is time.
-  if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "interrupted") {
+  // Out of steps or time, stopped for repeating itself, or for replying twice with nothing, it gives its
+  // verdict on what it has checked (milestone 24's reviews used their steps up three times in five and gave
+  // none), within the time limit, since a verdict after it leaves none for the re-runs. A reply without a
+  // verdict (in milestone 29, a tool call written out as text) is answered once, while there is time.
+  if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "empty" || result.stop === "interrupted") {
     let request = withRequest(conversation.messages, outOf(result.stop === "interrupted" ? "time" : "steps"));
+    let asked: string | undefined; // what the last reply without a verdict was answered with
     for (let ask = 0; ask < 2 && secondsLeft() > 5; ask++) {
       const signal = AbortSignal.timeout(secondsLeft() * 1000);
       const turn = await meteredVerdict(request, signal, { summarize: true }).catch((err: unknown) => {
@@ -133,11 +134,20 @@ export async function reviewCommand(args: string[]): Promise<void> {
       });
       if (!turn) break;
       addUsage(result.usage, turn.message.usage);
-      text = turn.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
-      if (ask > 0) conversation.push({ role: "user", content: NO_VERDICT });
+      const said = turn.message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
+      // A reply with no text (empty, or only thinking) stays out of the request and the history, as in the
+      // loop: the API rejects an assistant message with nothing in it.
+      if (!said.trim()) {
+        asked = noVerdict(true);
+        request = withRequest(request, asked);
+        continue;
+      }
+      text = said;
+      if (asked) conversation.push({ role: "user", content: asked });
       conversation.push({ role: "assistant", content: turn.message.content });
       if (verdictOf(text).verdict !== "none") break;
-      request = [...request, { role: "assistant", content: turn.message.content }, { role: "user", content: NO_VERDICT }];
+      asked = noVerdict(false);
+      request = [...request, { role: "assistant", content: turn.message.content }, { role: "user", content: asked }];
     }
   }
 
@@ -198,7 +208,9 @@ function reviewerSystem(workdir?: string): string {
 const outOf = (what: "steps" | "time") =>
   `You have run out of ${what}: no more commands will run. Give your verdict now, on what you have checked, starting with APPROVED, or with PROBLEMS: and each problem as a <problem> with its <what>, <command> and <shows>, as asked.`;
 
-const NO_VERDICT = "That reply has no verdict, and no tool runs now. Reply in text, starting with APPROVED or PROBLEMS: as asked.";
+// An empty reply isn't in the request, so the model is told what it was.
+const noVerdict = (empty: boolean) =>
+  `${empty ? "Your last reply was empty" : "That reply has no verdict"}, and no tool runs now. Reply in text, starting with APPROVED or PROBLEMS: as asked.`;
 
 /** The agent's last message: the text of its last reply that has any. */
 function lastAnswer(messages: MessageParam[]): string {

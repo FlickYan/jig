@@ -104,12 +104,14 @@ In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/co
 received (subagents included), and how many input tokens came from the prompt cache. Up brings back earlier
 tasks; a paste of several lines is one message, sent with Enter, and a line ending in `\` goes on in the
 next. Ctrl+C stops a task, and at the prompt clears the line; on an empty prompt it says how to quit, and
-pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line.
+pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line,
+one ending in `\` too.
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
 tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
-same tool calls (see below), 7 at `--time-limit`, and 130 on Ctrl+C. So
+same tool calls (see below), 7 at `--time-limit`, 8 when the model gave a second reply with no text or
+tool call (see below), and 130 on Ctrl+C. So
 `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
 
 `--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
@@ -172,7 +174,7 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
-  `glob`, and commands that only read inside the project (`ls`, `cat`, `git status`, `git diff`, ...).
+  `glob`, and commands that only read inside the project (`ls`, `cat`, `sed -n 10,20p`, `git diff`, ...).
   When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session. On a
   file change it approves file changes only: commands still ask, even ones the sandbox contains.
   With no terminal to ask in (a script, CI), such a call is refused instead, and the third in a task
@@ -241,10 +243,11 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 - **Long output.** Tool output over 40,000 characters (about 10k tokens) is cut from the middle, keeping
   its start and its end (errors and test summaries tend to be at the end). A command's whole output then
   goes to a file in the temp directory that only you can read, and the model is told where, so it can
-  search what it didn't see instead of running the command again (though not in plan mode, whose commands
-  may only read inside the project). The files hold 100 million characters at most, the oldest making
-  room, and jig deletes them when it exits. However much a command prints, jig keeps only its start and
-  end in memory, so the command runs to the end.
+  search what it didn't see instead of running the command again. Commands that only read one of these
+  files while jig keeps it (`grep -n`, `sed -n 10,20p`, `tail`, ...) count as reading inside the project,
+  so they don't ask, in plan mode too; other files with names like theirs don't count. The files hold 100
+  million characters at most, the oldest making room, and jig deletes them when it exits. However much a
+  command prints, jig keeps only its start and end in memory, so the command runs to the end.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
   User memories (how you like to work) hold in every project; project memories (facts about a project
   that its code doesn't say) in that one. Both are Markdown files under `~/.jig/memory/`, one per memory,
@@ -328,15 +331,19 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
   gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
-  stderr goes to the model with the result (a linter's complaints, say). Any other failure is shown to you
-  and otherwise ignored; a hook still running after 60 seconds is stopped, with everything it started.
+  stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
+  middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
+  a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
+  seconds is stopped, with everything it started.
 
   A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
   task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
   already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
   Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task going: the model is
-  told the stderr or the reason, and works on. A task's Stop hooks send it back 3 times at most; after
+  told the stderr or the reason, and works on. A long reason (a whole test log, say) is cut from the
+  middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A task's Stop
+  hooks send it back 3 times at most; after
   that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
   too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
   doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
@@ -435,11 +442,14 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
 check its work against the task, if a step is left for that, and stops at the next such reply. Also on
 `--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
-and none starts after; nor do `--check` and `--reviewer` in the last quarter of the time, since what they
-find might not get done), on
+a question asking you to allow a tool call is closed unanswered, and none starts after; nor do `--check`
+and `--reviewer` in the last quarter of the time, since what they find might not get done), on
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
-or only thinking): it stays out of the history, and the model is asked once to go on.
+or only thinking): it stays out of the history, and the model is asked once to go on. A second one ends
+the task as `empty`, with no answer for `--check`, the reviewer or a Stop hook to check, and one on the
+last step ends it out of steps; if that reply was cut off at the output limit, the task ends as cut off
+(exit 3) instead.
 A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
 same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
 its step limit), and a call identical to an earlier one in the same reply, with only reads between them,

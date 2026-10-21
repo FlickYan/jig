@@ -365,6 +365,14 @@ describe("hooks", () => {
     assert.match(pre.warnings.join(), /failed: broken/);
   });
 
+  it("keeps only the start and end of a long report, however much a hook prints", async () => {
+    // It used to keep all of it and cut it afterwards: half a billion characters crashed jig.
+    const hooks = preEdit("echo first >&2; head -c 20000000 /dev/zero | tr '\\0' x >&2; echo >&2; echo last >&2; exit 2");
+    const block = (await runHooks(hooks, "PreToolUse", { tool: "edit_file", input: {} }, dir)).block ?? "";
+    assert.ok(block.length < 40_000, `${block.length} characters`);
+    assert.match(block, /^first\nx{19494}\n\n\[\.\.\. 19961012 characters truncated \.\.\.\]\n\nx{19494}\nlast$/);
+  });
+
   const stop = { task: "fix the tests", last_message: "Done.", stop_hook_active: false, changed_files: ["a.py"] };
 
   it("keeps the task from ending when a Stop hook exits with code 2 or prints a block decision, and tells it the task", async () => {
@@ -391,6 +399,28 @@ describe("hooks", () => {
     assert.equal(pre.block, undefined, "a Stop hook doesn't run around tool calls");
   });
 
+  it("reads a Stop hook's decision whole, with a reason far longer than a command's output is kept", async () => {
+    // A failing test log wrapped in JSON. Kept only to a command's 39,000 characters, it couldn't be read, and
+    // the task would end as finished; the loop cuts the reason instead.
+    const hooks = [{ event: "Stop" as const, command: `printf '{"decision": "block", "reason": "tests failed: '; head -c 3900000 /dev/zero | tr '\\0' x; printf '"}'` }];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome.warnings, []);
+    assert.ok(outcome.block === `tests failed: ${"x".repeat(3_900_000)}`, `${outcome.block?.slice(0, 40)}…, ${outcome.block?.length} characters`);
+  });
+
+  it("keeps only the start and end of a Stop hook's stdout past millions of characters, and says when a decision is too long to read", async () => {
+    const lots = "head -c 20000000 /dev/zero | tr '\\0' x";
+    const hooks = [
+      { event: "Stop" as const, command: lots }, // a test runner's report, say: its own business
+      { event: "Stop" as const, command: `yes '{"Action":"pass","Package":"example.com/pkg","Test":"TestCase","Elapsed":0.01}' | head -n 80000` }, // go test -json
+      { event: "Stop" as const, command: `printf '{"decision": "block", "reason": "'; ${lots}; printf '"}'` },
+      { event: "Stop" as const, command: `printf '{"reason": "'; ${lots}; printf '", "decision": "block"}'` }, // the end is kept too
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    const tooLong = (hook: { command: string }) => `Hook "${hook.command}" printed too much on stdout to read it as a decision`;
+    assert.deepEqual(outcome, { warnings: [tooLong(hooks[2]), tooLong(hooks[3])] });
+  });
+
   it("are applied around tool calls by the agent loop", async () => {
     await writeFile(join(dir, "a.txt"), "hello\n");
     const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
@@ -406,6 +436,23 @@ describe("hooks", () => {
     const [read, bash] = conversation.messages[2].content as ToolResult[];
     assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nlint: all clear$/);
     assert.deepEqual([bash.is_error, bash.content], [true, "Blocked by a hook: no commands today"]);
+  });
+
+  it("have what they tell the model cut, as a tool's output is", async () => {
+    // A hook that prints a whole test log mustn't put megabytes into one result.
+    await writeFile(join(dir, "a.txt"), "hello\n");
+    const log = "FAIL test_parse\n".repeat(10_000);
+    const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
+    const model = fakeModel([
+      reply([toolUse("t1", "read_file", { path: "a.txt" }), toolUse("t2", "bash", { command: "echo hi" })]),
+      reply([text("Done.")]),
+    ]);
+    const hooks = { before: async (tool: string) => (tool === "bash" ? log : null), after: async () => log };
+    await runAgent(conversation, agentOptions(model, { hooks }));
+    const [read, bash] = conversation.messages[2].content as ToolResult[];
+    assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nFAIL test_parse\n[\s\S]*characters truncated/);
+    assert.match(String(bash.content), /^Blocked by a hook: FAIL test_parse\n[\s\S]*characters truncated/);
+    for (const result of [read, bash]) assert.ok(String(result.content).length < 41_000, `${String(result.content).length} characters`);
   });
 });
 

@@ -67,18 +67,46 @@ export async function fakeMessagesApi(answer: (request: Record<string, unknown>)
   };
 }
 
-/** Runs jig's CLI against a fake API, in `cwd`, with its own JIG_HOME unless `env` gives one. */
-export async function runJig(args: string[], { api, cwd, env = {}, stdin = "" }: { api: FakeApi; cwd: string; env?: NodeJS.ProcessEnv; stdin?: string }): Promise<{ code: number | null; output: string }> {
+// Runs a program at a pseudo-terminal no one types at, prints what it shows there, and exits as the program does.
+const AT_A_TERMINAL = `
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+while True:
+    try:
+        shown = os.read(fd, 65536)
+    except OSError:  # Linux, once the program has exited
+        shown = b""
+    if not shown:
+        break
+    sys.stdout.buffer.write(shown)
+    sys.stdout.buffer.flush()
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+`;
+
+/**
+ * Runs jig's CLI against a fake API, in `cwd`, with its own JIG_HOME unless `env` gives one. With `terminal`,
+ * its input and output are a pseudo-terminal that python3 makes and no one types at (`stdin` goes unread), and
+ * the output comes without the terminal's escape codes and carriage returns. Still waiting for an answer after
+ * 20 seconds, jig is hung up on, so a test fails rather than hangs.
+ */
+export async function runJig(
+  args: string[],
+  { api, cwd, env = {}, stdin = "", terminal = false }: { api: FakeApi; cwd: string; env?: NodeJS.ProcessEnv; stdin?: string; terminal?: boolean },
+): Promise<{ code: number | null; output: string }> {
   const home = env.JIG_HOME ?? (await mkdtemp(join(tmpdir(), "jig-home-")));
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");
-  const child = spawn(process.execPath, [cli, ...args], {
+  const [program, ...rest] = terminal ? ["python3", "-c", AT_A_TERMINAL, process.execPath, cli, ...args] : [process.execPath, cli, ...args];
+  const child = spawn(program, rest, {
     cwd,
     env: { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", NO_COLOR: "1", ...env, JIG_HOME: home },
+    timeout: terminal ? 20_000 : undefined,
   });
   let output = "";
-  child.stdout.on("data", (chunk) => (output += chunk));
-  child.stderr.on("data", (chunk) => (output += chunk));
+  child.stdout.setEncoding("utf8").on("data", (chunk) => (output += chunk));
+  child.stderr.setEncoding("utf8").on("data", (chunk) => (output += chunk));
   child.stdin.end(stdin);
   const code = await new Promise<number | null>((done) => child.on("close", done));
-  return { code, output };
+  return { code, output: terminal ? output.replace(/\x1b\[[0-9;?]*[A-Za-z]|\r/g, "") : output };
 }

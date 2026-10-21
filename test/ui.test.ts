@@ -41,13 +41,22 @@ describe("the input at a terminal", () => {
     assert.equal(shown.split("… ").length, 3, "a prompt for each line after the first");
   });
 
+  it("joins a line ending in \\ to the next, so one message can span lines", async () => {
+    const term = terminal();
+    const answer = askTask("> ", term.input);
+    await term.type("the build fails with this error:\\\r");
+    await term.type("TypeError: x is undefined\\\r    at main (app.js:3)\r");
+    assert.equal(await answer, "the build fails with this error:\nTypeError: x is undefined\n    at main (app.js:3)");
+    assert.equal((await term.shown()).split("… ").length, 3, "a prompt for each line after the first");
+  });
+
   it("brings back earlier tasks with Up, but not answers to questions or the lines of a paste", async () => {
     const term = terminal();
     const entered = async (read: Promise<string | null>, keys: string) => (await term.type(keys), read);
-    assert.equal(await entered(ask("Trust this project? ", term.input), "y\r"), "y");
+    assert.equal(await entered(ask("Trust this project? ", undefined, term.input), "y\r"), "y");
     assert.equal(await entered(askTask("> ", term.input), "\x1b[A\r"), "", "nothing to bring back yet");
     assert.equal(await entered(askTask("> ", term.input), "say hi\r"), "say hi");
-    assert.equal(await entered(ask("Allow? ", term.input), "y\r"), "y");
+    assert.equal(await entered(ask("Allow? ", undefined, term.input), "y\r"), "y");
     assert.equal(await entered(askTask("> ", term.input), "\x1b[200~line one\rline two\x1b[201~\r"), "line one\nline two");
     assert.equal(await entered(askTask("> ", term.input), "\x1b[A\r"), "say hi");
     // Ctrl+C drops what was typed and asks again, the history still there.
@@ -77,9 +86,31 @@ describe("the input at a terminal", () => {
 
   it("answers a question with null at Ctrl+C, which stops the task", async () => {
     const term = terminal();
-    const answer = ask("  Allow? [y]es / [n]o: ", term.input);
+    const answer = ask("  Allow? [y]es / [n]o: ", undefined, term.input);
     await term.type("y\x03");
     assert.equal(await answer, null);
+  });
+
+  it("answers a question with null when the task stops meanwhile (at --time-limit), as at Ctrl+C, and reads on", async () => {
+    const term = terminal();
+    const task = new AbortController();
+    const answer = ask("  Allow? [y]es / [n]o: ", task.signal, term.input);
+    await term.type("y");
+    task.abort("the time limit (--time-limit) was reached");
+    assert.equal(await answer, null);
+    assert.equal(term.raw(), false);
+    assert.ok((await term.shown()).includes("\n\x1b[?2004l"), "on a line of its own, bracketed paste off");
+    assert.equal(await ask("  Allow? [y]es / [n]o: ", task.signal, term.input), null, "already stopped");
+    // Answered in time, a question lets go of the task's signal: stopping the task later leaves the next read alone.
+    // That read is a question, which unlike the prompt doesn't ask again once interrupted.
+    const later = new AbortController();
+    const answered = ask("  Allow? [y]es / [n]o: ", later.signal, term.input);
+    await term.type("y\r");
+    assert.equal(await answered, "y");
+    const next = ask("  Allow? [y]es / [n]o: ", undefined, term.input);
+    later.abort();
+    await term.type("n\r");
+    assert.equal(await next, "n");
   });
 
   it("redraws the prompt when the terminal is resized only while asking, not over a task's output", async () => {
@@ -106,6 +137,26 @@ describe("piped input", () => {
     for (let i = 0; i < 4; i++) read.push(await askTask("> ", from));
     assert.deepEqual(read, ["say hi", "/context", "say bye", null]);
   });
+
+  it("takes a line ending in \\ as it is, so the command after it still runs", async () => {
+    const lines = new PassThrough();
+    const from = new Input(lines as unknown as NodeJS.ReadStream, new PassThrough().resume() as unknown as NodeJS.WriteStream);
+    lines.end("list the files in C:\\build\\\n/undo\n");
+    const read = [];
+    for (let i = 0; i < 3; i++) read.push(await askTask("> ", from));
+    assert.deepEqual(read, ["list the files in C:\\build\\", "/undo", null]);
+  });
+
+  it("answers a question with null when the task stops meanwhile, and still gives the next prompt the next line", async () => {
+    const lines = new PassThrough();
+    const from = new Input(lines as unknown as NodeJS.ReadStream, new PassThrough().resume() as unknown as NodeJS.WriteStream);
+    const task = new AbortController();
+    const answer = ask("Allow? ", task.signal, from);
+    task.abort();
+    assert.equal(await answer, null);
+    lines.end("say hi\n");
+    assert.deepEqual([await askTask("> ", from), await askTask("> ", from)], ["say hi", null]);
+  });
 });
 
 describe("the input once its interface has closed", () => {
@@ -123,7 +174,7 @@ describe("the input once its interface has closed", () => {
   it("gives the terminal back at Ctrl+D, at the prompt or at a question, and reads on", async (t) => {
     asOnNode24(t);
     const term = terminal();
-    for (const read of [() => askTask("> ", term.input), () => ask("  Allow? [y]es / [n]o: ", term.input)]) {
+    for (const read of [() => askTask("> ", term.input), () => ask("  Allow? [y]es / [n]o: ", undefined, term.input)]) {
       const answer = read();
       await term.type("\x04");
       assert.equal(await answer, null);

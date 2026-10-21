@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { matchesDenyRule, Permissions } from "../src/permissions.ts";
+import { OutputFiles } from "../src/tools/bash.ts";
 import { parseCommand } from "../src/tools/shell.ts";
 import { TOOLS } from "../src/tools/index.ts";
 
@@ -33,7 +35,7 @@ describe("Permissions", () => {
 
   it("allows commands that only read inside the project", () => {
     const permissions = new Permissions("edits", "/project");
-    for (const command of ["ls -la src", "cat README.md | head -5", "grep -rn TODO .", "git diff HEAD", "find . -name '*.py'"]) {
+    for (const command of ["ls -la src", "cat README.md | head -5", "grep -rn TODO .", "git diff HEAD", "find . -name '*.py'", "sed -n 10,20p src/a.ts"]) {
       assert.ok(bash(permissions, command), command);
     }
   });
@@ -48,6 +50,9 @@ describe("Permissions", () => {
       "find . -delete", // a reader with an option that writes
       "git push",
       "git diff --output=/tmp/x",
+      "sed -i 1d a.ts", // sed that edits, or might
+      "sed -n 1p -i a.ts",
+      "sed -n '1w b.ts' a.ts",
       "ls && rm -rf /", // one bad part is enough
       "echo hi > file.txt", // syntax we don't follow
     ];
@@ -67,6 +72,25 @@ describe("Permissions", () => {
     permissions.allowAlways(tool("edit_file"), { path: "a" });
     assert.equal(permissions.decide(tool("write_file"), { path: "b", content: "" }), "allow");
     assert.equal(permissions.alwaysLabel(tool("bash"), { command: "echo $(date)" }), null, "can't generalize this");
+  });
+
+  it("lets commands that only read look at jig's own files of long output, while it keeps them", () => {
+    const outputs = new OutputFiles();
+    try {
+      outputs.create("line 1\n");
+      const [path] = outputs.paths();
+      const permissions = new Permissions("plan", "/project", { outputs });
+      for (const command of [`grep -n ERROR ${path}`, `sed -n 10,20p ${path}`, `tail -n 50 ${path} | head -5`, `wc -l ${path}`]) {
+        assert.ok(bash(permissions, command), command);
+      }
+      // Not a file named like jig's: a command can make one, or a symlink to a file of yours.
+      const alike = join(dirname(path), "jig-output-000000000000.log");
+      for (const command of [`cat ${alike}`, `rm ${path}`, `sed -n '1w ${alike}' ${path}`]) assert.ok(!bash(permissions, command), command);
+      outputs.remove();
+      assert.ok(!bash(permissions, `cat ${path}`), "not once jig has deleted it");
+    } finally {
+      outputs.remove();
+    }
   });
 
   it("'always' on a file change allows file changes, not contained commands", () => {

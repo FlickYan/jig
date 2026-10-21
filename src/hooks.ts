@@ -3,11 +3,15 @@ import type { Socket } from "node:net";
 import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { hookMatcher, type Hook, type HookEvent } from "./settings.ts";
-import { LINGER_MS, whyStopped } from "./tools/bash.ts";
+import { LINGER_MS, Output, whyStopped } from "./tools/bash.ts";
 import type { ToolInput } from "./tools/index.ts";
 import { withoutKeys } from "./tools/util.ts";
 
 const TIMEOUT = 60_000;
+// Characters of a Stop hook's stdout kept whole, to read as a decision. A hook often puts a whole test log
+// in its reason, which the loop then cuts as it does tool output; kept only to a command's 39,000, such a
+// decision couldn't be read, and the task would end as finished just when the tests failed at length.
+const DECISION_LIMIT = 4_000_000;
 
 export interface HookOutcome {
   /** A PreToolUse hook blocked the call, or a Stop hook the end of the task; this is why (sent to the model). */
@@ -82,9 +86,13 @@ export async function runStopHooks(hooks: Hook[], stop: StopInput, cwd: string, 
     const env = { ...withoutKeys(), JIG_EVENT: "Stop", JIG_PROJECT_DIR: cwd };
     const { code, stdout, stderr } = await run(hook.command, JSON.stringify({ event: "Stop", ...stop, cwd }), cwd, env, { timeout, signal, readStdout: true });
     const message = stderr.trim() || `the hook exited with code ${code}`;
-    const reason = code === 2 ? message : code === 0 ? blockReason(stdout) : undefined;
+    // Past DECISION_LIMIT, stdout keeps only its start and end, which isn't JSON: a decision that long can't
+    // be read. Only one that looks like a decision gets a warning; JSON lines from a test runner that passed
+    // (go test -json, say) are the hook's own business.
+    const reason = code === 2 ? message : code === 0 && !stdout.cut ? blockReason(stdout.shown()) : undefined;
     if (reason !== undefined) outcome.block = [outcome.block, reason].filter(Boolean).join("\n");
     else if (code !== 0) outcome.warnings.push(`Hook "${hook.command}" failed: ${message}`);
+    else if (stdout.cut && /"decision"\s*:\s*"block"/.test(stdout.shown())) outcome.warnings.push(`Hook "${hook.command}" printed too much on stdout to read it as a decision`);
   }
   return outcome;
 }
@@ -106,6 +114,9 @@ function blockReason(stdout: string): string | undefined {
  * kills everything it started, not just the shell. Once the shell has exited, a job it left in the
  * background may hold its output open; jig waits a moment for its last words, then goes on and leaves it.
  * Only Stop hooks have their stdout read; a tool hook's goes nowhere, so a job holding it isn't waited for.
+ * As with a command's output, only the start and end of a long stream are kept, so memory stays the same
+ * however much a hook prints; kept whole, half a billion characters crashed jig. stdout keeps more whole
+ * than stderr, for a decision with a long reason.
  */
 function run(
   command: string,
@@ -113,12 +124,12 @@ function run(
   cwd: string,
   env: NodeJS.ProcessEnv,
   { timeout, signal, readStdout = false }: { timeout: number; signal?: AbortSignal; readStdout?: boolean },
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+): Promise<{ code: number | null; stdout: Output; stderr: string }> {
   return new Promise((done) => {
     // stdin and stderr are always pipes, so only stdout can be missing.
     const child = spawn("bash", ["-c", command], { cwd, env, detached: true, stdio: ["pipe", readStdout ? "pipe" : "ignore", "pipe"] }) as ChildProcessByStdio<Writable, Readable | null, Readable>;
-    let stdout = "";
-    let stderr = "";
+    const stdout = new Output(undefined, DECISION_LIMIT);
+    const stderr = new Output();
     let killedBecause = "";
     let finished = false;
     const kill = (reason: string) => {
@@ -139,13 +150,13 @@ function run(
       clearTimeout(timer);
       clearTimeout(lingering);
       signal?.removeEventListener("abort", onAbort);
-      done({ code, stdout, stderr: killedBecause ? `${stderr}\n(killed: ${killedBecause})` : `${stderr}${note}` });
+      done({ code, stdout, stderr: killedBecause ? `${stderr.shown()}\n(killed: ${killedBecause})` : `${stderr.shown()}${note}` });
     };
     child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
-      if (!finished) stdout += chunk;
+      if (!finished) stdout.add(chunk);
     });
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => {
-      if (!finished) stderr += chunk;
+      if (!finished) stderr.add(chunk);
     });
     child.on("error", (err) => finish(null, err.message));
     child.on("exit", (code) => {

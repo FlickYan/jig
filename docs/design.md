@@ -76,8 +76,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   and a note after the last user message asks the model to go on: two user messages in a row, which the
   Messages API merges into one turn, as with compaction's summary request.
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
-  runner's worker processes die too. Commands get no stdin, so an interactive prompt gets end-of-file
-  instead of hanging the agent.
+  runner's worker processes die too. So does jig's exit: the group is a session of its own, which closing
+  the terminal doesn't reach, so without bubblewrap's `--die-with-parent` a command ran on after jig was
+  killed. Commands get no stdin, so an interactive prompt gets end-of-file instead of hanging the agent.
 - **jig hides its arguments.** Models stop programs by matching their command lines
   (`pkill -f server.py`), and jig's arguments hold the task, which names the very files and programs a
   model might stop: twice in milestone 10 the model's command killed jig. So jig sets its process title to

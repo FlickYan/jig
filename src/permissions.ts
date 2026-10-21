@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import type { OutputFiles } from "./tools/bash.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
 import { parseCommand } from "./tools/shell.ts";
 import { isInside } from "./tools/util.ts";
@@ -35,6 +36,8 @@ export interface PolicyOptions {
   contained?: boolean;
   /** Directories outside the project that count as part of it (--add-dir). */
   dirs?: string[];
+  /** jig's files of long command output, which commands that only read may read as if in the project. */
+  outputs?: OutputFiles;
 }
 
 // Programs that only print: they don't change files or start other programs, whatever their arguments.
@@ -42,6 +45,8 @@ const READERS = new Set(["cat", "cut", "diff", "du", "echo", "grep", "head", "ls
 // These only read as long as they don't get an option that writes files or runs programs.
 const GIT_READERS = new Set(["blame", "diff", "log", "ls-files", "rev-parse", "show", "status"]);
 const FIND_ACTIONS = /^-(exec|execdir|ok|okdir|delete|fprint0?|fprintf|fls)$/;
+// sed only prints given -n and a script like 10,20p: other scripts can write files (w) or run programs (e).
+const SED_LINES = /^\d+(,\d+)?p$/;
 
 /**
  * The permission policy for a session: decides each tool call (run it, ask the user, or refuse) by the
@@ -55,6 +60,7 @@ export class Permissions {
   private readonly allowRules: string[][];
   private readonly denyRules: string[];
   private readonly contained: boolean;
+  private readonly outputs?: OutputFiles;
   /** Programs the user chose to always allow for this session, like "python3". */
   private readonly programs = new Set<string>();
   /** External tools (MCP) the user chose to always allow for this session. */
@@ -65,13 +71,14 @@ export class Permissions {
    */
   private editsAllowed = false;
 
-  constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false, dirs = [] }: PolicyOptions = {}) {
+  constructor(mode: Mode, root: string, { allow = [], deny = [], contained = false, dirs = [], outputs }: PolicyOptions = {}) {
     this.mode = mode;
     this.root = root;
     this.dirs = dirs;
     this.allowRules = allow.map((rule) => rule.split(/\s+/));
     this.denyRules = deny;
     this.contained = contained;
+    this.outputs = outputs;
   }
 
   /** Whether a call runs, asks first, or is refused (and why). */
@@ -137,24 +144,27 @@ export class Permissions {
   }
 
   private readsOnly([program, ...args]: string[]): boolean {
-    if (!this.stayInside(args)) return false;
+    // jig's files of long output too: a result that was cut tells the model to search its file.
+    if (!this.stayInside(args, this.outputs?.paths())) return false;
     if (READERS.has(program)) return true;
     if (program === "find") return !args.some((arg) => FIND_ACTIONS.test(arg));
     if (program === "git") return GIT_READERS.has(args[0] ?? "") && !args.some((arg) => arg.startsWith("--output"));
+    // GNU sed takes options after the script too, so no other argument may be one (-i edits in place).
+    if (program === "sed") return args[0] === "-n" && SED_LINES.test(args[1] ?? "") && !args.slice(2).some((arg) => arg.startsWith("-"));
     return false;
   }
 
   /**
    * False if any argument looks like a path outside the project (and the added directories): an absolute
-   * path elsewhere, anything in ~, or climbing out with "..".
+   * path elsewhere, anything in ~, or climbing out with "..". `files` are paths outside it that count too.
    */
-  private stayInside(args: string[]): boolean {
+  private stayInside(args: string[], files: string[] = []): boolean {
     return args.every((arg) => {
       const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : arg;
       if (value.startsWith("~")) return false;
       if (!value.startsWith("/") && !value.split("/").includes("..")) return true;
       const abs = resolve(this.root, value);
-      return [this.root, ...this.dirs].some((dir) => isInside(dir, abs));
+      return [this.root, ...this.dirs].some((dir) => isInside(dir, abs)) || files.includes(abs);
     });
   }
 }

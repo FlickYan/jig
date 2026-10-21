@@ -1,6 +1,7 @@
 // bash: runs a command in a fresh shell, in the sandbox when there is one and in a process group of its
-// own, so a timeout or Ctrl+C stops everything it started; jig's API keys are kept out of its environment.
-// The model gets the output and the exit code; a job left in the background keeps running, as in a terminal.
+// own, so a timeout, Ctrl+C or jig's exit stops everything it started; jig's API keys are kept out of its
+// environment. The model gets the output and the exit code; a job left in the background keeps running, as
+// in a terminal.
 // A long output is cut from the middle, and the whole of it goes to a file the model can search.
 
 import { spawn } from "node:child_process";
@@ -89,6 +90,26 @@ export function whyStopped(signal: AbortSignal | undefined, byUser: string): str
   return typeof signal?.reason === "string" ? signal.reason : byUser;
 }
 
+// The process groups of the commands running now, for killCommands.
+const running = new Set<number>();
+
+/**
+ * Kills the commands still running, with everything they started, as Ctrl+C does: for jig's exit. Each
+ * command has a session of its own, which closing the terminal doesn't reach, and apart from bubblewrap's
+ * --die-with-parent (the Linux sandbox) nothing else would stop it with jig.
+ */
+export function killCommands(): void {
+  for (const group of running) killGroup(group);
+}
+
+function killGroup(group: number): void {
+  try {
+    process.kill(-group, "SIGKILL");
+  } catch {
+    // the process group has already exited
+  }
+}
+
 /**
  * Runs a command; resolves to its output (its head and tail, if it is long) and how it ended, and rejects
  * only if it can't be started. Given `files`, the whole of a long output is kept in one of them, and given
@@ -108,16 +129,14 @@ export function runCommand(
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell.
     const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const group = child.pid; // none if it couldn't be started
+    if (group) running.add(group);
     const output = new Output(files);
     let killedBecause = "";
     let done = false;
     const kill = (reason: string) => {
       killedBecause ||= reason;
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        // the process group has already exited
-      }
+      killGroup(group!);
     };
     const collect = (chunk: string) => {
       if (done) return; // a background job's output, after the call has returned
@@ -132,6 +151,7 @@ export function runCommand(
     let lingering: NodeJS.Timeout | undefined;
     const settle = () => {
       done = true;
+      if (group) running.delete(group); // a job it left in the background keeps running, as in a terminal
       output.close();
       clearTimeout(timer);
       clearTimeout(lingering);
@@ -169,35 +189,41 @@ export function runCommand(
  * A command's output, as much of it as the model sees: all of it up to SHOWN characters, or else the first
  * and last SHOWN / 2, with the whole of it in a file when there are files to keep it in. Memory stays the
  * same however much a command prints, so a command that prints a lot runs to the end; it used to be killed
- * at 5 million characters, its exit code lost.
+ * at 5 million characters, its exit code lost. Hooks keep what they print this way too, without a file, and
+ * with a larger `limit` in place of SHOWN where they need more of it whole.
  */
-class Output {
+export class Output {
   private head = "";
   private tail = "";
   private length = 0;
   private file?: OutputFile;
   private readonly files?: OutputFiles;
+  private readonly limit: number;
 
-  constructor(files?: OutputFiles) {
+  constructor(files?: OutputFiles, limit = SHOWN) {
     this.files = files;
+    this.limit = limit;
   }
 
   add(chunk: string): void {
     // Once there is more than the model will see, everything so far and all that follows goes to a file.
-    if (this.length <= SHOWN && this.length + chunk.length > SHOWN) this.file = this.files?.create(this.head + this.tail);
+    if (this.length <= this.limit && this.length + chunk.length > this.limit) this.file = this.files?.create(this.head + this.tail);
     if (this.file) this.files!.add(this.file, chunk);
     this.length += chunk.length;
-    const room = SHOWN / 2 - this.head.length;
+    const room = this.limit / 2 - this.head.length;
     if (room > 0) {
       this.head += chunk.slice(0, room);
       chunk = chunk.slice(room);
     }
-    this.tail = (this.tail + chunk).slice(-SHOWN / 2);
+    // The tail is cut back only once it has grown to twice what is kept. Cut with every chunk, a tail of
+    // millions of characters would be copied each time: 3 seconds for a hook printing 200 MB, not 0.2.
+    this.tail += chunk;
+    if (this.tail.length > this.limit) this.tail = this.tail.slice(-this.limit / 2);
   }
 
   /** Whether there is more than the model will see, so only the head and tail are shown. */
   get cut(): boolean {
-    return this.length > SHOWN;
+    return this.length > this.limit;
   }
 
   /** The command has ended: nothing more goes to its file. */
@@ -207,13 +233,13 @@ class Output {
 
   /** The output, or its head and tail with where the rest is. */
   shown(): string {
-    if (this.length <= SHOWN) return this.head + this.tail;
+    if (this.length <= this.limit) return this.head + this.tail;
     const file = this.file;
     const where = !file
       ? ""
       : `. ${file.whole ? "The whole output is" : `The output's first ${file.size} characters are`} in ${file.path}: ` +
         "search it with grep -n, or print lines of it with sed -n, rather than running the command again";
-    return `${this.head}\n\n[... ${this.length - SHOWN} characters truncated${where} ...]\n\n${this.tail}`;
+    return `${this.head}\n\n[... ${this.length - this.limit} characters truncated${where} ...]\n\n${this.tail.slice(-this.limit / 2)}`;
   }
 }
 
@@ -283,6 +309,14 @@ export class OutputFiles {
     } catch {
       file.whole = false;
     }
+  }
+
+  /**
+   * The files jig keeps now, by path. The permission policy lets commands that only read look at these, as
+   * the note tells the model to; not other files with names like theirs, which a command can make.
+   */
+  paths(): string[] {
+    return this.files.map((file) => file.path);
   }
 
   /** Done with a file: its command has ended. */
