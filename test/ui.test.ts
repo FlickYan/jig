@@ -102,14 +102,15 @@ describe("the input at a terminal", () => {
     assert.ok((await term.shown()).includes("\n\x1b[?2004l"), "on a line of its own, bracketed paste off");
     assert.equal(await ask("  Allow? [y]es / [n]o: ", task.signal, term.input), null, "already stopped");
     // Answered in time, a question lets go of the task's signal: stopping the task later leaves the next read alone.
+    // That read is a question, which unlike the prompt doesn't ask again once interrupted.
     const later = new AbortController();
     const answered = ask("  Allow? [y]es / [n]o: ", later.signal, term.input);
     await term.type("y\r");
     assert.equal(await answered, "y");
-    const next = askTask("> ", term.input);
+    const next = ask("  Allow? [y]es / [n]o: ", undefined, term.input);
     later.abort();
-    await term.type("say hi\r");
-    assert.equal(await next, "say hi");
+    await term.type("n\r");
+    assert.equal(await next, "n");
   });
 
   it("redraws the prompt when the terminal is resized only while asking, not over a task's output", async () => {

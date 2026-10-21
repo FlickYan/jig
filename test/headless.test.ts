@@ -198,17 +198,23 @@ describe("a command's long output", () => {
 });
 
 describe("a signal that ends jig", () => {
-  it("kills the command still running, which without the sandbox would outlive it", async () => {
+  it("kills the command still running, which without the sandbox would outlive it, but not a job an earlier one left in the background", async () => {
     for (const signal of ["SIGHUP", "SIGTERM"] as const) {
-      // The command signals jig, then waits for the test's word to leave a file behind.
-      const command = `kill -${signal} $PPID; until [ -e go-${signal} ]; do sleep 0.05; done; touch outlived-${signal}`;
-      const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
+      // The first command leaves a job in the background and finishes; the second signals jig. Each then waits
+      // for the test's word to leave a file behind. The job should run on, as in a terminal.
+      const wait = `until [ -e go-${signal} ]; do sleep 0.05; done`;
+      const job = `(${wait}; touch left-${signal}) >/dev/null 2>&1 &`;
+      const command = `kill -${signal} $PPID; ${wait}; touch outlived-${signal}`;
+      const api = await fakeMessagesApi((request) => [{ tool: "bash", input: { command: (request.messages as unknown[]).length === 1 ? job : command } }]);
       try {
         const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Fix the parser."], { api, cwd: project });
         await writeFile(join(project, `go-${signal}`), ""); // first, so a command that outlived jig doesn't wait forever
-        await new Promise((done) => setTimeout(done, 500));
+        const left = join(project, `left-${signal}`);
+        for (let i = 0; i < 50 && !existsSync(left); i++) await new Promise((done) => setTimeout(done, 100));
+        await new Promise((done) => setTimeout(done, 500)); // then a moment for the command, had it outlived jig
         assert.equal(code, 128 + constants.signals[signal]);
         assert.equal(existsSync(join(project, `outlived-${signal}`)), false, `the command outlived jig after ${signal}`);
+        assert.equal(existsSync(left), true, `jig's exit after ${signal} killed the job left in the background`);
       } finally {
         api.close();
       }
@@ -705,6 +711,22 @@ describe("a one-shot run with --time-limit", () => {
       assert.equal(api.requests.length, 1);
       assert.match(output, /Killed: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n1 step · /);
       assert.equal(JSON.parse(await readFile(file, "utf8")).stop, "time_limit");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("closes a question asking to allow a call at the limit, unanswered, and refuses the call with the reason", async () => {
+    // In ask mode at a terminal, where no one answers: the question used to wait past the limit.
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: "touch made" } }]);
+    try {
+      const started = Date.now();
+      const asking = ["--no-sandbox", "--mode", "ask", "--model", "claude-haiku-4-5", "--time-limit", "1", "Fix the parser."];
+      const { code, output } = await runJig(asking, { api, cwd: project, terminal: true });
+      assert.equal(code, 7, output);
+      assert.ok(Date.now() - started < 10_000, "it didn't wait for an answer");
+      assert.match(output, /Allow\? \[y\]es \/ \[n\]o[^\n]*: \n {2}✗ Not run: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n1 step · /);
+      assert.equal(existsSync(join(project, "made")), false);
     } finally {
       api.close();
     }
