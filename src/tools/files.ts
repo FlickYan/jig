@@ -9,6 +9,8 @@ const SKIP_DIRS = new Set([
   ".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", ".tox", "dist", "build",
   ".next", "target",
 ]);
+// What a walk of a path git ignores skips, when the model named that path: it asked for what is in there.
+const GIT_ONLY = new Set([".git"]);
 // Kernel file systems, which a walk of / (--add-dir / in a container) would otherwise wander through.
 const PSEUDO_FILESYSTEMS = new Set(["/proc", "/sys", "/dev"]);
 
@@ -29,8 +31,9 @@ export interface FileList {
  * The files under `path` (a directory or a single file). In a git repository this is git's view of the
  * files, so .gitignore applies, and all of it: matching names is cheap, and grep limits what it reads
  * itself. Elsewhere it is a plain walk, which stops at the limit, since with --add-dir / it would walk the
- * whole system. A path the settings hide is refused, but a file in the list can still be hidden, through a
- * symlink say: the caller leaves those out with firstVisible, on only the files it uses.
+ * whole system. A path git ignores is walked too, all of it but .git: git lists nothing in it, and the
+ * model asked for it by name. A path the settings hide is refused, but a file in the list can still be
+ * hidden, through a symlink say: the caller leaves those out with firstVisible, on only the files it uses.
  */
 export async function listFiles(root: string, path = ".", dirs: string[] = [], hidden: string[] = []): Promise<FileList> {
   const abs = resolveInRoot(root, path, dirs);
@@ -40,10 +43,16 @@ export async function listFiles(root: string, path = ".", dirs: string[] = [], h
   // Shown relative to the project, or in full in an --add-dir directory.
   const shown = isInside(root, abs) ? relative(root, abs) : abs;
   if (info.isFile()) return { files: [shown], capped: false };
-  let files = await gitFiles(abs);
+  const ignored = await ignoredByGit(abs);
+  let files = ignored ? null : await gitFiles(abs);
   let capped = false;
   if (!files) {
-    files = await walk(abs, abs, [], searchLimits.files + 1); // one more than the limit, to tell there are more
+    // A path git ignores that the model named is walked whole but for .git: most packages in node_modules
+    // keep their code in dist/ or build/. Not the project or an --add-dir directory, which an enclosing
+    // repository (a home directory's) may ignore whole: their own node_modules and dist/ weren't asked for.
+    const named = ignored && ![root, ...dirs].some((dir) => resolve(dir) === abs);
+    // One more than the limit, to tell there are more.
+    files = await walk(abs, abs, [], searchLimits.files + 1, named ? GIT_ONLY : SKIP_DIRS);
     capped = files.length > searchLimits.files;
     files = files.slice(0, searchLimits.files);
   }
@@ -102,6 +111,19 @@ async function gitFiles(dir: string): Promise<string[] | null> {
   return files;
 }
 
+/**
+ * Whether git ignores dir itself, as it often does node_modules/: git then lists nothing in it, and grep
+ * said "No matches." there for text that was in it. Not when git tracks files in dir (a tracked build/ is
+ * git's list), nor at a nested repository's top, which its own git lists. False outside a git repository.
+ */
+function ignoredByGit(dir: string): Promise<boolean> {
+  const args = [...SAFE_GIT, "check-ignore", "-q", "--", "."];
+  return new Promise((resolve) => {
+    // 0 when ignored, 1 when not, 128 outside a repository.
+    execFile("git", args, { cwd: dir, env: withoutKeys() }, (err) => resolve(!err));
+  });
+}
+
 function lsFiles(dir: string, which: string[]): Promise<string[] | null> {
   const args = [...SAFE_GIT, "ls-files", ...which, "-z"];
   return new Promise((resolve) => {
@@ -111,12 +133,12 @@ function lsFiles(dir: string, which: string[]): Promise<string[] | null> {
   });
 }
 
-/** The files under dir, relative to root, up to `limit` of them. */
-async function walk(root: string, dir: string, out: string[], limit: number): Promise<string[]> {
+/** The files under dir, relative to root, up to `limit` of them, leaving out the directories named in skip. */
+async function walk(root: string, dir: string, out: string[], limit: number, skip = SKIP_DIRS): Promise<string[]> {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     if (out.length >= limit) break;
     const abs = join(dir, entry.name);
-    if (entry.isDirectory() && !SKIP_DIRS.has(entry.name) && !PSEUDO_FILESYSTEMS.has(abs)) await walk(root, abs, out, limit);
+    if (entry.isDirectory() && !skip.has(entry.name) && !PSEUDO_FILESYSTEMS.has(abs)) await walk(root, abs, out, limit, skip);
     else if (entry.isFile()) out.push(relative(root, abs)); // symlinks are skipped, so walks can't loop
   }
   return out;

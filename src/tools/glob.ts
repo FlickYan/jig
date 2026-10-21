@@ -13,7 +13,8 @@ export const globTool: Tool = {
     name: "glob",
     description:
       "Find files by path pattern, e.g. **/*.py, src/**/*.test.ts or *.{json,yaml} (top level only). Returns " +
-      "matching paths relative to the working directory, skipping .git, node_modules and files git ignores. " +
+      "matching paths relative to the working directory, skipping .git, node_modules and files git ignores, " +
+      "unless path points into them (node_modules/pkg). " +
       "Use it to see how a project is laid out or to find files by name.",
     input_schema: {
       type: "object",

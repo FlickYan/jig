@@ -30,7 +30,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   is a git repository (so ignored files are skipped for free), and walk the directory otherwise. They are
   plain Node, with no dependency on ripgrep being installed. Everything git tracks is listed, and a nested
   repository (a submodule, a clone) through its own git; the built-in list of directories not worth
-  searching (`node_modules`, `build`, `target`, ...) is only for what git doesn't track. A search that
+  searching (`node_modules`, `build`, `target`, ...) is only for what git doesn't track. A path that git
+  ignores, and tracks nothing in, is walked when the model names it (`grep` in `node_modules/pkg`): git
+  lists nothing there, and grep said "No matches." for text that was in it. Only `.git` is skipped in it,
+  since most packages keep their code in `dist/` or `build/`; the project itself, which a home directory's
+  git may ignore whole, still skips the list. A search that
   doesn't look at every file says so: `grep` reads 20,000 files at most, the first by name, and a walk
   outside git stops there too. The cut used to be silent: in a large repository, grep said "No matches."
   for code that was there. `grep` matches in a worker thread that Ctrl+C stops, as do 30 seconds on one

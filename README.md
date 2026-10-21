@@ -156,7 +156,9 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   The git that `grep` and `glob` run to list files
   runs with `core.fsmonitor` and hooks turned off, and without jig's API keys. `grep` matches in a worker
   thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially
-  long on some lines.
+  long on some lines. They leave out what git ignores, but walk a path git ignores when they are given it
+  (`node_modules/pkg`), its `dist/` and `build/` included: git lists nothing there, and they used to find
+  nothing.
   `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or UTF-16 file the model is told to
   use a command, and `read_file` says when what it shows isn't UTF-8. `read_file` reads a file a chunk at a
   time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. A file over

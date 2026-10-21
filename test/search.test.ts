@@ -140,6 +140,42 @@ describe("listFiles", () => {
     assert.equal(await grepTool.run({ pattern: "needle", path: "vendor/lib/src" }, ctx), "vendor/lib/src/x.py:1: needle");
     assert.equal(await globTool.run({ pattern: "*.py", path: "mods/up" }, ctx), "mods/up/lib.py");
   });
+
+  it("walks a path git ignores when path names it, all of it but .git, within the same limits", async () => {
+    const files = {
+      ".gitignore": "node_modules/\nbuild/\nvendor/\n",
+      "node_modules/pkg/index.js": "needle\n",
+      "node_modules/pkg/dist/index.js": "needle\n", // where most packages keep their code
+      "node_modules/pkg/lib/build/util.js": "needle\n",
+      "build/out.js": "needle\n",
+      "build/new.js": "needle\n",
+      "vendor/lib/x.py": "needle\n", // a clone, in a directory git ignores
+      "vendor/lib/.gitignore": "*.log\n",
+      "vendor/lib/debug.log": "needle\n",
+    };
+    const ctx = await repository(files, [".gitignore"]);
+    execFileSync("git", ["add", "-f", "build/out.js"], { cwd: ctx.cwd });
+    execFileSync("git", ["init", "-q"], { cwd: join(ctx.cwd, "vendor/lib") });
+    const pkg = ["dist/index.js", "index.js", "lib/build/util.js"].map((file) => `node_modules/pkg/${file}`);
+    assert.equal(await grepTool.run({ pattern: "needle", path: "node_modules/pkg" }, ctx), pkg.map((file) => `${file}:1: needle`).join("\n"));
+    assert.equal(await globTool.run({ pattern: "*.js", path: "node_modules/pkg" }, ctx), "node_modules/pkg/index.js");
+    assert.equal(await globTool.run({ pattern: "**/*.js", path: "node_modules" }, ctx), pkg.join("\n"));
+    await withLimits({ files: 1 }, async () => {
+      assert.match(await grepTool.run({ pattern: "needle", path: "node_modules" }, ctx), /\(Searched only the first 1 files: the listing stops there\./);
+    });
+    // A whole search still leaves them out, a directory git tracks files in is git's list, a clone is
+    // listed with its own git, and a walk still leaves out .git.
+    assert.equal(await grepTool.run({ pattern: "needle" }, ctx), "build/out.js:1: needle");
+    assert.equal(await grepTool.run({ pattern: "needle", path: "build" }, ctx), "build/out.js:1: needle");
+    assert.equal(await grepTool.run({ pattern: "needle", path: "vendor/lib" }, ctx), "vendor/lib/x.py:1: needle");
+    assert.equal(await globTool.run({ pattern: "**/HEAD", path: "vendor" }, ctx), "No files found.");
+    // A project, or an --add-dir directory, that an enclosing repository ignores is walked too, as a home
+    // directory's git may ignore everything, but its own dist/ and the like are still left out.
+    const ignored = join(ctx.cwd, "node_modules/pkg");
+    assert.deepEqual((await listFiles(ignored)).files, ["index.js"]);
+    const other = await mkdtemp(join(tmpdir(), "jig-search-"));
+    assert.deepEqual((await listFiles(other, ignored, [ignored])).files, [join(ignored, "index.js")]);
+  });
 });
 
 describe("grep", () => {

@@ -19,8 +19,8 @@ export const grepTool: Tool = {
     description:
       "Search the contents of files with a regular expression (JavaScript syntax). Returns matching lines as " +
       "path:line: text. Searches the whole project by default, skipping .git, node_modules and files git " +
-      "ignores. Use it to find where something is defined or used before reading files; read_file can then " +
-      "start at the line number it gives.",
+      "ignores, unless path points into them (node_modules/pkg). Use it to find where something is defined " +
+      "or used before reading files; read_file can then start at the line number it gives.",
     input_schema: {
       type: "object",
       properties: {
