@@ -109,7 +109,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   Reading still follows links out, since commands can read anything anyway; refusing would protect only
   the hidden paths, which are checked by real path instead, and would break linked packages. A git
   directory's `config` and hooks are never changed, since git runs the programs they name outside the
-  sandbox.
+  sandbox. Some of jig's own writes into the project are held to the same: in an audit, a command's
+  `ln -sf` sent the `--stats` file and an approved AGENTS.md edit to a file outside it. Those edits and
+  the skills the model writes now go by real path, and the stats file, rewritten all through a run, is
+  written anew and renamed into place, since a rename replaces a link where a write follows it (a linked
+  folder on the way to it is still followed). `jig skills add`, `update` and `remove` don't check yet.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig

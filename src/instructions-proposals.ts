@@ -1,8 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { lstat, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { type Approve, notApproved } from "./proposals.ts";
 import { findSecret } from "./secrets.ts";
 import type { Tool } from "./tools/index.ts";
+import { isInside, resolveForChange } from "./tools/util.ts";
 
 // Context that every agent working on a project should have, a convention or a rule, belongs in its
 // AGENTS.md rather than in jig's memory: it travels with the repository and other agents read it too.
@@ -43,24 +45,38 @@ export function proposeInstructionsTool(approve: Approve): Tool {
       const secret = findSecret(added);
       if (secret) throw new Error(`The edit seems to hold ${secret}; AGENTS.md must not contain secrets.`);
       const path = instructionsFile(ctx.cwd);
+      const file = relative(ctx.cwd, path);
+      // jig writes it itself, outside the sandbox, so it goes by where it really leads, as write_file does:
+      // a symlink (a command can make one) mustn't take the edit out of the project, or to a git directory's
+      // config. Checked again once approved, since a command left running could make one meanwhile.
+      const check = () => resolveForChange(ctx.cwd, file, ctx.dirs, ctx.hidden);
+      await check();
       const current = existsSync(path) ? readFileSync(path, "utf8") : "";
       let next: string;
       let diff: string;
       if (old) {
         const count = current.split(old).length - 1;
-        if (count !== 1) throw new Error(count ? `old_string occurs ${count} times in ${relative(ctx.cwd, path)}; give more of the passage.` : `old_string isn't in ${relative(ctx.cwd, path)}.`);
+        if (count !== 1) throw new Error(count ? `old_string occurs ${count} times in ${file}; give more of the passage.` : `old_string isn't in ${file}.`);
         next = current.replace(old, () => added);
         diff = [...lines(old, "- "), ...lines(added, "+ ")].join("\n");
       } else {
         next = current.trim() ? `${current.trimEnd()}\n\n${added.trim()}\n` : `${added.trim()}\n`;
         diff = lines(added, "+ ").join("\n");
       }
-      const file = relative(ctx.cwd, path);
-      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${file}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`))) return notApproved(`edit to ${file}`);
+      const shown = await linkedName(ctx.cwd, path, file);
+      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${shown}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`))) return notApproved(`edit to ${file}`);
+      await check();
       writeFileSync(path, next);
-      return `Edited ${file}. It applies from the next session (or after /reset).`;
+      return `Edited ${shown}. It applies from the next session (or after /reset).`;
     },
   };
+}
+
+/** The file's name, and if it is a symlink, the file the edit really changes, for the user to see. */
+async function linkedName(project: string, path: string, file: string): Promise<string> {
+  if (!(await lstat(path).catch(() => null))?.isSymbolicLink()) return file;
+  const [root, real] = await Promise.all([realpath(project), realpath(path)]);
+  return `${file} (a link to ${isInside(root, real) ? relative(root, real) : real})`;
 }
 
 function lines(text: string, prefix: string): string[] {

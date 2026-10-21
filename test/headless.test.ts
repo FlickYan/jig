@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { constants, tmpdir } from "node:os";
@@ -192,6 +192,24 @@ describe("--stats", () => {
     stats.count("retry.quiet");
     stats.count("compaction");
     assert.deepEqual(await events(), { "retry.quiet": 2, compaction: 1 });
+  });
+
+  it("replaces a link a command put in its place, rather than writing to the file it leads to", async () => {
+    // jig writes the file outside the sandbox, so a symlink or hard link a sandboxed command made would
+    // otherwise let it overwrite a file of the user's that the sandbox kept the command from changing.
+    const victims = [join(outside, "bashrc"), join(outside, "notes.txt")];
+    for (const victim of victims) await writeFile(victim, "the user's own\n");
+    await symlink(victims[0], join(project, "stats.json"));
+    await link(victims[1], join(project, "hard.json"));
+    for (const name of ["stats.json", "hard.json"]) {
+      const stats = new Stats(join(project, name), "test-model");
+      stats.count("compaction");
+      const info = await lstat(join(project, name));
+      assert.ok(info.isFile() && info.nlink === 1, `${name} is a file of its own now`);
+      assert.deepEqual(JSON.parse(await readFile(join(project, name), "utf8")).events, { compaction: 1 });
+    }
+    for (const victim of victims) assert.equal(await readFile(victim, "utf8"), "the user's own\n");
+    assert.deepEqual((await readdir(project)).sort(), ["hard.json", "stats.json"], "no temporary file is left behind");
   });
 });
 

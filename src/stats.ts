@@ -1,4 +1,5 @@
-import { writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { renameSync, writeFileSync } from "node:fs";
 import { addUsage, type RunResult, type Usage } from "./agent.ts";
 import type { CallModel } from "./model.ts";
 
@@ -148,8 +149,16 @@ export class Stats {
     this.write();
   }
 
+  /**
+   * Written to a new file beside it, then renamed over it. jig writes it outside the sandbox, often in the
+   * project, where a command can put a symlink or a hard link in its place: writing to that would change a
+   * file of the user's, while a rename replaces the link itself. A reader never sees half a file either.
+   * Only the file itself: a directory on the way to it is still followed.
+   */
   private write(): void {
     this.data.seconds = Math.round((Date.now() - this.started) / 100) / 10;
-    writeFileSync(this.path, `${JSON.stringify(this.data, null, 2)}\n`);
+    const temp = `${this.path}.${randomBytes(4).toString("hex")}.tmp`;
+    writeFileSync(temp, `${JSON.stringify(this.data, null, 2)}\n`, { flag: "wx" }); // "wx": never through a file already there
+    renameSync(temp, this.path);
   }
 }

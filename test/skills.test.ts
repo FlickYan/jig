@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -180,6 +180,20 @@ describe("proposing a skill", () => {
 
     assert.match(await tool.run({ ...proposal }, context()), /saved as a proposal in .*\.jig\/proposals\/skills\/release-notes.*jig skills add/s);
     assert.match(await tool.run({ ...proposal }, context()), /didn't keep this skill/);
+  });
+
+  it("isn't saved, nor an earlier version removed, through a symlink out of the project", async () => {
+    // jig writes the skill itself, outside the sandbox, so a .jig a sandboxed command made into a symlink
+    // would otherwise let it delete and write folders of the user's.
+    const outside = await mkdtemp(join(tmpdir(), "jig-skills-outside-"));
+    await mkdir(join(outside, "skills", "release-notes"), { recursive: true });
+    await writeFile(join(outside, "skills", "release-notes", "work.txt"), "the user's own\n");
+    await symlink(outside, join(dir, ".jig"));
+    for (const decision of ["project", "proposal"] as const) {
+      await assert.rejects(proposeSkillTool(async () => decision).run({ ...proposal }, context()), /\.jig\/.*release-notes leads through a symlink to .*, outside the working directory/);
+    }
+    assert.equal(await readFile(join(outside, "skills", "release-notes", "work.txt"), "utf8"), "the user's own\n");
+    assert.ok(!existsSync(join(outside, "proposals")));
   });
 });
 
