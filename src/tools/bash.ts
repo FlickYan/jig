@@ -189,35 +189,41 @@ export function runCommand(
  * A command's output, as much of it as the model sees: all of it up to SHOWN characters, or else the first
  * and last SHOWN / 2, with the whole of it in a file when there are files to keep it in. Memory stays the
  * same however much a command prints, so a command that prints a lot runs to the end; it used to be killed
- * at 5 million characters, its exit code lost.
+ * at 5 million characters, its exit code lost. Hooks keep what they print this way too, without a file, and
+ * with a larger `limit` in place of SHOWN where they need more of it whole.
  */
-class Output {
+export class Output {
   private head = "";
   private tail = "";
   private length = 0;
   private file?: OutputFile;
   private readonly files?: OutputFiles;
+  private readonly limit: number;
 
-  constructor(files?: OutputFiles) {
+  constructor(files?: OutputFiles, limit = SHOWN) {
     this.files = files;
+    this.limit = limit;
   }
 
   add(chunk: string): void {
     // Once there is more than the model will see, everything so far and all that follows goes to a file.
-    if (this.length <= SHOWN && this.length + chunk.length > SHOWN) this.file = this.files?.create(this.head + this.tail);
+    if (this.length <= this.limit && this.length + chunk.length > this.limit) this.file = this.files?.create(this.head + this.tail);
     if (this.file) this.files!.add(this.file, chunk);
     this.length += chunk.length;
-    const room = SHOWN / 2 - this.head.length;
+    const room = this.limit / 2 - this.head.length;
     if (room > 0) {
       this.head += chunk.slice(0, room);
       chunk = chunk.slice(room);
     }
-    this.tail = (this.tail + chunk).slice(-SHOWN / 2);
+    // The tail is cut back only once it has grown to twice what is kept. Cut with every chunk, a tail of
+    // millions of characters would be copied each time: 3 seconds for a hook printing 200 MB, not 0.2.
+    this.tail += chunk;
+    if (this.tail.length > this.limit) this.tail = this.tail.slice(-this.limit / 2);
   }
 
   /** Whether there is more than the model will see, so only the head and tail are shown. */
   get cut(): boolean {
-    return this.length > SHOWN;
+    return this.length > this.limit;
   }
 
   /** The command has ended: nothing more goes to its file. */
@@ -227,13 +233,13 @@ class Output {
 
   /** The output, or its head and tail with where the rest is. */
   shown(): string {
-    if (this.length <= SHOWN) return this.head + this.tail;
+    if (this.length <= this.limit) return this.head + this.tail;
     const file = this.file;
     const where = !file
       ? ""
       : `. ${file.whole ? "The whole output is" : `The output's first ${file.size} characters are`} in ${file.path}: ` +
         "search it with grep -n, or print lines of it with sed -n, rather than running the command again";
-    return `${this.head}\n\n[... ${this.length - SHOWN} characters truncated${where} ...]\n\n${this.tail}`;
+    return `${this.head}\n\n[... ${this.length - this.limit} characters truncated${where} ...]\n\n${this.tail.slice(-this.limit / 2)}`;
   }
 }
 

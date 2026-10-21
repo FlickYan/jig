@@ -309,16 +309,19 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
   gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
   a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
-  stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut as tool output
-  is (see Long output). Any other failure is shown to you and otherwise ignored; a hook still running after
-  60 seconds is stopped, with everything it started.
+  stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
+  middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
+  a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
+  seconds is stopped, with everything it started.
 
   A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
   task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
   already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
   Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task going: the model is
-  told the stderr or the reason, and works on. A task's Stop hooks send it back 3 times at most; after
+  told the stderr or the reason, and works on. A long reason (a whole test log, say) is cut from the
+  middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A task's Stop
+  hooks send it back 3 times at most; after
   that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
   too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
   doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
