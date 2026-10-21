@@ -7,7 +7,7 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { addUsage, runAgent, type Reviewer, type ReviewVerdict } from "./agent.ts";
 import { Conversation } from "./conversation.ts";
-import { type SubagentSetup, withRequest } from "./tools/subagent.ts";
+import { stoppedBecause, type SubagentSetup, withRequest } from "./tools/subagent.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
@@ -19,11 +19,13 @@ export function reviewer(model: string, setup: SubagentSetup): Reviewer {
       const conversation = new Conversation(undefined, [{ role: "user", content: reviewPrompt(task, answer, workLog(messages)) }]);
       const result = await runAgent(conversation, { ...setup, ui: setup.ui("review") }, signal);
       let text = result.stop === "end_turn" ? result.text : "";
-      // Out of steps, or stopped for repeating itself, it is asked for its verdict on what it has checked (in
-      // milestone 24, three reviews in five used their steps up and gave none). Cut off for any other reason,
-      // it gives none.
-      if (result.stop === "max_steps" || result.stop === "loop") {
-        const { message } = await setup.callModel(withRequest(conversation.messages, OUT_OF_STEPS), signal, { summarize: true });
+      // Out of steps, stopped for repeating itself, or for replying twice with nothing, it is asked for its
+      // verdict on what it has checked (in milestone 24, three reviews in five used their steps up and gave
+      // none), as `jig review`'s is. Cut off for any other reason, it gives none. An approval with nothing
+      // checked leaves the work as no verdict would: only problems go back.
+      if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "empty") {
+        const request = `${stoppedBecause(result.stop)}. Don't call any more tools: give your verdict now, on what you have checked, starting with APPROVED or PROBLEMS: as asked.`;
+        const { message } = await setup.callModel(withRequest(conversation.messages, request), signal, { summarize: true });
         addUsage(result.usage, message.usage);
         text = message.content.map((block) => (block.type === "text" ? block.text : "")).join("");
       }
@@ -75,8 +77,6 @@ export function verdictOf(text: string): { verdict: ReviewVerdict; problems?: st
 
 const NONE = /^\W*(?:none|no (?:problems|issues)|nothing|n\/a)\b/i;
 const NO_PROBLEMS = /^\W*(?:none|no (?:problems|issues)|nothing|n\/a)(?: found| to report)?\W*$/i;
-
-const OUT_OF_STEPS = "You have run out of steps. Don't call any more tools: give your verdict now, on what you have checked, starting with APPROVED or PROBLEMS: as asked.";
 
 /** Sent to the model that did the work, with the problems the review found. */
 export function sentBack(problems: string): string {

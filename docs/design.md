@@ -249,8 +249,8 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   servers included, and servers crash. A tool call to a server that has stopped starts it again.
 - **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
   everything it read, so it gets one more call, without tools, to write up what it found, as it does when
-  it is stopped for repeating itself. So does the main loop at its step limit, with what it changed,
-  verified and left undone: without it, a run that hit the limit left the user "Stopped after 50 steps"
+  it is stopped for repeating itself or for replying twice with nothing. So does the main loop at its step
+  limit, with what it changed, verified and left undone: without it, a run that hit the limit left the user "Stopped after 50 steps"
   and a diff to read (Python-Markdown's second attempt). The reply is a report, not evidence, and not a
   finished answer to train on. The runs in `bench/` leave it out (`--no-wrap-up`): at evolve2's four
   steps every attempt would make the extra call, and costs would no longer compare with earlier runs.

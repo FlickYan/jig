@@ -125,6 +125,19 @@ describe("the reviewer", () => {
     assert.match(JSON.stringify(seen.at(-1)!.at(-1)), /You have run out of steps/);
   });
 
+  it("is asked for its verdict when it replies twice with nothing, and told only that", async () => {
+    const seen: MessageParam[][] = [];
+    const silent = (): ModelTurn => ({ message: { ...turn("").message, content: [] }, malformed: new Map() });
+    const setup = await setupWith([look("a"), silent(), silent(), turn("PROBLEMS:\n- out.txt is missing")], seen);
+    const review = await reviewer("strong", setup).review(work);
+    assert.equal(review.verdict, "problems");
+    assert.equal(seen.length, 4, "three steps, then the request for its verdict");
+    // The loop's note after the first empty reply asked it to go on: the request takes its place.
+    const request = JSON.stringify(seen.at(-1));
+    assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: give your verdict now/);
+    assert.doesNotMatch(request, /continue the task|run out of steps/);
+  });
+
   it("sends nothing back when it approves or stays cut off, and finishes a verdict that was cut off", async () => {
     const approves = await reviewer("strong", await setupWith([turn("APPROVED")], [])).review(work);
     assert.deepEqual([approves.verdict, approves.feedback], ["approved", undefined]);
@@ -243,13 +256,16 @@ describe("jig review", () => {
     assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\./);
   });
 
-  it("asks for the verdict, as when the steps run out, when the reviewer replies twice with nothing", async () => {
+  it("asks for the verdict, as when the steps run out, when the reviewer replies twice with nothing, and says only that", async () => {
     // A command, then empty replies, until it is asked for its verdict (the request that allows no tool).
     const empty = (request: Record<string, unknown>): Reply =>
       request.tool_choice ? [{ text: "APPROVED" }] : (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [];
     const { verdict, requests } = await review(empty);
     assert.deepEqual([verdict.verdict, verdict.stop, verdict.steps, requests.length], ["approved", "empty", 3, 4]);
-    assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps: no more commands will run\./);
+    // The loop's note after the first empty reply asked it to go on: the request takes its place.
+    const request = JSON.stringify(requests.at(-1)!.messages);
+    assert.match(request, /Two of your replies were empty: no more commands will run\. Give your verdict now, on what you have checked/);
+    assert.doesNotMatch(request, /continue the task|run out of steps/);
   });
 
   it("answers a verdict request's reply that has no verdict once, as when a model writes a tool call out as text", async () => {
@@ -269,7 +285,7 @@ describe("jig review", () => {
     assert.deepEqual([verdict.verdict, verdict.stop, requests.length], ["approved", "empty", 5]);
     const sent = requests.flatMap((request) => request.messages as MessageParam[]);
     assert.ok(sent.every((message) => message.role === "user" || message.content.length > 0), "no assistant message without content");
-    assert.match(JSON.stringify(requests.at(-1)!.messages), /You have run out of steps.*Your last reply was empty, and no tool runs now\./);
+    assert.match(JSON.stringify(requests.at(-1)!.messages), /Two of your replies were empty: no more commands.*Your last reply was empty, and no tool runs now\./);
   });
 
   it("asks only twice when no verdict comes", async () => {
