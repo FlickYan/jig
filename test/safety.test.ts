@@ -83,7 +83,8 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     const fileOf = (out: string) => /The whole output is in (\S+):/.exec(out)?.[1];
     try {
       const path = fileOf(await runCommand("seq 1 20000", project, 20, undefined, sandbox, outputs));
-      assert.equal(await run(`wc -l < ${path}`, sandbox), "20000\n\nExit code: 0");
+      // macOS's wc pads the count with spaces.
+      assert.match(await run(`wc -l < ${path}`, sandbox), /^ *20000\n\nExit code: 0$/);
       // Midway, a command puts a symlink to a file it can't write in place of the file jig writes to, which
       // it finds by what it printed (other tests' files may be there too).
       await writeFile(target, "untouched\n");
