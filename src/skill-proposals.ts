@@ -1,10 +1,10 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 import { findSecret } from "./secrets.ts";
 import type { SkillEval } from "./skill-evals.ts";
+import { assertInProject } from "./skill-store.ts";
 import { descriptionProblems, nameProblems, userSkillsDir } from "./skills.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
-import { resolveForChange } from "./tools/util.ts";
 import * as ui from "./ui.ts";
 
 // A skill the model wrote is a proposal: jig checks it against the Agent Skills specification, shows it to
@@ -64,10 +64,10 @@ export function proposeSkillTool(approve: Approver = askInTerminal): Tool {
         decision === "user" ? join(userSkillsDir(), proposal.name)
         : decision === "project" ? join(ctx.cwd, ".jig", "skills", proposal.name)
         : join(ctx.cwd, ".jig", "proposals", "skills", proposal.name);
-      // jig writes it itself, outside the sandbox, so in the project it goes by where the path really leads,
-      // as write_file does: a symlink a command made (.jig, say) mustn't take the files, or the removal of an
-      // earlier version, out of it.
-      if (decision !== "user") await resolveForChange(ctx.cwd, relative(ctx.cwd, target), ctx.dirs, ctx.hidden);
+      // jig writes it itself, outside the sandbox, so in the project it is checked as jig skills add checks
+      // a skill's folder: a symlink a command made (.jig, say) mustn't take the files, or the removal of an
+      // earlier version, out of the project, or into a submodule's git directory in place of its config.
+      if (decision !== "user") await assertInProject(ctx.cwd, target, ctx.hidden);
       writeSkill(target, files);
       if (decision === "proposal") {
         return `Nobody could approve the skill now, so it was saved as a proposal in ${target}. The user can read it and install it with: jig skills add ${target}`;

@@ -131,6 +131,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   a name of `../..` made `remove` delete the project. They also change nothing in a `.git` directory. They
   replace a skill's folder whole, and the check for `config` and hooks looks at one file: in a review,
   `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a submodule's config.
+  A skill the model wrote replaced its folder whole too, and is held to the same. `update` skips an entry
+  it refuses, or can't fetch or install, and updates the rest: one entry a command wrote, with a bad name,
+  a missing path or no fields at all, used to stop it before the user's own skills.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
   own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
   `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig
