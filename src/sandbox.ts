@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { isGitControl, isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
@@ -67,11 +67,12 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
  * the files that say where those are. That is a commondir or config.worktree in any of them, every linked
  * worktree's own commondir, gitdir and config.worktree (not only this one's: the user runs git in the
  * others too), and the .git file of every worktree and submodule checkout. As isGitControl has it for the
- * file tools. Undefined outside a repository, and for a bare one, left alone as the file tools leave it:
+ * file tools. Undefined outside a repository, and for a bare one (as git says, not by its name: a git
+ * directory made with --separate-git-dir has no .git in its path), left alone as the file tools leave it:
  * setting up a server's hooks can be the task.
  */
 export function gitControl(project: string, repo = gitDirs(project)): GitControl | undefined {
-  if (!repo || !isGitControl(join(repo.common, "config"))) return undefined;
+  if (!repo || repo.bare) return undefined;
   const { common, own } = repo;
   const inGitDir = (dir: string) => [
     ...["config", "config.worktree", "commondir", "hooks"].map((name) => join(dir, name)),
@@ -331,18 +332,21 @@ function findProgram(name: string): string | undefined {
 /**
  * The repository's git directories: the common one, which may be outside the project (jig started in a
  * subdirectory, or in a linked worktree), and the work tree's own (a linked worktree's, under the common
- * one's worktrees/).
+ * one's worktrees/), and whether the repository is bare rather than one with a work tree.
  */
-function gitDirs(project: string): { common: string; own: string } | undefined {
+function gitDirs(project: string): { common: string; own: string; bare: boolean } | undefined {
   try {
-    const out = execFileSync("git", [...SAFE_GIT, "rev-parse", "--path-format=absolute", "--git-common-dir", "--git-dir"], {
+    // The paths come relative to the project unless they are elsewhere: --path-format=absolute would make
+    // them absolute, but a git before 2.31 (Debian 11 has 2.30) prints it back as if it were a path.
+    const out = execFileSync("git", [...SAFE_GIT, "rev-parse", "--is-bare-repository", "--git-common-dir", "--git-dir"], {
       cwd: project,
       env: withoutKeys(),
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     });
-    const [common, own] = out.trim().split("\n").map((dir) => realpathSync(dir));
-    return { common, own };
+    const [bare, ...dirs] = out.trim().split("\n");
+    const [common, own] = dirs.map((dir) => realpathSync(resolve(project, dir)));
+    return { common, own, bare: bare === "true" };
   } catch {
     return undefined;
   }

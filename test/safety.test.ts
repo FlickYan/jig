@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
 import { createSandbox, gitControl, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
@@ -137,6 +137,27 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.equal(existsSync(join(repo, ".git", "hooks", "post-commit")), false);
     } finally {
       await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a git directory made with --separate-git-dir read-only too, though it has no .git in its path", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const [work, gitDir] = [join(base, "work"), join(base, "gitdirs", "work")]; // as dotfile managers set up
+      for (const path of [work, dirname(gitDir)]) await mkdir(path);
+      git(work, "init", "-q", `--separate-git-dir=${gitDir}`);
+      const config = await readFile(join(gitDir, "config"), "utf8");
+      const sandbox = createSandbox(work, { network: false })!;
+      const inWork = (command: string) => runCommand(command, work, 20, undefined, sandbox);
+      assert.match(await inWork('git config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inWork(`echo "touch planted" > ${join(gitDir, "hooks", "pre-commit")}`), /Exit code: [1-9]/);
+      assert.match(await inWork(`echo "gitdir: ${tmpdir()}" > .git`), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(gitDir, "config"), "utf8"), config);
+      assert.equal(existsSync(join(gitDir, "hooks", "pre-commit")), false);
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s";
+      assert.equal(await inWork(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
     }
   });
 
@@ -404,7 +425,29 @@ describe("the macOS sandbox's profile", () => {
         assert.ok(fixed.includes(rule("literal", join(dotGit, dir))), `${dir || ".git"} stays in place`);
       }
       assert.equal(gitControl(base), undefined, "outside a repository");
+      git(base, "init", "-q", "--bare", "server.git");
+      assert.equal(gitControl(join(base, "server.git")), undefined, "in a bare repository");
     } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("finds the repository's git directory with a git older than 2.31, which prints back a flag it doesn't know", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    const path = process.env.PATH;
+    try {
+      git(base, "init", "-q", "repo");
+      await mkdir(join(base, "repo", "sub"));
+      await mkdir(join(base, "bin"));
+      // As git rev-parse before 2.31 (2.30 is Debian 11's) takes --path-format=absolute: it prints it back.
+      const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+      const shim = `#!/bin/sh\nfor a do shift; case $a in --path-format=*) echo "$a" ;; *) set -- "$@" "$a" ;; esac; done\nexec '${real}' "$@"\n`;
+      await writeFile(join(base, "bin", "git"), shim, { mode: 0o755 });
+      process.env.PATH = `${join(base, "bin")}:${path}`;
+      const config = join(await realpath(join(base, "repo")), ".git", "config");
+      for (const project of ["repo", "repo/sub"]) assert.ok(gitControl(join(base, project))?.locked.includes(config), `from ${project}`);
+    } finally {
+      process.env.PATH = path;
       await rm(base, { recursive: true, force: true });
     }
   });
