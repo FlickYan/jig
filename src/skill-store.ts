@@ -176,24 +176,25 @@ function writeLock(scope: InstallScope, project: string, skills: Record<string, 
 
 /**
  * Refuses a path in the project that jig is about to replace or remove itself, outside the sandbox: a
- * skill's folder (installed, or one the model wrote) or the lockfile. A project's .jig is within a
- * command's reach, and a symlink a command put there (.jig, .jig/skills, a skill's folder, the lockfile)
- * would take the change out of the project. So the path goes by where it really leads, as write_file's
- * changes do, and stays out of any .git directory: write_file's check is for one file, but a skill's
- * folder is replaced whole, so with .jig/skills linked to .git/modules, a skill named like a submodule
- * would put its files in place of that submodule's config and hooks. The messages are jig's own, not
- * write_file's, as the user reads them too.
+ * skill's folder (installed, or one the model wrote), the lockfile, or AGENTS.md for an approved edit. A
+ * project's .jig is within a command's reach, and a symlink a command put there (.jig, .jig/skills, a
+ * skill's folder, the lockfile) would take the change out of the project. So the path goes by where it
+ * really leads, as write_file's changes do, and stays out of any .git directory: write_file's check is for
+ * one file, but a skill's folder is replaced whole, so with .jig/skills linked to .git/modules, a skill
+ * named like a submodule would put its files in place of that submodule's config and hooks. The messages
+ * are jig's own, not write_file's, as the user reads them too. `dirs`, the --add-dir directories, count
+ * as the project.
  */
-export async function assertInProject(project: string, path: string, hidden: string[] = []): Promise<void> {
+export async function assertInProject(project: string, path: string, hidden: string[] = [], dirs: string[] = []): Promise<void> {
   const shown = relative(project, path);
   const real = await realTarget(path);
   if (!real) throw new Error(`${shown} leads through a broken symlink, so jig won't change it. A command may have put it there; if so, delete it.`);
   await assertVisible(path, shown, hidden);
-  const root = await realTarget(project);
-  if (!root || !isInside(root, real)) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
+  const roots = await Promise.all([project, ...dirs].map((dir) => realTarget(dir)));
+  if (!roots.some((root) => root && isInside(root, real))) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
   // Without case, as isGitControl: macOS's file systems usually ignore it.
   if (real.toLowerCase().split(sep).includes(".git")) {
-    throw new Error(`${shown} leads into a git directory, to ${real}, so jig won't change it: a skill's files there could take the place of git's own, such as a submodule's config. A command may have put a link there.`);
+    throw new Error(`${shown} leads into a git directory, to ${real}, so jig won't change it: what jig writes there could take the place of git's own files, such as a submodule's config. A command may have put a link there.`);
   }
 }
 
