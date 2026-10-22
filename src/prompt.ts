@@ -32,7 +32,8 @@ export function loadInstructions(cwd: string): Instructions[] {
   return dirs.flatMap((dir) => {
     const path = ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).find((file) => existsSync(file));
     if (!path) return [];
-    // Enough bytes for the characters kept: UTF-8 takes 3 bytes a character at most.
+    // As many bytes as the characters kept can take (UTF-8 takes 4 bytes a character at most), so a longer
+    // file reads longer and is marked truncated.
     let text = readRegularFile(path, 4 * MAX_INSTRUCTIONS_CHARS)?.trim() ?? "";
     if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
     return text ? [{ path: relative(here, path), text }] : [];

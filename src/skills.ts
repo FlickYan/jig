@@ -168,7 +168,7 @@ export function skillTool(skills: Skill[]): Tool {
       const skill = skills.find((s) => s.name === name)!;
       if (file) {
         const path = join(skill.dir, file);
-        // Enough bytes for the characters kept: UTF-8 takes 3 bytes a character at most.
+        // Enough bytes for the characters kept: UTF-8 takes 4 bytes a character at most.
         const text = isInside(skill.dir, path) ? readRegularFile(path, 4 * MAX_FILE_CHARS) : undefined;
         if (text === undefined) throw new Error(`The skill "${name}" has no file ${file}.`);
         return text.slice(0, MAX_FILE_CHARS);
