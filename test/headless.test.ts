@@ -220,6 +220,24 @@ describe("a signal that ends jig", () => {
       }
     }
   });
+
+  it("kills the hook still running, which has a process group of its own too, and outside the sandbox", async () => {
+    for (const [signal, event] of [["SIGHUP", "Stop"], ["SIGTERM", "PreToolUse"]] as const) {
+      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const command = `kill -${signal} $PPID; until [ -e go-${signal} ]; do sleep 0.05; done; touch outlived-${signal}`;
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { [event]: [{ command }] } }));
+      const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
+      try {
+        const { code } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Fix the parser."], { api, cwd: project, env: { JIG_HOME: home } });
+        await writeFile(join(project, `go-${signal}`), "");
+        await new Promise((done) => setTimeout(done, 500)); // a moment for the hook, had it outlived jig
+        assert.equal(code, 128 + constants.signals[signal]);
+        assert.equal(existsSync(join(project, `outlived-${signal}`)), false, `the ${event} hook outlived jig after ${signal}`);
+      } finally {
+        api.close();
+      }
+    }
+  });
 });
 
 describe("--stats", () => {

@@ -827,6 +827,23 @@ describe("Stop hooks before finishing", () => {
     assert.equal(messages.at(-1)?.role, "assistant", "the session ends on the answer");
   });
 
+  it("run on the last step too once they have sent the model back, only to say whether they still object", async () => {
+    // The task ended as finished, without a word, though the project's check last said it wasn't done.
+    let runs = 0;
+    const events: string[] = [];
+    const objecting = setup([reply([text("Done.")]), reply([text("Done again.")])], { stopHooks: async () => (runs++, "tests fail"), count: (event) => events.push(event), maxSteps: 2, ui });
+    assert.deepEqual(await runAgent(objecting.conversation, objecting.options).then((r) => [r.stop, r.steps, r.text]), ["end_turn", 2, "Done again."]);
+    assert.equal(runs, 2);
+    assert.deepEqual(events, ["hook.stopBlocked", "hook.stopCapped"]);
+    assert.equal(notices.at(-1), 'A Stop hook still says the task isn\'t done ("tests fail"), but no step is left (--max-steps), so the task ends.');
+    notices.length = 0;
+    const verdicts = ["tests fail", null];
+    const passing = setup([reply([text("Done.")]), reply([text("Fixed.")])], { stopHooks: async () => verdicts.shift()!, maxSteps: 2, ui });
+    assert.equal((await runAgent(passing.conversation, passing.options)).text, "Fixed.");
+    assert.equal(verdicts.length, 0, "asked again on the last step");
+    assert.deepEqual(notices, ['A Stop hook says the task isn\'t done ("tests fail"); the model goes on (1 of 3).']);
+  });
+
   it("don't run with no step left to act on what they say, or on a reply that isn't an answer", async () => {
     let runs = 0;
     const stopHooks = async () => (runs++, "tests fail");

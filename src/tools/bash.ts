@@ -90,13 +90,13 @@ export function whyStopped(signal: AbortSignal | undefined, byUser: string): str
   return typeof signal?.reason === "string" ? signal.reason : byUser;
 }
 
-// The process groups of the commands running now, for killCommands.
-const running = new Set<number>();
+// The process groups of the commands and hooks (hooks.ts) running now, for killCommands.
+export const running = new Set<number>();
 
 /**
- * Kills the commands still running, with everything they started, as Ctrl+C does: for jig's exit. Each
- * command has a session of its own, which closing the terminal doesn't reach, and apart from bubblewrap's
- * --die-with-parent (the Linux sandbox) nothing else would stop it with jig.
+ * Kills the commands and hooks still running, with everything they started, as Ctrl+C does: for jig's exit.
+ * Each has a session of its own, which closing the terminal doesn't reach, and apart from bubblewrap's
+ * --die-with-parent (the Linux sandbox, for commands) nothing else would stop it with jig.
  */
 export function killCommands(): void {
   for (const group of running) killGroup(group);

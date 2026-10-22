@@ -51,8 +51,8 @@ export type Mechanism =
   | "hook.blocked"
   | "hook.feedback"
   | "output.truncated"
-  // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times,
-  // so the task ended anyway.
+  // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
+  // on the last step, so the task ended anyway.
   | "hook.stopBlocked"
   | "hook.stopCapped"
   // --check's request, --reviewer's review and the problems it sent back (either skipped, too close to

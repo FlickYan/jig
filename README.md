@@ -340,9 +340,10 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
   middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
   a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
-  seconds is stopped, with everything it started.
+  seconds is stopped, with everything it started, as is one still running when jig exits.
 
-  A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
+  A `Stop` hook runs when the model gives its final answer with a step left (and, once one has sent the
+  model back, on the last step too, only to say whether it still objects), so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
   task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
   already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
@@ -350,7 +351,8 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   told the stderr or the reason, and works on. A long reason (a whole test log, say) is cut from the
   middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A task's Stop
   hooks send it back 3 times at most; after
-  that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
+  that, the task ends as finished, with a notice that the hook still objects, as it does when one still
+  objects on the last step. The 60 seconds apply here
   too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
   doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
@@ -466,7 +468,8 @@ what it verified and how, and what is left, and prints the reply: the model's ow
 Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
 and `jig skills test` do, so that their steps and costs compare with earlier runs.
 A `Stop` hook can send the model back to work from its final answer, after `--check` and the reviewer,
-with a step left and 3 times a task at most (see Hooks).
+with a step left and 3 times a task at most; once it has, it is asked on the last step too, only to say
+whether it still objects (see Hooks).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at
