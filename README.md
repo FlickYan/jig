@@ -2,9 +2,9 @@
 
 A minimal coding agent for the terminal, written from scratch in TypeScript on the Anthropic Messages API
 (Claude, or DeepSeek through its Anthropic-compatible endpoint), and on any OpenAI-compatible API (OpenAI,
-DeepSeek's, or a local model through Ollama or vLLM). There is no agent framework: it is one
-streaming tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety
-(an OS sandbox on macOS and Linux, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
+DeepSeek's, or a local model through Ollama or vLLM). There is no agent framework: it is one streaming
+tool-use loop, six tools, context management (AGENTS.md, saved sessions, compaction), safety (an OS sandbox
+on macOS and Linux, permission modes, deny rules, snapshots with undo), extensions (Agent Skills, MCP
 servers, hooks, subagents), a benchmark that measures each version, and a loop in which jig proposes
 changes to its own code and a referee it can't reach measures them.
 
@@ -15,10 +15,10 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 209 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 450 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
-  reaches the commands the model runs, and on Terminal-Bench it never enters the container.
+  reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
 - **Context and extensions.** AGENTS.md, saved sessions, compaction; memories, skills and AGENTS.md edits
   that jig proposes and you approve; Agent Skills it installs, writes and measures; MCP servers; hooks.
 - **Measured, including what didn't work.** An in-house benchmark with hidden tests, and Terminal-Bench 2.0
@@ -30,7 +30,7 @@ agent harness does for a model.)
 - **On a real issue, filed after its model.** [Python-Markdown #1651](examples/python-markdown-1651), filed
   after jig's default model was in use, with the maintainers' tests hidden: in three attempts jig traced
   the lost text through Python-Markdown's parser into the standard library's, fixed it the way the
-  maintainers did (the same output on 148,188 generated inputs) and passed their tests, for $0.13 in all.
+  maintainers did (the same output on 49,396 generated inputs) and passed their tests, for $0.13 in all.
 
 ## Quick start
 
@@ -68,10 +68,11 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         a model an OpenAI-compatible API serves (gpt-5, or a local model with --base-url)
       --api <format>    anthropic | openai (default: anthropic for Claude and DeepSeek, openai for others)
       --base-url <url>  the API's address, e.g. http://localhost:11434/v1 for Ollama
-  -e, --effort <level>  low | medium | high | xhigh | max (default: the model's own; DeepSeek takes low | high | max)
+  -e, --effort <level>  low | medium | high | xhigh | max (default: medium for Claude models, the model's own
+                        for others; DeepSeek takes low | high | max)
       --mode <mode>     when to ask before a tool call (default: edits)
                           plan   look around and plan; refuse every change
-                          ask    ask before every file change and command
+                          ask    ask before every file change, and every command that does more than read
                           edits  change files in the project freely; ask before commands the sandbox doesn't contain
                           auto   never ask
   -y, --yes             same as --mode auto
@@ -81,11 +82,13 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --hide-thinking   don't print the model's thinking (/thinking toggles it in a session)
   -c, --continue        continue this project's most recent session
       --resume <file>   continue a saved session (--sessions lists them)
-      --compact-at <n>  summarize the conversation once it reaches n tokens (default: 200000; 0: never)
+      --sessions        list this project's saved sessions
+      --compact-at <n>  summarize the conversation once it reaches n tokens, or 80% of the model's context
+                        window if that is less (default: 200000; 0: never)
   -C, --cwd <dir>       project directory (default: the current directory)
       --add-dir <dir>   let the file tools work in this directory too, and the sandbox write there
                         (repeatable; --add-dir / inside a container makes the whole system the project)
-      --max-steps <n>   most model calls per task (default: 50)
+      --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
@@ -97,30 +100,30 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
+  -v, --version         print jig's version
+  -h, --help            show this help
 ```
 
-In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help` and
-`/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens sent and
-received (subagents included), and how many input tokens came from the prompt cache. Up brings back earlier
-tasks; a paste of several lines is one message, sent with Enter, and a line ending in `\` goes on in the
-next. Ctrl+C stops a task, and at the prompt clears the line; on an empty prompt it says how to quit, and
-pressed again it quits, as Ctrl+D does. Piped into jig, a session takes a task or command from each line,
-one ending in `\` too.
+In a session: `/mode`, `/undo`, `/thinking`, `/skills`, `/mcp`, `/context`, `/compact`, `/reset`, `/help`
+and `/exit`, and `/<skill> [task]` runs a skill. After each task jig prints the steps taken, the tokens
+sent and received (subagents included), and how many input tokens came from the prompt cache. Up brings
+back earlier tasks and commands of one line; a paste of several lines is one message, sent with Enter, and
+a line ending in `\` goes on in the next. Ctrl+C stops a task, and at the prompt clears the line; on an
+empty prompt it says how to quit, and pressed again it quits, as Ctrl+D does. Piped into jig, a session
+takes a task or command from each line, one ending in `\` too.
 
-A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
-of steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when
-tool calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the
-same tool calls (see below), 7 at `--time-limit`, 8 when the model gave a second reply with no text or
-tool call (see below), and 130 on Ctrl+C. So
-`jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out of
+steps, 3 when a reply hit the output limit or the context window, 4 when the model declined, 5 when tool
+calls needed approval and there was no terminal to ask, 6 when the model was stuck repeating the same tool
+calls, 7 at `--time-limit`, 8 when the model gave a second reply with no text or tool call, and 130 on
+Ctrl+C. So `jig "fix the tests" && git commit -am fix` doesn't commit after a run that stopped short.
 
 `--stats` keeps a JSON file for scripts and evaluation harnesses, rewritten as the task runs: the stop
-reason, steps, model calls, tokens (subagents' included), tool calls by name, seconds, and `events`, how
-often each of jig's mechanisms fired: retries (`retry.api`, `retry.brokeOff`, `retry.quiet`), compactions,
-the model asked again after a reply that wasn't an answer, calls that didn't run as asked (the permission
-policy's refusals among them, `call.refused`), hooks' blocks, `--check` and the reviewer (or either one
-skipped for time), `--escalate`, the stop for repeating and the wrap-up (`src/stats.ts` lists them).
-So a change to one can be seen to run at all, which in milestone 28 only reading the sessions showed.
+reason, steps, model calls (the subagents' and the reviewer's in `subagentModelCalls`), tokens (theirs
+included), the main loop's tool calls by name (those that didn't run included), seconds, and `events`, how
+often each of jig's mechanisms fired (retries, compactions, calls that didn't run as asked, hooks' blocks,
+the reviewer, the wrap-up and more: `src/stats.ts` lists them). So you can see that a change to one runs at
+all: in milestone 28, two candidates' changes never ran, which only reading the sessions showed.
 
 ## What it does
 
@@ -131,59 +134,55 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   only inside the project, its git directory (not its config or hooks, which name programs git runs, nor
   its submodules', nor the files that tell git where they are: every worktree's and submodule checkout's
   `.git` file, `commondir`, `config.worktree`), the directories added with `--add-dir` and the temp
-  directories, and they can't reach the network (`--allow-network` lifts that). On Linux, a `commondir`
-  or `config.worktree` that isn't there can't be made read-only without creating it (an empty
-  `commondir` breaks git), and a submodule's checkout can be moved aside and another put in its place,
-  so if a command does either, jig warns after the task and when a session ends: git would then read its
-  config from elsewhere (or more of it, from a `config.worktree`), so check the file before you run git
-  there. Started in a subdirectory of a repository, jig warns the same way, on macOS as well, when a
-  command makes a `.git` in it, which your git there would then use: making a repository can be the
-  task, so neither sandbox refuses it. jig also warns, on both, when a command removes or breaks a git
-  directory's `HEAD`, `objects` or `refs`, which git changes all the time, so commands can too: your git
-  then no longer takes it for a repository, and fails there or uses one above it. jig finds the
-  repository by its `.git` all the same, so the next session still keeps its config read-only. A job a
-  command leaves running in the background can still do it after jig has looked, and after a one-shot
-  run nothing looks again.
-  On macOS, localhost stays open; on Linux each command gets an empty
-  network of its own, so a test can still start a server and talk to it, but only within one command.
-  Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
-  within reach. And commands share the machine's processes, so they can see yours and signal them.
-  Because a sandboxed command can't change files outside the project or reach the network, in the
-  default `edits` mode commands run without asking (a hook that runs the project's code runs outside the
-  sandbox: see Hooks). On Linux the sandbox
-  needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where it can't
-  run, jig says why, and commands ask first. `--no-sandbox` turns it off.
+  directories, and they can't reach the network. Some changes to git's files aren't refused, so jig warns
+  of them after the task and when a session ends: on Linux, a `commondir` or `config.worktree` that wasn't
+  there (one can't be made read-only without creating it, and an empty `commondir` breaks git); on both
+  systems, a submodule's checkout moved aside and another put in its place (on macOS, a link to one), a
+  `.git` made in the project when jig was started in a subdirectory of a repository (making a repository
+  can be the task), and a git directory's `HEAD`, `objects` or `refs` removed or broken (git changes them
+  all the time, so commands can too). Your git would then take its config from elsewhere, or pass over the
+  directory and fail or use a repository above it, so look before you run git there; jig still finds the
+  repository by its `.git`, so the next session keeps its config read-only. A job a command leaves in the
+  background can still do so after jig has looked, and after a one-shot run nothing looks again.
+
+  On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
+  still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
+  a daemon listening on a Unix socket (Docker's, say) is still within reach. And commands share the
+  machine's processes, so they can see yours and signal them. Because a sandboxed command can't change
+  files outside the project or reach the network, in the default `edits` mode commands run without asking
+  (a hook that runs the project's code runs outside the sandbox: see Hooks). `--allow-network`, or
+  `"network": true`, lets them reach it, so a command that does more than read then asks first. On Linux
+  the sandbox needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where
+  it can't run, jig says why, and commands ask first. `--no-sandbox` turns it off.
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
   sandbox, so they keep to the project and the `--add-dir` directories on their own. A change goes by where
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
   as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
-  git directory's `config` or hooks, or a `.git` file or `commondir` that tells git where they are, which
-  could make git run programs outside the sandbox. An approved AGENTS.md edit, and a skill the model
-  wrote saved in the project, go by real path too (the question names the file an AGENTS.md link leads
-  to), and the `--stats` file is written anew and renamed into place, which replaces a link instead of
-  writing through it (a linked folder on the way to it is still followed). A path in `/dev` or `/proc`,
-  such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to, not replaced; a named
-  pipe anywhere else is replaced. What jig reads from the project to work in it (AGENTS.md, skills, the
-  settings, the git files the sandbox watches) it reads only if it is a regular file: a named pipe a
-  command made there would have jig wait until it was killed, and a link to `/dev/zero` never ends. Such
-  an AGENTS.md or skill is left out, a settings file is refused, and a git file is reported by what it is.
-  `read_file` and `edit_file` likewise open only a regular file, and tell the model so.
-  What `jig skills add`, `update` and `remove` change in the project, and a skill the model wrote, go
-  by real path too, and never into a `.git` directory, where a skill's folder could be a submodule's git
-  directory; they refuse a name in the lockfile that isn't a skill's name: commands can write it.
-  `update` says why it skips an entry it refuses or can't fetch, updates the rest, and exits non-zero.
-  The git that `grep` and `glob` run to list files
-  runs with `core.fsmonitor` and hooks turned off, and without jig's API keys; it stops with the task, or
-  after 30 seconds, and they then walk the files, since a named pipe where git reads (a `.gitignore`,
-  `.git/info/exclude`, a nested repository's config) would have it wait forever. `grep` matches in a worker
-  thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take exponentially
-  long on some lines. They leave out what git ignores, but walk a path git ignores when they are given it
-  (`node_modules/pkg`), its `dist/` and `build/` included: git lists nothing there, and they used to find
-  nothing.
+  `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
+  `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
+  sandbox. An approved AGENTS.md edit goes by real path too (the question names the file an AGENTS.md link
+  leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
+  the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
+  git directory. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
+  write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
+  exits non-zero. The `--stats` file is written anew and renamed into place, which replaces a link or a
+  named pipe instead of writing through it (a linked folder on the way to it is still followed); a path in
+  `/dev` or `/proc`, such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
+  jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
+  watches) it reads only if it is a regular file: a named pipe a command made there would have jig wait
+  until it was killed, and a link to `/dev/zero` never ends. Such an AGENTS.md or skill is left out, a
+  settings file is refused, and a git file is reported by what it is. `read_file` and `edit_file` likewise
+  open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
+  folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
+  they are given it (`node_modules/pkg`, its own `dist/` included). The git they run to list files runs
+  with `core.fsmonitor` and hooks turned off; each run stops with the task, or after 30 seconds, and they
+  then walk the files, since a named pipe where git reads (a `.gitignore`, `.git/info/exclude`, a nested
+  repository's config) would have it wait forever. `grep` matches in a worker thread that Ctrl+C stops, as
+  do 30 seconds on one file, since a regular expression can take exponentially long on some lines.
   `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or UTF-16 file the model is told to
   use a command, and `read_file` says when what it shows isn't UTF-8. `read_file` reads a file a chunk at a
-  time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. A file over
-  537 MB, V8's longest string, is too big for `edit_file` and `write_file`, and they say to use a command.
+  time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. `edit_file`
+  and `write_file` refuse a file over 537 MB, V8's longest string, and say to use a command.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
@@ -203,28 +202,28 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. A deny rule can also name a
   tool, like `"mcp__github__merge_pull_request"`. The settings can also hold `"sandbox": false` or
   `"network": true` for a project, and `"hiddenPaths"`: files and folders sandboxed commands can't read at
-  all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which). A project's
-  hidden paths apply whether it is trusted or not, since they only restrict.
+  all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which).
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
-  loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply after
-  you say yes to a prompt listing exactly what they would do; the answer is remembered for that version of
-  the file, and any change asks again. Until then only its deny rules apply, since they only restrict.
+  loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
+  after you say yes to a prompt listing exactly what they would do; the answer is remembered for that
+  version of the file, and any change asks again. Until then only its deny rules and hidden paths apply,
+  since they only restrict. With no terminal to ask in, `JIG_TRUST_PROJECT=1` trusts it.
 - **Undo.** Before each task, jig snapshots the project's files into a private git repository in
   `~/.jig/snapshots/` (so it works in any folder and never touches the project's own git history), and
   `/undo` puts back every file the task changed, created or deleted, whether through the file tools or a
-  command. `/undo` again goes one task further back. Files inside a nested repository (a submodule, a
-  clone) aren't snapshotted, so `/undo` leaves them as they are: to look at them, git would run programs
-  that repository's config names. Projects with more than 200 MB of files that aren't
-  ignored aren't snapshotted: the size is checked before every task, and a project that grows past it (a
-  task downloads a dataset, say) turns `/undo` off for the rest of the session. Snapshots are never
-  signed and run no hooks, whatever your git config says. When git fails (a lock another git left, say),
-  `/undo` says why and keeps the snapshot, so you can try again. git still taking a snapshot after 60
-  seconds is stopped, and `/undo` is off: git waits as long as a named pipe is where it reads (a
-  `.gitignore`, say), and a command can make one.
-- **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
-  (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
-  runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key
-  into the conversation and the logs, where a prompt injection could also reach it. Hooks don't get them either.
+  command. `/undo` again goes one task further back. Snapshots leave out, and `/undo` leaves as they are,
+  files git ignores (a `.env`, say), what is in `node_modules/`, `dist/`, `build/`, `.jig/` and the like,
+  and files inside a nested repository (a submodule, a clone), where git would run programs that
+  repository's config names. Projects with more than 200 MB of files that aren't ignored aren't
+  snapshotted: the size is checked before every task, and a project that grows past it (a task downloads a
+  dataset, say) turns `/undo` off for the rest of the session. So does git still taking a snapshot after 60
+  seconds, which is stopped: git waits as long as a named pipe is where it reads (a `.gitignore`, say), and
+  a command can make one. Snapshots are never signed and run no hooks, whatever your git config says. When
+  `/undo` fails (a lock another git left, say), it says why and keeps the snapshot, so you can try again.
+- **Credentials stay with jig.** Commands the model runs, hooks and jig's own git get jig's environment
+  without its API keys (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`).
+  They never need them, and a model that runs `env` to look around, as both agents did on Terminal-Bench,
+  would otherwise put the key in the conversation and the logs, within a prompt injection's reach.
 - **Prompt injection.** The system prompt tells the model that text in files and command output is data,
   not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
   are what protect you when that isn't enough.
@@ -236,31 +235,32 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   specific file last. Build commands, conventions and gotchas written there apply to every session.
 - **Sessions.** Every message is appended to a JSON Lines file in `~/.jig/sessions/<project>/` the moment
   it exists, so nothing is lost on a crash or Ctrl+C. `jig -c` continues the most recent session,
-  `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results
-  are answered as interrupted when a session is loaded, so the history is always valid. Each line says
+  `jig --sessions` lists them, `jig --resume <name>` picks one. Tool calls a crash left without results are
+  answered as interrupted when a session is loaded, so the history is always valid. Each line after the
+  first, which records the session's start (the date, the model, the system prompt and the tools), says
   when it was written (`at`); a reply, how long its model call took, retries included (`ms`); and tool
-  results, how long each call took (`toolMs`), in milliseconds, so a session shows where the time went.
-  A project's directory there, as in `~/.jig/memory/` and `~/.jig/snapshots/`, is named after its real path
+  results, how long each call took (`toolMs`), in milliseconds, so a session shows where the time went. A
+  project's directory there, as in `~/.jig/memory/` and `~/.jig/snapshots/`, is named after its real path
   and a short hash of it: a symlink to a project shares its sessions, and `/a/my-app` and `/a/my/app` no
-  longer do. The sessions, memories and snapshots under the older name, the path alone, move to the new
-  one together the first time, if the sessions saved there all started in this project; if there are
-  none, or one started in another project, they all stay where they were.
+  longer do. What was kept under the older name, the path alone, moves to the new one the first time, if
+  the sessions saved there show it was this project's.
 - **Compaction.** jig tracks how many tokens the conversation takes up (measured from each reply's usage,
   estimated for tool output since, and from the text's length when a server reports no usage). Past
-  `--compact-at` it asks the model to summarize the conversation and continues from that summary;
-  `/compact` does it on demand and `/context` shows the numbers. Mid-task, the task's own words and a
-  list of the file changes and commands so far follow the summary. When the API rejects a request as too
-  long for the model, jig compacts and asks again, once (not with `--compact-at 0`). The conversation is
-  then too long to summarize as well, so the summary is written from a copy with the tool output cut to
-  its start and end, the oldest first (`/compact` does the same when the API rejects its request). Past
-  `--compact-at`, a summary that fails doesn't end the task: it goes on as it is, and compaction is tried
-  again 3 steps later. After the API's rejection it does, since the conversation can't go on as it is.
-- **Long output.** Tool output over 40,000 characters (about 10k tokens) is cut from the middle, keeping
-  its start and its end (errors and test summaries tend to be at the end). A command's whole output then
-  goes to a file in the temp directory that only you can read, and the model is told where, so it can
-  search what it didn't see instead of running the command again. Commands that only read one of these
-  files while jig keeps it (`grep -n`, `sed -n 10,20p`, `tail`, ...) count as reading inside the project,
-  so they don't ask, in plan mode too; other files with names like theirs don't count. The files hold 100
+  `--compact-at`, or 80% of the model's context window if that is less (as jig takes it: 1M tokens for
+  Claude and DeepSeek, 200k for Haiku, 128k for others), it asks the model to summarize the conversation
+  and continues from that summary; `/compact` does it on demand and `/context` shows the numbers. Mid-task,
+  the task's own words and a list of the file changes and commands so far follow the summary. When the API
+  rejects a request as too long for the model, jig compacts and asks again, once (not with
+  `--compact-at 0`). The conversation is then too long to summarize as well, so the summary is written from
+  a copy with the tool output cut to its start and end, the oldest first (`/compact` does the same when the
+  API rejects its request). Past `--compact-at`, a summary that fails doesn't end the task: it goes on as
+  it is, and compaction is tried again 3 steps later. One that fails after the API's rejection ends it.
+- **Long output.** Tool output over 40,000 characters (about 10k tokens), and a command's over 39,000, is
+  cut from the middle, keeping its start and its end (errors and test summaries tend to be at the end). A
+  command's whole output then goes to a file in the temp directory that only you can read, and the model is
+  told where, so it can search what it didn't see instead of running the command again. Commands that only
+  read one of these files while jig keeps it (`grep -n`, `sed -n 10,20p`, `tail`, ...) count as reading
+  inside the project, even in plan mode; other files with names like theirs don't. The files hold 100
   million characters at most, the oldest making room, and jig deletes them when it exits. However much a
   command prints, jig keeps only its start and end in memory, so the command runs to the end.
 - **Memory.** jig keeps what a session showed that later ones should know, each item with your approval.
@@ -282,22 +282,23 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   is one fact, its description one line, and nothing that looks like a secret), shows it to you, and keeps
   it only if you say yes. Memories were true when saved, so the prompt asks the model to check one that
   names a file, function or command before relying on it, and to propose forgetting one that turned out
-  wrong. `--no-memory` leaves memory out. What counts as a secret here, and is blanked out of
-  `jig sessions export`: a key or token in the shape a provider gives out (`sk-`, `ghp_`, `github_pat_`,
-  `glpat-`, `hf_`, `npm_`, `AIza`, `sk_live_` and others), a private key, a password assignment, and a
-  password in a URL, unless its host is this machine or an example (`postgres://postgres:postgres@localhost`
-  is fine). Exports blank out JWTs too.
+  wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
+  provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
+  assignment (`password=…`, `api_key: …`, but not `DB_PASSWORD=…` or a JSON key), and a password in a URL,
+  unless its host is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
+  `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
+  digit in it and doesn't look like code (`token = tokens[i]`).
 
 ### Extensions
 
 - **Skills.** jig reads [Agent Skills](https://agentskills.io): folders with a `SKILL.md` (a name and a
   description in YAML frontmatter, then instructions) and maybe scripts and reference files. They are found
   in `.jig/skills`, `.agents/skills` and `.claude/skills`, in the project and in your home directory, then
-  among jig's own (`skill-writer`), the project's winning on a name clash. jig's own skills are for
-  writing skills, so a plain one-shot task leaves them out and a benchmark measures what it did before. Loading is progressive: the
-  system prompt lists only each skill's name and description; the model calls the `skill` tool to load the
-  instructions when a task matches, and reads the skill's other files only if the instructions point to
-  them. `/<skill> [task]` loads one yourself. Skills can be installed, written and measured:
+  among jig's own (`skill-writer`), the project's winning on a name clash. jig's own skills are for writing
+  skills, so a plain one-shot task leaves them out and a benchmark measures what it did before. Loading is
+  progressive: the system prompt lists only each skill's name and description; the model calls the `skill`
+  tool to load the instructions when a task matches, and reads its other files only if the instructions
+  point to them. `/<skill> [task]` loads one yourself. Skills can be installed, written and measured:
 
   ```bash
   jig skills add anthropics/skills/skills/pdf      # from GitHub: owner/repo/path[@ref], a git URL, or a folder
@@ -329,12 +330,14 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
 
   A tool the server marks read-only runs like jig's own read tools; any other asks first (outside `auto`
   mode) and is refused in `plan` mode, because it acts outside the sandbox's reach. `[a]lways` approves one
-  tool for the session; allow and deny rules can name tools too.
-  A name keeps only letters, digits, `_` and `-` (the rest become `_`) and 64 characters, so two tools can
-  come out with the same one (servers `db.prod` and `db prod`, say). Then each gets a short hash of its
-  server's and its own name added, jig says so, and `/mcp` shows which server each is from; a deny rule
-  or hook naming the name they shared applies to each.
-- **Hooks.** Commands that run around tool calls, and before a task ends, configured like Claude Code's:
+  tool for the session; allow and deny rules can name tools too. A name keeps only letters, digits, `_` and
+  `-` (the rest become `_`) and 64 characters, so two tools can come out with the same one (servers
+  `db.prod` and `db prod`, say). Then each gets a short hash of its server's and its own name, jig says so,
+  and `/mcp` shows each one's server; a deny rule or hook naming their shared name applies to each.
+- **Hooks.** Commands that run around tool calls, and before a task ends, set much as in Claude Code but
+  flatter: each hook is one `{"matcher", "command"}`, and a matcher names jig's tools (`bash`,
+  `edit_file`), not Claude Code's. Claude Code's nested form (`"hooks": [...]`) is an error, and jig
+  doesn't start; a hook for an event jig doesn't have (`SessionStart`, say) is left out, with a warning:
 
   ```json
   { "hooks": {
@@ -344,34 +347,32 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   ```
 
   `matcher` is a regular expression for whole tool names; `"*"`, or no matcher, matches every tool. A hook
-  gets the call as JSON on stdin, plus `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code 2 from
-  a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook, its
-  stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
-  middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
-  a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
+  gets the call as JSON on stdin, plus `JIG_EVENT`, `JIG_TOOL`, `JIG_FILE` and `JIG_PROJECT_DIR`. Exit code
+  2 from a `PreToolUse` hook blocks the call and its stderr tells the model why; from a `PostToolUse` hook,
+  its stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
+  middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much a
+  hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
   seconds is stopped, with everything it started, as is one still running when jig exits. Hooks are your
-  own commands, so they run outside the sandbox, as you (though without jig's API keys). One that runs the
-  project's own code, as both `./scripts/check-command.sh` and `npm test` above do, runs whatever the
-  model's commands changed there: a command the sandbox kept from writing outside the project can rewrite a
-  test for the Stop hook to run, unsandboxed, before you have seen the change.
+  own commands, so they run outside the sandbox, as you. One that runs the project's own code, as both
+  `./scripts/check-command.sh` and `npm test` above do, runs whatever the model's commands changed there: a
+  command the sandbox kept from writing outside the project can rewrite a test for the Stop hook to run,
+  unsandboxed, before you have seen the change.
 
   A `Stop` hook runs when the model gives its final answer with a step left (and, once one has sent the
-  model back, on the last step too, only to say whether it still objects), so a project can say what
-  done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
-  task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
-  already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
-  Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task going: the model is
-  told the stderr or the reason, and works on. A long reason (a whole test log, say) is cut from the
-  middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A task's Stop
-  hooks send it back 3 times at most; after
-  that, the task ends as finished, with a notice that the hook still objects, as it does when one still
-  objects on the last step. The 60 seconds apply here
-  too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
-  doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
+  model back, on the last step too, only to say whether it still objects), so a project can say what done
+  means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the task,
+  the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back already in
+  this task), `session_path` and `changed_files` (what the task changed, by its snapshot, so not what
+  snapshots leave out). Exit code 2, or `{"decision": "block", "reason": "..."}` on stdout, keeps the task
+  going: the model is told the stderr or the reason, and works on. A long reason (a whole test log, say) is
+  cut from the middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A
+  task's Stop hooks send it back 3 times at most; after that, or when one still objects on the last step,
+  the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here too: a
+  test suite that takes longer is stopped, and doesn't hold the task up.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
-  touch) to a fresh agent loop with a context of its own. It gets the tools that only look, under `plan`
-  mode's rules, never asks you anything, and returns only its findings, so the files it read don't fill the
-  main conversation. Several subagent calls in one reply run at the same time.
+  touch) to a fresh agent loop with a context of its own. It gets the tools that only look, and `bash`
+  under `plan` mode's rules, never asks you anything, and returns only its findings, so the files it read
+  don't fill the main conversation. Several subagent calls in one reply run at the same time.
 
 ### Improving itself
 
@@ -423,7 +424,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
              │                                    ▼
              │   for each call: check input ▶ PreToolUse hooks ▶ permission policy ▶ run
              │                  ▶ truncate output ▶ PostToolUse hooks
-             │   (calls that only read run at the same time, the others in order)
+             │   (calls run at the same time if all of them only read, else in order)
              │                                    │
              └──── all tool results, in one message ◀┘
 ```
@@ -433,11 +434,12 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/agent.ts`](src/agent.ts) | The loop: call the model, run the tools it asks for, send back the results, until it answers without a tool call; compact when needed; with `--escalate`, hand over to a stronger model once a test run fails |
 | [`src/review.ts`](src/review.ts) | `--reviewer`: a second model, as a read-only subagent, checks the work against the task before it ends; and the prompt, verdict and re-check of a review that runs the work |
 | [`src/review-cli.ts`](src/review-cli.ts) | `jig review`: a review of finished work that runs it, its commands going into a copy of the machine through `--exec`, for an evaluation harness to call |
-| [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts) | A conversation's messages, size and saved session file |
+| [`src/conversation.ts`](src/conversation.ts), [`src/session.ts`](src/session.ts), [`src/paths.ts`](src/paths.ts) | A conversation's messages, size and saved session file; where jig keeps each project's sessions, memories and snapshots |
+| [`src/sessions-cli.ts`](src/sessions-cli.ts), [`src/export.ts`](src/export.ts) | `jig sessions`: listing a project's sessions, and exporting them as fine-tuning data with secrets blanked out |
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
 | [`src/openai.ts`](src/openai.ts) | The OpenAI-compatible API: the conversation as chat messages on the way out, the streamed reply as Messages API blocks on the way in |
-| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent` |
+| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent`; grep reads and matches in a worker thread (`grep-worker.ts`) |
 | [`src/skills.ts`](src/skills.ts) | Finding skills (the project's, the user's, jig's own), checking them against the specification, the catalog in the system prompt, and the `skill` tool |
 | [`src/skill-store.ts`](src/skill-store.ts), [`src/skills-cli.ts`](src/skills-cli.ts) | `jig skills`: installing skills from folders and git repositories, the lockfile, updating and removing |
 | [`src/skill-proposals.ts`](src/skill-proposals.ts) | `propose_skill`: a skill the model wrote, checked and shown to the user, saved where they say |
@@ -460,30 +462,25 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
-`--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
-check its work against the task, if a step is left for that, and stops at the next such reply. Also on
-`--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
-a question asking you to allow a tool call or to keep a proposal is closed unanswered, and none starts
-after; nor do `--check`
-and `--reviewer` in the last quarter of the time, since what they find might not get done), on
-Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
-answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
-or only thinking): it stays out of the history, and the model is asked once to go on. A second one ends
-the task as `empty`, with no answer for `--check`, the reviewer or a Stop hook to check (a subagent or a
-reviewer that stops so is asked what it found, as at its step limit), and one on the last step ends it
-out of steps; if that reply was cut off at the output limit, the task ends as cut off
-(exit 3) instead.
-A model can get stuck repeating itself, as milestone 27's trained one did: the same tool calls with the
-same results 5 steps in a row stop the task (a subagent or a reviewer is then asked what it found, as at
-its step limit), and a call identical to an earlier one in the same reply, with only reads between them,
-isn't run (its result says which call it repeats).
-At `--max-steps`, jig makes one more call, in which the model can't call tools, asking what it changed,
-what it verified and how, and what is left, and prints the reply: the model's own report, not evidence.
-Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
-and `jig skills test` do, so that their steps and costs compare with earlier runs.
-A `Stop` hook can send the model back to work from its final answer, after `--check` and the reviewer,
-with a step left and 3 times a task at most; once it has, it is asked on the last step too, only to say
-whether it still objects (see Hooks).
+`--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to check
+its work against the task, if a step is left for that, and stops at the next such reply. Also after
+`--max-steps` steps, at `--time-limit` seconds (a model call or command still running is stopped, a
+question asking you to allow a tool call or to keep a proposal is closed unanswered, and none starts after;
+nor do `--check` and `--reviewer` in the last quarter of the time, since what they find might not get
+done), on Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit
+isn't an answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call
+(empty, or only thinking): it stays out of the history, and the model is asked once to go on. A second such
+reply ends the task as `empty` (exit 8), with no answer for `--check`, the reviewer or a Stop hook to
+check; one on the last step ends it out of steps (exit 2), and one cut off at the output limit as cut off
+(exit 3). A model can also get stuck repeating itself, as milestone 27's trained one did: the same tool
+calls with the same results 5 steps in a row stop the task, and a call identical to an earlier one in the
+same reply, with only reads between them, isn't run (its result says which call it repeats). A subagent or
+a reviewer that stops either way is asked what it found, as at its step limit. At `--max-steps`, jig makes
+one more call, in which the model can't call tools, asking what it changed, what it verified and how, and
+what is left, and prints the reply: the model's own report, not evidence. Its tokens count in the totals
+and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/` and `jig skills test` do, so
+that their steps and costs compare with earlier runs. A `Stop` hook can send the model back to work from
+its final answer, after `--check` and the reviewer (see Hooks).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at
@@ -500,7 +497,7 @@ What each question came to; the write-ups, with every number's run and caveat, a
 |----------|---------------------|---------------|
 | Does jig work? | the in-house benchmark: 20 tasks, hidden tests, 3 attempts each | 60 of 60 for every version since milestone 7, on macOS and Linux; no attempt followed a prompt injection |
 | Against another agent? | Terminal-Bench 2.0, 20 tasks × 3, against mini-swe-agent on the same model (deepseek-flash) | 68% against 73%: 5 points behind (−3 to +15), within the noise, at 39% lower cost |
-| On a real bug, filed after its model was in use? | [Python-Markdown #1651](examples/python-markdown-1651), filed after deepseek-flash was in use; the maintainers' tests hidden; 3 attempts | 3 of 3 solved, $0.13 in all; each fix renders 148,188 generated inputs exactly as upstream's does; one of the three explained why the bug depends on the Python version, and one ran out of steps before its summary |
+| On a real bug, filed after its model was in use? | [Python-Markdown #1651](examples/python-markdown-1651), filed after deepseek-flash was in use; the maintainers' tests hidden; 3 attempts | 3 of 3 solved, $0.13 in all; each fix renders 49,396 generated inputs, three ways each, exactly as upstream's does; one of the three explained why the bug depends on the Python version, and one ran out of steps before its summary |
 | Does checking before finishing help? (9) | Terminal-Bench, the 20 tasks and 20 held-out ones | it fixed the failures it aimed at, ran others out of time and solved no more, at 38–65% more cost: opt-in |
 | Do skills and memory work? (12, 13) | each with and without, 9 runs each | a skill learned from one session: 9 of 9 against 0 of 9; a convention remembered from an earlier session: 9 of 9 against 0 of 9 |
 | Can jig improve its own code? (14–22, 28) | the evolve loop and its referee, on two suites | 19 candidates; one accepted (+15 and +17 points on the suite), then 15 points worse on Terminal-Bench, so not merged; neither advice in the prompt nor changes to the loop moved the suite, and two of the loop's changes never ran at all |
@@ -580,19 +577,19 @@ npm test            # the tools, permissions, sandbox, snapshots, search, contex
 npm run typecheck
 ```
 
-[CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests
-included (on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and
-checks the benchmark's tasks with the oracle and noop agents, which needs no API key, and packs,
-installs and runs the npm package. The Linux setup
-was tried locally in Debian containers as an ordinary user, with Node 22 and 24, before it went in.
+[CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests included
+(on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and checks the
+benchmark's tasks with the oracle and noop agents, which needs no API key, and packs, installs and runs the
+npm package. The Linux setup was tried locally in Debian containers as an ordinary user, with Node 22 and
+24, before it went in.
 
 ## Releasing
 
 The npm package is `jig-agent`. Node won't strip types from files under `node_modules`, so the package
 ships JavaScript: `npm pack` and `npm publish` first compile `src/` into `dist/` (`tsconfig.build.json`),
-and the package holds only `dist/`, the README and the license. To release, bump the version with
-`npm version <patch|minor|major>`, then `npm publish` from an npm account; CI's `package` job packs,
-installs and runs the tarball on every push.
+and the package holds only `dist/`, `skills/` (jig's own skills), the README and the license. To release,
+bump the version with `npm version <patch|minor|major>`, then `npm publish` from an npm account; CI's
+`package` job packs, installs and runs the tarball on every push.
 
 ## License
 
