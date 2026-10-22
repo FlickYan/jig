@@ -486,6 +486,29 @@ describe("snapshots", () => {
     assert.throws(() => new Snapshots(dir).take("t"), /201 MB of files that aren't ignored/);
   });
 
+  it("stops a git that waits on a named pipe a command made, and leaves no lock behind", async () => {
+    // git opens a .gitignore or a .gitattributes and waits for as long as a named pipe is there: jig waited
+    // with it, in its own thread, past --time-limit, before the next task or for a Stop hook's changed_files.
+    await mkdir(join(dir, "sub"));
+    await writeFile(join(dir, "sub", "a.txt"), "1");
+    const snapshots = new Snapshots(dir, undefined, 1);
+    snapshots.take("t1");
+    execFileSync("mkfifo", [join(dir, "sub", ".gitignore")]);
+    assert.throws(() => snapshots.changed(), /git took over 1 seconds/);
+    assert.throws(() => snapshots.take("t2"), /git took over 1 seconds/);
+    await rm(join(dir, "sub", ".gitignore"));
+    // git add waits on a .gitattributes holding the index's lock: stopped with SIGTERM, git removes the lock,
+    // where SIGKILL left one that failed every later snapshot.
+    execFileSync("mkfifo", [join(dir, ".gitattributes")]);
+    assert.throws(() => snapshots.take("t3"), /git took over 1 seconds/);
+    await rm(join(dir, ".gitattributes"));
+    await writeFile(join(dir, "sub", "a.txt"), "2");
+    snapshots.take("t4");
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: [] });
+    assert.deepEqual(snapshots.undo(), { changed: ["sub/a.txt"], removed: [] });
+    assert.equal(await readFile(join(dir, "sub", "a.txt"), "utf8"), "1");
+  });
+
   it("works outside git and doesn't touch the project's own repository", async () => {
     await writeFile(join(dir, "a.txt"), "1");
     const snapshots = new Snapshots(dir);

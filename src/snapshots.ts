@@ -6,6 +6,11 @@ import { jigHome, projectDir } from "./paths.ts";
 import { isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_PROJECT_BYTES = 200_000_000;
+// The most a git command here may take: a first snapshot at the size limit takes seconds. git waits for as
+// long as a named pipe is where it reads (a .gitignore, a .gitattributes), and a command can make one; jig,
+// waiting on git in its own thread, ran nothing else, not even --time-limit's stop. git is stopped with
+// SIGTERM, on which it removes its lock: killed, it would leave one that failed every later snapshot.
+const GIT_SECONDS = 60;
 // Never snapshot these, even in a project without a .gitignore.
 const EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", "dist/", "build/", "target/", ".next/", ".jig/"];
 // Paths go back to git as the bytes it listed, on its standard input: a name a command picks needn't be
@@ -27,12 +32,14 @@ export class Snapshots {
   private readonly root: string;
   private readonly gitDir: string;
   private readonly maxBytes: number;
+  private readonly gitSeconds: number;
   private readonly taken: string[] = []; // commits, oldest first
 
-  constructor(root: string, maxBytes = MAX_PROJECT_BYTES) {
+  constructor(root: string, maxBytes = MAX_PROJECT_BYTES, gitSeconds = GIT_SECONDS) {
     this.root = root;
     this.gitDir = projectDir("snapshots", root);
     this.maxBytes = maxBytes;
+    this.gitSeconds = gitSeconds;
   }
 
   /** Records the project's current files. Throws if the project is too big to snapshot, or git fails. */
@@ -184,8 +191,12 @@ export class Snapshots {
         input,
         stdio: [input ? "pipe" : "ignore", "pipe", "pipe"],
         maxBuffer: 64 * 1024 * 1024,
+        timeout: this.gitSeconds * 1000,
       });
     } catch (err) {
+      if ((err as { code?: string }).code === "ETIMEDOUT") {
+        throw new Error(`git took over ${this.gitSeconds} seconds (a named pipe where it reads, a .gitignore say, has it wait forever)`);
+      }
       // What git said, rather than execFileSync's "Command failed:" and the whole command line.
       const said = (err as { stderr?: Buffer }).stderr?.toString().trim();
       throw said ? new Error(said) : err;

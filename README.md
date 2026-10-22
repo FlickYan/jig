@@ -213,7 +213,9 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   ignored aren't snapshotted: the size is checked before every task, and a project that grows past it (a
   task downloads a dataset, say) turns `/undo` off for the rest of the session. Snapshots are never
   signed and run no hooks, whatever your git config says. When git fails (a lock another git left, say),
-  `/undo` says why and keeps the snapshot, so you can try again.
+  `/undo` says why and keeps the snapshot, so you can try again. git still taking a snapshot after 60
+  seconds is stopped, and `/undo` is off: git waits as long as a named pipe is where it reads (a
+  `.gitignore`, say), and a command can make one.
 - **Credentials stay with jig.** The commands the model runs get jig's environment without its API keys
   (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`). They never need them, and a model that
   runs `env` to look around, as both agents did in the Terminal-Bench runs, would otherwise copy the key
