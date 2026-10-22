@@ -166,9 +166,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   stay writable, as git changes them all the time. When the sandbox asked git, a command that moved
   `.git/HEAD` aside had the next session lock nothing there, and a command in that one could change the
   config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in the background
-  can still do it after jig has looked, and after a one-shot run nothing looks again. Commands can still
-  make a repository of their own (a submodule whose git directory is in its checkout is one), so jig's git
-  doesn't rely on any of this.
+  can still do it after jig has looked, and after a one-shot run nothing looks again. The search for the
+  `.git` stops where git's does: at a bare repository, a directory whose `config` says it is one, and at
+  `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's dotfiles repository for the project's,
+  and let commands write in it. Commands can still make a repository of their own (a submodule whose git
+  directory is in its checkout is one), so jig's git doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

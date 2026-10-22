@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { isGitControl, isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
@@ -392,15 +392,38 @@ function findProgram(name: string): string | undefined {
  * the project or above it, whether git takes them for a repository now or not: it doesn't while their
  * HEAD, objects or refs are out of order, which commands can arrange, as git changes them all the time.
  * Asking git, a session after one whose command moved .git/HEAD aside would lock nothing, and a command in
- * it could change the config and put the HEAD back. git is asked where there is no .git (a bare
- * repository), or one that leads to no git directory (git passes over an empty .git directory).
+ * it could change the config and put the HEAD back. The walk stops where git's does: at a bare repository,
+ * one whose config says it is, which has no .git (looked for after the .git, as git does, so a config a
+ * command writes beside a .git hides nothing), and below GIT_CEILING_DIRECTORIES. Going on, it took a home
+ * directory's dotfiles repository for that of a bare repository in it, or of a project the user had told
+ * git to keep apart, and let commands write in it. git is asked where the walk finds nothing, or a .git
+ * that leads to no git directory (git passes over an empty .git directory).
  */
 function gitDirs(project: string): GitDirs | undefined {
+  const ceilings = gitCeilings();
   for (let dir = project; ; dir = dirname(dir)) {
     const dotGit = join(dir, ".git");
     if (existsSync(dotGit)) return gitDirsOf(dotGit) ?? gitDirsFromGit(project);
-    if (dirname(dir) === dir) return gitDirsFromGit(project);
+    if (isBare(join(dir, "config"))) {
+      const real = realpathSync(dir);
+      return { common: real, own: real, bare: true };
+    }
+    if (dirname(dir) === dir || ceilings.includes(dirname(dir))) return gitDirsFromGit(project);
   }
+}
+
+/**
+ * GIT_CEILING_DIRECTORIES, the directories git doesn't go up into to look for a repository: as git takes
+ * them, those that are absolute and there, by real path.
+ */
+function gitCeilings(): string[] {
+  return (process.env.GIT_CEILING_DIRECTORIES ?? "").split(delimiter).filter((dir) => isAbsolute(dir)).flatMap((dir) => {
+    try {
+      return [realpathSync(dir)];
+    } catch {
+      return [];
+    }
+  });
 }
 
 /**

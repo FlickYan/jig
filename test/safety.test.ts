@@ -162,6 +162,32 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("stops looking for the repository where git does: at a bare one, and at GIT_CEILING_DIRECTORIES", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    const ceilings = process.env.GIT_CEILING_DIRECTORIES;
+    try {
+      // A home directory's dotfiles repository, with a server's bare repository and a project below it.
+      git(base, "init", "-q");
+      git(base, "init", "-q", "--bare", "srv/r.git");
+      for (const dir of ["srv/r.git/hooks", "proj"]) await mkdir(join(base, dir), { recursive: true });
+      const planted = join(base, ".git", "planted");
+      const plant = async (from: string) => {
+        const cwd = join(base, from);
+        return runCommand(`echo planted > ${planted}`, cwd, 20, undefined, createSandbox(cwd, { network: false })!);
+      };
+      // git takes the bare repository for the one it is in, not base's.
+      for (const from of ["srv/r.git", "srv/r.git/hooks"]) assert.match(await plant(from), denied, `from ${from}`);
+      // Told to stop at base, git finds no repository from proj.
+      process.env.GIT_CEILING_DIRECTORIES = base;
+      assert.match(await plant("proj"), denied, "from proj");
+      assert.equal(existsSync(planted), false);
+    } finally {
+      if (ceilings === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = ceilings;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("keeps submodules' git config and hooks read-only, and their git directories in place", async () => {
     const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
     try {
@@ -527,6 +553,8 @@ describe("the macOS sandbox's profile", () => {
       await rename(join(dotGit, "HEAD"), join(dotGit, "HEAD-moved"));
       await rename(join(dotGit, "modules", "libs", "s", "refs"), join(dotGit, "modules", "libs", "s", "refs-moved"));
       assert.equal(git(repo, "rev-parse", "--absolute-git-dir").trim(), join(await realpath(base), ".git"));
+      // Nor does a config beside the .git that says it is bare, as a command can write one.
+      await writeFile(join(repo, "config"), "[core]\n\tbare = true\n");
       for (const config of configs) assert.ok(denied(repo).includes(config), `${config} is read-only`);
       // From a linked worktree whose own HEAD is gone, which git takes for no repository at all.
       await rename(join(dotGit, "worktrees", "wt", "HEAD"), join(dotGit, "worktrees", "wt", "HEAD-moved"));
