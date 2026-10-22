@@ -498,7 +498,10 @@ describe("snapshots", () => {
     assert.throws(() => snapshots.take("t2"), /git took over 1 seconds/);
     await rm(join(dir, "sub", ".gitignore"));
     // git add waits on a .gitattributes holding the index's lock: stopped with SIGTERM, git removes the lock,
-    // where SIGKILL left one that failed every later snapshot.
+    // where SIGKILL left one that failed every later snapshot. It reads attributes only for a file it hashes,
+    // so one changes size here: git hashes an unchanged file only if it was written in the same second as
+    // t1's index, which made this test pass or fail by the clock.
+    await writeFile(join(dir, "sub", "a.txt"), "12");
     execFileSync("mkfifo", [join(dir, ".gitattributes")]);
     assert.throws(() => snapshots.take("t3"), /git took over 1 seconds/);
     await rm(join(dir, ".gitattributes"));
