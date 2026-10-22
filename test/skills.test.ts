@@ -339,6 +339,10 @@ describe("proposing a skill", () => {
     await assert.rejects(tool.run({ ...proposal, name: "Release Notes" }, context()), /lowercase letters/);
     await assert.rejects(tool.run({ ...proposal, files: { "../escape.sh": "x" } }, context()), /isn't inside the skill's folder/);
     await assert.rejects(tool.run({ ...proposal, files: { "SKILL.md": "x" } }, context()), /written from the other fields/);
+    // jig writes the files itself, outside the sandbox: a .git there made the skill's folder a repository.
+    for (const path of [".git", "./.git/config", "scripts/.GIT/hooks/pre-commit"]) {
+      await assert.rejects(tool.run({ ...proposal, files: { [path]: "x" } }, context()), /a skill has no \.git/, path);
+    }
     assert.equal(asked, false);
   });
 

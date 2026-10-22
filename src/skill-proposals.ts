@@ -87,6 +87,9 @@ function toProposal(input: ToolInput): SkillProposal {
     const clean = normalize(path);
     if (isAbsolute(path) || clean.startsWith("..") || clean.split(sep).includes("..")) problems.push(`The file ${path} isn't inside the skill's folder.`);
     else if (clean === "SKILL.md" || clean === join("evals", "evals.json")) problems.push(`${path} is written from the other fields; leave it out of files.`);
+    // Ignoring case, as the check on the folder does: jig writes these files itself, outside the sandbox,
+    // and a .git among them made the folder a repository whose config names programs for git to run.
+    else if (clean.toLowerCase().split(sep).includes(".git")) problems.push(`${path} would be git's own file; a skill has no .git.`);
     if (typeof content !== "string") problems.push(`The content of ${path} isn't text.`);
   }
   if (!Array.isArray(evals) || evals.some((item) => typeof item?.prompt !== "string")) problems.push("Each eval needs a prompt.");
