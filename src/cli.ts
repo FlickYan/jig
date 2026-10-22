@@ -8,9 +8,9 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { constants } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
+import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks, runStopHooks } from "./hooks.ts";
@@ -514,6 +514,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       );
     }
     takeSnapshot(label);
+    // The loop's note after an empty reply, left last when the previous request ended without an answer:
+    // it asks the model to go on with that request, so the model is told it is over.
+    const last = conversation.messages.at(-1)?.content;
+    if (typeof last === "string" && AFTER_EMPTY.includes(last)) notes.push("Your previous request ended without an answer from you.");
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
@@ -537,19 +541,26 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return ending;
   }
 
-  /** Says which files telling git where its config is commands changed, where the sandbox doesn't stop them. */
+  /**
+   * Says which files telling git where its config is commands changed, and which git directories they made
+   * git pass over, where the sandbox doesn't stop them.
+   */
   function warnOfGitChanges(): void {
     for (const path of sandbox?.gitChanges?.() ?? []) {
-      // A commondir or a .git sends git to another git directory's config; a config.worktree adds to the config.
-      const effect = basename(path) === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere";
-      ui.notice(`A command created or changed ${path}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
+      // A commondir or a .git sends git to another git directory's config; a config.worktree adds to the config;
+      // without its HEAD, objects and refs in order, git passes over a git directory, to one above it if any.
+      const name = basename(path);
+      const [done, effect] = ["HEAD", "objects", "refs"].includes(name)
+        ? ["removed or broke", `git no longer takes ${dirname(path)} for a git directory, so it fails there or uses another above it`]
+        : ["created or changed", name === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere"];
+      ui.notice(`A command ${done} ${path}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
     }
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
-  function runSkill(skill: Skill, task: string): Promise<Ending> {
+  async function runSkill(skill: Skill, task: string): Promise<Ending> {
     const content = skillContent(skill);
-    if (content === undefined) return Promise.resolve("error");
+    if (content === undefined) return "error";
     conversation.pin(`skill:${skill.name}`, content);
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
@@ -564,8 +575,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   /**
-   * A skill's instructions, or undefined, with a notice, if a command has since removed its SKILL.md or put
-   * a named pipe there: the skill is left out, as the skill tool leaves it out, rather than ending the session.
+   * A skill's instructions, or a notice and undefined if its SKILL.md is gone (or is a named pipe) since
+   * jig found it: a command or a checkout can do that mid-session, and it is no reason to end the session.
    */
   function skillContent(skill: Skill): string | undefined {
     try {
@@ -680,7 +691,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/compact") {
       await asTask(async (signal) => {
         ui.notice("Compacting the conversation…");
-        const done = await compact(conversation, agent.callModel, { signal });
+        const done = await compact(conversation, agent.callModel, { signal }).catch((err: unknown) => {
+          throw new Error(`Compaction failed: ${describeError(err)}`); // compact's "the model wrote no summary" doesn't say what failed
+        });
         ui.notice(done ? `Compacted ${formatTokens(done.before)} tokens into about ${formatTokens(done.after)}.` : "Nothing to compact yet.");
       });
     } else {

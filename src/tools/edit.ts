@@ -5,6 +5,7 @@
 
 import { writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
+import { shownLine } from "./read.ts";
 import { assertFile, lineCount, numbered, readUTF8, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
 
 export const editTool: Tool = {
@@ -204,19 +205,12 @@ function part(fileLines: string[], start: number, wanted: string[], oldLines: st
   return [first.slice(from), ...fileLines.slice(start + 1, start + last), end.slice(0, to)].join("\n");
 }
 
-/** read_file's limit on a line, which an error keeps to as well: minified code can hold megabytes on one. */
-const MAX_LINE_CHARS = 2000;
-
 /**
- * File lines shown around where old_string's first line matches, numbered as read_file shows them. A line
- * longer than read_file shows is cut to that length, as one gigantic line could otherwise fill the
- * conversation.
+ * File lines shown around where old_string's first line matches, numbered and cut as read_file shows them:
+ * minified code can hold megabytes on one line, which could otherwise fill the conversation.
  */
 function excerpt(fileLines: string[], start: number, count: number): string {
-  const lines = fileLines
-    .slice(start, start + count)
-    .map((line) => (line.length > MAX_LINE_CHARS ? `${line.slice(0, MAX_LINE_CHARS)}… [line truncated]` : line));
-  return numbered(lines, start);
+  return numbered(fileLines.slice(start, start + count).map((line) => shownLine(line)), start);
 }
 
 function prefixLines(text: string, prefix: string): string[] {

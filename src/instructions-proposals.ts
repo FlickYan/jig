@@ -3,8 +3,9 @@ import { lstat, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { type Approve, notApproved } from "./proposals.ts";
 import { findSecret } from "./secrets.ts";
+import { assertInProject } from "./skill-store.ts";
 import type { Tool } from "./tools/index.ts";
-import { isInside, readRegularFile, resolveForChange } from "./tools/util.ts";
+import { isInside, readRegularFile } from "./tools/util.ts";
 
 // Context that every agent working on a project should have, a convention or a rule, belongs in its
 // AGENTS.md rather than in jig's memory: it travels with the repository and other agents read it too.
@@ -46,10 +47,11 @@ export function proposeInstructionsTool(approve: Approve): Tool {
       if (secret) throw new Error(`The edit seems to hold ${secret}; AGENTS.md must not contain secrets.`);
       const path = instructionsFile(ctx.cwd);
       const file = relative(ctx.cwd, path);
-      // jig writes it itself, outside the sandbox, so it goes by where it really leads, as write_file does:
-      // a symlink (a command can make one) mustn't take the edit out of the project, or to a git directory's
-      // config. Checked again once approved, since a command left running could make one meanwhile.
-      const check = () => resolveForChange(ctx.cwd, file, ctx.dirs, ctx.hidden);
+      // jig writes it itself, outside the sandbox, so it is checked as a skill the model wrote is, in jig's
+      // own words: a symlink (a command can make one) mustn't take the edit out of the project, or into a git
+      // directory, to its config. Checked again once approved, since a command left running could make one
+      // meanwhile.
+      const check = () => assertInProject(ctx.cwd, path, ctx.hidden, ctx.dirs);
       await check();
       // Only a regular file: a named pipe a command made in its place would have jig wait on it forever.
       const current = existsSync(path) ? readRegularFile(path) : "";
@@ -66,7 +68,7 @@ export function proposeInstructionsTool(approve: Approve): Tool {
         diff = lines(added, "+ ").join("\n");
       }
       const shown = await linkedName(ctx.cwd, path, file);
-      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${shown}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`))) return notApproved(`edit to ${file}`);
+      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${shown}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`, ctx.signal))) return notApproved(`edit to ${file}`, ctx.signal);
       await check();
       writeFileSync(path, next);
       return `Edited ${shown}. It applies from the next session (or after /reset).`;

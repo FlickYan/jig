@@ -136,6 +136,12 @@ describe("the reviewer", () => {
     const request = JSON.stringify(seen.at(-1));
     assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: give your verdict now/);
     assert.doesNotMatch(request, /continue the task|run out of steps/);
+    // The first cut off at the output limit while still thinking: its own note gives way too.
+    const cut: MessageParam[][] = [];
+    const thinking: ModelTurn = { message: { ...turn("", "max_tokens").message, content: [{ type: "thinking", thinking: "Every requirement", signature: "sig" }] }, malformed: new Map() };
+    await reviewer("strong", await setupWith([look("a"), thinking, silent(), turn("APPROVED")], cut)).review(work);
+    assert.match(JSON.stringify(cut.at(-1)), /tool_result.*Two of your replies were empty\. Don't call any more tools: give your verdict now/);
+    assert.doesNotMatch(JSON.stringify(cut.at(-1)), /continue the task/);
   });
 
   it("sends nothing back when it approves or stays cut off, and finishes a verdict that was cut off", async () => {
@@ -189,14 +195,16 @@ describe("a review that runs the work", () => {
 });
 
 describe("jig review", () => {
-  /** A session in which the agent wrote out.txt and said it was done. */
-  async function session(dir: string): Promise<string> {
+  /** A session in which the agent wrote out.txt and said it was done; `compacted` before saying so. */
+  async function session(dir: string, compacted = false): Promise<string> {
     const path = join(dir, "agent.jsonl");
+    const summary = { role: "user", content: "The conversation so far was compacted to save context. This is its summary:\n\nI wrote out.txt and checked it." };
     const entries = [
       { type: "start", cwd: "/app", model: "deepseek-flash", date: "2026-10-14T00:00:00Z" },
       { type: "message", message: { role: "user", content: "Write out.txt with the total, 42." } },
       { type: "message", message: call("w", "write_file", { path: "out.txt", content: "41" }) },
       { type: "message", message: result("w", "Wrote out.txt") },
+      ...(compacted ? [{ type: "compaction", messages: [summary] }] : []),
       { type: "message", message: { role: "assistant", content: [{ type: "text", text: "Done: out.txt holds the total." }] } },
     ];
     await writeFile(path, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
@@ -210,11 +218,11 @@ describe("jig review", () => {
       (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [{ text: queue.length > 1 ? queue.shift()! : queue[0] }];
   };
 
-  async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = []) {
+  async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = [], compacted = false) {
     const dir = await mkdtemp(join(tmpdir(), "jig-review-cli-"));
     const api = await fakeMessagesApi(typeof verdict === "function" ? verdict : replies(verdict));
     try {
-      const args = ["review", "--session", await session(dir), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
+      const args = ["review", "--session", await session(dir, compacted), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
       const { code, output } = await runJig(args, { api, cwd: dir });
       assert.equal(code, 0, output);
       return { verdict: JSON.parse(await readFile(join(dir, "verdict.json"), "utf8")), requests: api.requests };
@@ -232,6 +240,15 @@ describe("jig review", () => {
     assert.deepEqual([verdict.problems[0].held, verdict.problems[0].output], [true, "total: 41\n\nExit code: 0"]);
     assert.match(verdict.feedback, /1\. out\.txt holds 41, not 42\n {3}It ran:\n {6}printf 'total: 41\\n'\n/);
     assert.equal(verdict.stop, "end_turn");
+  });
+
+  it("takes the task and what the agent did from the whole session, not from a compaction's summary", async () => {
+    // After a compaction the conversation starts from the agent's own summary: the reviewer got its claims as
+    // the task, and only what it did after them.
+    const { requests } = await review("APPROVED", [], true);
+    const prompt = JSON.stringify(requests[0].messages);
+    assert.match(prompt, /<task>\\nWrite out\.txt with the total, 42\.\\n<\/task>.*write_file out\.txt/);
+    assert.doesNotMatch(prompt, /This is its summary/);
   });
 
   it("drops a problem whose command doesn't show it again, and then sends nothing back", async () => {

@@ -3,7 +3,7 @@ import type { Socket } from "node:net";
 import { resolve } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import { hookMatcher, type Hook, type HookEvent } from "./settings.ts";
-import { LINGER_MS, Output, whyStopped } from "./tools/bash.ts";
+import { LINGER_MS, Output, running, whyStopped } from "./tools/bash.ts";
 import type { ToolInput } from "./tools/index.ts";
 import { withoutKeys } from "./tools/util.ts";
 
@@ -112,8 +112,8 @@ function blockReason(stdout: string): string | undefined {
 }
 
 /**
- * Runs one hook the way bash.ts runs commands: in a process group of its own, so a timeout or Ctrl+C
- * kills everything it started, not just the shell. Once the shell has exited, a job it left in the
+ * Runs one hook the way bash.ts runs commands: in a process group of its own, so a timeout, Ctrl+C or
+ * jig's exit kills everything it started, not just the shell. Once the shell has exited, a job it left in the
  * background may hold its output open; jig waits a moment for its last words, then goes on and leaves it.
  * Only Stop hooks have their stdout read; a tool hook's goes nowhere, so a job holding it isn't waited for.
  * As with a command's output, only the start and end of a long stream are kept, so memory stays the same
@@ -130,6 +130,7 @@ function run(
   return new Promise((done) => {
     // stdin and stderr are always pipes, so only stdout can be missing.
     const child = spawn("bash", ["-c", command], { cwd, env, detached: true, stdio: ["pipe", readStdout ? "pipe" : "ignore", "pipe"] }) as ChildProcessByStdio<Writable, Readable | null, Readable>;
+    if (child.pid) running.add(child.pid);
     const stdout = new Output(undefined, DECISION_LIMIT);
     const stderr = new Output();
     let killedBecause = "";
@@ -149,6 +150,7 @@ function run(
     const finish = (code: number | null, note = "") => {
       if (finished) return;
       finished = true;
+      if (child.pid) running.delete(child.pid); // a job it left in the background keeps running, as a command's does
       clearTimeout(timer);
       clearTimeout(lingering);
       signal?.removeEventListener("abort", onAbort);

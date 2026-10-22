@@ -138,8 +138,12 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   config from elsewhere (or more of it, from a `config.worktree`), so check the file before you run git
   there. Started in a subdirectory of a repository, jig warns the same way, on macOS as well, when a
   command makes a `.git` in it, which your git there would then use: making a repository can be the
-  task, so neither sandbox refuses it. A job a command leaves running in
-  the background can still do it after jig has looked, and after a one-shot run nothing looks again.
+  task, so neither sandbox refuses it. jig also warns, on both, when a command removes or breaks a git
+  directory's `HEAD`, `objects` or `refs`, which git changes all the time, so commands can too: your git
+  then no longer takes it for a repository, and fails there or uses one above it. jig finds the
+  repository by its `.git` all the same, so the next session still keeps its config read-only. A job a
+  command leaves running in the background can still do it after jig has looked, and after a one-shot
+  run nothing looks again.
   On macOS, localhost stays open; on Linux each command gets an empty
   network of its own, so a test can still start a server and talk to it, but only within one command.
   Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
@@ -163,7 +167,7 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   settings, the git files the sandbox watches) it reads only if it is a regular file: a named pipe a
   command made there would have jig wait until it was killed, and a link to `/dev/zero` never ends. Such
   an AGENTS.md or skill is left out, a settings file is refused, and a git file is reported by what it is.
-  `read_file` and `edit_file` likewise open only a regular file.
+  `read_file` and `edit_file` likewise open only a regular file, and tell the model so.
   What `jig skills add`, `update` and `remove` change in the project, and a skill the model wrote, go
   by real path too, and never into a `.git` directory, where a skill's folder could be a submodule's git
   directory; they refuse a name in the lockfile that isn't a skill's name: commands can write it.
@@ -345,13 +349,14 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
   middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
   a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
-  seconds is stopped, with everything it started. Hooks are your own commands, so they run outside the
-  sandbox, as you (though without jig's API keys). One that runs the project's own code, as both
-  `./scripts/check-command.sh` and `npm test` above do, runs whatever the model's commands changed there:
-  a command the sandbox kept from writing outside the project can rewrite a test for the Stop hook to
-  run, unsandboxed, before you have seen the change.
+  seconds is stopped, with everything it started, as is one still running when jig exits. Hooks are your
+  own commands, so they run outside the sandbox, as you (though without jig's API keys). One that runs the
+  project's own code, as both `./scripts/check-command.sh` and `npm test` above do, runs whatever the
+  model's commands changed there: a command the sandbox kept from writing outside the project can rewrite a
+  test for the Stop hook to run, unsandboxed, before you have seen the change.
 
-  A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
+  A `Stop` hook runs when the model gives its final answer with a step left (and, once one has sent the
+  model back, on the last step too, only to say whether it still objects), so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
   task, the answer (`last_message`), `stop_hook_active` (whether a Stop hook has sent the model back
   already in this task), `session_path` and `changed_files` (what the task changed, by its snapshot).
@@ -359,7 +364,8 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   told the stderr or the reason, and works on. A long reason (a whole test log, say) is cut from the
   middle, as stderr is; a decision over 4 million characters isn't read, and jig says so. A task's Stop
   hooks send it back 3 times at most; after
-  that, the task ends as finished, with a notice that the hook still objects. The 60 seconds apply here
+  that, the task ends as finished, with a notice that the hook still objects, as it does when one still
+  objects on the last step. The 60 seconds apply here
   too: a test suite that takes longer is stopped, and doesn't hold the task up. Hooks for events jig
   doesn't have (`SessionStart`, say) are left out, with a warning, and the rest of the settings apply.
 - **Subagents.** The `subagent` tool hands a research task (where is X handled, which files would a change
@@ -457,7 +463,8 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
 check its work against the task, if a step is left for that, and stops at the next such reply. Also on
 `--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
-a question asking you to allow a tool call is closed unanswered, and none starts after; nor do `--check`
+a question asking you to allow a tool call or to keep a proposal is closed unanswered, and none starts
+after; nor do `--check`
 and `--reviewer` in the last quarter of the time, since what they find might not get done), on
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,
@@ -475,7 +482,8 @@ what it verified and how, and what is left, and prints the reply: the model's ow
 Its tokens count in the totals and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/`
 and `jig skills test` do, so that their steps and costs compare with earlier runs.
 A `Stop` hook can send the model back to work from its final answer, after `--check` and the reviewer,
-with a step left and 3 times a task at most (see Hooks).
+with a step left and 3 times a task at most; once it has, it is asked on the last step too, only to say
+whether it still objects (see Hooks).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at

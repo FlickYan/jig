@@ -205,6 +205,36 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("still locks the config of a repository and of a submodule whose HEAD a command moved aside, and says so", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const gitDir = join(await realpath(repo), ".git");
+      const sub = join(gitDir, "modules", "libs", "s");
+      const configs = () => Promise.all([gitDir, sub].map((dir) => readFile(join(dir, "config"), "utf8")));
+      const before = await configs();
+      // git passes over a git directory without a HEAD. Asked where the repository is, the next session would
+      // lock nothing there, and a command could change the config and put the HEAD back.
+      const first = createSandbox(repo, { network: false })!;
+      const move = "mv .git/HEAD .git/HEAD.away && mv .git/modules/libs/s/HEAD .git/modules/libs/s/HEAD.away && echo moved";
+      assert.equal(await runCommand(move, repo, 20, undefined, first), "moved\n\nExit code: 0");
+      assert.deepEqual(first.gitChanges!(), [join(gitDir, "HEAD"), join(sub, "HEAD")]);
+      assert.deepEqual(first.gitChanges!(), []);
+      const next = createSandbox(repo, { network: false })!;
+      for (const config of [".git/config", ".git/modules/libs/s/config"]) {
+        assert.match(await runCommand(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ${config}`, repo, 20, undefined, next), denied);
+      }
+      assert.deepEqual(await configs(), before);
+      // Put back, both are in order again: nothing to say. A HEAD that names nothing, or refs gone, are told too.
+      for (const dir of [gitDir, sub]) await rename(join(dir, "HEAD.away"), join(dir, "HEAD"));
+      assert.deepEqual(next.gitChanges!(), []);
+      await runCommand("echo nothing > .git/modules/libs/s/HEAD && mv .git/refs .git/refs-moved", repo, 20, undefined, next);
+      assert.deepEqual(next.gitChanges!(), [join(gitDir, "refs"), join(sub, "HEAD")]);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
   it("keeps every linked worktree's files read-only, from the main worktree and from another one", async () => {
     const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
     try {
@@ -373,6 +403,22 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("warns after a task in which a command moved a git directory's HEAD aside", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const command = "mv .git/HEAD .git/HEAD.away";
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo });
+      assert.equal(code, 0, output);
+      const gitDir = join(await realpath(repo), ".git");
+      assert.match(output, new RegExp(`A command removed or broke ${join(gitDir, "HEAD")}, .*: git no longer takes ${gitDir} for a git directory, so it fails there or uses another above it`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
   it("warns at the end of a session of a commondir made after the last task, as a job a command left running can", async () => {
     const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
     git(repo, "init", "-q");
@@ -396,7 +442,7 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
 
 describe("the macOS sandbox's profile", () => {
   it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
-    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"] };
+    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"], gitDirectories: ["/p/.git"] };
     const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], git);
     const locked = profile.indexOf('(deny file-write* (literal "/p/.git/config") (subpath "/p/.git/hooks"))');
     assert.ok(locked > profile.indexOf('(allow file-write* (subpath "/p")'), "after the rule it overrides, since the last rule wins");
@@ -462,6 +508,34 @@ describe("the macOS sandbox's profile", () => {
       for (const project of ["repo", "repo/sub"]) assert.ok(gitControl(join(base, project))?.locked.includes(config), `from ${project}`);
     } finally {
       process.env.PATH = path;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("covers a git directory git passes over, and a submodule's that a planted HEAD would hide", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      // In a repository of its own, where git goes on to once it passes over the project's.
+      git(base, "init", "-q");
+      const repo = await repoWithSubmodule(base);
+      git(repo, "worktree", "add", "-q", "--detach", join(base, "wt"));
+      const dotGit = join(await realpath(repo), ".git");
+      const profileOf = (project: string) => seatbeltProfile([project], false, [], gitControl(project)!);
+      const denied = (project: string) => profileOf(project).split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      const configs = ["config", "modules/libs/s/config"].map((path) => `(literal "${join(dotGit, path)}")`);
+      // A command moves HEAD aside in one session, or the refs: git takes base's repository for the project's.
+      await rename(join(dotGit, "HEAD"), join(dotGit, "HEAD-moved"));
+      await rename(join(dotGit, "modules", "libs", "s", "refs"), join(dotGit, "modules", "libs", "s", "refs-moved"));
+      assert.equal(git(repo, "rev-parse", "--absolute-git-dir").trim(), join(await realpath(base), ".git"));
+      for (const config of configs) assert.ok(denied(repo).includes(config), `${config} is read-only`);
+      // From a linked worktree whose own HEAD is gone, which git takes for no repository at all.
+      await rename(join(dotGit, "worktrees", "wt", "HEAD"), join(dotGit, "worktrees", "wt", "HEAD-moved"));
+      assert.ok(denied(join(base, "wt")).includes(configs[0]), "from the worktree");
+      // A HEAD or a config in modules/libs, as if it were a submodule's git directory, doesn't hide libs/s in it.
+      await writeFile(join(dotGit, "modules", "libs", "HEAD"), "ref: refs/heads/main\n");
+      await writeFile(join(dotGit, "modules", "libs", "config"), "");
+      assert.ok(denied(repo).includes(configs[1]), "behind a planted HEAD");
+    } finally {
       await rm(base, { recursive: true, force: true });
     }
   });

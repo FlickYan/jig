@@ -63,7 +63,8 @@ export interface AgentOptions {
   checkUntil?: number;
   /**
    * The settings' Stop hooks (see hooks.ts), asked each time the model gives its final answer with a step
-   * left: resolves to why the task isn't done, which the model is told, or null. `active` says whether they
+   * left (and, once they have sent the model back, on the last step too, only to say whether they still
+   * object): resolves to why the task isn't done, which the model is told, or null. `active` says whether they
    * have sent the model back already in this task. Only a task's own loop has them: a subagent's or the
    * reviewer's answer doesn't end the task.
    */
@@ -211,7 +212,11 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         if (signal?.aborted || opts.compactAt === 0 || !tooLong(err)) throw err;
         opts.count?.("compaction.tooLong");
         opts.ui.notice("The API says the conversation is too long for the model; compacting it and asking again.");
-        if (!(await compactNow(true))) throw err;
+        // The request can't be made without it, so a summary that fails ends the task, saying it was that.
+        const compacted = await compactNow(true).catch((failed: unknown) => {
+          throw new Error(`Compaction failed: ${errorMessage(failed)}`);
+        });
+        if (!compacted) throw err;
         began = Date.now();
         ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
       }
@@ -298,7 +303,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
             conversation.push({ role: "user", content: found.feedback });
             continue;
           }
-          const said = found.text?.trim() ? ` (it said: "${found.text.trim().replace(/\s+/g, " ").slice(0, 160)}…")` : "";
+          // Quoted as a Stop hook is, below: marked as cut only if it was.
+          const quoted = found.text?.trim().replace(/\s+/g, " ");
+          const said = quoted ? ` (it said: "${quoted.length > 160 ? `${quoted.slice(0, 160)}…` : quoted}")` : "";
           opts.ui.notice(found.verdict === "approved" ? `${model} found no problems.` : `${model} gave no verdict${said}, so the work stands as it is.`);
         } catch (err) {
           if (signal?.aborted) return result("interrupted", step);
@@ -314,8 +321,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         conversation.push({ role: "user", content: opts.review });
         continue;
       }
-      // Then the project's own check, its Stop hooks, at every stop with a step left to act on what they say.
-      if (opts.stopHooks && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
+      // Then the project's own check, its Stop hooks, at every stop with a step left to act on what they say;
+      // on the last step too once they have sent the model back, so the task doesn't end as if they passed.
+      if (opts.stopHooks && reply.stop_reason === "end_turn" && (step < opts.maxSteps || stopBlocks > 0)) {
         let blocked: string | null = null;
         try {
           blocked = await opts.stopHooks({ task, answer, active: stopBlocks > 0, session: conversation.sessionPath }, signal);
@@ -327,7 +335,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         if (blocked) {
           const short = blocked.trim().replace(/\s+/g, " ");
           const said = `"${short.length > 160 ? `${short.slice(0, 160)}…` : short}"`;
-          if (stopBlocks < MAX_STOP_BLOCKS) {
+          if (stopBlocks < MAX_STOP_BLOCKS && step < opts.maxSteps) {
             stopBlocks++;
             opts.count?.("hook.stopBlocked");
             opts.ui.notice(`A Stop hook says the task isn't done (${said}); the model goes on (${stopBlocks} of ${MAX_STOP_BLOCKS}).`);
@@ -336,7 +344,8 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
             continue;
           }
           opts.count?.("hook.stopCapped");
-          opts.ui.notice(`A Stop hook still says the task isn't done (${said}), but it has sent the model back ${MAX_STOP_BLOCKS} times, so the task ends.`);
+          const why = step < opts.maxSteps ? `it has sent the model back ${MAX_STOP_BLOCKS} times` : "no step is left (--max-steps)";
+          opts.ui.notice(`A Stop hook still says the task isn't done (${said}), but ${why}, so the task ends.`);
         }
       }
       return result(reply.stop_reason ?? "end_turn", step, answer);
@@ -417,8 +426,12 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
   let report: Message;
   const asked = Date.now();
+  // The note after an empty reply, if it is last, asked for a tool call and was never answered: the request
+  // takes it back, as a subagent's or the reviewer's does (withRequest).
+  const last = conversation.messages.at(-1)?.content;
+  const sent = typeof last === "string" && AFTER_EMPTY.includes(last) ? conversation.messages.slice(0, -1) : conversation.messages;
   try {
-    ({ message: report } = await callModel([...conversation.messages, request], signal, { summarize: true }));
+    ({ message: report } = await callModel([...sent, request], signal, { summarize: true }));
   } catch (err) {
     if (signal?.aborted) return result("interrupted", opts.maxSteps);
     opts.ui.notice(`The wrap-up failed (${errorMessage(err)}), so the task ends without one.`);

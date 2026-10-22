@@ -93,6 +93,15 @@ describe("installing skills", () => {
     assert.deepEqual(discoverSkills(dir, join(dir, "home"), { builtin: null }).skills.map((skill) => [skill.name, skill.scope]), [["alpha", "project"]]);
   });
 
+  it("leaves out a .git in a skill's folder, whatever its case, as macOS's file systems ignore it", async () => {
+    // A folder of the user's, or a proposal a command wrote, can hold one; a git repository can't.
+    const files = { "scripts/run.sh": "echo gamma", "scripts/.git/config": "[core]\n", "references/.GIT/config": "[core]\n" };
+    const source = parseSource(await writeSkill(join(dir, "local"), "gamma", undefined, files));
+    const fetched = fetchSource(source);
+    const target = await installSkill(describeSkill(fetched.dir), source, fetched, { scope: "project", project: dir });
+    assert.deepEqual((await readdir(target, { recursive: true })).sort(), ["SKILL.md", "references", "scripts", join("scripts", "run.sh")]);
+  });
+
   it("sees what changed upstream, updates, and removes", async () => {
     const repo = await skillRepository();
     const source = parseSource(`file://${repo}`, { path: "skills/beta" });

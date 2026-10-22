@@ -77,8 +77,8 @@ export class SessionFile {
     appendFileSync(this.path, `${JSON.stringify({ type, at: new Date().toISOString(), ...rest })}\n`);
   }
 
-  /** The messages a session file ended with. */
-  static load(path: string): MessageParam[] {
+  /** The messages a session file ended with; with `whole`, every message it holds, as if never compacted. */
+  static load(path: string, whole = false): MessageParam[] {
     let messages: MessageParam[] = [];
     for (const line of readFileSync(path, "utf8").split("\n")) {
       let entry: Entry;
@@ -88,7 +88,7 @@ export class SessionFile {
         continue; // blank, or cut off by a crash mid-write
       }
       if (entry.type === "message") messages.push(entry.message);
-      else if (entry.type === "compaction") messages = [...entry.messages];
+      else if (entry.type === "compaction" && !whole) messages = [...entry.messages];
     }
     return answerOpenToolCalls(messages);
   }
@@ -105,19 +105,24 @@ export class SessionFile {
 }
 
 /**
- * If the session ended while tools were running, the last assistant message has tool calls with no
- * results, and the API would reject the history. Answer them as interrupted.
+ * If the session ended while tools were running, an assistant message has tool calls with no results, and
+ * the API would reject the history. Answer them as interrupted, right after the calls. Not only at the end:
+ * the answers aren't written to the file, so once a continued session goes on, the open calls are mid-file.
  */
 function answerOpenToolCalls(messages: MessageParam[]): MessageParam[] {
-  const last = messages.at(-1);
-  if (last?.role !== "assistant" || typeof last.content === "string") return messages;
-  const calls = last.content.filter((block) => block.type === "tool_use");
-  if (calls.length === 0) return messages;
-  const results = calls.map((call) => ({
-    type: "tool_result" as const,
-    tool_use_id: call.id,
-    content: "Not run: the session ended before this call ran.",
-    is_error: true,
-  }));
-  return [...messages, { role: "user", content: results }];
+  return messages.flatMap((message, i) => {
+    if (message.role !== "assistant" || typeof message.content === "string") return [message];
+    const next = messages[i + 1]?.content;
+    const answered = new Set(Array.isArray(next) ? next.flatMap((block) => (block.type === "tool_result" ? [block.tool_use_id] : [])) : []);
+    const results = message.content
+      .filter((block) => block.type === "tool_use")
+      .filter((call) => !answered.has(call.id))
+      .map((call) => ({
+        type: "tool_result" as const,
+        tool_use_id: call.id,
+        content: "Not run: the session ended before this call ran.",
+        is_error: true,
+      }));
+    return results.length ? [message, { role: "user" as const, content: results }] : [message];
+  });
 }

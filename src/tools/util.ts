@@ -77,9 +77,10 @@ export async function realTarget(abs: string): Promise<string | undefined> {
  * Whether a real path is a git directory's config or one of its hooks, or a file that tells git where to
  * find them: a .git file (a worktree's or a submodule's pointer to its git directory, or one planted where
  * there was none) and commondir. A submodule's (under .git/modules) and a worktree's (under .git/worktrees)
- * count too. Any of them can make git run a program (core.fsmonitor, a pre-commit hook) the next time the
- * user or jig runs git, and grep and glob run git outside the sandbox. A bare repository's are left alone:
- * setting up a server's hooks can be the task.
+ * count too, and so does a worktree's gitdir, which names the worktree's .git file: the sandbox reads it to
+ * know which .git file to lock (sandbox.ts's gitControl). Any of them can make git run a program
+ * (core.fsmonitor, a pre-commit hook) the next time the user or jig runs git, and grep and glob run git
+ * outside the sandbox. A bare repository's are left alone: setting up a server's hooks can be the task.
  */
 export function isGitControl(real: string): boolean {
   const parts = real.toLowerCase().split(sep); // macOS's file systems usually ignore case
@@ -87,7 +88,7 @@ export function isGitControl(real: string): boolean {
   if (at === -1) return false;
   const rest = parts.slice(at + 1);
   if (!rest.length) return true;
-  if (rest[0] === "modules" || rest[0] === "worktrees") return rest.includes("hooks") || GIT_CONFIG.includes(rest.at(-1) ?? "");
+  if (rest[0] === "modules" || rest[0] === "worktrees") return rest.includes("hooks") || [...GIT_CONFIG, "gitdir"].includes(rest.at(-1) ?? "");
   return rest[0] === "hooks" || (rest.length === 1 && GIT_CONFIG.includes(rest[0]));
 }
 
@@ -121,8 +122,8 @@ export function isInside(root: string, abs: string): boolean {
 
 /**
  * Fails with a message the model can act on if `abs` is missing or isn't a regular file. Opening a named
- * pipe a command made waits for a writer in a thread nothing can stop: read_file or edit_file on one hung
- * jig past --time-limit and Ctrl+C, until it was killed.
+ * pipe a command made would wait for a writer, in a thread that Ctrl+C, --time-limit and a kill can't stop
+ * (exiting waits for it too), and a link to a device such as /dev/zero would never end.
  */
 export async function assertFile(abs: string, path: string): Promise<Stats> {
   const info = await stat(abs).catch(() => null);

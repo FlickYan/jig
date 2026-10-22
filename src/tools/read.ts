@@ -8,7 +8,7 @@ import { assertFile, assertVisible, decodeUTF8, isUTF16, resolveInRoot, utf16Err
 const DEFAULT_LIMIT = 2000; // lines per call
 const MAX_LINE_CHARS = 2000; // minified files have enormous lines
 const MAX_CHARS = 30_000; // per call; longer files are read in pages with offset
-const LINE_BYTES = 4 * MAX_LINE_CHARS; // kept of a line: UTF-8 takes 3 bytes a character at most
+const LINE_BYTES = 4 * MAX_LINE_CHARS; // kept of a line: UTF-8 takes 4 bytes a character at most
 const CHUNK_BYTES = 65_536; // read at a time
 const COUNT_BYTES = 50_000_000; // once the page is full, lines are counted only this far into a file
 
@@ -64,6 +64,14 @@ export const readTool: Tool = {
   },
 };
 
+/**
+ * A line as read_file shows it: cut to MAX_LINE_CHARS and marked, if it is longer or was `cut` already.
+ * edit_file shows the lines around a near miss the same way.
+ */
+export function shownLine(text: string, cut = false): string {
+  return cut || text.length > MAX_LINE_CHARS ? `${text.slice(0, MAX_LINE_CHARS)}… [line truncated]` : text;
+}
+
 interface Page {
   /** The lines shown, numbered. */
   text: string;
@@ -103,7 +111,7 @@ async function readPage(file: string, path: string, first: number, limit: number
     const decoded = decodeUTF8(bytes, cut);
     let text = decoded ?? bytes.toString("utf8"); // with � for each byte that isn't UTF-8
     if (!cut) text = text.replace(/\r$/, ""); // edit_file handles Windows line endings itself
-    if (cut || text.length > MAX_LINE_CHARS) text = `${text.slice(0, MAX_LINE_CHARS)}… [line truncated]`;
+    text = shownLine(text, cut);
     const numbered = `${String(line).padStart(6)}\t${text}\n`;
     if (page.text.length + numbered.length > MAX_CHARS && line > first) {
       full = true;

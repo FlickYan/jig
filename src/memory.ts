@@ -139,7 +139,7 @@ export function proposeMemoryTool(project: string, approve: Approve, now = () =>
     },
     kind: "propose",
     describe: ({ action, name }) => `${action} ${name}`,
-    async run(input) {
+    async run(input, ctx) {
       const proposal = input as unknown as MemoryProposal;
       const problems = memoryProblems(proposal);
       if (problems.length) throw new Error(`The memory can't be proposed as it is: ${problems.join(" ")}`);
@@ -147,14 +147,14 @@ export function proposeMemoryTool(project: string, approve: Approve, now = () =>
       const previous = existsSync(path) ? frontmatterFields(readFileSync(path, "utf8")).description : undefined;
       if (proposal.action === "forget") {
         if (previous === undefined) throw new Error(`There is no ${proposal.scope} memory "${proposal.name}" to forget.`);
-        const ok = await approve(`Forget the ${proposal.scope} memory ${proposal.name}?`, `  ${previous}${proposal.reason ? `\n  Why: ${proposal.reason}` : ""}`);
-        if (!ok) return notApproved("forgetting");
+        const ok = await approve(`Forget the ${proposal.scope} memory ${proposal.name}?`, `  ${previous}${proposal.reason ? `\n  Why: ${proposal.reason}` : ""}`, ctx.signal);
+        if (!ok) return notApproved("forgetting", ctx.signal);
         rmSync(path);
         return `Forgot the ${proposal.scope} memory "${proposal.name}".`;
       }
       const details = [`  ${proposal.description}`, ...(proposal.body ? [indent(proposal.body)] : []), ...(previous !== undefined ? [`  (replaces: ${previous})`] : [])];
       const title = `${previous === undefined ? "Remember" : "Update"} (${proposal.scope}): ${proposal.name}`;
-      if (!(await approve(title, details.join("\n")))) return notApproved("memory");
+      if (!(await approve(title, details.join("\n"), ctx.signal))) return notApproved("memory", ctx.signal);
       mkdirSync(memoryDir(proposal.scope, project), { recursive: true });
       const updated = now().toLocaleDateString("en-CA");
       const fields = [`name: ${proposal.name}`, `description: ${JSON.stringify(proposal.description!.trim())}`, ...(proposal.type ? [`type: ${proposal.type}`] : []), `updated: ${updated}`];
