@@ -428,6 +428,19 @@ describe("the macOS sandbox's profile", () => {
       assert.equal(gitControl(base), undefined, "outside a repository");
       git(base, "init", "-q", "--bare", "server.git");
       assert.equal(gitControl(join(base, "server.git")), undefined, "in a bare repository");
+      // A bare clone with its worktrees beside it is no server's: the user runs git in the worktrees. One
+      // named .git is locked before it has any, as the file tools refuse its config.
+      git(base, "clone", "-q", "--bare", repo, "x/.git");
+      git(base, "clone", "-q", "--bare", repo, "y/.bare");
+      await writeFile(join(base, "y", ".git"), "gitdir: ./.bare\n");
+      const [x, y] = [await realpath(join(base, "x")), await realpath(join(base, "y"))];
+      assert.ok(gitControl(x)?.locked.includes(join(x, ".git", "config")), "a bare x/.git");
+      assert.equal(gitControl(y), undefined, "a bare y/.bare with no worktree");
+      for (const folder of [x, y]) git(folder, "worktree", "add", "-q", "--detach", "main");
+      for (const [project, config] of [[x, join(x, ".git", "config")], [y, join(y, ".bare", "config")]]) {
+        for (const from of [project, join(project, "main")]) assert.ok(gitControl(from)?.locked.includes(config), `from ${from}`);
+      }
+      assert.ok(gitControl(y)?.locked.includes(join(y, ".git")), "y's .git file, which says where its git directory is");
     } finally {
       await rm(base, { recursive: true, force: true });
     }

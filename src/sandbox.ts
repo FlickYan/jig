@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
-import { isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { isGitControl, isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
@@ -68,11 +68,12 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
  * worktree's own commondir, gitdir and config.worktree (not only this one's: the user runs git in the
  * others too), and the .git file of every worktree and submodule checkout. As isGitControl has it for the
  * file tools. Undefined outside a repository, and for a bare one (as git says, not by its name: a git
- * directory made with --separate-git-dir has no .git in its path), left alone as the file tools leave it:
- * setting up a server's hooks can be the task.
+ * directory made with --separate-git-dir has no .git in its path), where setting up a server's hooks can
+ * be the task. But not for a bare one named .git, whose config the file tools refuse too, nor for one with
+ * linked worktrees, which is no server's: the user runs git in them (a bare clone, its worktrees beside it).
  */
 export function gitControl(project: string, repo = gitDirs(project)): GitControl | undefined {
-  if (!repo || repo.bare) return undefined;
+  if (!repo || (repo.bare && !worktrees(repo.common).length && !isGitControl(join(repo.common, "config")))) return undefined;
   const { common, own } = repo;
   const inGitDir = (dir: string) => [
     ...["config", "config.worktree", "commondir", "hooks"].map((name) => join(dir, name)),
