@@ -86,10 +86,11 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       // macOS's wc pads the count with spaces.
       assert.match(await run(`wc -l < ${path}`, sandbox), /^ *20000\n\nExit code: 0$/);
       // Midway, a command puts a symlink to a file it can't write in place of the file jig writes to, which
-      // it finds by what it printed (other tests' files may be there too).
+      // it finds by what it printed (other tests' files may be there too, and other users' unreadable ones,
+      // which make grep fail though it found the file).
       await writeFile(target, "untouched\n");
       const mark = `jig-sandbox-swap-${process.pid}`;
-      const swap = `f=$(grep -l ${mark} ${tmpdir()}/jig-output-*.log 2>/dev/null) && rm "$f" && ln -s ${target} "$f" && swapped=$f`;
+      const swap = `f=$(grep -l ${mark} ${tmpdir()}/jig-output-*.log 2>/dev/null); [ -n "$f" ] && rm "$f" && ln -s ${target} "$f" && swapped=$f`;
       const out = await runCommand(`echo ${mark}; seq 1 20000; sleep 0.5; ${swap}; seq 1 20000; echo "swapped $swapped"`, project, 20, undefined, sandbox, outputs);
       assert.match(out, new RegExp(`swapped ${fileOf(out)}\n`));
       assert.equal(await readFile(target, "utf8"), "untouched\n");
