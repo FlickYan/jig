@@ -345,6 +345,31 @@ describe("sessions", () => {
       content: [{ type: "tool_result", tool_use_id: "t9", content: "Not run: the session ended before this call ran.", is_error: true }],
     });
   });
+
+  it("answers them where they are once the session went on, since the answers aren't written to the file", async () => {
+    // Continued once, the file has the next request and its reply after the open call: the next --continue sent
+    // a tool call without its result, which the APIs reject.
+    const path = join(dir, "continued.jsonl");
+    const answered: MessageParam = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
+    const messages: MessageParam[] = [
+      { role: "user", content: "go" },
+      { role: "assistant", content: [toolUse("t1", "glob", { pattern: "*" })] },
+      answered,
+      { role: "assistant", content: [toolUse("t9", "bash", { command: "make" })] },
+      { role: "user", content: "and now?" },
+      { role: "assistant", content: [text("Answer.")] },
+    ];
+    const lines = [{ type: "start", cwd: dir, model: "m", date: "" }, ...messages.map((message) => ({ type: "message", message }))];
+    await writeFile(path, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+    const loaded = SessionFile.load(path);
+    assert.deepEqual(loaded.map((message) => message.role), ["user", "assistant", "user", "assistant", "user", "user", "assistant"]);
+    assert.deepEqual(loaded[2], answered, "an answered call is left as it is");
+    assert.deepEqual(loaded[4], {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "t9", content: "Not run: the session ended before this call ran.", is_error: true }],
+    });
+    assert.deepEqual(loaded[5], messages[4]);
+  });
 });
 
 describe("a project's directories in jig's home", () => {

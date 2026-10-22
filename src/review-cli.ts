@@ -87,7 +87,9 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const exec = through(prefixOf(values.exec, "--exec"));
   const fresh = values["verify-exec"] ? through(prefixOf(values["verify-exec"], "--verify-exec")) : undefined;
 
-  const messages = SessionFile.load(resolve(values.session));
+  // The whole history: after a compaction, the conversation starts from the agent's own summary, which
+  // isn't the task, and leaves out what it did before.
+  const messages = SessionFile.load(resolve(values.session), true);
   const start = messages.findIndex((message) => message.role === "user" && typeof message.content === "string");
   if (start === -1) throw new Error(`${values.session} holds no task.`);
   const changes = values.changes ? clipped(readFileSync(values.changes, "utf8").trim(), MAX_CHANGES) : undefined;
