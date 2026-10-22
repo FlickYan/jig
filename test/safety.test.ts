@@ -177,6 +177,11 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       };
       // git takes the bare repository for the one it is in, not base's.
       for (const from of ["srv/r.git", "srv/r.git/hooks"]) assert.match(await plant(from), denied, `from ${from}`);
+      // The server's own hooks stay writable, as setting them up can be the task, and nothing of base's is in it.
+      const server = join(base, "srv", "r.git");
+      const inServer = createSandbox(server, { network: false })!;
+      assert.equal(await runCommand("echo 'exit 0' > hooks/post-receive && echo set", server, 20, undefined, inServer), "set\n\nExit code: 0");
+      assert.equal(inServer.gitChanges, undefined);
       // Told to stop at base, git finds no repository from proj.
       process.env.GIT_CEILING_DIRECTORIES = base;
       assert.match(await plant("proj"), denied, "from proj");
@@ -226,6 +231,44 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       await inRepo("mv libs/s libs/s-moved && mkdir libs/s && git init -q libs/s");
       assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
       assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a submodule checkout's .git read-only from the directory holding it, though a command made that look bare", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      // jig runs in libs, which holds the checkout libs/s: the user's git status in repo runs git in it.
+      const libs = join(repo, "libs");
+      const dotGit = join(await realpath(libs), "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      const session = () => {
+        const sandbox = createSandbox(libs, { network: false })!;
+        return { sandbox, inLibs: (command: string) => runCommand(command, libs, 20, undefined, sandbox) };
+      };
+      // A command in an earlier session wrote a config there that says it is bare. git takes that for no
+      // repository, and goes on to repo's: so does jig, which locks repo's files and lets git work as before.
+      await writeFile(join(libs, "config"), "[core]\n\tbare = true\n");
+      assert.equal(git(libs, "rev-parse", "--is-bare-repository").trim(), "false");
+      const first = session();
+      assert.match(await first.inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.match(await first.inLibs(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ../.git/config`), denied);
+      const commit = "cd s && echo 2 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await first.inLibs(commit), "t\n\nExit code: 0");
+      // With a HEAD, objects and refs too, git takes it for a bare repository, and so does jig. The checkout's
+      // .git, which is repo's, stays read-only all the same, and repo's git directory isn't made writable.
+      assert.equal(await first.inLibs("git init -q --bare . && echo made"), "made\n\nExit code: 0");
+      assert.equal(git(libs, "rev-parse", "--is-bare-repository").trim(), "true");
+      const { sandbox, inLibs } = session();
+      assert.match(await inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.match(await inLibs("echo planted > ../.git/planted"), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      assert.equal(existsSync(join(repo, ".git", "planted")), false);
+      // Seatbelt refuses a new .git there. bubblewrap can't keep the checkout in place, so the sandbox tells.
+      await inLibs("mv s s-moved && mkdir s && git init -q s");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
     } finally {
       await rm(base, { recursive: true, force: true });
     }
@@ -534,6 +577,29 @@ describe("the macOS sandbox's profile", () => {
       for (const project of ["repo", "repo/sub"]) assert.ok(gitControl(join(base, project))?.locked.includes(config), `from ${project}`);
     } finally {
       process.env.PATH = path;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("takes a directory for a bare repository only as git does, and covers what the repository around one has in it", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      await mkdir(join(repo, "docs"));
+      const real = await realpath(repo);
+      // A config a command wrote in a subdirectory, saying it is bare, git takes for no repository.
+      for (const dir of ["docs", "libs"]) await writeFile(join(repo, dir, "config"), "[core]\n\tbare = true\n");
+      for (const dir of ["docs", "libs"]) assert.ok(gitControl(join(repo, dir))?.locked.includes(join(real, ".git", "config")), `from ${dir}`);
+      // With a HEAD, objects and refs too, git does: it is left alone, as a server's would be, but the .git of
+      // the checkout in it is denied, and nothing of repo's git directory, which isn't made writable, is fixed.
+      git(join(repo, "libs"), "init", "-q", "--bare", ".");
+      const control = gitControl(join(repo, "libs"))!;
+      const profile = seatbeltProfile([join(real, "libs"), "/private/tmp"], false, [], control);
+      const denied = profile.split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      assert.equal(denied, `(deny file-write* (literal "${join(real, "libs", "s", ".git")}"))`);
+      assert.doesNotMatch(profile, /file-write-unlink/);
+      assert.deepEqual(control.fixed, []);
+    } finally {
       await rm(base, { recursive: true, force: true });
     }
   });
