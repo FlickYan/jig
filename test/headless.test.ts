@@ -1020,6 +1020,20 @@ describe("an interactive session fed through stdin", () => {
     }
   });
 
+  it("says it was compaction that failed when /compact gets no summary, and goes on", async () => {
+    // It said only "the model wrote no summary".
+    let replies = 0;
+    const api = await fakeMessagesApi(() => (replies++ === 1 ? [] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(args, { api, cwd: project, stdin: "say hi\n/compact\nsay bye\n" });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 3, output);
+      assert.match(output, /Compacting the conversation…\n.*Compaction failed: the model wrote no summary\n/);
+    } finally {
+      api.close();
+    }
+  });
+
   it("undoes a task and tells the model, announces plan mode, and starts a new session at /reset", async () => {
     const api = await fakeMessagesApi((request) => (last(request).includes("Write notes.txt.") ? [{ tool: "write_file", input: { path: "notes.txt", content: "draft\n" } }] : [{ text: "Done." }]));
     try {

@@ -172,7 +172,7 @@ const TOO_LONG = anthropicError(400, "prompt is too long: 40312 tokens > 32768 m
 
 describe("a conversation too long for the model", () => {
   /** A finished task whose tool result is long, then a new request; and a model that sees it all. */
-  function setup(answer: (call: number) => ModelTurn) {
+  function setup(answer: (call: number) => ModelTurn, written = "SUMMARY: the build fails at the link step.") {
     const output = `first line\n${"x".repeat(20_000)}\nlast line`;
     const result = { type: "tool_result" as const, tool_use_id: "t1", content: output };
     const conversation = new Conversation(undefined, [
@@ -187,7 +187,7 @@ describe("a conversation too long for the model", () => {
     const callModel: CallModel = async (messages, _signal, options) => {
       if (options?.summarize) {
         summaries.push(messages);
-        return reply([text("SUMMARY: the build fails at the link step.")]);
+        return reply([text(written)]);
       }
       return answer(++calls);
     };
@@ -239,6 +239,15 @@ describe("a conversation too long for the model", () => {
     });
     await assert.rejects(off.run(0), /prompt is too long/);
     assert.equal(off.summaries.length, 0);
+  });
+
+  it("ends the task saying the compaction failed when the summary does", async () => {
+    // compact's own words alone ("the model wrote no summary") were the task's error, and --stats' too.
+    const empty = setup(() => {
+      throw TOO_LONG;
+    }, "");
+    await assert.rejects(empty.run(), /^Error: Compaction failed: the model wrote no summary$/);
+    assert.equal(empty.summaries.length, 1);
   });
 
   it("tells the APIs' 'too long' from their other errors", () => {

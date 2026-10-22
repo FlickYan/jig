@@ -684,7 +684,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/compact") {
       await asTask(async (signal) => {
         ui.notice("Compacting the conversation…");
-        const done = await compact(conversation, agent.callModel, { signal });
+        const done = await compact(conversation, agent.callModel, { signal }).catch((err: unknown) => {
+          throw new Error(`Compaction failed: ${describeError(err)}`); // compact's "the model wrote no summary" doesn't say what failed
+        });
         ui.notice(done ? `Compacted ${formatTokens(done.before)} tokens into about ${formatTokens(done.after)}.` : "Nothing to compact yet.");
       });
     } else {

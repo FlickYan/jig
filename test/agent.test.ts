@@ -763,6 +763,14 @@ describe("a reviewer before finishing", () => {
     assert.match(notices.join("\n"), /The review failed \(overloaded\), so the work stands as it is/);
     const silent = setup([reply([text("Done.")])], { reviewer: fakeReviewer("none").reviewer });
     assert.equal((await runAgent(silent.conversation, silent.options)).reviewed?.verdict, "none");
+    // What it said instead is quoted, and marked as cut only if it was: "Looks fine." read as cut off.
+    for (const [said, shown] of [["Looks\n  fine.", "Looks fine."], ["x".repeat(200), `${"x".repeat(160)}…`]]) {
+      const usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
+      const talking = setup([reply([text("Done.")])], { reviewer: { model: "strong", review: async () => ({ verdict: "none", text: said, usage }) } });
+      notices.length = 0;
+      await runAgent(talking.conversation, { ...talking.options, ui: { ...talking.options.ui, notice: (n) => notices.push(n) } });
+      assert.equal(notices.at(-1), `strong gave no verdict (it said: "${shown}"), so the work stands as it is.`);
+    }
     const last = fakeReviewer("problems");
     const lastStep = setup([reply([text("Done.")])], { reviewer: last.reviewer, maxSteps: 1 });
     assert.equal((await runAgent(lastStep.conversation, lastStep.options)).text, "Done.");

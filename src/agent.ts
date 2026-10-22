@@ -212,7 +212,11 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         if (signal?.aborted || opts.compactAt === 0 || !tooLong(err)) throw err;
         opts.count?.("compaction.tooLong");
         opts.ui.notice("The API says the conversation is too long for the model; compacting it and asking again.");
-        if (!(await compactNow(true))) throw err;
+        // The request can't be made without it, so a summary that fails ends the task, saying it was that.
+        const compacted = await compactNow(true).catch((failed: unknown) => {
+          throw new Error(`Compaction failed: ${errorMessage(failed)}`);
+        });
+        if (!compacted) throw err;
         began = Date.now();
         ({ message: reply, malformed, offered } = await callModel(conversation.messages, signal));
       }
@@ -299,7 +303,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
             conversation.push({ role: "user", content: found.feedback });
             continue;
           }
-          const said = found.text?.trim() ? ` (it said: "${found.text.trim().replace(/\s+/g, " ").slice(0, 160)}…")` : "";
+          // Quoted as a Stop hook is, below: marked as cut only if it was.
+          const quoted = found.text?.trim().replace(/\s+/g, " ");
+          const said = quoted ? ` (it said: "${quoted.length > 160 ? `${quoted.slice(0, 160)}…` : quoted}")` : "";
           opts.ui.notice(found.verdict === "approved" ? `${model} found no problems.` : `${model} gave no verdict${said}, so the work stands as it is.`);
         } catch (err) {
           if (signal?.aborted) return result("interrupted", step);
