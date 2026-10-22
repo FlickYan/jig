@@ -350,6 +350,9 @@ describe("a git directory's config and hooks", () => {
     await assert.rejects(write(".git/config.worktree", "[core]\n"), /tells git where they are/);
     await assert.rejects(write(".git/worktrees/wt/commondir", "../../../planted\n"), /tells git where they are/);
     await assert.rejects(write(".git/modules/lib/commondir", "../../../planted\n"), /tells git where they are/);
+    // A worktree's gitdir names its .git file: changed, the next session's sandbox would lock another one.
+    await assert.rejects(write(".git/worktrees/wt/gitdir", "/elsewhere/.git\n"), /tells git where they are/);
+    await assert.rejects(write(".git/modules/lib/worktrees/wt/gitdir", "/elsewhere/.git\n"), /tells git where they are/);
     assert.equal(existsSync(join(cwd, ".git", "hooks", "pre-commit")), false);
     assert.equal(existsSync(join(cwd, ".git", "commondir")), false);
     assert.equal(existsSync(join(cwd, ".git", "worktrees")), false);
