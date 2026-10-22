@@ -138,8 +138,12 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   config from elsewhere (or more of it, from a `config.worktree`), so check the file before you run git
   there. Started in a subdirectory of a repository, jig warns the same way, on macOS as well, when a
   command makes a `.git` in it, which your git there would then use: making a repository can be the
-  task, so neither sandbox refuses it. A job a command leaves running in
-  the background can still do it after jig has looked, and after a one-shot run nothing looks again.
+  task, so neither sandbox refuses it. jig also warns, on both, when a command removes or breaks a git
+  directory's `HEAD`, `objects` or `refs`, which git changes all the time, so commands can too: your git
+  then no longer takes it for a repository, and fails there or uses one above it. jig finds the
+  repository by its `.git` all the same, so the next session still keeps its config read-only. A job a
+  command leaves running in the background can still do it after jig has looked, and after a one-shot
+  run nothing looks again.
   On macOS, localhost stays open; on Linux each command gets an empty
   network of its own, so a test can still start a server and talk to it, but only within one command.
   Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
