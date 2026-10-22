@@ -51,8 +51,8 @@ Options:
                           models, openai for others; DeepSeek serves both)
       --base-url <url>    the API's address, e.g. http://localhost:11434/v1 for Ollama (default: the
                           provider's own; OPENAI_BASE_URL works too)
-  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: medium for Claude models,
-                          the model's own for others; DeepSeek takes low | high | max)
+  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: medium for Claude models, the model's own
+                          for others; DeepSeek takes low | high | max)
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto

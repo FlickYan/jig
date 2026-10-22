@@ -132,18 +132,20 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 - **Sandbox.** Commands run in the operating system's sandbox, as in Codex and Claude Code: Seatbelt on
   macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but write
   only inside the project, its git directory (not its config or hooks, which name programs git runs, nor
-  its submodules', nor the files that tell git where they are: every worktree's and submodule checkout's
-  `.git` file, `commondir`, `config.worktree`), the directories added with `--add-dir` and the temp
-  directories, and they can't reach the network. Some changes to git's files aren't refused, so jig warns
-  of them after the task and when a session ends: on Linux, a `commondir` or `config.worktree` that wasn't
-  there (one can't be made read-only without creating it, and an empty `commondir` breaks git); on both
-  systems, a submodule's checkout moved aside and another put in its place (on macOS, a link to one), a
-  `.git` made in the project when jig was started in a subdirectory of a repository (making a repository
-  can be the task), and a git directory's `HEAD`, `objects` or `refs` removed or broken (git changes them
-  all the time, so commands can too). Your git would then take its config from elsewhere, or pass over the
-  directory and fail or use a repository above it, so look before you run git there; jig still finds the
-  repository by its `.git`, so the next session keeps its config read-only. A job a command leaves in the
-  background can still do so after jig has looked, and after a one-shot run nothing looks again.
+  its submodules', nor the files that tell git where they are: worktrees' and submodule checkouts' `.git`
+  files, `commondir`, `config.worktree`, `gitdir`), the directories added with `--add-dir` and the temp
+  directories, and they can't reach the network. A bare repository's config and hooks stay writable, unless
+  it has linked worktrees or is named `.git`: setting up a server's hooks can be the task. Some changes to
+  git's files aren't refused, so jig warns of them after the task and when a session ends: on Linux, a
+  `commondir` or `config.worktree` that wasn't there (one can't be made read-only without creating it, and
+  an empty `commondir` breaks git); on both systems, a submodule's checkout moved aside and another put in
+  its place (on macOS, a link to one), a `.git` made in the project when jig was started in a subdirectory
+  of a repository (making a repository can be the task), and a git directory's `HEAD`, `objects` or `refs`
+  removed or broken (git changes them all the time, so commands can too). Your git would then take its
+  config from elsewhere, or pass over the directory and fail or use a repository above it, so look before
+  you run git there; jig still finds the repository by its `.git`, so the next session keeps its config
+  read-only. A job a command leaves in the background can still do so after jig has looked, and after a
+  one-shot run nothing looks again.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
@@ -174,7 +176,7 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   settings file is refused, and a git file is reported by what it is. `read_file` and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
-  they are given it (`node_modules/pkg`, its own `dist/` included). The git they run to list files runs
+  they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
   with `core.fsmonitor` and hooks turned off; each run stops with the task, or after 30 seconds, and they
   then walk the files, since a named pipe where git reads (a `.gitignore`, `.git/info/exclude`, a nested
   repository's config) would have it wait forever. `grep` matches in a worker thread that Ctrl+C stops, as
@@ -220,10 +222,11 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   seconds, which is stopped: git waits as long as a named pipe is where it reads (a `.gitignore`, say), and
   a command can make one. Snapshots are never signed and run no hooks, whatever your git config says. When
   `/undo` fails (a lock another git left, say), it says why and keeps the snapshot, so you can try again.
-- **Credentials stay with jig.** Commands the model runs, hooks and jig's own git get jig's environment
-  without its API keys (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `OPENAI_API_KEY`).
-  They never need them, and a model that runs `env` to look around, as both agents did on Terminal-Bench,
-  would otherwise put the key in the conversation and the logs, within a prompt injection's reach.
+- **Credentials stay with jig.** Commands the model runs, hooks and the git jig runs on the project get
+  jig's environment without its API keys (`DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+  `OPENAI_API_KEY`). They never need them, and a model that runs `env` to look around, as both agents did
+  on Terminal-Bench, would otherwise put the key in the conversation and the logs, within a prompt
+  injection's reach.
 - **Prompt injection.** The system prompt tells the model that text in files and command output is data,
   not instructions, and to tell the user when it finds instructions there. The sandbox and the deny rules
   are what protect you when that isn't enough.

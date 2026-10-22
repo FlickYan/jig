@@ -132,7 +132,7 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   files the sandbox watches) it opens only if it is a regular file, without waiting: in a review, a
   command's `mkfifo .git`, where jig ran in a subdirectory, had jig wait after the task until it was
   killed, and a link to `/dev/zero` read without end. `jig skills` still reads the project's lockfile and
-  an installed skill's files as they are, so a named pipe there has `jig skills list` wait until it is
+  an installed skill's files as they are, so a named pipe there has `jig skills update` wait until it is
   killed. `jig skills add`, `update` and `remove` go by real path in the project as well, and refuse a name
   in the lockfile, which commands can write, that isn't a skill's name: a name of `../..` made `remove`
   delete the project. Nor do they, or a skill the model writes, change anything in a `.git` directory: each
@@ -267,10 +267,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
 - **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
   everything it read, so it gets one more call, without tools, to write up what it found, as it does when
   it is stopped for repeating itself or for replying twice with nothing. So does the main loop at its step
-  limit, with what it changed, verified and left undone: without it, a run that hit the limit left the user "Stopped after 50 steps"
-  and a diff to read (Python-Markdown's second attempt). The reply is a report, not evidence, and not a
-  finished answer to train on. The runs in `bench/` leave it out (`--no-wrap-up`): at evolve2's four
-  steps every attempt would make the extra call, and costs would no longer compare with earlier runs.
+  limit, with what it changed, verified and left undone: without it, a run that hit the limit left the user
+  "Stopped after 50 steps" and a diff to read (Python-Markdown's second attempt). The reply is a report,
+  not evidence, and not a finished answer to train on. The runs in `bench/` leave it out (`--no-wrap-up`):
+  at evolve2's four steps every attempt would make the extra call, and costs would no longer compare with
+  earlier runs.
 - **Checking before finishing is opt-in.** With nobody to look at the result, a model that declares a
   task done after a quick look has the last word; on Terminal-Bench, 15 of jig's 18 failures were tasks it
   finished on its own and got wrong. `--check` makes one-shot runs tell the model nobody can answer and
