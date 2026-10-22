@@ -85,7 +85,7 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
  * be the task. But not for a bare one named .git, whose config the file tools refuse too, nor for one with
  * linked worktrees, which is no server's: the user runs git in them (a bare clone, its worktrees beside it).
  * And a bare one in another repository's work tree leaves locked what that repository has in the project
- * (see aroundBare).
+ * or the bare one (see aroundBare).
  */
 export function gitControl(project: string, repo = gitDirs(project)): GitControl | undefined {
   if (!repo) return undefined;
@@ -98,22 +98,23 @@ export function gitControl(project: string, repo = gitDirs(project)): GitControl
 }
 
 /**
- * What of the repository around a bare one lies in the project, for gitControl to lock: the .git of a
- * submodule checkout in it, say. A command can make the project a bare repository as git takes one (a
- * HEAD, objects, refs, and a config that says it is bare). Made in the directory holding a submodule's
- * checkout, the next session there locked nothing, and a command in it could point the checkout's .git at
- * a git directory with a config of its own, which the user's git status in the repository around then
- * read. Only locked: that repository's git directory isn't the project's, so it is neither made writable
- * nor bound in place (bubblewrap makes a directory it binds writable).
+ * What of the repository around a bare one lies in the project or the bare one, which createSandbox makes
+ * writable (the bare one is above the project when jig starts in a subdirectory of it), for gitControl to
+ * lock: the .git of a submodule checkout there, say. A command can make the project a bare repository as
+ * git takes one (a HEAD, objects, refs, and a config that says it is bare). Made in the directory holding
+ * a submodule's checkout, the next session there, or in a subdirectory, locked nothing, and a command in
+ * it could point the checkout's .git at a git directory with a config of its own, which the user's git
+ * status in the repository around then read. Only locked: that repository's git directory isn't the
+ * project's, so it is neither made writable nor bound in place (bubblewrap makes what it binds writable).
  */
 function aroundBare(project: string, bare: string): GitControl | undefined {
   const outer = repositoryAround(bare);
   if (!outer) return undefined;
-  const root = realpathSync(project); // the listing has real paths
+  const writable = [realpathSync(project), bare]; // the listing has real paths
   const { locked, gitDirectories } = controlOf(outer.repo, dotGitFile(outer.tree));
-  const inProject = (path: string) => isInside(root, path);
-  const control = { locked: locked.filter(inProject), fixed: [], gitDirectories: gitDirectories.filter(inProject) };
-  return control.locked.length ? control : undefined; // any of its git directories in the project has its config there too
+  const inWritable = (path: string) => writable.some((dir) => isInside(dir, path));
+  const control = { locked: locked.filter(inWritable), fixed: [], gitDirectories: gitDirectories.filter(inWritable) };
+  return control.locked.length ? control : undefined; // any of its git directories there has its config there too
 }
 
 /**

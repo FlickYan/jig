@@ -266,6 +266,12 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.match(await inLibs("echo planted > ../.git/planted"), denied);
       assert.equal(await readFile(dotGit, "utf8"), pointer);
       assert.equal(existsSync(join(repo, ".git", "planted")), false);
+      // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
+      const deep = join(libs, "deep");
+      await mkdir(deep);
+      const inDeep = createSandbox(deep, { network: false })!;
+      assert.match(await runCommand(`echo "gitdir: ${tmpdir()}" > ../s/.git`, deep, 20, undefined, inDeep), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
       // Seatbelt refuses a new .git there. bubblewrap can't keep the checkout in place, so the sandbox tells.
       await inLibs("mv s s-moved && mkdir s && git init -q s");
       assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
@@ -599,6 +605,9 @@ describe("the macOS sandbox's profile", () => {
       assert.equal(denied, `(deny file-write* (literal "${join(real, "libs", "s", ".git")}"))`);
       assert.doesNotMatch(profile, /file-write-unlink/);
       assert.deepEqual(control.fixed, []);
+      // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
+      await mkdir(join(repo, "libs", "deep"));
+      assert.deepEqual(gitControl(join(repo, "libs", "deep"))?.locked, [join(real, "libs", "s", ".git")]);
     } finally {
       await rm(base, { recursive: true, force: true });
     }

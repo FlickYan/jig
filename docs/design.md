@@ -171,10 +171,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   `config` says it is bare, and at `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's
   dotfiles repository for the project's, and let commands write in it. Stopping at a `config` alone, which
   a command in a subdirectory of a repository can write, the next session there locked nothing. A command
-  can make the whole bare repository too, so what the repository around a bare one has in the project
-  stays read-only (the `.git` of a submodule checkout in it, say), though that repository's git directory
-  isn't made writable. Commands can still make a repository of their own (a submodule whose git
-  directory is in its checkout is one), so jig's git doesn't rely on any of this.
+  can make the whole bare repository too, so what the repository around a bare one has in the project or
+  the bare one, both writable, stays read-only (the `.git` of a submodule checkout there, say), though
+  that repository's git directory isn't made writable. Commands can still make a repository of their own
+  (a submodule whose git directory is in its checkout is one), so jig's git doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.
