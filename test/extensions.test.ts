@@ -502,7 +502,8 @@ describe("subagents", () => {
 
   it("report what they found when they reply twice with nothing, and are told only that", async () => {
     const seen: MessageParam[][] = [];
-    const model = fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([]), reply([])], seen);
+    // The first of them cut off at the output limit, so the note after it is the one that says so.
+    const model = fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([], "max_tokens"), reply([])], seen);
     const answer = await subagentTool(setup(model)).run({ description: "look", prompt: "Look around." }, context());
 
     assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: empty.)");

@@ -405,6 +405,23 @@ describe("proposing a skill", () => {
     }
     assert.deepEqual([(await readdir(gitDir)).sort(), await readFile(join(gitDir, "config"), "utf8")], before);
   });
+
+  it("isn't saved, nor an earlier version removed, in a folder the settings hide", async () => {
+    // A hidden folder in the project is out of commands' reach, but a link to it isn't: with .jig linked
+    // there, jig itself would replace a folder in it that commands can't even read.
+    const secret = join(dir, "secret");
+    await mkdir(join(secret, "skills", "release-notes"), { recursive: true });
+    await writeFile(join(secret, "skills", "release-notes", "work.txt"), "the user's own\n");
+    await symlink("secret", join(dir, ".jig"));
+    for (const decision of ["project", "proposal"] as const) {
+      await assert.rejects(
+        proposeSkillTool(async () => decision).run({ ...proposal }, { ...context(), hidden: [secret] }),
+        /^Error: \.jig\/.*skills\/release-notes is hidden by the user's settings\. Don't try to get around it\.$/,
+      );
+    }
+    assert.equal(await readFile(join(secret, "skills", "release-notes", "work.txt"), "utf8"), "the user's own\n");
+    assert.ok(!existsSync(join(secret, "proposals")));
+  });
 });
 
 describe("testing a skill", () => {
