@@ -510,6 +510,12 @@ describe("subagents", () => {
     const request = JSON.stringify(seen.at(-1));
     assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: reply now with what you found so far/);
     assert.doesNotMatch(request, /continue the task|run out of steps/);
+    // The first cut off at the output limit while still thinking: its own note gives way too.
+    const cut: MessageParam[][] = [];
+    const thinking = { type: "thinking", thinking: "Every file, one by one", signature: "sig" } as Block;
+    await subagentTool(setup(fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([thinking], "max_tokens"), reply([])], cut))).run({ description: "look", prompt: "Look around." }, context());
+    assert.match(JSON.stringify(cut.at(-1)), /tool_result.*Two of your replies were empty\. Don't call any more tools/);
+    assert.doesNotMatch(JSON.stringify(cut.at(-1)), /continue the task/);
   });
 
   it("keep the text they gave before replying twice with nothing, when their report has none", async () => {

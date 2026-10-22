@@ -136,6 +136,12 @@ describe("the reviewer", () => {
     const request = JSON.stringify(seen.at(-1));
     assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: give your verdict now/);
     assert.doesNotMatch(request, /continue the task|run out of steps/);
+    // The first cut off at the output limit while still thinking: its own note gives way too.
+    const cut: MessageParam[][] = [];
+    const thinking: ModelTurn = { message: { ...turn("", "max_tokens").message, content: [{ type: "thinking", thinking: "Every requirement", signature: "sig" }] }, malformed: new Map() };
+    await reviewer("strong", await setupWith([look("a"), thinking, silent(), turn("APPROVED")], cut)).review(work);
+    assert.match(JSON.stringify(cut.at(-1)), /tool_result.*Two of your replies were empty\. Don't call any more tools: give your verdict now/);
+    assert.doesNotMatch(JSON.stringify(cut.at(-1)), /continue the task/);
   });
 
   it("sends nothing back when it approves or stays cut off, and finishes a verdict that was cut off", async () => {

@@ -261,6 +261,10 @@ describe("runAgent", () => {
     assert.deepEqual(wrapped.summaries.map((messages) => messages.at(-1)), [{ role: "user", content: WRAP_UP }]);
     // The user hears why the last step did nothing before the request for the wrap-up.
     assert.deepEqual(notices, ["The model replied without text or a tool call on the last step.", "Out of steps: asking the model where the work stands."]);
+    // After two empty replies, the note asking for a tool call was never answered: the wrap-up takes it back.
+    const twice = setup([reply([toolUse("t1", "bash", { command: "true" })]), reply([]), reply([])], { maxSteps: 3, wrapUp: true, ui });
+    assert.equal((await runAgent(twice.conversation, twice.options)).stop, "max_steps");
+    assert.deepEqual(twice.summaries[0].slice(-2).map((message) => (typeof message.content === "string" ? message.content : message.content[0].type)), ["tool_result", WRAP_UP]);
   });
 
   it("checks no work on an empty end: there is no answer for --check, the reviewer or the Stop hooks", async () => {

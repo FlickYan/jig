@@ -1005,6 +1005,21 @@ describe("an interactive session fed through stdin", () => {
     }
   });
 
+  it("tells the model a request that ended after two empty replies is over, as the note asking it to go on is still there", async () => {
+    // The next task read "first task / continue the task, calling a tool or giving your answer / second task".
+    let replies = 0;
+    const api = await fakeMessagesApi(() => (replies++ < 2 ? [] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(args, { api, cwd: project, stdin: "first task\nsecond task\n" });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 3, output);
+      assert.match(JSON.stringify(api.requests[2].messages), /Your last reply was empty: continue the task/);
+      assert.match(last(api.requests[2]), /^"\(Note from jig: Your previous request ended without an answer from you\.\)\\n\\nsecond task"$/);
+    } finally {
+      api.close();
+    }
+  });
+
   it("undoes a task and tells the model, announces plan mode, and starts a new session at /reset", async () => {
     const api = await fakeMessagesApi((request) => (last(request).includes("Write notes.txt.") ? [{ tool: "write_file", input: { path: "notes.txt", content: "draft\n" } }] : [{ text: "Done." }]));
     try {

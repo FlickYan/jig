@@ -420,8 +420,12 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   const callModel = escalated ? opts.escalate!.callModel : opts.callModel;
   let report: Message;
   const asked = Date.now();
+  // The note after an empty reply, if it is last, asked for a tool call and was never answered: the request
+  // takes it back, as a subagent's or the reviewer's does (withRequest).
+  const last = conversation.messages.at(-1)?.content;
+  const sent = typeof last === "string" && AFTER_EMPTY.includes(last) ? conversation.messages.slice(0, -1) : conversation.messages;
   try {
-    ({ message: report } = await callModel([...conversation.messages, request], signal, { summarize: true }));
+    ({ message: report } = await callModel([...sent, request], signal, { summarize: true }));
   } catch (err) {
     if (signal?.aborted) return result("interrupted", opts.maxSteps);
     opts.ui.notice(`The wrap-up failed (${errorMessage(err)}), so the task ends without one.`);

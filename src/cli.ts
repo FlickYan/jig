@@ -10,7 +10,7 @@ import { existsSync } from "node:fs";
 import { constants } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
+import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { runHooks, runStopHooks } from "./hooks.ts";
@@ -514,6 +514,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       );
     }
     takeSnapshot(label);
+    // The loop's note after an empty reply, left last when the previous request ended without an answer:
+    // it asks the model to go on with that request, so the model is told it is over.
+    const last = conversation.messages.at(-1)?.content;
+    if (typeof last === "string" && AFTER_EMPTY.includes(last)) notes.push("Your previous request ended without an answer from you.");
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
