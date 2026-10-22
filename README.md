@@ -162,6 +162,7 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   settings, the git files the sandbox watches) it reads only if it is a regular file: a named pipe a
   command made there would have jig wait until it was killed, and a link to `/dev/zero` never ends. Such
   an AGENTS.md or skill is left out, a settings file is refused, and a git file is reported by what it is.
+  `read_file` and `edit_file` likewise open only a regular file, and tell the model so.
   What `jig skills add`, `update` and `remove` change in the project, and a skill the model wrote, go
   by real path too, and never into a `.git` directory, where a skill's folder could be a submodule's git
   directory; they refuse a name in the lockfile that isn't a skill's name: commands can write it.

@@ -119,11 +119,16 @@ export function isInside(root: string, abs: string): boolean {
   return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
 }
 
-/** Fails with a message the model can act on if `abs` is missing or is a directory. */
+/**
+ * Fails with a message the model can act on if `abs` is missing or isn't a regular file. Opening a named
+ * pipe a command made would wait for a writer, in a thread that Ctrl+C, --time-limit and a kill can't stop
+ * (exiting waits for it too), and a link to a device such as /dev/zero would never end.
+ */
 export async function assertFile(abs: string, path: string): Promise<Stats> {
   const info = await stat(abs).catch(() => null);
   if (!info) throw new Error(`File not found: ${path}`);
   if (info.isDirectory()) throw new Error(`${path} is a directory. Use glob or bash (e.g. ls) to see what is in it.`);
+  if (!info.isFile()) throw new Error(`${path} isn't a regular file (it may be a named pipe or a device). The file tools only read and change regular files.`);
   return info;
 }
 

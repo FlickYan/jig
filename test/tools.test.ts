@@ -50,12 +50,18 @@ describe("read_file", () => {
     assert.equal(await read("win.txt"), "     1\tone\n     2\ttwo\n");
   });
 
-  it("explains missing files, directories and binary files", async () => {
+  it("explains missing files, directories, files that aren't regular and binary files", async () => {
     await assert.rejects(read("nope.txt"), /File not found: nope\.txt/);
     await mkdir(join(cwd, "dir"));
     await assert.rejects(read("dir"), /is a directory/);
     await writeFile(join(cwd, "blob.bin"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
     await assert.rejects(read("blob.bin"), /binary/);
+    // Opening a named pipe would wait for a writer, past Ctrl+C and --time-limit, and /dev/zero never ends.
+    // (edit_file refuses the link before that, as it leads outside the project.)
+    execFileSync("mkfifo", [join(cwd, "fifo")]);
+    await symlink("/dev/zero", join(cwd, "zeros"));
+    for (const path of ["fifo", "zeros"]) await assert.rejects(read(path), new RegExp(`${path} isn't a regular file`));
+    await assert.rejects(edit("a", "b", "fifo"), /fifo isn't a regular file/);
   });
 
   it("refuses paths outside the working directory", async () => {
