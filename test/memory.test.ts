@@ -213,6 +213,23 @@ describe("proposals in the agent loop", () => {
     assert.equal(overlapped, false);
     assert.deepEqual(loadMemories(project).map((m) => m.name).sort(), ["first", "second"]);
   });
+
+  it("are asked with the task's signal, and say why nothing was saved once it stopped the question", async () => {
+    // At --time-limit the question closes unanswered (as terminalApprover's does), and the model is told why.
+    await proposeMemoryTool(project, yes).run(saved("tabs"), context());
+    const stopped = new AbortController();
+    stopped.abort("the time limit (--time-limit) was reached");
+    const given: (AbortSignal | undefined)[] = [];
+    const closed: Approve = async (_title, _details, signal) => (given.push(signal), false);
+    const ctx = { ...context(), signal: stopped.signal };
+    const why = "Nothing was saved: the time limit (--time-limit) was reached.";
+    assert.equal(await proposeMemoryTool(project, closed).run(saved("spaces"), ctx), why);
+    assert.equal(await proposeMemoryTool(project, closed).run({ action: "forget", scope: "project", name: "tabs" }, ctx), why);
+    assert.equal(await proposeInstructionsTool(closed).run({ new_string: "Indent with tabs." }, ctx), why);
+    assert.deepEqual(given, [stopped.signal, stopped.signal, stopped.signal]);
+    assert.deepEqual(loadMemories(project).map((memory) => memory.name), ["tabs"]);
+    assert.equal(existsSync(join(project, "AGENTS.md")), false);
+  });
 });
 
 describe("memory in the CLI", () => {

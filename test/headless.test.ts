@@ -812,6 +812,36 @@ describe("a one-shot run with --time-limit", () => {
     }
   });
 
+  it("closes a question asking to keep a skill or a memory at the limit too, and saves nothing", async () => {
+    // They waited past the limit for an answer, and a late yes saved the proposal after the deadline.
+    const api = await fakeMessagesApi((request) => {
+      const tools = (request.tools as { name: string }[]).map((tool) => tool.name);
+      if (typeof (request.messages as { content: unknown }[]).at(-1)?.content !== "string") return [{ text: "Done." }];
+      if (tools.includes("propose_skill")) return [{ tool: "propose_skill", input: { name: "tabby", description: "Indent with tabs. Use when indenting.", instructions: "Indent with tabs." } }];
+      if (tools.includes("propose_memory")) return [{ tool: "propose_memory", input: { action: "save", scope: "project", name: "tabs", description: "Indent with tabs.", body: "The user said so." } }];
+      return [{ text: "Done." }];
+    });
+    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const limited = ["--no-sandbox", "--model", "claude-haiku-4-5", "--time-limit", "1"];
+    const closed = /Keep it\? [^\n]*: \n[^\n]*Nothing was saved: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n/;
+    try {
+      const started = Date.now();
+      const skill = await runJig(["skills", "new", "indenting", ...limited], { api, cwd: project, terminal: true, env: { JIG_HOME: home } });
+      assert.equal(skill.code, 7, skill.output);
+      assert.ok(Date.now() - started < 10_000, "it didn't wait for an answer");
+      assert.match(skill.output, closed);
+      assert.equal(existsSync(join(project, ".jig", "skills", "tabby")), false);
+      // jig memory reflect, on the session a task leaves.
+      await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Indent the parser."], { api, cwd: project, env: { JIG_HOME: home } });
+      const memory = await runJig(["memory", "reflect", ...limited], { api, cwd: project, terminal: true, env: { JIG_HOME: home } });
+      assert.equal(memory.code, 7, memory.output);
+      assert.match(memory.output, closed);
+      assert.deepEqual((await readdir(home, { recursive: true })).filter((path) => path.endsWith("tabs.md")), []);
+    } finally {
+      api.close();
+    }
+  });
+
   it("stops a model call still waiting at the limit", async () => {
     const server = createServer((req) => req.resume()); // takes the request and never answers
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
@@ -1014,10 +1044,12 @@ describe("an interactive session fed through stdin", () => {
     let step = 0;
     const api = await fakeMessagesApi(() => (step < calls.length ? [calls[step++]] : [{ text: "Done." }]));
     try {
-      const stdin = "Take notes.\n/reset\nAgain.\n";
+      const stdin = "Take notes.\n/notes now\n/reset\nAgain.\n";
       const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"], { api, cwd: project, stdin, timeout: 20_000 });
       assert.equal(code, 0, output);
       assert.equal(api.requests.length, 6, output);
+      // Typed as /notes, the skill whose SKILL.md is gone is said to be, and the session goes on: it ended it.
+      assert.match(output, /^> The skill "notes" no longer has a SKILL\.md file\.$/m);
       const system = systemText(api.requests[0] as { system?: string });
       assert.match(system, /<skill name="notes">/);
       assert.doesNotMatch(system, /piped|zeroed|looped|<instructions/);

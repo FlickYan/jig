@@ -450,7 +450,8 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to
 check its work against the task, if a step is left for that, and stops at the next such reply. Also on
 `--max-steps` model calls, at `--time-limit` seconds (a model call or command still running is stopped,
-a question asking you to allow a tool call is closed unanswered, and none starts after; nor do `--check`
+a question asking you to allow a tool call or to keep a proposal is closed unanswered, and none starts
+after; nor do `--check`
 and `--reviewer` in the last quarter of the time, since what they find might not get done), on
 Ctrl+C, and when a safety classifier declines the request. A reply cut off at the output limit isn't an
 answer: jig asks the model to continue it, twice at most. Nor is one with no text and no tool call (empty,

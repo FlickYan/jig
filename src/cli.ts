@@ -547,8 +547,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
-  function runSkill(skill: Skill, task: string): Promise<Ending> {
-    const content = loadSkill(skill);
+  async function runSkill(skill: Skill, task: string): Promise<Ending> {
+    const content = skillContent(skill);
+    if (content === undefined) return "error";
     conversation.pin(`skill:${skill.name}`, content);
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
@@ -556,10 +557,23 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
   function runSkillWriting(task: string, label: string): Promise<Ending> {
     const writer = skills.find((skill) => skill.name === "skill-writer");
-    if (!writer) return runTask(task, label);
-    const content = loadSkill(writer);
+    const content = writer && skillContent(writer);
+    if (!writer || content === undefined) return runTask(task, label);
     conversation.pin(`skill:${writer.name}`, content);
     return runTask(`${content}\n\n${task}`, label);
+  }
+
+  /**
+   * A skill's instructions, or a notice and undefined if its SKILL.md is gone (or is a named pipe) since
+   * jig found it: a command or a checkout can do that mid-session, and it is no reason to end the session.
+   */
+  function skillContent(skill: Skill): string | undefined {
+    try {
+      return loadSkill(skill);
+    } catch (err) {
+      ui.notice((err as Error).message);
+      return undefined;
+    }
   }
 
   /** Finds the skills and memories again (new ones may have been saved) and gives the model the new lists. */

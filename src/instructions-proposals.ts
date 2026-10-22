@@ -66,7 +66,7 @@ export function proposeInstructionsTool(approve: Approve): Tool {
         diff = lines(added, "+ ").join("\n");
       }
       const shown = await linkedName(ctx.cwd, path, file);
-      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${shown}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`))) return notApproved(`edit to ${file}`);
+      if (!(await approve(`${existsSync(path) ? "Edit" : "Create"} ${shown}?`, `${reason ? `  Why: ${reason}\n` : ""}${diff}`, ctx.signal))) return notApproved(`edit to ${file}`, ctx.signal);
       await check();
       writeFileSync(path, next);
       return `Edited ${shown}. It applies from the next session (or after /reset).`;
