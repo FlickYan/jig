@@ -217,7 +217,7 @@ export async function installSkill(info: SkillInfo, source: SkillSource, fetched
   if (existsSync(target) && !force) throw new Error(`There is already a skill "${info.name}" in ${target} (--force replaces it).`);
   rmSync(target, { recursive: true, force: true }); // a link in its place is removed, not what it leads to
   mkdirSync(dirname(target), { recursive: true });
-  cpSync(info.dir, target, { recursive: true, filter: (path) => basename(path) !== ".git" });
+  cpSync(info.dir, target, { recursive: true, filter: (path) => basename(path).toLowerCase() !== ".git" }); // as isGitControl
   const lock = readLock(scope, project);
   lock[info.name] = {
     source: source.spec,

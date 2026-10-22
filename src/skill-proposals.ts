@@ -92,6 +92,9 @@ function toProposal(input: ToolInput): SkillProposal {
     const clean = normalize(path);
     if (isAbsolute(path) || clean.startsWith("..") || clean.split(sep).includes("..")) problems.push(`The file ${path} isn't inside the skill's folder.`);
     else if (clean === "SKILL.md" || clean === join("evals", "evals.json")) problems.push(`${path} is written from the other fields; leave it out of files.`);
+    // Nor in a .git of the skill's own, which git there would take for its git directory, config and all.
+    // Without case, as isGitControl: macOS's file systems usually ignore it.
+    else if (clean.toLowerCase().split(sep).includes(".git")) problems.push(`The file ${path} can't be part of a skill: git would take it for its own.`);
     if (typeof content !== "string") problems.push(`The content of ${path} isn't text.`);
   }
   if (!Array.isArray(evals) || evals.some((item) => typeof item?.prompt !== "string")) problems.push("Each eval needs a prompt.");

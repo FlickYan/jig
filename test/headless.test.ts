@@ -1064,13 +1064,16 @@ describe("an interactive session fed through stdin", () => {
       assert.equal(code, 0, output);
       assert.equal(api.requests.length, 6, output);
       // Typed as /notes, the skill whose SKILL.md is gone is said to be, and the session goes on: it ended it.
-      assert.match(output, /^> The skill "notes" no longer has a SKILL\.md file\.$/m);
+      assert.match(output, /^> The skill "notes" no longer has a SKILL\.md, or it isn't a regular file \(a named pipe, say\)\.$/m);
       const system = systemText(api.requests[0] as { system?: string });
       assert.match(system, /<skill name="notes">/);
       assert.doesNotMatch(system, /piped|zeroed|looped|<instructions/);
+      // The user is told why those skills are missing; the link to itself, like a missing SKILL.md, says nothing.
+      for (const name of ["piped", "zeroed"]) assert.match(output, new RegExp(`Skipped the skill in \\S+${name}: its SKILL\\.md isn't a regular file\\.`));
+      assert.doesNotMatch(output, /Skipped the skill in \S+looped/);
       assert.match(last(api.requests[1]), /The skill \\"notes\\" has no file references\/zero\.md\./);
       assert.match(last(api.requests[2]), /AGENTS\.md isn't a regular file \(a named pipe, say\), so it can't be edited\./);
-      assert.match(last(api.requests[4]), /The skill \\"notes\\" no longer has a SKILL\.md file\./);
+      assert.match(last(api.requests[4]), /The skill \\"notes\\" no longer has a SKILL\.md, or it isn't a regular file/);
       // /reset finds the instructions and skills again: the skill whose SKILL.md is now a named pipe is gone,
       // and the one whose SKILL.md is now a link to itself is skipped.
       assert.match(output, /Started a new conversation\.\n/);

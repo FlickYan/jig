@@ -63,8 +63,13 @@ export function discoverSkills(root: string, home = homedir(), { builtin = BUILT
   for (const [dir, scope] of places.filter(([d]) => existsSync(d) && statSync(d).isDirectory())) {
     for (const entry of readdirSync(dir).sort()) {
       const skillDir = join(dir, entry);
-      const text = readRegularFile(join(skillDir, "SKILL.md"));
-      if (text === undefined) continue;
+      const file = join(skillDir, "SKILL.md");
+      const text = readRegularFile(file);
+      if (text === undefined) {
+        // A folder without one isn't a skill; one that is a named pipe, say, is left out unread.
+        if (existsSync(file)) warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md isn't a regular file.`);
+        continue;
+      }
       const { name = entry, description } = frontmatter(text);
       if (hidden.includes(name)) continue;
       if (!description) {
@@ -184,7 +189,7 @@ export function skillTool(skills: Skill[]): Tool {
 /** A skill's instructions as the model sees them: the SKILL.md body, where it lives, and what else is there. */
 export function loadSkill(skill: Skill): string {
   const text = readRegularFile(join(skill.dir, "SKILL.md"));
-  if (text === undefined) throw new Error(`The skill "${skill.name}" no longer has a SKILL.md file.`);
+  if (text === undefined) throw new Error(`The skill "${skill.name}" no longer has a SKILL.md, or it isn't a regular file (a named pipe, say).`);
   const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
   const files = listSkillFiles(skill.dir).filter((file) => file !== "SKILL.md");
   const resources = files.length
