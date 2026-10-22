@@ -19,7 +19,7 @@ export type Mode = (typeof MODES)[number];
 
 export const MODE_HELP: Record<Mode, string> = {
   plan: "look around and plan; refuse every change",
-  ask: "ask before every file change and command",
+  ask: "ask before every file change, and every command that does more than read",
   edits: "change files in the project freely; ask before commands the sandbox doesn't contain",
   auto: "never ask",
 };

@@ -34,13 +34,13 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   ignores, and tracks nothing in, is walked when the model names it (`grep` in `node_modules/pkg`): git
   lists nothing there, and grep said "No matches." for text that was in it. Only `.git` is skipped in it,
   since most packages keep their code in `dist/` or `build/`; the project itself, which a home directory's
-  git may ignore whole, still skips the list. A search that
-  doesn't look at every file says so: `grep` reads 20,000 files at most, the first by name, and a walk
-  outside git stops there too. The cut used to be silent: in a large repository, grep said "No matches."
-  for code that was there. `grep` matches in a worker thread that Ctrl+C stops, as do 30 seconds on one
-  file: a regular expression can take exponentially long on some lines, and in jig's own thread nothing
-  can stop it. The limit is for one file because a whole search can take that long just reading, from a
-  cold disk in a fresh container.
+  git may ignore whole, still skips the list. A search cut short of the file list says so: `grep` reads
+  20,000 files at most, the first by name, and a walk outside git stops there too. The cut used to be
+  silent: in a large repository, grep said "No matches." for code that was there. Binary files and files
+  over 5 MB are still skipped without a word. `grep` matches in a worker thread that Ctrl+C stops, as do 30
+  seconds on one file: a regular expression can take exponentially long on some lines, and in jig's own
+  thread nothing can stop it. The limit is for one file because a whole search can take that long just
+  reading, from a cold disk in a fresh container.
 - **Streamed tool input is checked twice.** For Claude, tool input streams as it is generated
   (`eager_input_streaming`), so the API no longer validates it. The SDK's lenient parser can turn
   `"say "hi" now"` into `"say "`, which would silently write a truncated file. jig re-parses the raw JSON
@@ -54,13 +54,15 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   stay fixed for the whole session. This keeps the prompt cache hitting (each call pays full price only
   for what is new) and keeps the model's earlier thinking blocks valid (the API can reject them once the
   history before them has changed).
-- **Compaction replaces the history; it never edits it.** The summary request repeats the last request
-  with one extra message, so it is served from the prompt cache. Afterwards only the summary is sent:
-  keeping the last few turns verbatim would replay thinking blocks whose earlier history is gone, which
-  the API can reject, and a fresh start is valid for both providers. A request the user just typed is
-  kept word for word after the summary, and the model must read files again before editing them.
-  Mid-task, the task is restated word for word after the summary, with the log of file changes and
-  commands a reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
+- **Compaction replaces the history; it never edits it.** The summary request repeats the last request with
+  one extra message, and allows no tool call (`tool_choice: none`). For Claude, that change keeps only the
+  tools and the system prompt in the prompt cache: the history is written to it again. Afterwards only the
+  summary is sent: keeping the last few turns verbatim would replay thinking blocks whose earlier history
+  is gone, which the API can reject, and a fresh start is valid for every provider. A request the user just
+  typed is kept word for word after the summary, and the model must read a file again before `write_file`
+  replaces it. Mid-task, the task is restated after the summary, word for word up to 20,000 characters (a
+  longer one by its start and its end, since what it asks for is often last), with the log of file changes
+  and commands a reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
 - **The API says when the conversation is too long.** jig doesn't know every server's window, so it
   doesn't compact before a request that won't fit (milestone 28); when the API rejects one as too long,
   by one of a few specific wordings, it compacts and makes the call again, once. The summary request is
@@ -76,9 +78,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   and a note after the last user message asks the model to go on: two user messages in a row, which the
   Messages API merges into one turn, as with compaction's summary request.
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
-  runner's worker processes die too. So does jig's exit: the group is a session of its own, which closing
-  the terminal doesn't reach, so without bubblewrap's `--die-with-parent` a command ran on after jig was
-  killed. Commands get no stdin, so an interactive prompt gets end-of-file instead of hanging the agent.
+  runner's worker processes die too. So does jig's exit, which closing the terminal (SIGHUP) and a plain
+  `kill` (SIGTERM) bring about too: the group is a session of its own, which closing the terminal doesn't
+  reach, so without bubblewrap's `--die-with-parent` a command ran on after jig was killed. Without it, one
+  still does after a `kill -9`, which jig can't catch. Commands get no stdin, so an interactive prompt gets
+  end-of-file instead of hanging the agent.
 - **jig hides its arguments.** Models stop programs by matching their command lines
   (`pkill -f server.py`), and jig's arguments hold the task, which names the very files and programs a
   model might stop: twice in milestone 10 the model's command killed jig. So jig sets its process title to
@@ -107,71 +111,76 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   command leaves in the background would die with its shell, which the rule above leaves running. And
   `--unshare-net` cuts off IP only: a daemon listening on a Unix socket (Docker's, say) stays within
   reach, and closing that would take seccomp.
-- **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach,
-  so they check paths themselves: against the project and the `--add-dir` directories, and a change
-  again by where its path really leads. Without that, a symlink (a cloned repository can carry one, a
-  command can make one) let an audit's edit reach `~/.bashrc`, with no question in `edits` mode.
-  Reading still follows links out, since commands can read anything anyway; refusing would protect only
-  the hidden paths, which are checked by real path instead, and would break linked packages. A git
-  directory's `config` and hooks are never changed, since git runs the programs they name outside the
-  sandbox. Some of jig's own writes into the project are held to the same: in an audit, a command's
-  `ln -sf` sent the `--stats` file and an approved AGENTS.md edit to a file outside it. Those edits and
-  the skills the model writes now go by real path, and the stats file, rewritten all through a run, is
-  written anew and renamed into place, since a rename replaces a link where a write follows it (a linked
-  folder on the way to it is still followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is still
-  written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
-  sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
-  earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
-  write. So a named pipe elsewhere is replaced too. What jig reads itself (AGENTS.md, skills, the
-  settings, the git files the sandbox watches) it opens only if it is a regular file, without waiting:
-  in a review, a command's `mkfifo .git`, where jig ran in a subdirectory, had jig wait after the task
-  until it was killed, and a link to `/dev/zero` read without end. `jig skills add`, `update` and
-  `remove` go by real path in the project as well, and take only a skill's name from the lockfile,
-  which commands can write:
-  a name of `../..` made `remove` delete the project. They also change nothing in a `.git` directory. They
-  replace a skill's folder whole, and the check for `config` and hooks looks at one file: in a review,
-  `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a submodule's config.
-  A skill the model wrote replaced its folder whole too, and is held to the same. `update` skips an entry
-  it refuses, or can't fetch or install, and updates the rest: one entry a command wrote, with a bad name,
-  a missing path or no fields at all, used to stop it before the user's own skills.
-- **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's
-  own process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed
-  `git config core.fsmonitor` ran a program as jig on the next search, and it copied the API key. So jig
-  runs git with fsmonitor and hooks turned off and without its API keys. The sandbox also keeps
-  read-only, for the user's own git after the session, the repository's git config and hooks and its
-  submodules', and the files that point git at a git directory (every worktree's and submodule
-  checkout's `.git` file, and every worktree's `commondir`, not only the one jig runs in: the user runs
-  git in the others too) or add config (`config.worktree`); and the directories holding them in the git
-  directory in place, since one moved aside could be replaced. So `git worktree remove`, and `git rm` or
-  `git mv` of a submodule, fail in the sandbox for one that was there when the session began. bubblewrap
-  can only make a path read-only by binding something over it, which creates a missing one: a missing
-  hooks directory is created, empty as git's default one, but an empty `commondir` would break git. Nor
-  can it keep a submodule's checkout in place short of fixing every directory above it in the project.
-  So on Linux a command can still create a `commondir` or `config.worktree`, or put another checkout in
-  a submodule's place, and jig warns after the task and when a session ends; Seatbelt refuses them (a
-  symlink in a checkout's place gets the warning). With jig started in a subdirectory of a repository,
-  a `.git` a command makes there is the one the user's git there finds; making a repository can be the
-  task, so neither sandbox refuses it, and jig warns of it the same way. The sandbox finds the
-  repository by the nearest `.git`, and submodules' git directories by their `config` or `HEAD`, not by
-  whether git takes them for one: git passes over a git directory whose `HEAD`, `objects` or `refs` are
-  gone or broken, and those stay writable, as git changes them all the time. When the sandbox asked git,
-  a command that moved `.git/HEAD` aside had the next session lock nothing there, and a command in that
-  one could change the config and put `HEAD` back. jig warns of such a move as well. A job a command
-  leaves in the background can still do it after jig has looked, and after a one-shot run nothing looks
-  again.
-  Commands can still make a repository of their own (a submodule whose git directory is in its checkout
-  is one), so jig's git doesn't rely on any of this.
+- **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
+  they check paths themselves: against the project and the `--add-dir` directories, and a change again by
+  where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can
+  make one) let an audit's edit reach `~/.bashrc`, with no question in `edits` mode. Reading still follows
+  links out, since commands can read anything anyway; refusing would protect only the hidden paths, which
+  are checked by real path instead, and would break linked packages. A `.git` directory's `config` and
+  hooks, and the files that say where they are, are never changed, since git runs the programs they name
+  outside the sandbox. The tools know a git directory by that name, so one by another name
+  (`--separate-git-dir` can put one in the project) is changed like any other file. Some of jig's own
+  writes into the project are held to the same: in an audit, a command's `ln -sf` sent the `--stats` file
+  and an approved AGENTS.md edit to a file outside it. Those edits and the skills the model writes now go
+  by real path, and the stats file, rewritten all through a run, is written anew and renamed into place,
+  since a rename replaces a link where a write follows it (a linked folder on the way to it is still
+  followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is still written to: jig can't make a file
+  there, or as root would replace `/dev/stdout` with one, and no sandboxed command can put a link there.
+  That goes by where the path is, not by what is there: a job an earlier run left in the background can
+  leave a link to a device, or a named pipe, anywhere else it can write. So a named pipe elsewhere is
+  replaced too. What jig reads from the project to work in it (AGENTS.md, skills, the settings, the git
+  files the sandbox watches) it opens only if it is a regular file, without waiting: in a review, a
+  command's `mkfifo .git`, where jig ran in a subdirectory, had jig wait after the task until it was
+  killed, and a link to `/dev/zero` read without end. `jig skills` still reads the project's lockfile and
+  an installed skill's files as they are, so a named pipe there has `jig skills list` wait until it is
+  killed. `jig skills add`, `update` and `remove` go by real path in the project as well, and refuse a name
+  in the lockfile, which commands can write, that isn't a skill's name: a name of `../..` made `remove`
+  delete the project. Nor do they, or a skill the model writes, change anything in a `.git` directory: each
+  replaces a skill's folder whole, while the file tools' check for `config` and hooks looks at one file,
+  and in a review, `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a
+  submodule's config. `update` skips an entry it refuses, or can't fetch or install, updates the rest and
+  exits non-zero: one entry a command wrote, with a bad name, a missing path or no fields at all, used to
+  stop it before the user's own skills.
+- **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's own
+  process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed `git config core.fsmonitor`
+  ran a program as jig on the next search, and it copied the API key. So jig runs git with fsmonitor and
+  hooks turned off and without its API keys. The sandbox also keeps read-only, for the user's own git after
+  the session, the repository's git config and hooks and its submodules', and the files that point git at a
+  git directory (every worktree's and submodule checkout's `.git` file, and every worktree's `commondir`,
+  not only the one jig runs in: the user runs git in the others too) or add config (`config.worktree`); and
+  the directories holding them in the git directory in place, since one moved aside could be replaced. So
+  `git worktree remove`, and `git rm` or `git mv` of a submodule, fail in the sandbox for one that was
+  there when the session began. A bare repository's config and hooks stay writable, since setting up a
+  server's hooks can be the task, unless it is named `.git` or has worktrees, where the user runs git.
+  bubblewrap can only make a path read-only by binding something over it, which creates a missing one: a
+  missing hooks directory is created empty, which runs nothing (git's default one holds only samples, which
+  never run either), but an empty `commondir` would break git. Nor can it keep a submodule's checkout in
+  place short of fixing every directory above it in the project. So on Linux a command can still create a
+  `commondir` or `config.worktree`, or put another checkout in a submodule's place, and jig warns after the
+  task and when a session ends; Seatbelt refuses them (a symlink in a checkout's place gets the warning).
+  With jig started in a subdirectory of a repository, a `.git` a command makes there is the one the user's
+  git there finds; making a repository can be the task, so neither sandbox refuses it, and jig warns of it
+  the same way. The sandbox finds the repository by the nearest `.git`, whatever the git directory it leads
+  to is called, and submodules' git directories by their `config` or `HEAD`, not by whether git takes them
+  for one: git passes over a git directory whose `HEAD`, `objects` or `refs` are gone or broken, and those
+  stay writable, as git changes them all the time. When the sandbox asked git, a command that moved
+  `.git/HEAD` aside had the next session lock nothing there, and a command in that one could change the
+  config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in the background
+  can still do it after jig has looked, and after a one-shot run nothing looks again. Commands can still
+  make a repository of their own (a submodule whose git directory is in its checkout is one), so jig's git
+  doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.
-- **Snapshots in a private repository.** `git stash` would change the user's repository and miss
-  untracked files; a second git directory with the project as its work tree snapshots everything that
-  isn't ignored, deduplicates unchanged files, and leaves the project untouched. Nested repositories
-  (submodules, clones) are left out: git checks one it stores by running `git status` in it, which runs
-  the programs its config names (a clean filter, say) outside the sandbox, and a command can make one. So
-  jig's git only lists them, and `/undo` leaves the files in them as they are. Paths go back to git as
-  the bytes it listed, on its standard input: on Linux a command can give one a name that isn't UTF-8,
-  and decoded, the pathspec that left it out matched nothing.
+- **Snapshots in a private repository.** `git stash` would change the user's repository and miss untracked
+  files; a second git directory with the project as its work tree snapshots everything that isn't ignored,
+  deduplicates unchanged files, and leaves the project untouched. It never copies `node_modules/`, `dist/`,
+  `build/`, `target/`, `.jig/` and the like, even where the project's own git tracks them, so `/undo`
+  leaves those as they are. Nested repositories (submodules, clones) are left out: git checks one it stores
+  by running `git status` in it, which runs the programs its config names (a clean filter, say) outside the
+  sandbox, and a command can make one. So jig's git only lists them, and `/undo` leaves the files in them
+  as they are. Paths go back to git as the bytes it listed, on its standard input: on Linux a command can
+  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing.
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than

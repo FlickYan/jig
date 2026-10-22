@@ -51,7 +51,8 @@ Options:
                           models, openai for others; DeepSeek serves both)
       --base-url <url>    the API's address, e.g. http://localhost:11434/v1 for Ollama (default: the
                           provider's own; OPENAI_BASE_URL works too)
-  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
+  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: medium for Claude models,
+                          the model's own for others; DeepSeek takes low | high | max)
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto
@@ -62,11 +63,12 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
   -c, --continue          continue this project's most recent session
       --resume <file>     continue a saved session (--sessions lists them)
       --sessions          list this project's saved sessions
-      --compact-at <n>    summarize the conversation once it reaches n tokens (default: 200000; 0: never)
+      --compact-at <n>    summarize the conversation once it reaches n tokens, or 80% of the model's context
+                          window if that is less (default: 200000; 0: never)
   -C, --cwd <dir>         project directory (default: the current directory)
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
-      --max-steps <n>     most model calls per task (default: 50)
+      --max-steps <n>     most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
                           included, and --check and --reviewer don't start in its last quarter (default: none)
       --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
@@ -80,8 +82,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
-                          use this system prompt instead of jig's own (the project's AGENTS.md and the
-                          skills are still added after it)
+                          use this system prompt instead of jig's own (--check's instructions, the skills,
+                          what jig remembers and the project's AGENTS.md are still added after it)
       --check             in a one-shot run, tell the model nobody can answer and ask it to check its
                           work against the task before it finishes (costs turns; see the README)
       --reviewer <model>  before the task ends, this model checks the work against the task (it can only
@@ -105,7 +107,8 @@ Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .c
 project and in your home directory.
 Ctrl+C stops the current task (press it again to force quit). At the prompt it clears the line, and
 pressed twice on an empty one it quits. A paste of several lines is one message, sent with Enter, and a
-line ending in \\ goes on in the next. A session can also read its tasks and /commands from a pipe.
+line ending in \\ goes on in the next. A session can also read its tasks and /commands from a pipe, one
+on each line: there a line ending in \\ doesn't go on.
 
 A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
 of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
