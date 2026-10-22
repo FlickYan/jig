@@ -54,7 +54,7 @@ export const grepTool: Tool = {
       throw new Error(`Invalid regular expression: ${(err as Error).message}`);
     }
     const base = resolveInRoot(cwd, path, dirs);
-    const { files, capped } = await listFiles(cwd, path, dirs, hidden);
+    const { files, capped } = await listFiles(cwd, path, dirs, hidden, signal);
     const wanted = include ? files.filter(includes(include, cwd, base)) : files;
     // Reading is what takes the time, so grep reads so many files at most: the first, by name.
     const searched = await firstVisible(cwd, wanted, searchLimits.files, hidden);

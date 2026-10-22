@@ -35,7 +35,7 @@ export interface FileList {
  * model asked for it by name. A path the settings hide is refused, but a file in the list can still be
  * hidden, through a symlink say: the caller leaves those out with firstVisible, on only the files it uses.
  */
-export async function listFiles(root: string, path = ".", dirs: string[] = [], hidden: string[] = []): Promise<FileList> {
+export async function listFiles(root: string, path = ".", dirs: string[] = [], hidden: string[] = [], signal?: AbortSignal): Promise<FileList> {
   const abs = resolveInRoot(root, path, dirs);
   await assertVisible(abs, path, hidden);
   const info = await stat(abs).catch(() => null);
@@ -43,8 +43,8 @@ export async function listFiles(root: string, path = ".", dirs: string[] = [], h
   // Shown relative to the project, or in full in an --add-dir directory.
   const shown = isInside(root, abs) ? relative(root, abs) : abs;
   if (info.isFile()) return { files: [shown], capped: false };
-  const ignored = await ignoredByGit(abs);
-  let files = ignored ? null : await gitFiles(abs);
+  const ignored = await ignoredByGit(abs, signal);
+  let files = ignored ? null : await gitFiles(abs, signal);
   let capped = false;
   if (!files) {
     // A path git ignores that the model named is walked whole but for .git: most packages in node_modules
@@ -92,8 +92,8 @@ export async function firstVisible(
  * in dir itself, so in a nested repository it is that repository's git. Tracked files are all listed: a
  * tracked build/ or target/ is part of the project, and SKIP_DIRS is for what nobody added.
  */
-async function gitFiles(dir: string): Promise<string[] | null> {
-  const [tracked, untracked] = await Promise.all([lsFiles(dir, ["--cached"]), lsFiles(dir, ["--others", "--exclude-standard"])]);
+async function gitFiles(dir: string, signal?: AbortSignal): Promise<string[] | null> {
+  const [tracked, untracked] = await Promise.all([lsFiles(dir, ["--cached"], signal), lsFiles(dir, ["--others", "--exclude-standard"], signal)]);
   if (!tracked || !untracked) return null;
   const files: string[] = [];
   for (const file of [...tracked, ...untracked.filter((file) => !file.split("/").some((part) => SKIP_DIRS.has(part)))]) {
@@ -105,7 +105,7 @@ async function gitFiles(dir: string): Promise<string[] | null> {
     // was never checked out, git lists the directory itself, as "./".
     else if (resolve(dir, file) !== dir) {
       const nested = join(dir, file);
-      for (const name of (await gitFiles(nested)) ?? (await walk(nested, nested, [], Infinity))) files.push(join(file, name));
+      for (const name of (await gitFiles(nested, signal)) ?? (await walk(nested, nested, [], Infinity))) files.push(join(file, name));
     }
   }
   return files;
@@ -116,21 +116,31 @@ async function gitFiles(dir: string): Promise<string[] | null> {
  * said "No matches." there for text that was in it. Not when git tracks files in dir (a tracked build/ is
  * git's list), nor at a nested repository's top, which its own git lists. False outside a git repository.
  */
-function ignoredByGit(dir: string): Promise<boolean> {
+function ignoredByGit(dir: string, signal?: AbortSignal): Promise<boolean> {
   const args = [...SAFE_GIT, "check-ignore", "-q", "--", "."];
   return new Promise((resolve) => {
     // 0 when ignored, 1 when not, 128 outside a repository.
-    execFile("git", args, { cwd: dir, env: withoutKeys() }, (err) => resolve(!err));
+    execFile("git", args, gitOptions(dir, signal), (err) => resolve(!err));
   });
 }
 
-function lsFiles(dir: string, which: string[]): Promise<string[] | null> {
+function lsFiles(dir: string, which: string[], signal?: AbortSignal): Promise<string[] | null> {
   const args = [...SAFE_GIT, "ls-files", ...which, "-z"];
   return new Promise((resolve) => {
-    execFile("git", args, { cwd: dir, env: withoutKeys(), maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+    execFile("git", args, { ...gitOptions(dir, signal), maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
       resolve(err ? null : stdout.split("\0").filter(Boolean));
     });
   });
+}
+
+/**
+ * How the git that lists files runs in dir. git waits for as long as a named pipe is where it reads (a
+ * .gitignore, .git/info/exclude, a nested repository's config), and a command can make one: so it stops
+ * with the task, or after the seconds grep may spend in one file, and the files are then walked, as
+ * outside a repository. The walk lists only regular files, so it opens no pipe.
+ */
+function gitOptions(dir: string, signal?: AbortSignal) {
+  return { cwd: dir, env: withoutKeys(), signal, timeout: searchLimits.seconds * 1000 };
 }
 
 /** The files under dir, relative to root, up to `limit` of them, leaving out the directories named in skip. */

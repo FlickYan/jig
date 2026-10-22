@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { before, describe, it } from "node:test";
@@ -175,6 +175,23 @@ describe("listFiles", () => {
     assert.deepEqual((await listFiles(ignored)).files, ["index.js"]);
     const other = await mkdtemp(join(tmpdir(), "jig-search-"));
     assert.deepEqual((await listFiles(other, ignored, [ignored])).files, [join(ignored, "index.js")]);
+  });
+
+  it("walks the files when git waits on a named pipe a command made, or the task has stopped", async () => {
+    // git opens .git/info/exclude (or a .gitignore, or a nested repository's config) and waits for as long
+    // as a named pipe is there: grep and glob waited with it, past --time-limit, until jig was killed.
+    const ctx = await project(true, { "a.txt": "needle\n", "sub/b.txt": "needle\n" });
+    await rm(join(ctx.cwd, ".git", "info", "exclude"), { force: true });
+    execFileSync("mkfifo", [join(ctx.cwd, ".git", "info", "exclude")]);
+    await withLimits({ seconds: 1 }, async () => {
+      assert.deepEqual((await listFiles(ctx.cwd)).files, ["a.txt", "sub/b.txt"]);
+    });
+    // Stopped by Ctrl+C or the time limit, glob doesn't wait for git, and grep says why it stopped.
+    const stopped = { ...ctx, signal: AbortSignal.abort() };
+    const start = Date.now();
+    assert.equal(await globTool.run({ pattern: "**/*.txt" }, stopped), "a.txt\nsub/b.txt");
+    await assert.rejects(grepTool.run({ pattern: "needle" }, stopped), /grep stopped/);
+    assert.ok(Date.now() - start < 10_000, `took ${Date.now() - start} ms`);
   });
 });
 

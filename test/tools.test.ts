@@ -50,10 +50,14 @@ describe("read_file", () => {
     assert.equal(await read("win.txt"), "     1\tone\n     2\ttwo\n");
   });
 
-  it("explains missing files, directories and binary files", async () => {
+  it("explains missing files, directories, named pipes and binary files", async () => {
     await assert.rejects(read("nope.txt"), /File not found: nope\.txt/);
     await mkdir(join(cwd, "dir"));
     await assert.rejects(read("dir"), /is a directory/);
+    // Opening a named pipe a command made waits for a writer, past --time-limit: it isn't opened.
+    execFileSync("mkfifo", [join(cwd, "pipe")]);
+    await assert.rejects(read("pipe"), /pipe isn't a regular file/);
+    await assert.rejects(edit("a", "b", "pipe"), /pipe isn't a regular file/);
     await writeFile(join(cwd, "blob.bin"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
     await assert.rejects(read("blob.bin"), /binary/);
   });

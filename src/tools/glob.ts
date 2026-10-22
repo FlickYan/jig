@@ -29,12 +29,12 @@ export const globTool: Tool = {
   kind: "read",
   describe: ({ pattern, path }) => (path ? `${pattern} in ${path}` : String(pattern)),
 
-  async run(input, { cwd, dirs, hidden }) {
+  async run(input, { cwd, dirs, hidden, signal }) {
     const { pattern, path = "." } = input as { pattern: string; path?: string };
     const base = resolveInRoot(cwd, path, dirs);
     const regex = globToRegExp(relativeGlob(pattern, base));
     // The pattern is relative to `path`; results are relative to the project, ready for read_file.
-    const { files, capped } = await listFiles(cwd, path, dirs, hidden);
+    const { files, capped } = await listFiles(cwd, path, dirs, hidden, signal);
     const matches = files.filter((file) => regex.test(relative(base, resolve(cwd, file))));
     const { files: shown, total } = await firstVisible(cwd, matches, MAX_RESULTS, hidden);
     // Outside git the listing stops at a limit, and what wasn't found there may still exist.
