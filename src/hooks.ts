@@ -77,7 +77,9 @@ export interface StopInput {
  * the task and the answer as JSON on stdin, and keeps the task from ending by exiting with code 2 (the
  * model is told its stderr) or by printing {"decision": "block", "reason": "..."} (the model is told the
  * reason). There is no tool, so matchers don't apply. Every hook runs, so the model hears all that is
- * still wrong at once; a hook that fails otherwise is reported to the user but doesn't block.
+ * still wrong at once; a hook that fails otherwise is reported to the user but doesn't block. Like tool
+ * hooks, they run outside the sandbox, so one that runs the project's tests runs what the model's
+ * commands wrote.
  */
 export async function runStopHooks(hooks: Hook[], stop: StopInput, cwd: string, { signal, timeout = TIMEOUT }: { signal?: AbortSignal; timeout?: number } = {}): Promise<HookOutcome> {
   const outcome: HookOutcome = { warnings: [] };

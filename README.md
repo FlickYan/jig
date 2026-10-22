@@ -145,7 +145,8 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   Only IP networking is cut off, though: a daemon listening on a Unix socket (Docker's, say) is still
   within reach. And commands share the machine's processes, so they can see yours and signal them.
   Because a sandboxed command can't change files outside the project or reach the network, in the
-  default `edits` mode commands run without asking. On Linux the sandbox
+  default `edits` mode commands run without asking (a hook that runs the project's code runs outside the
+  sandbox: see Hooks). On Linux the sandbox
   needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where it can't
   run, jig says why, and commands ask first. `--no-sandbox` turns it off.
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
@@ -344,7 +345,11 @@ So a change to one can be seen to run at all, which in milestone 28 only reading
   stderr goes to the model with the result (a linter's complaints, say). A long stderr is cut from the
   middle, as tool output is, and isn't kept in a file; jig holds only its start and end, however much
   a hook prints. Any other failure is shown to you and otherwise ignored; a hook still running after 60
-  seconds is stopped, with everything it started.
+  seconds is stopped, with everything it started. Hooks are your own commands, so they run outside the
+  sandbox, as you (though without jig's API keys). One that runs the project's own code, as both
+  `./scripts/check-command.sh` and `npm test` above do, runs whatever the model's commands changed there:
+  a command the sandbox kept from writing outside the project can rewrite a test for the Stop hook to
+  run, unsandboxed, before you have seen the change.
 
   A `Stop` hook runs when the model gives its final answer with a step left, so a project can say what
   done means: its tests pass, its linter is quiet. It takes no matcher, and gets JSON on stdin with the
