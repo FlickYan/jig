@@ -7,7 +7,7 @@
 // review said it did. The verdict goes out as JSON.
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -100,6 +100,10 @@ export async function reviewCommand(args: string[]): Promise<void> {
   // when jig exits, whether the review ended well or failed.
   const cwd = mkdtempSync(join(tmpdir(), "jig-review-"));
   process.once("exit", () => rmSync(cwd, { recursive: true, force: true }));
+  // A signal ends jig without the exit event, so a harness stopping a review (SIGTERM), a closed terminal
+  // (SIGHUP) or Ctrl+C would leave the directory behind: they end it with an ordinary exit instead, and the
+  // exit code a shell would give, as in a task (cli.ts).
+  for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
   const count = stats && ((event: Mechanism) => stats.count(event));
   const system = reviewerSystem(values.workdir);

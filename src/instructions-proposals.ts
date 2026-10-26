@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, statSync, writeFileSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
 import { join, relative } from "node:path";
 import { type Approve, notApproved } from "./proposals.ts";
@@ -11,11 +11,23 @@ import { isInside, readRegularFile } from "./tools/util.ts";
 // AGENTS.md rather than in jig's memory: it travels with the repository and other agents read it too.
 // jig proposes an edit, shows it as a diff, and writes it only if the user agrees.
 
-/** The file a proposal edits: the project's AGENTS.md, or its CLAUDE.md where that is the one it has. */
+/**
+ * The file a proposal edits: the project's AGENTS.md, or its CLAUDE.md where that is the one jig follows
+ * (see loadInstructions): where there is no AGENTS.md, or it isn't a regular file (a named pipe, say).
+ */
 export function instructionsFile(project: string): string {
   const agents = join(project, "AGENTS.md");
   const claude = join(project, "CLAUDE.md");
-  return !existsSync(agents) && existsSync(claude) ? claude : agents;
+  return !regularFile(agents) && regularFile(claude) ? claude : agents;
+}
+
+/** Whether path leads to a regular file. stat doesn't open it, so a named pipe doesn't keep jig waiting. */
+function regularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false; // missing, a broken link, a link to itself, or a folder jig can't search
+  }
 }
 
 /** propose_instructions: an addition to AGENTS.md, or a replacement of one passage, shown as a diff first. */

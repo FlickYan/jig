@@ -192,10 +192,10 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
-  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows
-  the `CLAUDE.md` beside it, if that is a regular file. A settings file is refused, a lockfile or a skill's
-  file is reported and its skills left as they are, and a git file is reported by what it is. `read_file`
-  and `edit_file` likewise
+  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows,
+  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. A settings file is
+  refused, a lockfile or a skill's file is reported and its skills left as they are, and a git file is
+  reported by what it is. `read_file` and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
@@ -311,11 +311,11 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   names a file, function or command before relying on it, and to propose forgetting one that turned out
   wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
   provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
-  assignment (`password=…`, `DB_PASSWORD=…`, `"api_key": "…"`, but not a placeholder like
-  `${DB_PASSWORD}` or code that reads one, like `os.environ["DB_PASSWORD"]`), and a password in a URL,
+  assignment (`password=…`, `DB_PASSWORD=…`, `PGPASSWORD=…`, `"api_key": "…"`, but not a placeholder
+  like `${DB_PASSWORD}` or code that reads one, like `os.environ["DB_PASSWORD"]`), and a password in a URL,
   unless its host is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
   `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
-  digit in it and doesn't look like code (`token = tokens[i]`).
+  digit in its first 100 characters and doesn't look like code (`token = tokens[i]`).
 
 ### Extensions
 

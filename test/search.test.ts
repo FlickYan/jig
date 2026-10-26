@@ -189,12 +189,16 @@ describe("listFiles", () => {
       assert.deepEqual((await listFiles(ctx.cwd)).files, ["a.txt", "sub/b.txt"]);
       // The walk doesn't leave out what git ignores, so the model is told: a log's lines looked like the code's.
       const walked = "\n\n(git took over 1s to list the files, so they were walked instead, and files git ignores may be among them.)";
-      const [found, matched, none] = await Promise.all([
+      const [found, nothing, matched, none] = await Promise.all([
         globTool.run({ pattern: "**/*.txt" }, ctx),
+        globTool.run({ pattern: "**/*.rs" }, ctx),
         grepTool.run({ pattern: "needle" }, ctx),
         grepTool.run({ pattern: "nothing like this" }, ctx),
       ]);
-      assert.deepEqual([found, matched, none], [`a.txt\nsub/b.txt${walked}`, `a.txt:1: needle\nsub/b.txt:1: needle${walked}`, `No matches.${walked}`]);
+      assert.deepEqual(
+        [found, nothing, matched, none],
+        [`a.txt\nsub/b.txt${walked}`, `No files found.${walked}`, `a.txt:1: needle\nsub/b.txt:1: needle${walked}`, `No matches.${walked}`],
+      );
     });
     // Stopped by Ctrl+C or the time limit, glob doesn't wait for git, and grep says why it stopped.
     const stopped = { ...ctx, signal: AbortSignal.abort() };

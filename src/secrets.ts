@@ -30,10 +30,11 @@ const LOCAL_HOST = String.raw`(?:(?:[\w-]+\.)*(?:localhost|example(?:\.(?:com|ne
 const URL_PASSWORD = String.raw`(://[^\s/?#:@]*:)(?![$<{[*])[^\s/?#@"'<>]{3,}(?=@(?!${LOCAL_HOST}))`;
 
 // A password or token assigned to a name (password=, api_key: or, as in JSON, "secret": "), up to its value.
-// The name may end a longer one after an underscore (DB_PASSWORD, AWS_SECRET_ACCESS_KEY, MY_API_TOKEN), but
-// not be part of a word (passwordField, MAX_TOKENS) or start one (token_count). A quote may be escaped, as
-// in JSON in a string.
-const ASSIGNMENT = String.raw`\b(?:\w*_)?(?:password|passwd|secret(?:[_-]?(?:access[_-]?)?key)?|token|api[_-]?key)\b(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?`;
+// The name may end a longer one (DB_PASSWORD, AWS_SECRET_ACCESS_KEY, PGPASSWORD, clientSecret), but nothing
+// may follow it in the word (passwordField, token_count, MAX_TOKENS). The \b keeps a long word to one read:
+// without it, \w* would read the rest of the word again from every letter. A quote may be escaped, as in
+// JSON in a string, and escaped again, as a tool call's arguments hold a command with JSON in it.
+const ASSIGNMENT = String.raw`\b\w*(?:password|passwd|secret(?:[_-]?(?:access[_-]?)?key)?|token|api[_-]?key)(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?`;
 
 const PATTERNS: [string, RegExp][] = [
   ...KEYS,
@@ -59,8 +60,9 @@ const REDACTIONS: [RegExp, string][] = [
   [/\beyJ[\w-]{5,}\.eyJ[\w-]{5,}\.[\w-]{10,}/g, "[REDACTED]"],
   [new RegExp(URL_PASSWORD, "gi"), "$1[REDACTED]"],
   // The value must look like a secret, with a digit in it, and not like code: `token = tokens[i]` and
-  // `token = token.strip()` stay as they are.
-  [new RegExp(String.raw`(${ASSIGNMENT})(?=[\w+/=~!@#$%^&*-]*\d)[\w+/=~!@#$%^&*-]{8,}(?![\w.([])`, "gi"), "$1[REDACTED]"],
+  // `token = token.strip()` stay as they are. The digit must be in its first 100 characters: looked for to
+  // the end, a long run like token=token=... was read again from every name in it.
+  [new RegExp(String.raw`(${ASSIGNMENT})(?=[\w+/=~!@#$%^&*-]{0,99}\d)[\w+/=~!@#$%^&*-]{8,}(?![\w.([])`, "gi"), "$1[REDACTED]"],
 ];
 
 /** The text with everything that looks like a secret replaced by [REDACTED], and how many there were. */
