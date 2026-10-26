@@ -300,7 +300,7 @@ describe("symlinks out of the project", () => {
     assert.deepEqual(await readdir(outside), ["bashrc"]);
   });
 
-  it("can still be read, as commands can read anything", async () => {
+  it("can still be read, as commands can read what they lead to", async () => {
     assert.equal(await read("rc"), "     1\texport PATH=/usr/bin\n");
   });
 
@@ -336,6 +336,41 @@ describe("hidden paths", () => {
     await assert.rejects(edit("abc", "def", "creds"), /^Error: creds is hidden by the user's settings\. Don't try to get around it\.$/);
     assert.equal(await readFile(join(secrets, "credentials"), "utf8"), "aws_secret_access_key = abc\n");
     assert.deepEqual(await readdir(secrets), ["credentials"]);
+  });
+});
+
+describe("jig's own directory", () => {
+  const was = process.env.JIG_HOME;
+  let home: string;
+  beforeEach(async () => {
+    home = await tempDir("jig-own-");
+    process.env.JIG_HOME = home;
+  });
+  afterEach(() => {
+    if (was === undefined) delete process.env.JIG_HOME;
+    else process.env.JIG_HOME = was;
+  });
+
+  it("is refused to the file tools but for its skills, wherever a link leads, as the sandbox hides it", async () => {
+    // Its sessions hold other projects' files, and a command can link to them from the project.
+    await mkdir(join(home, "sessions", "other"), { recursive: true });
+    await writeFile(join(home, "sessions", "other", "s.jsonl"), "another project's session\n");
+    await mkdir(join(home, "skills", "hello"), { recursive: true });
+    await writeFile(join(home, "skills", "hello", "run.sh"), "echo hello\n");
+    await symlink(home, join(cwd, "lnk"));
+    await symlink(join(home, "sessions", "other", "s.jsonl"), join(cwd, "s.jsonl"));
+    await assert.rejects(read("lnk/sessions/other/s.jsonl"), /^Error: lnk\/sessions\/other\/s\.jsonl leads into jig's own directory/);
+    await assert.rejects(read("s.jsonl"), /leads into jig's own directory/);
+    await assert.rejects(write("lnk/settings.json", "{}\n"), /^Error: lnk\/settings\.json leads into jig's own directory/);
+    assert.equal(existsSync(join(home, "settings.json")), false);
+    assert.equal(await read("lnk/skills/hello/run.sh"), "     1\techo hello\n");
+    // A project in it stays as it was: a skill being written, or one elsewhere in it.
+    await mkdir(join(home, "work"));
+    for (const project of [join(home, "skills", "hello"), join(home, "work")]) {
+      ctx = { cwd: project, versions: new FileVersions() };
+      assert.equal(await write("a.txt", "1\n"), "Created a.txt (1 line).");
+      assert.equal(await read("a.txt"), "     1\t1\n");
+    }
   });
 });
 

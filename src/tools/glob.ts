@@ -36,7 +36,7 @@ export const globTool: Tool = {
     // The pattern is relative to `path`; results are relative to the project, ready for read_file.
     const { files, capped, gitTimedOut } = await listFiles(cwd, path, dirs, hidden, signal);
     const matches = files.filter((file) => regex.test(relative(base, resolve(cwd, file))));
-    const { files: shown, total } = await firstVisible(cwd, matches, MAX_RESULTS, hidden);
+    const { files: shown, total } = await firstVisible(cwd, matches, MAX_RESULTS, hidden, dirs);
     // Outside git the listing stops at a limit, and what wasn't found there may still exist.
     const unlisted = capped && `the first ${files.length} files: the listing stops there`;
     const walked = walkedNote(gitTimedOut);

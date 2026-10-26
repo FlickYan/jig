@@ -34,10 +34,10 @@ export const readTool: Tool = {
   kind: "read",
   describe: ({ path, offset }) => (offset ? `${path}:${offset}` : String(path)),
 
-  async run(input, { cwd, versions, dirs, hidden }) {
+  async run(input, { cwd, versions, dirs = [], hidden }) {
     const { path, offset = 1, limit = DEFAULT_LIMIT } = input as { path: string; offset?: number; limit?: number };
     const file = resolveInRoot(cwd, path, dirs);
-    await assertVisible(file, path, hidden);
+    await assertVisible(file, path, hidden, [cwd, ...dirs]);
     const info = await assertFile(file, path); // taken before reading, so a change during the read shows up later
     const first = Math.max(offset, 1);
     const page = await readPage(file, path, first, Math.max(limit, 1));

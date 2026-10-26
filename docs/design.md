@@ -115,10 +115,13 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   they check paths themselves: against the project and the `--add-dir` directories, and a change again by
   where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can
   make one) let an audit's edit reach `~/.bashrc`, with no question in `edits` mode. Reading still follows
-  links out, since commands can read anything anyway; refusing would protect only the hidden paths, which
-  are checked by real path instead, and would break linked packages. A `.git` directory's `config` and
-  hooks, and the files that say where they are, are never changed, since git runs the programs they name
-  outside the sandbox. The tools know a git directory by that name, and by what the sandbox locks, worked
+  links out, since commands can read what they lead to as well, and refusing would break linked packages.
+  What the sandbox hides from commands the tools refuse by real path instead, with the sandbox off too: the
+  hidden paths, and jig's own directory but for its skills (in a review, `read_file` and `grep` read
+  another project's session through a link a command made to it; the `skill` tool's files go the same
+  way). A `.git` directory's `config` and hooks, and the files that say where they are, are never
+  changed, since git runs the programs they name outside the sandbox. The tools know a git directory by
+  that name, and by what the sandbox locks, worked
   out once a session whether there is a sandbox or not: in a review, `write_file` put a hook in one made
   with `--separate-git-dir` in the project, which commands couldn't change. One by another name that a
   command makes during the session is changed like any other file. Some of jig's own
@@ -205,7 +208,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   hidden paths are left out too, by where they really lead: a command could read a copy back out of the
   store. And the sandbox hides jig's own directory from commands, but for the skills whose scripts the
   model runs, since its snapshots (the hidden paths too, in those older versions took) and sessions hold
-  copies of every project's files.
+  copies of every project's files. It hides it by path, so where it lies in a directory commands can
+  write in (a temp directory, in skill evals), the directories holding it there stay in place, as git's
+  do: in a review, a command moved one aside, and read the snapshots at their new path in the next.
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than

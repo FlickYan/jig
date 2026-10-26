@@ -150,10 +150,11 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `.git`, so the next session keeps its config read-only. A job a command leaves in the background can still
   do so after jig has looked, and after a one-shot run nothing looks again.
 
-  Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs:
-  its snapshots and sessions hold copies of your projects' files, and the snapshots older versions of jig
-  took, of the hidden paths too (see Rules). A project inside it (a skill you are writing, say) stays as
-  it was.
+  Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs,
+  nor can the file tools: its snapshots and sessions hold copies of your projects' files, and the
+  snapshots older versions of jig took, of the hidden paths too (see Rules). A project inside it (a skill
+  you are writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in
+  a temp directory, say), they can't move it aside either, nor a directory holding it there.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
@@ -167,7 +168,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
   sandbox, so they keep to the project and the `--add-dir` directories on their own. A change goes by where
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
-  as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
+  as commands can read what it leads to too. But wherever a link leads, and with the sandbox off too, they
+  refuse what the sandbox hides from commands: the hidden paths in the settings (below), and jig's own
+  directory but for its skills (so does the `skill` tool, for a skill's files). They don't change a
   `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
   `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
   sandbox; nor what the sandbox keeps read-only in a git directory by another name (one made with

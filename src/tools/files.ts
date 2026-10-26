@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
-import { assertVisible, isInside, realHiddenPaths, resolveInRoot, SAFE_GIT, withoutKeys } from "./util.ts";
+import { assertVisible, hiddenTest, isInside, resolveInRoot, SAFE_GIT, withoutKeys } from "./util.ts";
 
 /** Directories that are never worth searching when nobody added them to git: walks and untracked files skip them. */
 const SKIP_DIRS = new Set([
@@ -40,12 +40,13 @@ export function walkedNote(gitTimedOut: boolean): string {
  * files, so .gitignore applies, and all of it: matching names is cheap, and grep limits what it reads
  * itself. Elsewhere it is a plain walk, which stops at the limit, since with --add-dir / it would walk the
  * whole system. A path git ignores is walked too, all of it but .git: git lists nothing in it, and the
- * model asked for it by name. A path the settings hide is refused, but a file in the list can still be
- * hidden, through a symlink say: the caller leaves those out with firstVisible, on only the files it uses.
+ * model asked for it by name. A path the file tools hide is refused (see assertVisible), but a file in the
+ * list can still be hidden, through a symlink say: the caller leaves those out with firstVisible, on only
+ * the files it uses.
  */
 export async function listFiles(root: string, path = ".", dirs: string[] = [], hidden: string[] = [], signal?: AbortSignal): Promise<FileList> {
   const abs = resolveInRoot(root, path, dirs);
-  await assertVisible(abs, path, hidden);
+  await assertVisible(abs, path, hidden, [root, ...dirs]);
   const info = await stat(abs).catch(() => null);
   if (!info) throw new Error(`No such file or directory: ${path}`);
   // Shown relative to the project, or in full in an --add-dir directory.
@@ -69,19 +70,20 @@ export async function listFiles(root: string, path = ".", dirs: string[] = [], h
 }
 
 /**
- * The first `limit` of the files, in their order, whose real path the settings don't hide: a link in the
- * project, or the walk of / that --add-dir / allows, could reach a hidden one. It costs a realpath a file,
- * which for all the files of a large repository takes seconds, so it runs only on the files a tool uses:
- * those grep reads, or glob shows. `total` counts the files it didn't get to without checking them.
+ * The first `limit` of the files, in their order, whose real path the file tools don't hide (see
+ * hiddenTest): a link in the project, or the walk of / that --add-dir / allows, could reach a hidden one,
+ * or jig's own directory. It costs a realpath a file, which for all the files of a large repository takes
+ * seconds, so it runs only on the files a tool uses: those grep reads (20,000 took half a second on
+ * Linux), or glob shows. `total` counts the files it didn't get to without checking them.
  */
 export async function firstVisible(
   root: string,
   files: string[],
   limit: number,
   hidden: string[] = [],
+  dirs: string[] = [],
 ): Promise<{ files: string[]; total: number }> {
-  if (!hidden.length) return { files: files.slice(0, limit), total: files.length };
-  const unreadable = await realHiddenPaths(hidden);
+  const hides = await hiddenTest(hidden, [root, ...dirs]);
   const visible: string[] = [];
   let looked = 0;
   while (visible.length < limit && looked < files.length) {
@@ -90,7 +92,7 @@ export async function firstVisible(
     looked += batch.length;
     const real = await Promise.all(batch.map((file) => realpath(resolve(root, file)).catch(() => "")));
     for (const [i, file] of batch.entries()) {
-      if (!unreadable.some((path) => real[i] && isInside(path, real[i]))) visible.push(file);
+      if (!real[i] || !hides(real[i])) visible.push(file);
     }
   }
   return { files: visible, total: visible.length + files.length - looked };

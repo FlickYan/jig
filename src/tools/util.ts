@@ -2,11 +2,13 @@ import { constants } from "node:buffer";
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats, statSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { jigHome } from "../paths.ts";
 
 /**
  * Resolves a path from the model against the project root and refuses anything outside it and the
  * directories added with --add-dir. The check is lexical, so a symlink inside can still lead out: reading
- * may follow one (commands can read anything too), and resolveForChange checks changes by real path.
+ * may follow one, as commands can read what it leads to too, but not to what the sandbox hides from them
+ * (see assertVisible), and resolveForChange checks changes by real path.
  */
 export function resolveInRoot(root: string, path: string, dirs: string[] = []): string {
   const abs = resolve(root, path);
@@ -30,7 +32,8 @@ export async function resolveForChange(root: string, path: string, dirs: string[
   const abs = resolveInRoot(root, path, dirs);
   const real = await realTarget(abs);
   if (!real) throw new Error(`${path} leads through a broken symlink. Change the file it should point to instead.`);
-  if (await isHidden(real, hidden)) throw hiddenError(path); // first, so the message doesn't say where it is
+  const hiding = (await hiddenTest(hidden, [root, ...dirs]))(real);
+  if (hiding) throw hiddenError(path, hiding); // first, so the message doesn't say where it is
   const allowed = await Promise.all([root, ...dirs].map((dir) => realTarget(dir)));
   if (!allowed.some((dir) => dir && isInside(dir, real))) {
     const also = dirs.length ? ` and in ${dirs.join(", ")}` : "";
@@ -43,24 +46,46 @@ export async function resolveForChange(root: string, path: string, dirs: string[
   return abs;
 }
 
-/** Refuses a path the settings hide (hiddenPaths), wherever its symlinks lead: the sandbox hides it from commands. */
-export async function assertVisible(abs: string, path: string, hidden: string[] = []): Promise<void> {
-  if (!hidden.length) return;
+/**
+ * Refuses a path that hiddenTest hides, wherever its symlinks lead: one the settings hide, and given `roots`,
+ * one in jig's own directory.
+ */
+export async function assertVisible(abs: string, path: string, hidden: string[] = [], roots?: string[]): Promise<void> {
+  if (!hidden.length && !roots) return;
   const real = await realTarget(abs);
-  if (real && (await isHidden(real, hidden))) throw hiddenError(path);
+  const hiding = real && (await hiddenTest(hidden, roots))(real);
+  if (hiding) throw hiddenError(path, hiding);
 }
 
-/** Where the hidden paths really are, to check many files against (see listFiles). */
-export async function realHiddenPaths(hidden: string[]): Promise<string[]> {
-  return (await Promise.all(hidden.map((path) => realTarget(path)))).filter((path) => path !== undefined);
+/** What hides a path from the file tools: the settings (hiddenPaths), or its being in jig's own directory. */
+type Hiding = "settings" | "own";
+
+/**
+ * What hides a real path from the file tools, if anything, as the sandbox hides it from commands: the
+ * paths the settings hide, and given the directories the tools work in (`roots`, the project and the
+ * --add-dir ones), jig's own directory (see sandbox.ts's ownRules). Its sessions and snapshots hold copies
+ * of other projects' files, and of hidden ones, and a link a command made in the project led read_file and
+ * grep there. Its skills stay readable, as they do to commands, and so do the roots that lie in it (a
+ * project there stays as it was). jig's own changes in the project, which the user approves, give no
+ * roots (see skill-store.ts's assertInProject). Worked out once, to check many files against (see
+ * firstVisible).
+ */
+export async function hiddenTest(hidden: string[], roots?: string[]): Promise<(real: string) => Hiding | undefined> {
+  const reals = async (list: string[]) => (await Promise.all(list.map((path) => realTarget(path)))).filter((path) => path !== undefined);
+  const paths = await reals(hidden);
+  const home = roots && (await realTarget(jigHome()));
+  // What stays readable in it: its skills, and the roots that lie in it.
+  const shown = home ? (await reals([join(home, "skills"), ...(roots ?? [])])).filter((dir) => isInside(home, dir)) : [];
+  return (real) => {
+    if (paths.some((path) => isInside(path, real))) return "settings";
+    if (home && isInside(home, real) && !shown.some((dir) => isInside(dir, real))) return "own";
+    return undefined;
+  };
 }
 
-async function isHidden(real: string, hidden: string[]): Promise<boolean> {
-  return (await realHiddenPaths(hidden)).some((path) => isInside(path, real));
-}
-
-function hiddenError(path: string): Error {
-  return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
+function hiddenError(path: string, hiding: Hiding): Error {
+  if (hiding === "settings") return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
+  return new Error(`${path} leads into jig's own directory, which is hidden but for its skills: it holds copies of other projects' files. Don't try to get around it.`);
 }
 
 /**

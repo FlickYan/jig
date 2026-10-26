@@ -8,7 +8,7 @@ import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { jigHome } from "./paths.ts";
 import type { Tool } from "./tools/index.ts";
-import { isInside, readRegularFile } from "./tools/util.ts";
+import { assertVisible, isInside, readRegularFile } from "./tools/util.ts";
 
 /** An Agent Skill (agentskills.io): a directory with a SKILL.md of instructions, and maybe scripts and references. */
 export interface Skill {
@@ -171,13 +171,21 @@ export function skillTool(skills: Skill[]): Tool {
     async run(input, ctx) {
       const { name, file } = input as { name: string; file?: string };
       const skill = skills.find((s) => s.name === name)!;
+      // A file in it, SKILL.md too, can be a link, which a command can make in a project's skill after
+      // discovery read it: it is read only where the file tools would read it, not in a hidden path or
+      // jig's own directory.
+      const assertShown = (path: string, shown: string) => assertVisible(path, shown, ctx.hidden, [ctx.cwd, ...(ctx.dirs ?? [])]);
       if (file) {
         const path = join(skill.dir, file);
+        const missing = `The skill "${name}" has no file ${file}.`;
+        if (!isInside(skill.dir, path)) throw new Error(missing);
+        await assertShown(path, file);
         // Enough bytes for the characters kept: UTF-8 takes 4 bytes a character at most.
-        const text = isInside(skill.dir, path) ? readRegularFile(path, 4 * MAX_FILE_CHARS) : undefined;
-        if (text === undefined) throw new Error(`The skill "${name}" has no file ${file}.`);
+        const text = readRegularFile(path, 4 * MAX_FILE_CHARS);
+        if (text === undefined) throw new Error(missing);
         return text.slice(0, MAX_FILE_CHARS);
       }
+      await assertShown(join(skill.dir, "SKILL.md"), "SKILL.md");
       const content = loadSkill(skill);
       ctx.pin?.(`skill:${name}`, content); // keep the instructions through compaction
       recordSkillUse(name);

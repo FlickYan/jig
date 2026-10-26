@@ -57,7 +57,7 @@ export const grepTool: Tool = {
     const { files, capped, gitTimedOut } = await listFiles(cwd, path, dirs, hidden, signal);
     const wanted = include ? files.filter(includes(include, cwd, base)) : files;
     // Reading is what takes the time, so grep reads so many files at most: the first, by name.
-    const searched = await firstVisible(cwd, wanted, searchLimits.files, hidden);
+    const searched = await firstVisible(cwd, wanted, searchLimits.files, hidden, dirs);
     const { shown, total } = await search({ files: searched.files, cwd, pattern, flags }, signal);
 
     // Say when files went unsearched, so that what wasn't found isn't taken as absent.

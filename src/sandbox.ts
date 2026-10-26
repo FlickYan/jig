@@ -458,10 +458,11 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
  * Seatbelt's rules for jig's own directory, which holds copies of the files of every project jig worked
  * in: snapshots (with the hidden files in those older versions took), sessions, memories. So commands
  * can't read it, nor write in it where it lies in a writable directory (a temp directory, say), where
- * settings could add hooks. Only its skills stay readable: the model runs their scripts by their full path
- * there, as the skill tool tells it, and nothing else in it is for commands. A writable directory in it (a
- * project that is a skill being written, say) stays as it was, and so does the metadata of the directory
- * itself, which resolving a path through it needs (realpath, as Node does for a script it runs).
+ * settings could add hooks, nor move it aside, or a directory holding it there (see ownFixed). Only its
+ * skills stay readable: the model runs their scripts by their full path there, as the skill tool tells it,
+ * and nothing else in it is for commands. A writable directory in it (a project that is a skill being
+ * written, say) stays as it was, and so does the metadata of the directory itself, which resolving a path
+ * through it needs (realpath, as Node does for a script it runs).
  */
 function ownRules(home: string, writable: string[]): string[] {
   const inside = writable.filter((dir) => isInside(home, dir));
@@ -470,22 +471,43 @@ function ownRules(home: string, writable: string[]): string[] {
     `(allow file-read-metadata (literal ${quote(home)}))`,
     `(allow file-read* (subpath ${quote(join(home, "skills"))}))`,
     ...(inside.length ? [`(allow file-read* file-write* ${inside.map((dir) => `(subpath ${quote(dir)})`).join(" ")})`] : []),
+    ...deny("file-write-unlink", ownFixed(home, writable).map((dir) => `(literal ${quote(dir)})`)),
   ];
 }
 
 /**
- * bubblewrap's arguments for jig's own directory, as ownRules has it: an empty directory over it, with its
- * skills bound back in read-only, and then the writable directories in it as they were. Worked out for each
- * command, as the directory and its skills may be made during the session.
+ * bubblewrap's arguments for jig's own directory, as ownRules has it: the directories holding it that
+ * ownFixed keeps in place bound once more, so they are mount points a command can't move aside, then an
+ * empty directory over it (a mount point too), with its skills bound back in read-only, and then the
+ * writable directories in it as they were. Worked out for each command, as the directory and its skills may
+ * be made during the session.
  */
 function ownBinds(home: string, writable: string[]): string[] {
   if (!existsSync(home)) return [];
   const skills = join(home, "skills");
   return [
+    // Before the empty directory: bound after it, one would show what is under it again.
+    ...ownFixed(home, writable).flatMap((dir) => ["--bind", dir, dir]),
     "--tmpfs", home,
     ...(existsSync(skills) ? ["--ro-bind", skills, skills] : []),
     ...writable.filter((dir) => isInside(home, dir)).flatMap((dir) => ["--bind", dir, dir]),
   ];
+}
+
+/**
+ * The directories between jig's own and a writable directory it lies in (a temp directory, as in skill
+ * evals and the tests), the outermost first. The sandbox hides jig's directory by its path, so a command
+ * could move one of them aside, jig's directory with it, and read it at its new path in the next command,
+ * whose sandbox hid what was at the old one instead (a directory the command made there, settings and all).
+ * So they stay in place, as git's directories do (see controlOf), which grants nothing, as they lie in a
+ * writable directory already; jig's directory itself can't be moved either way. A writable directory in
+ * another (one added with --add-dir in a temp directory) counts as one between. ~/.jig has none: the home
+ * directory can't be moved, even in a home-directory project.
+ */
+function ownFixed(home: string, writable: string[]): string[] {
+  const fixed: string[] = [];
+  for (let dir = dirname(home); writable.some((other) => other !== dir && isInside(other, dir)); dir = dirname(dir)) fixed.unshift(dir);
+  return fixed;
 }
 
 /**

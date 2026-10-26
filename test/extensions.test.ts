@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { after, afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -107,6 +107,32 @@ describe("skills", () => {
     assert.equal(pinned.get("skill:release"), content);
     assert.equal(await tool.run({ name: "release", file: "references/policy.md" }, context()), "Never release on Fridays.");
     await assert.rejects(tool.run({ name: "release", file: "../../../etc/passwd" }, context()), /has no file/);
+  });
+
+  it("reads a skill's files, SKILL.md too, only where the file tools would, wherever a link in it leads", async () => {
+    // A command can make a link in a project's skill: to a hidden path, or into jig's own directory.
+    await writeSkill(join(dir, ".jig/skills"), "release", "---\nname: release\ndescription: Cut a release.\n---\n");
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key"), "the hidden key");
+    const session = join(process.env.JIG_HOME!, "sessions", "other", "s.jsonl");
+    await mkdir(join(session, ".."), { recursive: true });
+    await writeFile(session, "another project's session");
+    await symlink(join(secrets, "key"), join(dir, ".jig/skills/release/key"));
+    await symlink(session, join(dir, ".jig/skills/release/session"));
+    const tool = skillTool(discoverSkills(dir, join(dir, "home")).skills);
+    await assert.rejects(tool.run({ name: "release", file: "key" }, context({ hidden: [secrets] })), /^Error: key is hidden by the user's settings/);
+    await assert.rejects(tool.run({ name: "release", file: "session" }, context()), /^Error: session leads into jig's own directory/);
+    assert.equal(await tool.run({ name: "release", file: "key" }, context()), "the hidden key", "where the settings don't hide it");
+
+    // Its SKILL.md too, which loads without `file`, linked after discovery read it.
+    const skillMd = join(dir, ".jig/skills/release/SKILL.md");
+    await rm(skillMd);
+    await symlink(session, skillMd);
+    await assert.rejects(tool.run({ name: "release" }, context()), /^Error: SKILL.md leads into jig's own directory/);
+    await rm(skillMd);
+    await symlink(join(secrets, "key"), skillMd);
+    await assert.rejects(tool.run({ name: "release" }, context({ hidden: [secrets] })), /^Error: SKILL.md is hidden by the user's settings/);
+    assert.match(await tool.run({ name: "release" }, context()), /^<skill_content name="release">\nthe hidden key\n/, "where the settings don't hide it");
   });
 
   it("reads frontmatter leniently", () => {

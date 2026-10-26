@@ -107,6 +107,26 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     assert.equal(await readFile(join(skill, ".git", "config"), "utf8"), config);
   });
 
+  it("keeps jig's own directory, and those holding it where commands can write, in place", async () => {
+    // In a temp directory, as in skill evals: moved aside with a directory holding it, it was out of the place
+    // the next command's sandbox hid, which hid an empty directory a command made there instead, or nothing.
+    const home = join(dir, "h", "jig-home");
+    process.env.JIG_HOME = home;
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "s.jsonl"), "an earlier session\n");
+    const sandbox = createSandbox(project, { network: false })!;
+    const moved = [dir, join(dir, "h"), home];
+    try {
+      for (const path of moved) {
+        assert.match(await run(`mv ${path} ${path}-moved`, sandbox), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+      assert.doesNotMatch(await run(`cat ${join(home, "sessions", "s.jsonl")}`, sandbox), /an earlier session/);
+    } finally {
+      for (const path of moved) await rm(`${path}-moved`, { recursive: true, force: true });
+    }
+  });
+
   it("keeps a hidden file out of the snapshots, and those an older jig took out of commands' reach", async () => {
     const app = join(dir, "app");
     await mkdir(app);
@@ -719,6 +739,21 @@ describe("the macOS sandbox's profile", () => {
     assert.deepEqual(order, [...order].sort((a, b) => a - b));
     assert.ok(at('(allow file-read-metadata (literal "/u/.jig"))') > order[0], "paths through it can be resolved");
     assert.doesNotMatch(seatbeltProfile(["/p"], false, [], undefined, "/u/.jig"), /\(allow file-read\* file-write\*/);
+  });
+
+  it("keeps the directories holding jig's own in place, where it lies in a writable directory", () => {
+    // In a temp directory, as in skill evals: moved aside with one, it would be out of the rules' reach.
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], undefined, "/private/tmp/e/h/.jig");
+    const fixed = '(deny file-write-unlink (literal "/private/tmp/e") (literal "/private/tmp/e/h"))';
+    assert.ok(profile.split("\n").includes(fixed), profile);
+    assert.ok(profile.indexOf(fixed) > profile.indexOf("(allow file-write* "), "after the rule it overrides, since the last rule wins");
+    // An added directory in a temp directory can be moved too; a writable directory in none can't.
+    const added = seatbeltProfile(["/p", "/private/tmp/e", "/private/tmp"], false, [], undefined, "/private/tmp/e/.jig");
+    assert.match(added, /^\(deny file-write-unlink \(literal "\/private\/tmp\/e"\)\)$/m);
+    // Nor are there any for ~/.jig, in a home-directory project or in none.
+    for (const writable of [["/p", "/private/tmp"], ["/u", "/private/tmp"]]) {
+      assert.doesNotMatch(seatbeltProfile(writable, false, [], undefined, "/u/.jig"), /file-write-unlink/);
+    }
   });
 
   it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {

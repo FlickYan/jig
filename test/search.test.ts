@@ -253,6 +253,30 @@ describe("grep", () => {
     await assert.rejects(globTool.run({ pattern: "*", path: "secrets" }, ctx), /hidden by the user's settings/);
     assert.doesNotMatch(await globTool.run({ pattern: "**" }, ctx), /key\.txt|secrets/);
   });
+
+  it("leaves out jig's own directory but its skills, wherever a link leads", async () => {
+    const ctx = await project(true);
+    const home = await tempDir("jig-own-");
+    const was = process.env.JIG_HOME;
+    process.env.JIG_HOME = home;
+    try {
+      // Its sessions hold other projects' files, and a command can link to them from the project.
+      await mkdir(join(home, "sessions", "other"), { recursive: true });
+      await writeFile(join(home, "sessions", "other", "s.jsonl"), "another project's session\n");
+      await mkdir(join(home, "skills", "hello"), { recursive: true });
+      await writeFile(join(home, "skills", "hello", "SKILL.md"), "another skill\n");
+      await symlink(home, join(ctx.cwd, "lnk"));
+      await symlink(join(home, "sessions", "other", "s.jsonl"), join(ctx.cwd, "s.jsonl"));
+      assert.equal(await grepTool.run({ pattern: "another project" }, ctx), "No matches.");
+      await assert.rejects(grepTool.run({ pattern: "another", path: "lnk" }, ctx), /^Error: lnk leads into jig's own directory/);
+      await assert.rejects(globTool.run({ pattern: "**", path: "lnk/sessions" }, ctx), /leads into jig's own directory/);
+      assert.doesNotMatch(await globTool.run({ pattern: "**" }, ctx), /s\.jsonl|lnk/);
+      assert.equal(await grepTool.run({ pattern: "another", path: "lnk/skills" }, ctx), "lnk/skills/hello/SKILL.md:1: another skill");
+    } finally {
+      if (was === undefined) delete process.env.JIG_HOME;
+      else process.env.JIG_HOME = was;
+    }
+  });
 });
 
 describe("grep's limits", () => {
