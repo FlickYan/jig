@@ -16,9 +16,9 @@ import { Conversation } from "./conversation.ts";
 import { runHooks, runStopHooks } from "./hooks.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
-import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
+import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
+import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
 import { createSandbox, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
@@ -345,7 +345,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   ];
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
-  let instructions = loadInstructions(cwd);
+  let instructions = followedInstructions(cwd);
   // jig's own tools, unless --tools picks some. The prompts then name only the tools there are.
   const own = selectTools(toolNames);
   const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
@@ -638,7 +638,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/undo") {
       undo();
     } else if (name === "/reset") {
-      instructions = loadInstructions(cwd);
+      instructions = followedInstructions(cwd);
       refreshSkills();
       agent.callModel = newModel();
       agent.escalate = escalation;
@@ -713,7 +713,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   const through = api === defaultApi(model) && !baseURL ? "" : ` (${api} API${baseURL ? ` at ${baseURL}` : ""})`;
-  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model}${through} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model}${through} · effort ${effortFor(model, api, effort) ?? "default"} · mode ${mode} · ${cwd}`)}`);
   if (noSandbox) ui.notice(`${noSandbox} Commands run directly on this machine.`);
   else ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (sandbox off)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
@@ -743,7 +743,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 /**
  * The settings in effect: the user's, plus the project's. A repository could run programs through its
  * settings (hooks, MCP servers) or loosen the sandbox, so those parts of a project's settings only apply
- * once the user trusts them, which is asked again whenever the file changes. Deny rules always apply.
+ * once the user trusts them, which is asked again whenever the file changes. Deny rules and hidden paths
+ * always apply.
  */
 async function loadSettings(cwd: string): Promise<Settings> {
   const { user, project, warnings } = readSettings(cwd);
@@ -761,7 +762,7 @@ async function loadSettings(cwd: string): Promise<Settings> {
   }
   if (!trusted) {
     const how = process.stdin.isTTY ? "" : " Run jig in a terminal to review it, or set JIG_TRUST_PROJECT=1.";
-    ui.notice(`Not using ${file} (apart from its deny rules) until you trust it.${how}`);
+    ui.notice(`Not using ${file} (apart from its deny rules and hidden paths) until you trust it.${how}`);
   }
   return mergeSettings(user, project.settings, trusted);
 }
@@ -807,6 +808,13 @@ async function readStdin(): Promise<string> {
 
 function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/** The project's AGENTS.md files, and a notice of each one left out. */
+function followedInstructions(cwd: string): Instructions[] {
+  const { instructions, warnings } = loadInstructions(cwd);
+  for (const warning of warnings) ui.notice(warning);
+  return instructions;
 }
 
 function describeInstructions(instructions: { path: string }[]): string {

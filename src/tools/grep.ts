@@ -5,7 +5,7 @@
 import { basename, extname, relative, resolve } from "node:path";
 import { Worker } from "node:worker_threads";
 import { whyStopped } from "./bash.ts";
-import { firstVisible, globToRegExp, listFiles, relativeGlob, searchLimits } from "./files.ts";
+import { firstVisible, globToRegExp, listFiles, relativeGlob, searchLimits, walkedNote } from "./files.ts";
 import type { SearchJob, SearchResult } from "./grep-worker.ts";
 import type { Tool } from "./index.ts";
 import { resolveInRoot } from "./util.ts";
@@ -54,7 +54,7 @@ export const grepTool: Tool = {
       throw new Error(`Invalid regular expression: ${(err as Error).message}`);
     }
     const base = resolveInRoot(cwd, path, dirs);
-    const { files, capped } = await listFiles(cwd, path, dirs, hidden, signal);
+    const { files, capped, gitTimedOut } = await listFiles(cwd, path, dirs, hidden, signal);
     const wanted = include ? files.filter(includes(include, cwd, base)) : files;
     // Reading is what takes the time, so grep reads so many files at most: the first, by name.
     const searched = await firstVisible(cwd, wanted, searchLimits.files, hidden);
@@ -64,10 +64,11 @@ export const grepTool: Tool = {
     const unsearched = capped
       ? `the first ${files.length} files: the listing stops there`
       : searched.total > searched.files.length && `the first ${searched.files.length} of ${searched.total} files`;
-    if (total === 0) return unsearched ? `No matches in ${unsearched}. Narrow the search with path or include.` : "No matches.";
+    const walked = walkedNote(gitTimedOut);
+    if (total === 0) return (unsearched ? `No matches in ${unsearched}. Narrow the search with path or include.` : "No matches.") + walked;
     const notes = [total > shown.length && `Showed ${shown.length} of ${total} matches.`, unsearched && `Searched only ${unsearched}.`];
     if (notes.some(Boolean)) shown.push(`\n(${notes.filter(Boolean).join(" ")} Narrow the search with path or include.)`);
-    return shown.join("\n");
+    return shown.join("\n") + walked;
   },
 };
 

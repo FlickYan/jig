@@ -1092,6 +1092,7 @@ describe("an interactive session fed through stdin", () => {
       assert.doesNotMatch(system, /piped|zeroed|looped|<instructions/);
       // The user is told why those skills are missing; the link to itself, like a missing SKILL.md, says nothing.
       for (const name of ["piped", "zeroed"]) assert.match(output, new RegExp(`Skipped the skill in \\S+${name}: its SKILL\\.md isn't a regular file\\.`));
+      assert.match(output, /^> AGENTS\.md isn't a regular file \(a named pipe, say\), so jig doesn't read it\.$/m);
       assert.doesNotMatch(output, /Skipped the skill in \S+looped/);
       assert.match(last(api.requests[1]), /The skill \\"notes\\" has no file references\/zero\.md\./);
       assert.match(last(api.requests[2]), /AGENTS\.md isn't a regular file \(a named pipe, say\), so it can't be edited\./);

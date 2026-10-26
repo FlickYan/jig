@@ -44,8 +44,9 @@ export interface CompactOptions {
  * Replaces the conversation with a summary the model writes of it. Nothing else is replayed: earlier
  * thinking blocks can't be sent again once the history before them has changed, and a fresh start is
  * valid for every provider. The summary request repeats the last request's system prompt, tools and
- * history, so the prompt cache makes it cheap; if the API rejects it as too long, the summary is written
- * from a copy with the tool output cut. Never call this while a tool call waits for its result.
+ * history, but allows no tool call: for Claude, that keeps only the tools and the system prompt in the
+ * prompt cache, and the history is written to it again. If the API rejects it as too long, the summary is
+ * written from a copy with the tool output cut. Never call this while a tool call waits for its result.
  * Returns undefined when there is nothing to summarize.
  */
 export async function compact(conversation: Conversation, callModel: CallModel, options: CompactOptions = {}) {

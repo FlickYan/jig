@@ -74,6 +74,26 @@ describe("exporting sessions as fine-tuning data", () => {
     assert.deepEqual(roles, ["system: You are a coding agent.", "user: First task.", "assistant: Done with the first."]);
   });
 
+  it("answers a call a crash left open as jig did when the session was continued, so the example stays valid", async () => {
+    // Killed mid-call and continued: the call's answer was never written to the file, and the export was
+    // left out as in an order a trainer would reject.
+    const file = await sessionFile([
+      start,
+      message("user", "Fix the build."),
+      message("assistant", [call("t1", "make")]),
+      message("user", "Go on."),
+      message("assistant", [{ type: "text", text: "Fixed." }]),
+    ]);
+    const { example } = exportSession(file)!;
+    assert.deepEqual(exampleProblems(example), []);
+    assert.deepEqual(example.messages.slice(2).map((m) => `${m.role}: ${m.content}`), [
+      "assistant: null",
+      "tool: Error: Not run: the session ended before this call ran.",
+      "user: Go on.",
+      "assistant: Fixed.",
+    ]);
+  });
+
   it("blanks out secrets in any message, keeping the JSON valid", async () => {
     const file = await sessionFile([
       start,

@@ -18,6 +18,9 @@ type ContentBlock = Anthropic.Beta.BetaContentBlock;
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 
+/** What Claude is asked for when --effort is left out. Other models then think as much as they do by default. */
+const CLAUDE_EFFORT: Effort = "medium";
+
 /** The API formats jig speaks: Anthropic's Messages API, and OpenAI-compatible chat completions. */
 export const APIS = ["anthropic", "openai"] as const;
 export type Api = (typeof APIS)[number];
@@ -28,6 +31,14 @@ export type Api = (typeof APIS)[number];
  */
 export function defaultApi(model: string): Api {
   return model.startsWith("claude") || model.startsWith("deepseek") ? "anthropic" : "openai";
+}
+
+/**
+ * The effort a request asks for: --effort's or, left out, CLAUDE_EFFORT for a model the Messages API
+ * reaches as Claude (any but DeepSeek's), and none for the others.
+ */
+export function effortFor(model: string, api: Api, effort?: Effort): Effort | undefined {
+  return effort ?? (api === "anthropic" && !model.startsWith("deepseek") ? CLAUDE_EFFORT : undefined);
 }
 
 /** What one model call returns. */
@@ -57,7 +68,7 @@ export interface ModelOptions {
   timeout?: number;
   /** Milliseconds a reply that has started may send nothing (default: JIG_STREAM_IDLE_MS, or 5 minutes); for tests. */
   idle?: number;
-  /** Left out, the model's own default is used. */
+  /** Left out: medium for Claude, and the model's own default for others (see effortFor). */
   effort?: Effort;
   system: string;
   tools: Tool[];
@@ -228,7 +239,7 @@ function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
   return (messages, watchdog, summarize) => {
     const sent = deepseek ? withoutIsError(messages) : messages;
-    // Tools stay declared (the history refers to them, and the cached prefix stays the same); "none" stops calls.
+    // Tools stay declared (the history refers to them, and they and the system prompt stay cached); "none" stops calls.
     const params: BetaMessageStreamParams = { ...request, messages: sent, ...(summarize && { tool_choice: { type: "none" } }) };
     return streamTurn(client, params, watchdog, summarize || options.quiet);
   };
@@ -253,7 +264,7 @@ function chatCompletions(options: ModelOptions, settings: ClientSettings): Turn 
     chatTurn(client, chat, messages, { signal: watchdog.signal, alive: () => watchdog.alive(), quiet: summarize || options.quiet, summarize });
 }
 
-function claudeRequest({ model, effort = "medium", system, tools }: ModelOptions): Request {
+function claudeRequest({ model, effort = CLAUDE_EFFORT, system, tools }: ModelOptions): Request {
   return {
     model,
     max_tokens: 64_000, // counts thinking too; long coding turns need the room

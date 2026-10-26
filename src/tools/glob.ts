@@ -2,7 +2,7 @@
 // ignores. Paths come back relative to the project, ready for read_file.
 
 import { relative, resolve } from "node:path";
-import { firstVisible, globToRegExp, listFiles, relativeGlob } from "./files.ts";
+import { firstVisible, globToRegExp, listFiles, relativeGlob, walkedNote } from "./files.ts";
 import type { Tool } from "./index.ts";
 import { resolveInRoot } from "./util.ts";
 
@@ -34,16 +34,17 @@ export const globTool: Tool = {
     const base = resolveInRoot(cwd, path, dirs);
     const regex = globToRegExp(relativeGlob(pattern, base));
     // The pattern is relative to `path`; results are relative to the project, ready for read_file.
-    const { files, capped } = await listFiles(cwd, path, dirs, hidden, signal);
+    const { files, capped, gitTimedOut } = await listFiles(cwd, path, dirs, hidden, signal);
     const matches = files.filter((file) => regex.test(relative(base, resolve(cwd, file))));
     const { files: shown, total } = await firstVisible(cwd, matches, MAX_RESULTS, hidden);
     // Outside git the listing stops at a limit, and what wasn't found there may still exist.
     const unlisted = capped && `the first ${files.length} files: the listing stops there`;
-    if (shown.length === 0) return unlisted ? `No files found in ${unlisted}. Narrow the search with path.` : "No files found.";
+    const walked = walkedNote(gitTimedOut);
+    if (shown.length === 0) return (unlisted ? `No files found in ${unlisted}. Narrow the search with path.` : "No files found.") + walked;
     const notes = [total > shown.length && `Showed ${shown.length} of ${total} files.`, unlisted && `Looked only at ${unlisted}.`];
     if (notes.some(Boolean)) {
       shown.push(`\n(${notes.filter(Boolean).join(" ")} ${unlisted ? "Narrow the search with path." : "Use a narrower pattern or path."})`);
     }
-    return shown.join("\n");
+    return shown.join("\n") + walked;
   },
 };

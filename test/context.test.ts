@@ -479,7 +479,7 @@ describe("AGENTS.md", () => {
     await mkdir(join(dir, "service"));
     await writeFile(join(dir, "AGENTS.md"), "Use tabs.");
     await writeFile(join(dir, "service", "CLAUDE.md"), "Run `make test` before you finish.");
-    const instructions = loadInstructions(join(dir, "service"));
+    const { instructions } = loadInstructions(join(dir, "service"));
     assert.deepEqual(instructions, [
       { path: "../AGENTS.md", text: "Use tabs." },
       { path: "CLAUDE.md", text: "Run `make test` before you finish." },
@@ -492,8 +492,22 @@ describe("AGENTS.md", () => {
   it("prefers AGENTS.md to CLAUDE.md, and finds nothing outside a project", async () => {
     await writeFile(join(dir, "AGENTS.md"), "agents");
     await writeFile(join(dir, "CLAUDE.md"), "claude");
-    assert.deepEqual(loadInstructions(dir).map((i) => i.text), ["agents"]);
+    assert.deepEqual(loadInstructions(dir).instructions.map((i) => i.text), ["agents"]);
     assert.equal(systemPrompt(dir).includes("<instructions"), false);
     assert.ok((await readFile(join(dir, "AGENTS.md"), "utf8")).length > 0);
+  });
+
+  it("says when an AGENTS.md isn't a regular file, and follows the CLAUDE.md beside it", async () => {
+    // A named pipe a command made, or a link to /dev/zero, is left out unread: it used to be without a
+    // word, and it hid the CLAUDE.md beside it.
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    await mkdir(join(dir, "service"));
+    execFileSync("mkfifo", [join(dir, "AGENTS.md")]);
+    await writeFile(join(dir, "CLAUDE.md"), "claude");
+    await symlink("/dev/zero", join(dir, "service", "AGENTS.md"));
+    assert.deepEqual(loadInstructions(join(dir, "service")), {
+      instructions: [{ path: "../CLAUDE.md", text: "claude" }],
+      warnings: ["../AGENTS.md", "AGENTS.md"].map((path) => `${path} isn't a regular file (a named pipe, say), so jig doesn't read it.`),
+    });
   });
 });
