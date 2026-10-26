@@ -70,14 +70,23 @@ export function fetchSource(source: SkillSource, hidden: string[] = []): Fetched
   if (!FETCHED_URL.test(source.url)) throw new Error(`jig fetches skills only from https, ssh and file URLs, not ${source.url}.`);
   const tmp = mkdtempSync(join(tmpdir(), "jig-skills-"));
   const repo = join(tmp, "repo");
-  const cleanup = () => rmSync(tmp, { recursive: true, force: true });
   const sandbox = hidden.length && source.url.startsWith("file://") ? createSandbox(tmp, { network: false, hidden }) : undefined;
+  // The sandbox's keeper (on Linux) ends with jig anyway, but close it as soon as the fetch is done.
+  const cleanup = () => {
+    try {
+      sandbox?.close?.();
+    } catch {
+      // nothing more to do
+    }
+    rmSync(tmp, { recursive: true, force: true });
+  };
   // git refuses ext:: URLs, which run a command, unless a config allows them: this keeps them refused. In
-  // the sandbox, git's arguments are bash's own ("$@", after $0), so the shell reads none of them.
+  // the sandbox, git's arguments are bash's own ("$@", after $0), so the shell reads none of them. The sandbox
+  // joins the session's namespaces through descriptors the spawn passes on (child fds 3 onwards, see Keeper).
   const git = (args: string[], cwd = tmp) => {
     const argv = ["-c", "protocol.ext.allow=never", ...args];
-    const { program, args: wrapped } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [] };
-    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, { cwd, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 180_000 });
+    const { program, args: wrapped, stdio } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [], stdio: undefined };
+    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, { cwd, stdio: ["ignore", "pipe", "pipe", ...(stdio ?? [])], encoding: "utf8", timeout: 180_000 });
   };
   try {
     if (source.ref && /^[0-9a-f]{7,40}$/.test(source.ref)) {

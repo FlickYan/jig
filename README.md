@@ -158,8 +158,14 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
-  a daemon listening on a Unix socket (Docker's, say) is still within reach. And commands share the
-  machine's processes, so they can see yours and signal them. Because a sandboxed command can't change
+  a daemon listening on a Unix socket (Docker's, say) is still within reach. On macOS commands share the
+  machine's processes, so they can see yours and signal them; on Linux they run in one PID namespace for
+  the session with a `/proc` of their own, so they see only the session's own processes, not yours, and
+  can't reach outside the sandbox through `/proc/<pid>/root` of a process that is outside it. A job a
+  command leaves in the background runs on, reachable by the next command (a server on a port, or a `sleep`
+  it finds in `/proc`), until jig exits, when the whole namespace ends and the job with it; where
+  bubblewrap is too old to set this up, each command gets a namespace of its own instead and a background
+  job ends with the command that started it, which jig says once. Because a sandboxed command can't change
   files outside the project or reach the network, in the default `edits` mode commands run without asking
   (a hook that runs the project's code runs outside the sandbox: see Hooks). `--allow-network`, or
   `"network": true`, lets them reach it, so a command that does more than read then asks first. On Linux

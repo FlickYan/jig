@@ -95,7 +95,8 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   keeps the pipes open while it waits for the server. jig sat out the timeout and then killed the server
   with the process group. On Terminal-Bench that happened in 22 of the 55 calls that started something in
   the background. Now a call returns a second after the shell exits, tells the model that something it
-  started is still running, and leaves it running.
+  started is still running, and leaves it running: in the sandbox for the rest of the session (see the PID
+  namespace entry below), or without it as a terminal would, outliving jig.
 - **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
   slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
   just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
@@ -104,13 +105,33 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   in one command jig can run: the file system mounted read-only with the writable directories bound back
   in, a fresh `/dev`, and with `--unshare-net` a network namespace with nothing but loopback. It is small,
   packaged everywhere (Flatpak uses it), and needs no privileges where user namespaces are allowed.
-  Each command gets its own namespace, so a server one command starts is out of reach of the next; on
-  macOS it isn't. Killing a command's process group still reaches everything inside, and
-  `--die-with-parent` takes the sandbox down if jig dies. Commands keep the machine's process IDs, so
-  they can signal the user's other processes: in a PID namespace of their own (`--unshare-pid`), a job a
-  command leaves in the background would die with its shell, which the rule above leaves running. And
-  `--unshare-net` cuts off IP only: a daemon listening on a Unix socket (Docker's, say) stays within
-  reach, and closing that would take seccomp.
+  Each command gets its own network namespace, so a server one command starts is out of reach of the next;
+  on macOS it isn't. Killing a command's process group still reaches everything inside, and
+  `--die-with-parent` takes the sandbox down if jig dies. `--unshare-net` cuts off IP only: a daemon
+  listening on a Unix socket (Docker's, say) stays within reach, and closing that would take seccomp.
+- **One PID namespace per session.** bubblewrap runs commands in the host's PID namespace with the host's
+  `/proc`, and that was a hole: a command could step through `/proc/<pid>/root` of a process outside the
+  sandbox (jig, the user's shell, anything of the same user) into the host's mount namespace, where the
+  sandbox's binds don't apply. A review's probe read a hidden file and, outside the writable directories,
+  wrote one. We had turned `--unshare-pid` down because a per-command namespace would kill a job a command
+  left in the background when its shell exited. The answer is one namespace for the whole session, not one
+  per command: before the first command jig starts a small long-lived bubblewrap (the keeper) with
+  `--unshare-pid`, and each command joins its namespaces (`--pidns`, and `--userns` when run unprivileged,
+  where the user namespace owns the PID one) and mounts its own `--proc /proc`, so it sees only the
+  session's processes. A job left in the background is reparented to the namespace's init and runs on; a
+  server started in one command, a `sleep` the next command finds in `/proc` — both reach the next command,
+  as they would in a shell. The keeper's root is read-only with the hidden paths and jig's directory masked,
+  so reaching it through `/proc/1/root` grants nothing a command hasn't already (it can read every other
+  path, and can't write a read-only root). The keeper's life is tied to jig's — it reads a pipe jig holds
+  open, so jig's death sends end-of-file, and `--die-with-parent` kills it if jig is killed — so when jig
+  exits (normally, by a signal, or by `kill -9`) its init ends and the kernel ends every process in the
+  namespace, background jobs included. That changes documented behaviour: a background job used to outlive
+  jig; now it lasts the session. A timeout, Ctrl+C or the exit kill still kills a running command's whole
+  tree through its process group, which the reparented job stays part of. macOS's Seatbelt is unaffected,
+  since its rules hold whatever path a lookup takes. If bubblewrap is too old for the join (no `--pidns`) or
+  the keeper can't start, each command falls back to a namespace of its own (`--unshare-pid` with `--proc`):
+  as safe, but a command's background jobs end with it, and jig says so once. jig never runs a command in
+  the host's PID namespace.
 - **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
   they check paths themselves: against the project and the `--add-dir` directories, and a change again by
   where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can

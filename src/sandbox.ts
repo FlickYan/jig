@@ -1,5 +1,6 @@
-import { execFileSync } from "node:child_process";
-import { constants, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
@@ -12,10 +13,14 @@ export interface Sandbox {
   /** For the model: what commands can't do. */
   limits: string;
   /**
-   * The program and arguments that run `command` in bash inside the sandbox. They end with bash -c and the
-   * command, so arguments added after them are its $0 and "$@" (see fetchSource).
+   * The program and arguments that run `command` in bash inside the sandbox, and on Linux the file
+   * descriptors the spawn must pass on beyond stdio (the session's namespaces, see Keeper), at child
+   * descriptors 3 onwards. They end with bash -c and the command, so arguments added after them are its $0
+   * and "$@" (see fetchSource).
    */
-  wrap(command: string): { program: string; args: string[] };
+  wrap(command: string): { program: string; args: string[]; stdio?: number[] };
+  /** Ends the session's keeper (Linux) and frees what it holds: for jig's exit (see Keeper). */
+  close?(): void;
   /**
    * Those of the files telling git where its config is that commands created or changed since the last call,
    * the HEAD, objects or refs of a git directory they made git pass over, and, ending in a slash, a directory
@@ -65,7 +70,10 @@ const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are
  * `hidden` paths they can't read at all, nor jig's own directory but its skills (see ownRules). Returns
  * undefined where there is no sandbox; sandboxProblem says why.
  */
-export function createSandbox(root: string, { network, dirs = [], hidden = [] }: { network: boolean; dirs?: string[]; hidden?: string[] }): Sandbox | undefined {
+export function createSandbox(
+  root: string,
+  { network, dirs = [], hidden = [], onFallback }: { network: boolean; dirs?: string[]; hidden?: string[]; onFallback?: () => void },
+): Sandbox | undefined {
   if (sandboxProblem()) return undefined;
   const project = realpathSync(root); // Seatbelt sees real paths: /var is /private/var
   const unreadable = hidden.filter((path) => existsSync(path)).map((path) => realpathSync(path));
@@ -84,7 +92,7 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
   const sandbox =
     process.platform === "darwin"
       ? seatbelt(writable, network, where, unreadable, guarded, home)
-      : bubblewrap(writable, network, where, unreadable, guarded, home);
+      : bubblewrap(writable, network, where, unreadable, guarded, home, onFallback);
   return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project, repo?.tree) } : sandbox;
 }
 
@@ -523,12 +531,15 @@ function deny(operation: string, filters: string[] = []): string[] {
  * `network`, each command gets a network namespace of its own: no internet and no servers on the
  * machine's ports, though a command can still use its own loopback. A server started in one command is
  * therefore out of reach of the next, unlike on macOS, where localhost stays open. A Unix socket is a
- * file, though, so a daemon listening on one (Docker's, say) stays within reach. Commands also share the
- * machine's process IDs, and can signal the user's other processes: in a PID namespace of their own, a
- * job a command leaves running in the background would die with its shell.
+ * file, though, so a daemon listening on one (Docker's, say) stays within reach. Commands run in a PID
+ * namespace of the session's own, with their own /proc, so they see only the session's processes, not
+ * the machine's others, and can't reach the host's mount namespace through /proc/<pid>/root of a process
+ * outside the sandbox (see Keeper). A job a command leaves in the background keeps running, reparented to
+ * the namespace's init, until jig exits, when the kernel ends every process in the namespace.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void): Sandbox {
   const bwrap = findProgram("bwrap")!;
+  const keeper = new Keeper(bwrap, hidden, home, onFallback);
   // An empty directory over each hidden directory, and an empty file over each hidden file.
   const hiding = hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path]));
   // A bind of git's in jig's directory, outside the writable directories ownBinds shows there, or of one
@@ -536,25 +547,187 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   // of commands' reach anyway.
   const shown = (path: string) =>
     !home || (!isInside(path, home) && (!isInside(home, path) || writable.some((dir) => isInside(home, dir) && isInside(dir, path))));
-  // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too.
-  const args = () => [
+  // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too. --proc
+  // mounts a fresh /proc for the session's PID namespace, so it shows only the session's processes.
+  const args = (join: string[]) => [
     "--ro-bind", "/", "/",
     "--dev", "/dev",
+    "--proc", "/proc",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
     ...(home ? ownBinds(home, writable) : []),
     ...(git ? gitBinds(git, shown) : []),
     ...hiding,
+    ...join, // join the session's namespaces, or --unshare-pid in the fallback
     ...(network ? [] : ["--unshare-net"]),
     "--die-with-parent", // if jig is killed, so are its commands
   ];
   const offline =
     ", and have no network: each command gets an empty one of its own, so it can't reach the internet, servers on this " +
     "machine's ports, or a server an earlier command started (start a server and use it in the same command)";
+  const processes = " They see only this session's own processes, not the machine's others.";
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.`,
-    wrap: (command) => ({ program: bwrap, args: [...args(), "--", "/bin/bash", "-c", command] }),
+    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}`,
+    wrap: (command) => {
+      const { args: join, stdio } = keeper.join();
+      return { program: bwrap, args: [...args(join), "--", "/bin/bash", "-c", command], stdio: stdio.length ? stdio : undefined };
+    },
+    close: () => keeper.close(),
   };
+}
+
+/**
+ * One PID namespace per session, so each command's /proc shows only the session's processes and a command
+ * can't step through /proc/<pid>/root of a process outside the sandbox (jig, the user's shell, anything of
+ * the same user) into the host's mount namespace, where the sandbox's binds don't apply. bubblewrap runs
+ * commands in the host's PID namespace, so without this a probe read a hidden file and wrote outside the
+ * writable directories that way.
+ *
+ * The keeper is a small long-lived bubblewrap started once, lazily, at the first command, with --unshare-pid
+ * (and, run unprivileged, the user namespace bwrap adds on its own). Each command then joins its namespaces
+ * with --pidns (and --userns, which owns the PID namespace when unprivileged) and mounts its own /proc, so
+ * it sees only the session's processes. A job a command leaves in the background is reparented to the
+ * namespace's init and runs on for the session. The keeper's root is read-only with the hidden paths and
+ * jig's directory masked, so reaching it through /proc/1/root grants nothing: a command can already read
+ * every other path, and can't write through a read-only root. The keeper's life is tied to jig's: it reads
+ * a pipe jig holds open, so jig's death sends it end-of-file, and --die-with-parent kills it if jig is
+ * killed; either way its init ends and the kernel ends every process in the namespace. If bubblewrap is too
+ * old for the join (no --pidns) or the keeper can't start, each command falls back to a PID namespace of its
+ * own (--unshare-pid), which is as safe but ends a command's background jobs with the command; jig says so
+ * once. jig never runs commands in the host's PID namespace.
+ */
+class Keeper {
+  private started = false;
+  private child?: ChildProcess;
+  private userFd = -1;
+  private pidFd = -1;
+  private readonly bwrap: string;
+  private readonly hidden: string[];
+  private readonly home: string | undefined;
+  private readonly onFallback?: () => void;
+
+  constructor(bwrap: string, hidden: string[], home: string | undefined, onFallback?: () => void) {
+    this.bwrap = bwrap;
+    this.hidden = hidden;
+    this.home = home;
+    this.onFallback = onFallback;
+  }
+
+  /** How a command joins the session's namespaces: the bubblewrap arguments and the descriptors they name. */
+  join(): { args: string[]; stdio: number[] } {
+    this.ensure();
+    if (this.pidFd < 0) return { args: ["--unshare-pid"], stdio: [] }; // fallback: a PID namespace per command
+    return this.userFd >= 0
+      ? { args: ["--userns", "3", "--pidns", "4"], stdio: [this.userFd, this.pidFd] }
+      : { args: ["--pidns", "3"], stdio: [this.pidFd] };
+  }
+
+  private ensure(): void {
+    if (this.started) return;
+    this.started = true;
+    try {
+      if (!this.start()) throw new Error("the keeper's namespaces can't be joined");
+    } catch {
+      this.close();
+      this.onFallback?.();
+    }
+  }
+
+  /** Starts the keeper and verifies a command can join it; false (or a throw) means fall back. */
+  private start(): boolean {
+    if (!keeperSupported(this.bwrap)) return false;
+    const infoPath = join(tmpdir(), `jig-keeper-${randomBytes(6).toString("hex")}`);
+    let infoFd: number | undefined = openSync(infoPath, "wx", 0o600);
+    try {
+      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", "read x"];
+      // Detached, so the terminal's Ctrl+C doesn't reach it: the session goes on after an interrupted command.
+      // Its stdin is a pipe jig holds open; jig's death closes it, and the keeper's `read` then ends.
+      this.child = spawn(this.bwrap, args, { stdio: ["pipe", "ignore", "ignore", infoFd], detached: true });
+      this.child.unref();
+      this.child.stdin?.on("error", () => {}); // the write end can outlive the keeper; ignore EPIPE
+      closeSync(infoFd);
+      infoFd = undefined;
+      const childPid = keeperChildPid(infoPath);
+      if (childPid === undefined) return false;
+      this.pidFd = openSync(`/proc/${childPid}/ns/pid`, "r");
+      // Run unprivileged, bwrap gave the keeper a user namespace of its own, which owns the PID one; a
+      // command joins both. Run as root, the keeper stays in the host user namespace, so there is none to join.
+      if (readlinkSync(`/proc/${childPid}/ns/user`) !== readlinkSync("/proc/self/ns/user")) this.userFd = openSync(`/proc/${childPid}/ns/user`, "r");
+      return probeJoin(this.bwrap, this.userFd, this.pidFd);
+    } finally {
+      if (infoFd !== undefined) try { closeSync(infoFd); } catch {} // the spawn failed
+      try { rmSync(infoPath, { force: true }); } catch {}
+    }
+  }
+
+  /** Ends the keeper and the whole session's namespace, and frees the descriptors jig held open. */
+  close(): void {
+    try { this.child?.stdin?.destroy(); } catch {}
+    if (this.child?.pid) try { process.kill(-this.child.pid, "SIGKILL"); } catch {}
+    for (const fd of [this.userFd, this.pidFd]) if (fd >= 0) try { closeSync(fd); } catch {}
+    this.userFd = this.pidFd = -1;
+    this.child = undefined;
+  }
+}
+
+const KEEPER_START_MS = 5000; // how long to wait for the keeper to report its PID before falling back
+
+/** Whether this bubblewrap offers what the keeper and the join need (an old one, before --pidns, doesn't). */
+function keeperSupported(bwrap: string): boolean {
+  try {
+    const help = execFileSync(bwrap, ["--help"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 5000 });
+    return ["--pidns", "--userns", "--info-fd"].every((flag) => help.includes(flag));
+  } catch {
+    return false;
+  }
+}
+
+/** The keeper's PID, read from the --info-fd file it writes early; undefined if it never does (it failed to start). */
+function keeperChildPid(infoPath: string): number | undefined {
+  const deadline = Date.now() + KEEPER_START_MS;
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    try {
+      const pid = /"child-pid":\s*(\d+)/.exec(readFileSync(infoPath, "utf8"))?.[1];
+      if (pid) return Number(pid);
+    } catch {
+      // not written yet
+    }
+    Atomics.wait(sleeper, 0, 0, 10); // a short sync wait, so startup doesn't busy-loop
+  }
+  return undefined;
+}
+
+/** That a command can actually join the keeper's namespaces: as root it can, and unprivileged it can where the kernel allows it. */
+function probeJoin(bwrap: string, userFd: number, pidFd: number): boolean {
+  const { args, stdio } = userFd >= 0 ? { args: ["--userns", "3", "--pidns", "4"], stdio: [userFd, pidFd] } : { args: ["--pidns", "3"], stdio: [pidFd] };
+  try {
+    execFileSync(bwrap, [...args, "--ro-bind", "/", "/", "--proc", "/proc", "--die-with-parent", "--", "/bin/true"], {
+      stdio: ["ignore", "ignore", "ignore", ...stdio],
+      timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * How the keeper masks what a command masks, so its read-only root is no way around the sandbox: an empty
+ * directory over each hidden directory, /dev/null over each hidden file, and an empty directory over jig's
+ * own directory (its skills aren't needed here, only in commands). Only over what is there, since the
+ * keeper's root is read-only and a bind of a missing path would fail.
+ */
+function keeperHiding(hidden: string[], home: string | undefined): string[] {
+  const out = hidden.flatMap((path) => {
+    try {
+      return statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path];
+    } catch {
+      return [];
+    }
+  });
+  if (home && existsSync(home)) out.push("--tmpfs", home);
+  return out;
 }
 
 /**

@@ -181,6 +181,49 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     assert.doesNotMatch(flags(true), /deny network|--unshare-net/);
   });
 
+  const linuxOnly = process.platform === "darwin" && "Seatbelt applies its rules whatever path a lookup takes, so there is nothing to reach";
+
+  it("can't reach outside the sandbox through /proc/<pid>/root of a process outside it", { skip: linuxOnly }, async () => {
+    const hidden = await mkdtemp(join(homedir(), ".jig-sandbox-escape-"));
+    const answer = join(hidden, "answer.txt");
+    await writeFile(answer, "the hidden answer");
+    const target = join(homedir(), `.jig-escape-target-${process.pid}`);
+    try {
+      const sandbox = createSandbox(project, { network: false, hidden: [hidden] })!;
+      // bubblewrap ran commands in the host's PID namespace, so /proc/<jig>/root (here the test process) and
+      // /proc/1/root led into the host's mount namespace, where the sandbox's binds don't apply: a review's
+      // probe read a hidden file and wrote outside the writable directories that way. Now a command sees only
+      // the session's processes, each with the hidden paths and jig's directory masked in its root.
+      const roots = `/proc/${process.pid}/root $(for p in $(ls /proc | grep -E '^[0-9]+$'); do echo /proc/$p/root; done)`;
+      assert.doesNotMatch(await run(`for r in ${roots}; do cat $r${answer} 2>/dev/null; done; echo end`, sandbox), /the hidden answer/);
+      assert.match(await run(`for r in ${roots}; do echo bad > $r${target} 2>/dev/null; done; echo end`, sandbox), /\nend\n/);
+      assert.equal(existsSync(target), false);
+      sandbox.close?.();
+    } finally {
+      await rm(hidden, { recursive: true, force: true });
+      await rm(target, { force: true });
+    }
+  });
+
+  it("shows a command only the session's own processes in /proc", { skip: linuxOnly }, async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const lines = (await run(`ls /proc | grep -cE '^[0-9]+$'; [ -e /proc/${process.pid} ] && echo visible || echo hidden`, sandbox)).split("\n");
+    assert.equal(lines[1], "hidden", "the jig process, outside the session's namespace, isn't in the command's /proc");
+    assert.ok(Number(lines[0]) > 0 && Number(lines[0]) < 50, `only the session's processes, not the machine's hundreds: saw ${lines[0]}`);
+    sandbox.close?.();
+  });
+
+  it("kills a command's whole tree on timeout, inside the session's namespace", { skip: linuxOnly }, async () => {
+    // A command that leaves a job in the background and then hangs: its timeout must take the job down too,
+    // which the next command in the session confirms through the shared /proc.
+    const sandbox = createSandbox(project, { network: false })!;
+    const timedOut = await runCommand("sleep 60 & echo $! > child.pid; sleep 60", project, 1, undefined, sandbox);
+    assert.match(timedOut, /Killed: it timed out/);
+    const pid = (await readFile(join(project, "child.pid"), "utf8")).trim();
+    assert.match(await run(`[ -e /proc/${pid} ] && echo alive || echo gone`, sandbox), /^gone/);
+    sandbox.close?.();
+  });
+
   it("keeps the repository's git config and hooks read-only, and its git directory in place", async () => {
     const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
     try {
@@ -705,6 +748,73 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     } finally {
       api.close();
       await rm(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a background job in the session's PID namespace", { skip: sandboxProblem() || (process.platform === "darwin" && "the session's PID namespace is a Linux feature") }, () => {
+  it("is reachable by the next command in the session, and dies when jig exits", async () => {
+    const proj = join(dir, "bg-normal");
+    await mkdir(proj);
+    const marker = join(proj, "survived");
+    // cmd1 leaves a job in the background and records its namespace PID; cmd2 finds it still there; then the
+    // task ends and jig exits, which ends the whole namespace, so the job's later write never lands.
+    const cmds = [`(sleep 3; touch ${marker}) & echo $! > ns.pid; sleep 0.2; echo one`, "n=$(cat ns.pid); [ -e /proc/$n ] && echo REACHABLE || echo gone"];
+    let i = 0;
+    const api = await fakeMessagesApi(() => (i < cmds.length ? [{ tool: "bash", input: { command: cmds[i++] } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests), /REACHABLE/, "the next command saw the job in the shared /proc");
+      await new Promise((done) => setTimeout(done, 3500));
+      assert.equal(existsSync(marker), false, "the background job outlived jig's exit");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("dies when jig is killed with SIGKILL", async () => {
+    const proj = join(dir, "bg-sigkill");
+    await mkdir(proj);
+    const marker = join(proj, "survived");
+    // A long command keeps jig busy; runJig's timeout SIGKILLs jig before the job's delay elapses. The keeper
+    // dies with jig (--die-with-parent), the kernel ends the namespace, and the job never writes its marker.
+    const command = `(sleep 3; touch ${marker}) & echo started; sleep 30`;
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
+    try {
+      const { code } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj, timeout: 1500 });
+      assert.equal(code, null, "jig was killed by the signal, running no handler");
+      await new Promise((done) => setTimeout(done, 3000));
+      assert.equal(existsSync(marker), false, "the background job outlived a killed jig");
+    } finally {
+      api.close();
+    }
+  });
+});
+
+describe("the sandbox's fallback without a session PID namespace", { skip: sandboxProblem() || (process.platform === "darwin" && "Linux only") }, () => {
+  it("builds each command its own PID namespace when bubblewrap has no --pidns", async () => {
+    // A bwrap earlier on the PATH whose --help lacks --pidns stands in for an old bubblewrap. jig must fall
+    // back to --unshare-pid per command (still secure, but a command's background jobs end with it) and say so.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    await writeFile(join(fakeBin, "bwrap"), `#!/bin/sh\nif [ "$1" = "--help" ]; then echo "    --unshare-pid    Create new pid namespace"; exit 0; fi\nexec ${real} "$@"\n`);
+    await chmod(join(fakeBin, "bwrap"), 0o755);
+    const savedPath = process.env.PATH;
+    let fellBack = false;
+    try {
+      process.env.PATH = `${fakeBin}${sep === "\\" ? ";" : ":"}${savedPath}`;
+      const sandbox = createSandbox(dir, { network: false, onFallback: () => (fellBack = true) })!;
+      const { args, stdio } = sandbox.wrap("echo hi");
+      assert.equal(fellBack, true, "jig told the user it fell back");
+      assert.ok(args.includes("--unshare-pid"), "each command gets its own PID namespace");
+      assert.ok(args.join(" ").includes("--proc /proc"), "with its own /proc");
+      assert.ok(!args.includes("--pidns") && !args.includes("--userns"), "it doesn't try to join a keeper");
+      assert.equal(stdio, undefined, "and passes no namespace descriptors");
+      sandbox.close?.();
+    } finally {
+      process.env.PATH = savedPath;
     }
   });
 });

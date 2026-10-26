@@ -1,7 +1,7 @@
 // bash: runs a command in a fresh shell, in the sandbox when there is one and in a process group of its
 // own, so a timeout, Ctrl+C or jig's exit stops everything it started; jig's API keys are kept out of its
-// environment. The model gets the output and the exit code; a job left in the background keeps running, as
-// in a terminal.
+// environment. The model gets the output and the exit code; a job left in the background keeps running, in
+// the sandbox's session until jig exits (see sandbox.ts's Keeper), and without the sandbox as in a terminal.
 // A long output is cut from the middle, and the whole of it goes to a file the model can search.
 
 import { spawn } from "node:child_process";
@@ -125,10 +125,11 @@ export function runCommand(
   count?: ToolContext["count"],
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const { program, args } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
+    const { program, args, stdio } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
-    // with everything it started (a test runner and its workers, say), not just the shell.
-    const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    // with everything it started (a test runner and its workers, say), not just the shell. `stdio` carries
+    // the session's namespace descriptors on Linux (child fds 3 onwards), for the sandbox to join (see Keeper).
+    const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe", ...(stdio ?? [])] });
     const group = child.pid; // none if it couldn't be started
     if (group) running.add(group);
     const output = new Output(files);
@@ -142,8 +143,8 @@ export function runCommand(
       if (done) return; // a background job's output, after the call has returned
       output.add(chunk);
     };
-    child.stdout.setEncoding("utf8").on("data", collect);
-    child.stderr.setEncoding("utf8").on("data", collect);
+    child.stdout!.setEncoding("utf8").on("data", collect); // stdio asks for a pipe at 1 and 2
+    child.stderr!.setEncoding("utf8").on("data", collect);
 
     const timer = setTimeout(() => kill(`it timed out after ${seconds}s`), seconds * 1000);
     const onAbort = () => kill(whyStopped(signal, "the user interrupted it"));

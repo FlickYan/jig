@@ -286,7 +286,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
   const wantSandbox = values.sandbox ?? settings.sandbox ?? true;
-  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths }) : undefined;
+  // On Linux jig holds one PID namespace for the session (see sandbox.ts's Keeper); if it can't, each command
+  // gets one of its own, which ends a command's background jobs with the command. Said once, at the first command.
+  const onFallback = () =>
+    ui.notice("jig couldn't set up one process namespace for the whole session (bubblewrap is too old, or the kernel refused it), so each command gets its own: a job left in the background then ends with the command that started it.");
+  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths, onFallback }) : undefined;
   if (values.sandbox && !sandbox) throw new Error(`No sandbox: ${sandboxProblem()}.`);
   // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
@@ -299,10 +303,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
   // policy doesn't know them, so their results don't point to a file their commands couldn't read.
   const outputs = new OutputFiles();
-  // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, and a command still running is
-  // killed as Ctrl+C kills it: only bubblewrap's sandbox would take it down with jig.
+  // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, a command still running is killed
+  // as Ctrl+C kills it, and the session's keeper (sandbox.ts) ends with the whole PID namespace, so a job a
+  // command left in the background dies too: only bubblewrap's sandbox would otherwise take them down with jig.
   process.on("exit", () => {
     killCommands();
+    sandbox?.close?.();
     outputs.remove();
   });
   // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
