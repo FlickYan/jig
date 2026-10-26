@@ -30,7 +30,10 @@ export interface AgentOptions {
   callModel: CallModel;
   tools: Tool[];
   cwd: string;
-  /** Hard stop: the most model calls one task may take. */
+  /**
+   * Hard stop: the most steps one task may take, each a model call that may call tools. With wrapUp, one
+   * more call, in which no tool runs, follows the last.
+   */
   maxSteps: number;
   /** Compact the conversation before a model call once it is larger than this many tokens (0: never). */
   compactAt: number;

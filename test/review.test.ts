@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { constants } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
@@ -334,6 +336,38 @@ describe("jig review", () => {
       assert.deepEqual((await readdir(temp)).filter((name) => name.startsWith("jig-")), []);
     } finally {
       api.close();
+    }
+  });
+
+  it("leaves nothing in the temp directory when a signal ends it, and exits with the code a shell would give", async () => {
+    // The API hangs, and the review is stopped as a harness stops one that runs over time, as closing its
+    // terminal does, or with Ctrl+C. A signal ends jig without the exit event, which removes the directory.
+    const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+    for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"] as const) {
+      let pid = 0;
+      const server = createServer((req) => {
+        req.resume();
+        process.kill(pid, signal); // and never answers
+      });
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      const dir = await tempDir("jig-review-cli-");
+      const temp = await tempDir("jig-review-tmp-"); // jig's temp directory, of its own
+      try {
+        const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+        const env = { ...process.env, ANTHROPIC_BASE_URL: url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await tempDir("jig-home-"), TMPDIR: temp };
+        const args = ["review", "--session", await session(dir), "--exec", "bash -c", "--model", "claude-haiku-4-5", "--out", join(dir, "verdict.json")];
+        const child = spawn(process.execPath, [cli, ...args], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+        pid = child.pid!;
+        let output = "";
+        child.stdout.on("data", (chunk) => (output += chunk));
+        child.stderr.on("data", (chunk) => (output += chunk));
+        const code = await new Promise<number | null>((done) => child.on("close", done));
+        assert.equal(code, 128 + constants.signals[signal], `${signal}: ${output}`);
+        assert.deepEqual((await readdir(temp)).filter((name) => name.startsWith("jig-")), [], `${signal} left jig's directory behind`);
+      } finally {
+        server.closeAllConnections();
+        server.close();
+      }
     }
   });
 });

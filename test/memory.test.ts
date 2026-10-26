@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -10,6 +11,7 @@ import { proposeInstructionsTool } from "../src/instructions-proposals.ts";
 import { loadMemories, memoryDir, memoryPrompt, memoryTool, proposeMemoryTool } from "../src/memory.ts";
 import type { CallModel } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
+import { loadInstructions } from "../src/prompt.ts";
 import type { Approve } from "../src/proposals.ts";
 import { findSecret, redactSecrets } from "../src/secrets.ts";
 import { FileVersions } from "../src/tools/util.ts";
@@ -105,6 +107,16 @@ describe("AGENTS.md proposals", () => {
     await proposeInstructionsTool(yes).run({ new_string: "Use pnpm." }, context());
     assert.equal(await readFile(join(project, "CLAUDE.md"), "utf8"), "# Notes\n\nUse pnpm.\n");
     assert.ok(!existsSync(join(project, "AGENTS.md")));
+  });
+
+  it("edit the CLAUDE.md jig follows in place of an AGENTS.md that isn't a regular file", async () => {
+    // A named pipe a command made: the proposal went to it, and failed, while jig followed the CLAUDE.md.
+    execFileSync("mkfifo", [join(project, "AGENTS.md")]);
+    await writeFile(join(project, "CLAUDE.md"), "# Notes\n");
+    const shown: string[] = [];
+    assert.match(await proposeInstructionsTool(async (title) => (shown.push(title), true)).run({ new_string: "Use pnpm." }, context()), /^Edited CLAUDE\.md\./);
+    assert.deepEqual(shown, ["Edit CLAUDE.md?"]);
+    assert.deepEqual(loadInstructions(project).instructions, [{ path: "CLAUDE.md", text: "# Notes\n\nUse pnpm." }]);
   });
 
   it("go by where AGENTS.md really leads: never out of the project, and the question names the file", async () => {

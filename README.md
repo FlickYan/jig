@@ -187,10 +187,10 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
-  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows
-  the `CLAUDE.md` beside it, if that is a regular file. A settings file is refused, a lockfile or a skill's
-  file is reported and its skills left as they are, and a git file is reported by what it is. `read_file`
-  and `edit_file` likewise
+  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows,
+  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. A settings file is
+  refused, a lockfile or a skill's file is reported and its skills left as they are, and a git file is
+  reported by what it is. `read_file` and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
