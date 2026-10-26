@@ -1,15 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { before, describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { globToRegExp, listFiles, searchLimits } from "../src/tools/files.ts";
 import { globTool } from "../src/tools/glob.ts";
 import { grepTool } from "../src/tools/grep.ts";
 import type { ToolContext } from "../src/tools/index.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 const PROJECT: Record<string, string> = {
   "README.md": "# Demo\n",
@@ -23,7 +25,7 @@ const PROJECT: Record<string, string> = {
 };
 
 async function project(git: boolean, files = PROJECT): Promise<ToolContext> {
-  const cwd = await mkdtemp(join(tmpdir(), "jig-search-"));
+  const cwd = await tempDir("jig-search-");
   for (const [path, content] of Object.entries(files)) {
     await mkdir(dirname(join(cwd, path)), { recursive: true });
     await writeFile(join(cwd, path), content);
@@ -84,7 +86,7 @@ describe("listFiles", () => {
 
   it("doesn't run a program the repository's git config names", async () => {
     const { cwd } = await project(true);
-    const outside = await mkdtemp(join(tmpdir(), "jig-fsmonitor-"));
+    const outside = await tempDir("jig-fsmonitor-");
     // git runs core.fsmonitor on every ls-files, and a command the model ran may have set it.
     execFileSync("git", ["config", "core.fsmonitor", `env > ${join(outside, "ran")}; false`], { cwd });
     assert.ok((await listFiles(cwd)).files.includes("src/app.py"));
@@ -93,7 +95,7 @@ describe("listFiles", () => {
 
   it("runs git without jig's API keys", async () => {
     const { cwd } = await project(true);
-    const bin = await mkdtemp(join(tmpdir(), "jig-bin-"));
+    const bin = await tempDir("jig-bin-");
     // A git that notes its environment, then runs the real one from the rest of the PATH.
     await writeFile(join(bin, "git"), `#!/bin/sh\nenv > "${bin}/env"\nPATH="\${PATH#*:}" exec git "$@"\n`, { mode: 0o755 });
     const saved = { PATH: process.env.PATH, DEEPSEEK_API_KEY: process.env.DEEPSEEK_API_KEY };
@@ -173,7 +175,7 @@ describe("listFiles", () => {
     // directory's git may ignore everything, but its own dist/ and the like are still left out.
     const ignored = join(ctx.cwd, "node_modules/pkg");
     assert.deepEqual((await listFiles(ignored)).files, ["index.js"]);
-    const other = await mkdtemp(join(tmpdir(), "jig-search-"));
+    const other = await tempDir("jig-search-");
     assert.deepEqual((await listFiles(other, ignored, [ignored])).files, [join(ignored, "index.js")]);
   });
 
@@ -185,6 +187,14 @@ describe("listFiles", () => {
     execFileSync("mkfifo", [join(ctx.cwd, ".git", "info", "exclude")]);
     await withLimits({ seconds: 1 }, async () => {
       assert.deepEqual((await listFiles(ctx.cwd)).files, ["a.txt", "sub/b.txt"]);
+      // The walk doesn't leave out what git ignores, so the model is told: a log's lines looked like the code's.
+      const walked = "\n\n(git took over 1s to list the files, so they were walked instead, and files git ignores may be among them.)";
+      const [found, matched, none] = await Promise.all([
+        globTool.run({ pattern: "**/*.txt" }, ctx),
+        grepTool.run({ pattern: "needle" }, ctx),
+        grepTool.run({ pattern: "nothing like this" }, ctx),
+      ]);
+      assert.deepEqual([found, matched, none], [`a.txt\nsub/b.txt${walked}`, `a.txt:1: needle\nsub/b.txt:1: needle${walked}`, `No matches.${walked}`]);
     });
     // Stopped by Ctrl+C or the time limit, glob doesn't wait for git, and grep says why it stopped.
     const stopped = { ...ctx, signal: AbortSignal.abort() };
@@ -232,7 +242,7 @@ describe("grep", () => {
 
   it("follows links out of the project, but not into a hidden path", async () => {
     const ctx = await project(true);
-    const secrets = await mkdtemp(join(tmpdir(), "jig-hidden-"));
+    const secrets = await tempDir("jig-hidden-");
     await writeFile(join(secrets, "key.txt"), "hello secret\n");
     await symlink(join(secrets, "key.txt"), join(ctx.cwd, "key.txt"));
     await symlink(secrets, join(ctx.cwd, "secrets"));
@@ -262,7 +272,7 @@ describe("grep's limits", () => {
 
   it("leaves hidden files out of the ones it reads, and of the count", async () => {
     const ctx = await repository(letters, ["a.txt"]);
-    const secrets = await mkdtemp(join(tmpdir(), "jig-hidden-"));
+    const secrets = await tempDir("jig-hidden-");
     await writeFile(join(secrets, "key.txt"), "needle secret\n");
     await symlink(join(secrets, "key.txt"), join(ctx.cwd, "b2.txt")); // between b.txt and c.txt by name
     ctx.hidden = [secrets];

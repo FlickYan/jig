@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { describe, it } from "node:test";
+import { mkdir, rm, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { afterEach, describe, it } from "node:test";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "../bench/evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "../bench/evolve-workspace.ts";
 import { type Attempt, compare, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split } from "../bench/evolve-referee.ts";
 import { attemptsOf, nextStart, refusedByApi, runOrder, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 /** Attempts with the given passes out of three per task, each costing `cost`. */
 function runOf(passes: Record<string, number>, cost = 0.01): Attempt[] {
@@ -172,7 +174,7 @@ FAILED (failures=1)
   });
 
   it("collects the words that would tie a change to the tasks", async () => {
-    const tasks = await mkdtemp(join(tmpdir(), "jig-evolve-words-"));
+    const tasks = await tempDir("jig-evolve-words-");
     await mkdir(join(tasks, "retry-limit", "repo", "pkg"), { recursive: true });
     await writeFile(join(tasks, "retry-limit", "task.json"), JSON.stringify({ instruction: "Add a --max-retries flag, also read from APP_MAX_RETRIES." }));
     await writeFile(join(tasks, "retry-limit", "repo", "pkg", "client.py"), "def load_settings(path):\n    pass\n\ndef run():\n    pass\n");
@@ -188,7 +190,7 @@ describe("a candidate's workspace", () => {
   const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" }).trim();
 
   async function repository(): Promise<string> {
-    const root = await mkdtemp(join(tmpdir(), "jig-evolve-repo-"));
+    const root = await tempDir("jig-evolve-repo-");
     for (const [file, text] of Object.entries({
       "src/prompt.ts": "export const PROMPT = 1;\n",
       "bench/run.ts": "// the runner\n",
@@ -210,27 +212,35 @@ describe("a candidate's workspace", () => {
   it("leaves out the benchmarks and the evaluation, and the history that holds them", async () => {
     const root = await repository();
     const tree = workspace(root, "HEAD");
-    assert.ok(existsSync(join(tree, "src/prompt.ts")) && existsSync(join(tree, "bench/run.ts")) && existsSync(join(tree, "test/a.test.ts")));
-    assert.ok(!existsSync(join(tree, "bench/evolve")) && !existsSync(join(tree, "bench/tasks")) && !existsSync(join(tree, "eval")));
-    assert.equal(git(tree, "rev-list", "--all", "--count"), "1");
-    assert.equal(git(tree, "log", "--all", "--format=%B").includes("second"), false);
-    assert.deepEqual(changedFiles(tree), []);
+    try {
+      assert.ok(existsSync(join(tree, "src/prompt.ts")) && existsSync(join(tree, "bench/run.ts")) && existsSync(join(tree, "test/a.test.ts")));
+      assert.ok(!existsSync(join(tree, "bench/evolve")) && !existsSync(join(tree, "bench/tasks")) && !existsSync(join(tree, "eval")));
+      assert.equal(git(tree, "rev-list", "--all", "--count"), "1");
+      assert.equal(git(tree, "log", "--all", "--format=%B").includes("second"), false);
+      assert.deepEqual(changedFiles(tree), []);
+    } finally {
+      await rm(dirname(tree), { recursive: true, force: true }); // as bench/evolve.ts removes a candidate's
+    }
   });
 
   it("brings the change back as a branch, leaving the checkout as it was", async () => {
     const root = await repository();
     await writeFile(join(root, "test/a.test.ts"), "// edited in the checkout, not committed\n");
     const tree = workspace(root, "HEAD");
-    await writeFile(join(tree, "src/prompt.ts"), "export const PROMPT = 2;\n");
-    await writeFile(join(tree, "src/new.ts"), "export {};\n");
-    assert.deepEqual(changedFiles(tree).sort(), ["src/new.ts", "src/prompt.ts"]);
-    commitPatch(root, "evolve/1", "HEAD", patchOf(tree), ["evolve 1: a change", "Why it helps."]);
-    assert.deepEqual(git(root, "diff", "--name-only", "HEAD", "evolve/1").split("\n"), ["src/new.ts", "src/prompt.ts"]);
-    assert.equal(git(root, "show", "evolve/1:src/prompt.ts"), "export const PROMPT = 2;");
-    assert.equal(git(root, "log", "-1", "--format=%s%n%b", "evolve/1"), "evolve 1: a change\nWhy it helps.");
-    assert.equal(git(root, "branch", "--show-current"), "main");
-    assert.equal(git(root, "status", "--porcelain"), "M test/a.test.ts");
-    assert.equal(readFileSync(join(root, "src/prompt.ts"), "utf8"), "export const PROMPT = 1;\n");
+    try {
+      await writeFile(join(tree, "src/prompt.ts"), "export const PROMPT = 2;\n");
+      await writeFile(join(tree, "src/new.ts"), "export {};\n");
+      assert.deepEqual(changedFiles(tree).sort(), ["src/new.ts", "src/prompt.ts"]);
+      commitPatch(root, "evolve/1", "HEAD", patchOf(tree), ["evolve 1: a change", "Why it helps."]);
+      assert.deepEqual(git(root, "diff", "--name-only", "HEAD", "evolve/1").split("\n"), ["src/new.ts", "src/prompt.ts"]);
+      assert.equal(git(root, "show", "evolve/1:src/prompt.ts"), "export const PROMPT = 2;");
+      assert.equal(git(root, "log", "-1", "--format=%s%n%b", "evolve/1"), "evolve 1: a change\nWhy it helps.");
+      assert.equal(git(root, "branch", "--show-current"), "main");
+      assert.equal(git(root, "status", "--porcelain"), "M test/a.test.ts");
+      assert.equal(readFileSync(join(root, "src/prompt.ts"), "utf8"), "export const PROMPT = 1;\n");
+    } finally {
+      await rm(dirname(tree), { recursive: true, force: true });
+    }
   });
 
   it("reads the summary line and paragraph of the reply", () => {

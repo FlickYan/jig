@@ -1,6 +1,7 @@
 // Settings, the user's (~/.jig/settings.json) and a project's (.jig/settings.json): which commands run
-// without asking and which never run, the sandbox and the network, hooks and MCP servers. A project's
-// settings could run programs, so apart from its deny rules they apply only once the user trusts the file.
+// without asking and which never run, the sandbox and the network, hidden paths, hooks and MCP servers. A
+// project's settings could run programs, so apart from its deny rules and hidden paths they apply only once
+// the user trusts the file.
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -90,8 +91,8 @@ export function readSettings(root: string): { user: Settings; project?: ProjectS
 /**
  * The parts of a project's settings that could run code or weaken jig's safety, described for the
  * user. A repository you just cloned could otherwise start programs (hooks, MCP servers) or switch the
- * sandbox off the moment jig runs in it, so these need the user's trust. Deny rules only restrict, so
- * they always apply.
+ * sandbox off the moment jig runs in it, so these need the user's trust. Deny rules and hidden paths only
+ * restrict, so they always apply.
  */
 export function needsTrust(settings: Settings): string[] {
   const asks: string[] = [];

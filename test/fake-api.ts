@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -86,11 +86,12 @@ sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
 `;
 
 /**
- * Runs jig's CLI against a fake API, in `cwd`, with its own JIG_HOME unless `env` gives one. With `terminal`,
- * its input and output are a pseudo-terminal that python3 makes and no one types at (`stdin` goes unread), and
- * the output comes without the terminal's escape codes and carriage returns. Still waiting for an answer after
- * 20 seconds, jig is hung up on, so a test fails rather than hangs. With `timeout`, jig is killed after that
- * many milliseconds, for a test of a hang where it would run no signal handler (code null).
+ * Runs jig's CLI against a fake API, in `cwd`, with a JIG_HOME of its own, removed once jig has exited, unless
+ * `env` gives one. With `terminal`, its input and output are a pseudo-terminal that python3 makes and no one
+ * types at (`stdin` goes unread), and the output comes without the terminal's escape codes and carriage
+ * returns. Still waiting for an answer after 20 seconds, jig is hung up on, so a test fails rather than hangs.
+ * With `timeout`, jig is killed after that many milliseconds, for a test of a hang where it would run no signal
+ * handler (code null).
  */
 export async function runJig(
   args: string[],
@@ -109,5 +110,6 @@ export async function runJig(
   child.stderr.setEncoding("utf8").on("data", (chunk) => (output += chunk));
   child.stdin.end(stdin);
   const code = await new Promise<number | null>((done) => child.on("close", done));
+  if (home !== env.JIG_HOME) await rm(home, { recursive: true, force: true });
   return { code, output: terminal ? output.replace(/\x1b\[[0-9;?]*[A-Za-z]|\r/g, "") : output };
 }

@@ -1,20 +1,22 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { WRAP_UP } from "../src/agent.ts";
 import { exampleProblems, exportSession } from "../src/export.ts";
 import { redactSecrets } from "../src/secrets.ts";
 import { sessionsCommand } from "../src/sessions-cli.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 const FAKE_KEY = `sk-test${"0".repeat(24)}`;
 const TOOL = { name: "bash", description: "Runs a command.", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } };
 
 async function sessionFile(entries: object[], dir?: string): Promise<string> {
-  const file = join(dir ?? (await mkdtemp(join(tmpdir(), "jig-export-"))), "2026-10-11T10-00-00-abcd.jsonl");
+  const file = join(dir ?? (await tempDir("jig-export-")), "2026-10-11T10-00-00-abcd.jsonl");
   await writeFile(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
   return file;
 }
@@ -72,6 +74,26 @@ describe("exporting sessions as fine-tuning data", () => {
     assert.deepEqual(roles, ["system: You are a coding agent.", "user: First task.", "assistant: Done with the first."]);
   });
 
+  it("answers a call a crash left open as jig did when the session was continued, so the example stays valid", async () => {
+    // Killed mid-call and continued: the call's answer was never written to the file, and the export was
+    // left out as in an order a trainer would reject.
+    const file = await sessionFile([
+      start,
+      message("user", "Fix the build."),
+      message("assistant", [call("t1", "make")]),
+      message("user", "Go on."),
+      message("assistant", [{ type: "text", text: "Fixed." }]),
+    ]);
+    const { example } = exportSession(file)!;
+    assert.deepEqual(exampleProblems(example), []);
+    assert.deepEqual(example.messages.slice(2).map((m) => `${m.role}: ${m.content}`), [
+      "assistant: null",
+      "tool: Error: Not run: the session ended before this call ran.",
+      "user: Go on.",
+      "assistant: Fixed.",
+    ]);
+  });
+
   it("blanks out secrets in any message, keeping the JSON valid", async () => {
     const file = await sessionFile([
       start,
@@ -95,7 +117,7 @@ describe("exporting sessions as fine-tuning data", () => {
   });
 
   it("exports every project's sessions with jig sessions export --all", async () => {
-    const home = await mkdtemp(join(tmpdir(), "jig-export-home-"));
+    const home = await tempDir("jig-export-home-");
     for (const project of ["-a", "-b"]) {
       await mkdir(join(home, "sessions", project), { recursive: true });
       await sessionFile([start, message("user", `Task in ${project}.`), message("assistant", [{ type: "text", text: "Done." }])], join(home, "sessions", project));
@@ -120,8 +142,8 @@ describe("a session jig saves", () => {
       (request.messages as unknown[]).length === 1 ? [{ text: "I'll look." }, { tool: "bash", input: { command: "echo hi" } }] : [{ text: "It says hi." }],
     );
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-export-project-"));
-      const home = await mkdtemp(join(tmpdir(), "jig-export-home-"));
+      const project = await tempDir("jig-export-project-");
+      const home = await tempDir("jig-export-home-");
       await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "What does echo hi print?"], { api, cwd: project, env: { JIG_HOME: home } });
       const out = join(home, "examples.jsonl");
       const { output } = await runJig(["sessions", "export", "--out", out], { api, cwd: project, env: { JIG_HOME: home } });
@@ -172,6 +194,14 @@ describe("redacting secrets", () => {
     // A key that is the password is blanked once.
     assert.deepEqual(redactSecrets(`https://x-access-token:ghs_${"c".repeat(36)}@github.com/o/r.git`), { text: "https://x-access-token:[REDACTED]@github.com/o/r.git", count: 1 });
     const ordinary = "DATABASE_URL=postgres://postgres:postgres@localhost:5432/test\npostgres://app:${DB_PASSWORD}@db.internal/app\nhf_hub_download(x)\nnpm_config_cache=/tmp/npm\napt install xapp-sn-watcher\nhttps://example.com/user@x";
+    assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
+  });
+
+  it("blanks out the value of a name that ends in a password's, or of a quoted key as in JSON", () => {
+    const text = `DB_PASSWORD=s3cretpass99\nAWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}\n{"password": "hunter2hunter2", "api_key": "abcd1234efgh5678"}\n{\\"MY_API_TOKEN\\": \\"Zx81Qw93Lm\\"}`;
+    const redacted = 'DB_PASSWORD=[REDACTED]\nAWS_SECRET_ACCESS_KEY=[REDACTED]\n{"password": "[REDACTED]", "api_key": "[REDACTED]"}\n{\\"MY_API_TOKEN\\": \\"[REDACTED]\\"}';
+    assert.deepEqual(redactSecrets(text), { text: redacted, count: 5 });
+    const ordinary = 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}\n{"password": "", "token_count": 12345678}\nDB_PASSWORD = os.environ["DB_PASSWORD"]\nMAX_TOKENS=100000000';
     assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
   });
 });

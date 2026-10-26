@@ -18,10 +18,11 @@ export interface Instructions {
 
 /**
  * The project's instructions for agents: AGENTS.md (or CLAUDE.md where there is none) in each directory
- * from the repository root down to the working directory, outermost first so the more specific come last.
- * One that isn't a regular file (a named pipe a command made, say) is left out, unread.
+ * from the repository root down to the working directory, outermost first so the more specific come last;
+ * and what was left out, for the user. One that isn't a regular file (a named pipe a command made, say) is
+ * left out, unread, and a CLAUDE.md beside an AGENTS.md like that is read instead.
  */
-export function loadInstructions(cwd: string): Instructions[] {
+export function loadInstructions(cwd: string): { instructions: Instructions[]; warnings: string[] } {
   const here = realpathSync(cwd);
   const root = gitRoot(here) ?? here;
   const dirs: string[] = [];
@@ -29,15 +30,22 @@ export function loadInstructions(cwd: string): Instructions[] {
     dirs.unshift(dir);
     if (dir === root || dir === dirname(dir)) break;
   }
-  return dirs.flatMap((dir) => {
-    const path = ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).find((file) => existsSync(file));
-    if (!path) return [];
-    // As many bytes as the characters kept can take (UTF-8 takes 4 bytes a character at most), so a longer
-    // file reads longer and is marked truncated.
-    let text = readRegularFile(path, 4 * MAX_INSTRUCTIONS_CHARS)?.trim() ?? "";
-    if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
-    return text ? [{ path: relative(here, path), text }] : [];
+  const warnings: string[] = [];
+  const instructions = dirs.flatMap((dir) => {
+    for (const path of ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).filter((file) => existsSync(file))) {
+      // As many bytes as the characters kept can take (UTF-8 takes 4 bytes a character at most), so a longer
+      // file reads longer and is marked truncated.
+      let text = readRegularFile(path, 4 * MAX_INSTRUCTIONS_CHARS)?.trim();
+      if (text === undefined) {
+        warnings.push(`${relative(here, path)} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
+        continue;
+      }
+      if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
+      return text ? [{ path: relative(here, path), text }] : [];
+    }
+    return [];
   });
+  return { instructions, warnings };
 }
 
 /** What a system prompt holds besides jig's own guidance. */

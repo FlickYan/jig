@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 453 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 454 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -187,16 +187,18 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
-  ends. Such an AGENTS.md or skill is left out, a settings file is refused, a lockfile or a skill's file is
-  reported and its skills left as they are, and a git file is reported by what it is. `read_file` and
-  `edit_file` likewise
+  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows
+  the `CLAUDE.md` beside it, if that is a regular file. A settings file is refused, a lockfile or a skill's
+  file is reported and its skills left as they are, and a git file is reported by what it is. `read_file`
+  and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
   with `core.fsmonitor` and hooks turned off; each run stops with the task, or after 30 seconds, and they
   then walk the files, since a named pipe where git reads (a `.gitignore`, `.git/info/exclude`, a nested
-  repository's config) would have it wait forever. `grep` matches in a worker thread that Ctrl+C stops, as
-  do 30 seconds on one file, since a regular expression can take exponentially long on some lines.
+  repository's config) would have it wait forever. After the 30 seconds they tell the model that what git
+  ignores may be among the files. `grep` matches in a worker thread that Ctrl+C stops, as do 30 seconds on
+  one file, since a regular expression can take exponentially long on some lines.
   `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or UTF-16 file the model is told to
   use a command, and `read_file` says when what it shows isn't UTF-8. `read_file` reads a file a chunk at a
   time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. `edit_file`
@@ -304,7 +306,8 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   names a file, function or command before relying on it, and to propose forgetting one that turned out
   wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
   provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
-  assignment (`password=…`, `api_key: …`, but not `DB_PASSWORD=…` or a JSON key), and a password in a URL,
+  assignment (`password=…`, `DB_PASSWORD=…`, `"api_key": "…"`, but not a placeholder like
+  `${DB_PASSWORD}` or code that reads one, like `os.environ["DB_PASSWORD"]`), and a password in a URL,
   unless its host is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
   `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
   digit in it and doesn't look like code (`token = tokens[i]`).

@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, afterEach, describe, it } from "node:test";
 import { messagesReply } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // eval/key_proxy.py: Terminal-Bench's containers get a token, and the proxy on the host puts the key in.
 
@@ -39,6 +38,7 @@ async function fakeProvider(reply: string): Promise<{ origin: string; seen: Seen
 
 const children: ChildProcess[] = [];
 after(() => children.forEach((child) => child.kill()));
+afterEach(removeTempDirs);
 
 /** The Python proxy in a process of its own, forwarding to `upstream` with the key "real-key" for the token "this-run". */
 async function startProxy(upstream: string): Promise<string> {
@@ -87,8 +87,8 @@ describe("the key proxy", () => {
     const provider = await fakeProvider(messagesReply([{ text: "Done." }]));
     try {
       const proxy = await startProxy(provider.origin);
-      const cwd = await mkdtemp(join(tmpdir(), "jig-proxy-"));
-      const env = { ...process.env, DEEPSEEK_API_KEY: "this-run", NO_COLOR: "1", JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const cwd = await tempDir("jig-proxy-");
+      const env = { ...process.env, DEEPSEEK_API_KEY: "this-run", NO_COLOR: "1", JIG_HOME: await tempDir("jig-home-") };
       const child = spawn(process.execPath, [join(ROOT, "src", "cli.ts"), "--yes", "--no-sandbox", "--model", "deepseek-flash", "--base-url", `${proxy}/anthropic`, "Say done."], { cwd, env });
       let output = "";
       child.stdout.on("data", (chunk) => (output += chunk));

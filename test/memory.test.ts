@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
@@ -15,12 +14,14 @@ import type { Approve } from "../src/proposals.ts";
 import { findSecret } from "../src/secrets.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let project: string;
 beforeEach(async () => {
-  project = await mkdtemp(join(tmpdir(), "jig-memory-"));
+  project = await tempDir("jig-memory-");
   process.env.JIG_HOME = join(project, ".jig-home");
 });
+afterEach(removeTempDirs);
 
 const context = () => ({ cwd: project, versions: new FileVersions() });
 const yes: Approve = async () => true;
@@ -61,7 +62,7 @@ describe("memories", () => {
   });
 
   it("keep user memories for every project and project memories for theirs", async () => {
-    const other = await mkdtemp(join(tmpdir(), "jig-memory-other-"));
+    const other = await tempDir("jig-memory-other-");
     await proposeMemoryTool(project, yes).run({ ...saved("short-answers"), scope: "user" }, context());
     await proposeMemoryTool(project, yes).run(saved("make-check"), context());
     assert.deepEqual(loadMemories(project).map((m) => `${m.scope}:${m.name}`), ["project:make-check", "user:short-answers"]);
@@ -109,7 +110,7 @@ describe("AGENTS.md proposals", () => {
   it("go by where AGENTS.md really leads: never out of the project, and the question names the file", async () => {
     // jig writes the edit itself, outside the sandbox, so a symlink a sandboxed command made would
     // otherwise take an approved edit to a file of the user's, such as ~/.bashrc.
-    const outside = await mkdtemp(join(tmpdir(), "jig-memory-outside-"));
+    const outside = await tempDir("jig-memory-outside-");
     await writeFile(join(outside, "bashrc"), "# the user's shell\n");
     await symlink(join(outside, "bashrc"), join(project, "AGENTS.md"));
     const shown: string[] = [];
@@ -191,6 +192,40 @@ describe("secrets", () => {
       "curl https://user:pass@api.example.com/v1",
       "postgres://app:${DB_PASSWORD}@db.internal:5432/app or postgres://app:<password>@db.internal/app",
       "the hash is aGVsbG8gd29ybGQ= and sk_test is the mode",
+    ];
+    for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
+  });
+
+  it("are recognized assigned to a name that ends in one, or to a quoted key as in JSON", () => {
+    const secrets = [
+      "DB_PASSWORD=hunter22hunter",
+      "POSTGRES_PASSWORD: hunter22hunter",
+      `AWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}`,
+      "export MY_API_TOKEN='hunter22hunter'",
+      '{"password": "hunter22hunter"}',
+      "{'api_key': 'hunter22hunter'}",
+      '{"DB_PASSWORD":"hunter22hunter"}',
+      String.raw`curl -d "{\"api_key\": \"hunter22hunter\"}"`,
+      "password=p4ss.w0rd.long",
+    ];
+    for (const text of secrets) assert.equal(findSecret(text), "a password or token", text);
+    // A name inside a word or at the start of one, a type, an empty value, placeholders, and code that
+    // reads a secret from where it is kept, as a skill's script would.
+    const ordinary = [
+      'GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]',
+      'SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")',
+      "const ACCESS_TOKEN = process.env.ACCESS_TOKEN;",
+      'access_token = resp.json()["access_token"]',
+      "access_token: Optional[str] = None",
+      "client_secret: z.string().optional()",
+      "headers = { 'X-Api-Key': this.apiKey }",
+      "tokenizer.pad_token = tokenizer.eos_token",
+      "passwordField = form.elements.passwordField",
+      "token_count = 12345678 and MAX_TOKENS=100000000",
+      'interface Login { password: string; DB_PASSWORD?: string; "api_key": string }',
+      '{"password": "", "username": "administrator"}',
+      '{"password": "<your password>", "api_key": "${API_KEY}", "secret": "********"}',
+      "POSTGRES_PASSWORD=${POSTGRES_PASSWORD} and MY_API_TOKEN: $MY_API_TOKEN, or token: [REDACTED]",
     ];
     for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
   });

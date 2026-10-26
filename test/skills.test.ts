@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { evalFileTargets, testSkill } from "../src/skill-evals.ts";
 import { proposeSkillTool, type SkillProposal } from "../src/skill-proposals.ts";
@@ -16,12 +15,14 @@ import { BUILTIN_SKILLS, discoverSkills, frontmatter, skillProblems } from "../s
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-skills-"));
+  dir = await tempDir("jig-skills-");
   process.env.JIG_HOME = join(dir, "jig-home");
 });
+afterEach(removeTempDirs);
 
 async function writeSkill(base: string, name: string, description = `Does ${name}. Use when asked to ${name}.`, files: Record<string, string> = {}): Promise<string> {
   const skillDir = join(base, name);
@@ -152,7 +153,7 @@ describe("changing installed skills", () => {
   let outside: string;
   beforeEach(async () => {
     source = await writeSkill(join(dir, "source"), "beta");
-    outside = await mkdtemp(join(tmpdir(), "jig-skills-outside-"));
+    outside = await tempDir("jig-skills-outside-");
     await mkdir(join(outside, "skills", "beta"), { recursive: true });
     await writeFile(join(outside, "skills", "beta", "work.txt"), "the user's own\n");
     await writeFile(join(outside, "bashrc"), "# the user's shell\n");
@@ -536,7 +537,11 @@ describe("proposing a skill", () => {
     for (const path of [".git", "./.git/config", "scripts/.GIT/hooks/pre-commit"]) {
       await assert.rejects(tool.run({ ...proposal, files: { [path]: "x" } }, context()), /a skill has no \.git/, path);
     }
+    await assert.rejects(tool.run({ ...proposal, files: { "scripts/release.py": 'GITHUB_TOKEN = "hunter22hunter"' } }, context()), /a skill must not contain secrets/);
     assert.equal(asked, false);
+    // As the refusal asks, a script may read its token from where it is kept.
+    await tool.run({ ...proposal, files: { "scripts/release.py": 'import os\nGITHUB_TOKEN = os.environ["GITHUB_TOKEN"]\n' } }, context());
+    assert.equal(asked, true);
   });
 
   it("is saved only where the user says, as a valid skill with its evals", async () => {
@@ -561,7 +566,7 @@ describe("proposing a skill", () => {
   it("isn't saved, nor an earlier version removed, through a symlink out of the project", async () => {
     // jig writes the skill itself, outside the sandbox, so a .jig a sandboxed command made into a symlink
     // would otherwise let it delete and write folders of the user's.
-    const outside = await mkdtemp(join(tmpdir(), "jig-skills-outside-"));
+    const outside = await tempDir("jig-skills-outside-");
     await mkdir(join(outside, "skills", "release-notes"), { recursive: true });
     await writeFile(join(outside, "skills", "release-notes", "work.txt"), "the user's own\n");
     await symlink(outside, join(dir, ".jig"));

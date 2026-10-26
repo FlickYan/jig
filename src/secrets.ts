@@ -29,11 +29,20 @@ const KEYS: [string, RegExp][] = [
 const LOCAL_HOST = String.raw`(?:(?:[\w-]+\.)*(?:localhost|example(?:\.(?:com|net|org))?|test|invalid)|127(?:\.\d+){3}|0\.0\.0\.0|\[::1\])(?![\w.-])`;
 const URL_PASSWORD = String.raw`(://[^\s/?#:@]*:)(?![$<{[*])[^\s/?#@"'<>]{3,}(?=@(?!${LOCAL_HOST}))`;
 
+// A password or token assigned to a name (password=, api_key: or, as in JSON, "secret": "), up to its value.
+// The name may end a longer one after an underscore (DB_PASSWORD, AWS_SECRET_ACCESS_KEY, MY_API_TOKEN), but
+// not be part of a word (passwordField, MAX_TOKENS) or start one (token_count). A quote may be escaped, as
+// in JSON in a string.
+const ASSIGNMENT = String.raw`\b(?:\w*_)?(?:password|passwd|secret(?:[_-]?(?:access[_-]?)?key)?|token|api[_-]?key)\b(?:\\?["'])?\s*[:=]\s*(?:\\?["'])?`;
+
 const PATTERNS: [string, RegExp][] = [
   ...KEYS,
   ["a private key", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   ["a password in a URL", new RegExp(URL_PASSWORD, "i")],
-  ["a password or token", /\b(password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*["']?[^\s"']{8,}/i],
+  // Placeholders aren't passwords here either: ${DB_PASSWORD} is how a compose file says where one is kept.
+  // Nor is code that reads one from there, a value that starts with a name and then . ( or [, as in
+  // os.environ["DB_PASSWORD"], process.env.TOKEN or z.string(). The name has no digit, so p4ss.w0rd still is.
+  ["a password or token", new RegExp(String.raw`${ASSIGNMENT}(?![$<{[*]|[A-Za-z_$]+[.([])[^\s"']{8,}`, "i")],
 ];
 
 /** What kind of secret the text seems to hold, or undefined. */
@@ -49,9 +58,9 @@ const REDACTIONS: [RegExp, string][] = [
   // more likely logged in with it. Its header and payload are JSON, so both start with eyJ.
   [/\beyJ[\w-]{5,}\.eyJ[\w-]{5,}\.[\w-]{10,}/g, "[REDACTED]"],
   [new RegExp(URL_PASSWORD, "gi"), "$1[REDACTED]"],
-  // The value can be quoted, with the quote escaped (as in JSON in a string). It must look like a secret,
-  // with a digit in it, and not like code: `token = tokens[i]` and `token = token.strip()` stay as they are.
-  [/(\b(?:password|passwd|secret|token|api[_-]?key)\b\s*[:=]\s*(?:\\?["'])?)(?=[\w+/=~!@#$%^&*-]*\d)[\w+/=~!@#$%^&*-]{8,}(?![\w.([])/gi, "$1[REDACTED]"],
+  // The value must look like a secret, with a digit in it, and not like code: `token = tokens[i]` and
+  // `token = token.strip()` stay as they are.
+  [new RegExp(String.raw`(${ASSIGNMENT})(?=[\w+/=~!@#$%^&*-]*\d)[\w+/=~!@#$%^&*-]{8,}(?![\w.([])`, "gi"), "$1[REDACTED]"],
 ];
 
 /** The text with everything that looks like a secret replaced by [REDACTED], and how many there were. */

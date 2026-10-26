@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { failedTestRun, MAX_STOP_BLOCKS, runAgent, SAME_STEPS, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
@@ -11,6 +10,7 @@ import { OutputFiles } from "../src/tools/bash.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { toChatMessages } from "../src/openai.ts";
 import { TOOLS, type Tool } from "../src/tools/index.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -63,8 +63,9 @@ function resultsIn(message: MessageParam): ToolResult[] {
 
 let cwd: string;
 beforeEach(async () => {
-  cwd = await mkdtemp(join(tmpdir(), "jig-agent-"));
+  cwd = await tempDir("jig-agent-");
 });
+afterEach(removeTempDirs);
 
 describe("checking the work before finishing (one-shot runs)", () => {
   const REVIEW = "Check your work.";

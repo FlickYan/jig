@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { firstFailedTestRun } from "../bench/escalation.ts";
 import { ANSWERS, hideAnswers } from "../bench/hidden.ts";
 import { type Attempt, estimateCost, parseTranscript, summarize, triedForbidden } from "../bench/metrics.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 const TRANSCRIPT = `I'll look at the pager first.
 ● read_file pager.py
@@ -90,13 +92,13 @@ describe("the benchmark's answers", { skip: sandboxProblem() }, () => {
     // A task's hidden tests, which a model once found by searching the disk (milestone 14).
     const answer = join(ANSWERS[1], "explore", "tasks", "stock-export", "tests", "test_hidden.py");
     assert.match(readFileSync(answer, "utf8"), /class ExportTest/);
-    const home = await mkdtemp(join(tmpdir(), "jig-bench-home-"));
+    const home = await tempDir("jig-bench-home-");
     hideAnswers(home);
     const api = await fakeMessagesApi((request) =>
       (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: `cat ${answer}; git -C ${join(ANSWERS[0], "..")} log -1` } }] : [{ text: "Done." }],
     );
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-bench-project-"));
+      const project = await tempDir("jig-bench-project-");
       const { output } = await runJig(["--yes", "--model", "claude-haiku-4-5", "Look around."], { api, cwd: project, env: { JIG_HOME: home } });
       assert.match(output, /cat /);
       assert.doesNotMatch(output, /class ExportTest|Milestone \d+/);
@@ -122,7 +124,7 @@ describe("an escalated attempt", () => {
     // The first model runs the tests, which fail; the stronger one answers from then on.
     const api = await fakeMessagesApi((request) => (request.model === "claude-sonnet-5-5" ? [{ text: "Fixed." }] : [{ tool: "bash", input: { command: "false && pytest" } }]));
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-escalate-"));
+      const project = await tempDir("jig-escalate-");
       const file = join(project, "stats.json");
       const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--escalate", "claude-sonnet-5-5", "--stats", file, "Fix the tests."], { api, cwd: project });
       assert.deepEqual(api.requests.map((request) => request.model), ["claude-haiku-4-5", "claude-sonnet-5-5"]);
@@ -142,7 +144,7 @@ describe("firstFailedTestRun", () => {
     const call = (id: string, command: string) => ({ role: "assistant", content: [{ type: "tool_use", id, name: "bash", input: { command } }] });
     const result = (id: string, content: string) => ({ role: "user", content: [{ type: "tool_result", tool_use_id: id, content }] });
     const session = (...messages: object[]) => [{ type: "start" }, ...messages.map((message) => ({ type: "message", message }))].map((e) => JSON.stringify(e)).join("\n");
-    const dir = await mkdtemp(join(tmpdir(), "jig-escalation-"));
+    const dir = await tempDir("jig-escalation-");
     await writeFile(join(dir, "failed.jsonl"), session({ role: "user", content: "fix it" }, call("a", "ls"), result("a", "x.py\n\nExit code: 0"), call("b", "python -m unittest 2>&1 | tail -5"), result("b", "FAILED (failures=1)\n\nExit code: 0")));
     await writeFile(join(dir, "passed.jsonl"), session({ role: "user", content: "fix it" }, call("a", "python -m unittest"), result("a", "OK\n\nExit code: 0")));
     assert.equal(firstFailedTestRun(join(dir, "failed.jsonl")), 2);
@@ -159,7 +161,7 @@ describe("a reviewed attempt", () => {
       return calls++ === 0 ? [{ text: "Done." }] : [{ text: "Fixed: out.txt written." }];
     });
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-review-"));
+      const project = await tempDir("jig-review-");
       const file = join(project, "stats.json");
       const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-sonnet-5-5", "--reviewer", "claude-opus-5-5", "--stats", file, "Write out.txt."], { api, cwd: project });
       assert.deepEqual(api.requests.map((request) => request.model), ["claude-sonnet-5-5", "claude-opus-5-5", "claude-sonnet-5-5"]);
@@ -183,7 +185,7 @@ describe("a reviewed attempt", () => {
   it("can't be asked for together with --check", async () => {
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
-      const { code, output } = await runJig(["--yes", "--check", "--reviewer", "claude-opus-5-5", "--model", "claude-sonnet-5-5", "Do it."], { api, cwd: await mkdtemp(join(tmpdir(), "jig-review-")) });
+      const { code, output } = await runJig(["--yes", "--check", "--reviewer", "claude-opus-5-5", "--model", "claude-sonnet-5-5", "Do it."], { api, cwd: await tempDir("jig-review-") });
       assert.notEqual(code, 0);
       assert.match(output, /--check and --reviewer both check the work/);
       assert.equal(api.requests.length, 0);

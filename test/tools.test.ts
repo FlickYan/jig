@@ -2,10 +2,9 @@ import assert from "node:assert/strict";
 import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, mkdir, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
 import { lockedGitPaths } from "../src/sandbox.ts";
 import { bashTool, OutputFiles, runCommand } from "../src/tools/bash.ts";
@@ -14,13 +13,15 @@ import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, trunca
 import { readTool } from "../src/tools/read.ts";
 import { FileVersions, readRegularFile } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let ctx: ToolContext;
 let cwd: string;
 beforeEach(async () => {
-  cwd = await mkdtemp(join(tmpdir(), "jig-test-"));
+  cwd = await tempDir("jig-test-");
   ctx = { cwd, versions: new FileVersions() };
 });
+afterEach(removeTempDirs);
 
 const read = (path: string, more: object = {}) => readTool.run({ path, ...more }, ctx);
 const write = (path: string, content: string) => writeTool.run({ path, content }, ctx);
@@ -281,7 +282,7 @@ describe("files that aren't UTF-8", () => {
 describe("symlinks out of the project", () => {
   let outside: string;
   beforeEach(async () => {
-    outside = await mkdtemp(join(tmpdir(), "jig-outside-"));
+    outside = await tempDir("jig-outside-");
     await writeFile(join(outside, "bashrc"), "export PATH=/usr/bin\n");
     await symlink(join(outside, "bashrc"), join(cwd, "rc"));
     await symlink(outside, join(cwd, "out"));
@@ -321,7 +322,7 @@ describe("symlinks out of the project", () => {
 
 describe("hidden paths", () => {
   it("are refused to the file tools, through a link or an added directory", async () => {
-    const secrets = await mkdtemp(join(tmpdir(), "jig-hidden-"));
+    const secrets = await tempDir("jig-hidden-");
     await writeFile(join(secrets, "credentials"), "aws_secret_access_key = abc\n");
     await symlink(join(secrets, "credentials"), join(cwd, "creds"));
     const named = join(cwd, "named-in-settings"); // the settings may name a link too

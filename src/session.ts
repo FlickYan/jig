@@ -109,7 +109,7 @@ export class SessionFile {
  * the API would reject the history. Answer them as interrupted, right after the calls. Not only at the end:
  * the answers aren't written to the file, so once a continued session goes on, the open calls are mid-file.
  */
-function answerOpenToolCalls(messages: MessageParam[]): MessageParam[] {
+export function answerOpenToolCalls(messages: MessageParam[]): MessageParam[] {
   return messages.flatMap((message, i) => {
     if (message.role !== "assistant" || typeof message.content === "string") return [message];
     const next = messages[i + 1]?.content;

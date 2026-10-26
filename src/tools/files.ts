@@ -25,6 +25,14 @@ export interface FileList {
   files: string[];
   /** A walk stopped at searchLimits.files, so there are more files than these. */
   capped: boolean;
+  /** git took too long and was stopped (see gitOptions), so the files were walked, what it ignores included. */
+  gitTimedOut: boolean;
+}
+
+/** What grep and glob add to their result when git took too long: the walk didn't leave out what git ignores. */
+export function walkedNote(gitTimedOut: boolean): string {
+  if (!gitTimedOut) return "";
+  return `\n\n(git took over ${searchLimits.seconds}s to list the files, so they were walked instead, and files git ignores may be among them.)`;
 }
 
 /**
@@ -42,9 +50,10 @@ export async function listFiles(root: string, path = ".", dirs: string[] = [], h
   if (!info) throw new Error(`No such file or directory: ${path}`);
   // Shown relative to the project, or in full in an --add-dir directory.
   const shown = isInside(root, abs) ? relative(root, abs) : abs;
-  if (info.isFile()) return { files: [shown], capped: false };
+  if (info.isFile()) return { files: [shown], capped: false, gitTimedOut: false };
   const ignored = await ignoredByGit(abs, signal);
-  let files = ignored ? null : await gitFiles(abs, signal);
+  const git = { timedOut: false };
+  let files = ignored ? null : await gitFiles(abs, git, signal);
   let capped = false;
   if (!files) {
     // A path git ignores that the model named is walked whole but for .git: most packages in node_modules
@@ -56,7 +65,7 @@ export async function listFiles(root: string, path = ".", dirs: string[] = [], h
     capped = files.length > searchLimits.files;
     files = files.slice(0, searchLimits.files);
   }
-  return { files: files.map((file) => join(shown, file)).sort(), capped };
+  return { files: files.map((file) => join(shown, file)).sort(), capped, gitTimedOut: git.timedOut };
 }
 
 /**
@@ -90,10 +99,11 @@ export async function firstVisible(
 /**
  * The files under dir that git doesn't ignore, relative to dir, or null outside a git repository. git runs
  * in dir itself, so in a nested repository it is that repository's git. Tracked files are all listed: a
- * tracked build/ or target/ is part of the project, and SKIP_DIRS is for what nobody added.
+ * tracked build/ or target/ is part of the project, and SKIP_DIRS is for what nobody added. A git that took
+ * too long sets git.timedOut.
  */
-async function gitFiles(dir: string, signal?: AbortSignal): Promise<string[] | null> {
-  const [tracked, untracked] = await Promise.all([lsFiles(dir, ["--cached"], signal), lsFiles(dir, ["--others", "--exclude-standard"], signal)]);
+async function gitFiles(dir: string, git: { timedOut: boolean }, signal?: AbortSignal): Promise<string[] | null> {
+  const [tracked, untracked] = await Promise.all([lsFiles(dir, ["--cached"], git, signal), lsFiles(dir, ["--others", "--exclude-standard"], git, signal)]);
   if (!tracked || !untracked) return null;
   const files: string[] = [];
   for (const file of [...tracked, ...untracked.filter((file) => !file.split("/").some((part) => SKIP_DIRS.has(part)))]) {
@@ -105,7 +115,7 @@ async function gitFiles(dir: string, signal?: AbortSignal): Promise<string[] | n
     // was never checked out, git lists the directory itself, as "./".
     else if (resolve(dir, file) !== dir) {
       const nested = join(dir, file);
-      for (const name of (await gitFiles(nested, signal)) ?? (await walk(nested, nested, [], Infinity))) files.push(join(file, name));
+      for (const name of (await gitFiles(nested, git, signal)) ?? (await walk(nested, nested, [], Infinity))) files.push(join(file, name));
     }
   }
   return files;
@@ -124,10 +134,12 @@ function ignoredByGit(dir: string, signal?: AbortSignal): Promise<boolean> {
   });
 }
 
-function lsFiles(dir: string, which: string[], signal?: AbortSignal): Promise<string[] | null> {
+function lsFiles(dir: string, which: string[], git: { timedOut: boolean }, signal?: AbortSignal): Promise<string[] | null> {
   const args = [...SAFE_GIT, "ls-files", ...which, "-z"];
   return new Promise((resolve) => {
     execFile("git", args, { ...gitOptions(dir, signal), maxBuffer: 64 * 1024 * 1024 }, (err, stdout) => {
+      // killed is set only when the timeout stopped it, not when the task did.
+      if (err?.killed) git.timedOut = true;
       resolve(err ? null : stdout.split("\0").filter(Boolean));
     });
   });
@@ -137,7 +149,8 @@ function lsFiles(dir: string, which: string[], signal?: AbortSignal): Promise<st
  * How the git that lists files runs in dir. git waits for as long as a named pipe is where it reads (a
  * .gitignore, .git/info/exclude, a nested repository's config), and a command can make one: so it stops
  * with the task, or after the seconds grep may spend in one file, and the files are then walked, as
- * outside a repository. The walk lists only regular files, so it opens no pipe.
+ * outside a repository. The walk lists only regular files, so it opens no pipe; it doesn't leave out what
+ * git ignores either, so after a timeout grep and glob say so (walkedNote).
  */
 function gitOptions(dir: string, signal?: AbortSignal) {
   return { cwd: dir, env: withoutKeys(), signal, timeout: searchLimits.seconds * 1000 };
