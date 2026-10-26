@@ -109,6 +109,14 @@ describe("exporting sessions as fine-tuning data", () => {
     assert.match(exported.example.messages[3].content as string, /^HOME=\/home\/me\nDEEPSEEK_API_KEY=\[REDACTED\]\nDB="password: \\"\[REDACTED\]\\""$/);
   });
 
+  it("blanks out a key in JSON in a command, which the call's arguments escape once more", async () => {
+    const command = (key: string) => String.raw`curl -d "{\"api_key\": \"${key}\"}" https://api.internal`;
+    const file = await sessionFile([start, message("user", "Call it."), message("assistant", [call("t1", command("abcd1234efgh5678"))]), message("user", [result("t1", "{}")]), message("assistant", [{ type: "text", text: "Called." }])]);
+    const exported = exportSession(file)!;
+    assert.equal(exported.redacted, 1);
+    assert.deepEqual(exported.example.messages[2], { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: command("[REDACTED]") }) } }] });
+  });
+
   it("exports a session from before jig recorded the system prompt and tools, and says so", async () => {
     const { system: _, tools: __, ...old } = start;
     const exported = exportSession(await sessionFile([old, message("user", "Hi."), message("assistant", [{ type: "text", text: "Hello." }])]))!;
@@ -198,9 +206,9 @@ describe("redacting secrets", () => {
   });
 
   it("blanks out the value of a name that ends in a password's, or of a quoted key as in JSON", () => {
-    const text = `DB_PASSWORD=s3cretpass99\nAWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}\n{"password": "hunter2hunter2", "api_key": "abcd1234efgh5678"}\n{\\"MY_API_TOKEN\\": \\"Zx81Qw93Lm\\"}`;
-    const redacted = 'DB_PASSWORD=[REDACTED]\nAWS_SECRET_ACCESS_KEY=[REDACTED]\n{"password": "[REDACTED]", "api_key": "[REDACTED]"}\n{\\"MY_API_TOKEN\\": \\"[REDACTED]\\"}';
-    assert.deepEqual(redactSecrets(text), { text: redacted, count: 5 });
+    const text = `DB_PASSWORD=s3cretpass99\nAWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}\n{"password": "hunter2hunter2", "api_key": "abcd1234efgh5678"}\n{\\"MY_API_TOKEN\\": \\"Zx81Qw93Lm\\"}\nPGPASSWORD=correct-horse-battery-staple-1984 psql`;
+    const redacted = 'DB_PASSWORD=[REDACTED]\nAWS_SECRET_ACCESS_KEY=[REDACTED]\n{"password": "[REDACTED]", "api_key": "[REDACTED]"}\n{\\"MY_API_TOKEN\\": \\"[REDACTED]\\"}\nPGPASSWORD=[REDACTED] psql';
+    assert.deepEqual(redactSecrets(text), { text: redacted, count: 6 });
     const ordinary = 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}\n{"password": "", "token_count": 12345678}\nDB_PASSWORD = os.environ["DB_PASSWORD"]\nMAX_TOKENS=100000000';
     assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
   });

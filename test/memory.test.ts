@@ -11,7 +11,7 @@ import { loadMemories, memoryDir, memoryPrompt, memoryTool, proposeMemoryTool } 
 import type { CallModel } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
 import type { Approve } from "../src/proposals.ts";
-import { findSecret } from "../src/secrets.ts";
+import { findSecret, redactSecrets } from "../src/secrets.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -207,10 +207,14 @@ describe("secrets", () => {
       '{"DB_PASSWORD":"hunter22hunter"}',
       String.raw`curl -d "{\"api_key\": \"hunter22hunter\"}"`,
       "password=p4ss.w0rd.long",
+      "PGPASSWORD=hunter22hunter psql -h db.internal",
+      '{"clientSecret": "hunter22hunter"}',
+      // As a bash call's arguments hold that curl command, its quotes escaped twice.
+      JSON.stringify({ command: String.raw`curl -d "{\"api_key\": \"hunter22hunter\"}"` }),
     ];
     for (const text of secrets) assert.equal(findSecret(text), "a password or token", text);
-    // A name inside a word or at the start of one, a type, an empty value, placeholders, and code that
-    // reads a secret from where it is kept, as a skill's script would.
+    // A name with more of a word after it, a type, an empty value, placeholders, and code that reads a
+    // secret from where it is kept, as a skill's script would.
     const ordinary = [
       'GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]',
       'SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")',
@@ -226,8 +230,21 @@ describe("secrets", () => {
       '{"password": "", "username": "administrator"}',
       '{"password": "<your password>", "api_key": "${API_KEY}", "secret": "********"}',
       "POSTGRES_PASSWORD=${POSTGRES_PASSWORD} and MY_API_TOKEN: $MY_API_TOKEN, or token: [REDACTED]",
+      'conn = f"host={host} password={password}"',
     ];
     for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
+  });
+
+  it("take time in proportion to the text, however it repeats a name", () => {
+    // 400 KB of token= took minutes to redact while a value's digit was looked for to the end of the run,
+    // from every name in it. Now that a name may end a word, a long word would too, read from every letter.
+    for (const piece of ["token=", "x_token=", "PGPASSWORD=", "a"]) {
+      const text = piece.repeat(Math.ceil(400_000 / piece.length));
+      const started = Date.now();
+      findSecret(text);
+      redactSecrets(text);
+      assert.ok(Date.now() - started < 1000, `${piece}: ${Date.now() - started} ms`);
+    }
   });
 });
 
