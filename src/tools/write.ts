@@ -25,9 +25,9 @@ export const writeTool: Tool = {
   kind: "edit",
   describe: ({ path, content }) => `${path} (${lineCount(String(content))})`,
 
-  async run(input, { cwd, versions, dirs, hidden }) {
+  async run(input, { cwd, versions, dirs, hidden, gitLocked }) {
     const { path, content } = input as { path: string; content: string };
-    const file = await resolveForChange(cwd, path, dirs, hidden);
+    const file = await resolveForChange(cwd, path, dirs, hidden, gitLocked);
     const existing = await stat(file).catch(() => null);
     if (existing?.isDirectory()) throw new Error(`${path} is a directory.`);
 

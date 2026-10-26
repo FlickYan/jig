@@ -22,10 +22,11 @@ export function resolveInRoot(root: string, path: string, dirs: string[] = []): 
  * These tools run in jig's own process, out of the sandbox's reach, so a symlink in the project (a cloned
  * repository can hold one, a command can make one) would otherwise take a change to any file the user
  * can write, without a question in edits mode. A git directory's config and hooks are refused too, and
- * the files that tell git where they are: git runs the programs they name, outside the sandbox. A command
+ * the files that tell git where they are: git runs the programs they name, outside the sandbox. Those of a
+ * .git directory by name, and what the sandbox locks (`locked`, see sandbox.ts's lockedGitPaths). A command
  * left running in the background could still swap a link between this check and the write.
  */
-export async function resolveForChange(root: string, path: string, dirs: string[] = [], hidden: string[] = []): Promise<string> {
+export async function resolveForChange(root: string, path: string, dirs: string[] = [], hidden: string[] = [], locked: string[] = []): Promise<string> {
   const abs = resolveInRoot(root, path, dirs);
   const real = await realTarget(abs);
   if (!real) throw new Error(`${path} leads through a broken symlink. Change the file it should point to instead.`);
@@ -35,7 +36,8 @@ export async function resolveForChange(root: string, path: string, dirs: string[
     const also = dirs.length ? ` and in ${dirs.join(", ")}` : "";
     throw new Error(`${path} leads through a symlink to ${real}, outside the working directory (${root}). File tools only change files inside it${also}.`);
   }
-  if (isGitControl(real)) {
+  // Inside, for a hook in a locked hooks directory; without case, as isGitControl.
+  if (isGitControl(real) || locked.some((path) => isInside(path.toLowerCase(), real.toLowerCase()))) {
     throw new Error(`${path} is a git directory's config or a hook, or tells git where they are, which can make git run programs outside the sandbox. The file tools don't change these; if the change is needed, ask the user to make it.`);
   }
   return abs;

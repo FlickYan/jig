@@ -170,7 +170,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   as commands can read anything. They refuse the hidden paths in the settings (below), and don't change a
   `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
   `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
-  sandbox. An approved AGENTS.md edit goes by real path too (the question names the file an AGENTS.md link
+  sandbox; nor what the sandbox keeps read-only in a git directory by another name (one made with
+  `--separate-git-dir`, say), with the sandbox off too. An approved AGENTS.md edit goes by real
+  path too (the question names the file an AGENTS.md link
   leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
   the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
   git directory. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can

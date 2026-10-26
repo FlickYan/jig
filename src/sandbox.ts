@@ -110,6 +110,20 @@ export function gitControl(project: string, repo = gitDirs(project), writable?: 
 }
 
 /**
+ * What gitControl locks, for the file tools to refuse too, whether there is a sandbox or not: they run
+ * outside it, and isGitControl knows a git directory only by the name .git. One by another name (made with
+ * --separate-git-dir in the project, a bare clone a .git file names) was theirs to change, a hook included,
+ * though commands couldn't. Of the repositories around the project's, what lies where the file tools can
+ * change files: the project and `dirs`. By real path, as they check a change (a locked file can be a
+ * link), and worked out once a session, as the sandbox's lock is.
+ */
+export function lockedGitPaths(project: string, dirs: string[] = []): string[] {
+  const real = realpathSync(project);
+  const locked = gitControl(real, undefined, [real, ...dirs.map((dir) => realpathSync(dir))])?.locked ?? [];
+  return locked.flatMap((path) => realTargetSync(path) ?? []);
+}
+
+/**
  * What the repositories around the project's have in a writable directory (`writable`, by real path),
  * for gitControl to lock: the .git of a submodule checkout in the project, say, or the config of one in a
  * temp directory. A command can make a repository wherever it can write, bare (git init --bare .) or not

@@ -118,8 +118,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   links out, since commands can read anything anyway; refusing would protect only the hidden paths, which
   are checked by real path instead, and would break linked packages. A `.git` directory's `config` and
   hooks, and the files that say where they are, are never changed, since git runs the programs they name
-  outside the sandbox. The tools know a git directory by that name, so one by another name
-  (`--separate-git-dir` can put one in the project) is changed like any other file. Some of jig's own
+  outside the sandbox. The tools know a git directory by that name, and by what the sandbox locks, worked
+  out once a session whether there is a sandbox or not: in a review, `write_file` put a hook in one made
+  with `--separate-git-dir` in the project, which commands couldn't change. One by another name that a
+  command makes during the session is changed like any other file. Some of jig's own
   writes into the project are held to the same: in an audit, a command's `ln -sf` sent the `--stats` file
   and an approved AGENTS.md edit to a file outside it. Those edits and the skills the model writes now go
   by real path, and the stats file, rewritten all through a run, is written anew and renamed into place,

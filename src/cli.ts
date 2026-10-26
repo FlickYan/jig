@@ -20,7 +20,7 @@ import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi,
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
-import { createSandbox, sandboxProblem } from "./sandbox.ts";
+import { createSandbox, lockedGitPaths, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { reviewCommand } from "./review-cli.ts";
 import { listSessions, sessionsCommand } from "./sessions-cli.ts";
@@ -292,6 +292,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
+  // The file tools run outside the sandbox, so they refuse what it locks in git themselves, with it or without.
+  const gitLocked = lockedGitPaths(cwd, dirs);
   const contained = !!sandbox && !network;
   // The whole of a command's output too long to show, for the model to search: the main loop's policy lets
   // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
@@ -466,6 +468,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     cwd,
     dirs,
     hidden: settings.hiddenPaths,
+    gitLocked,
     maxSteps,
     compactAt: compactLimit,
     authorize,

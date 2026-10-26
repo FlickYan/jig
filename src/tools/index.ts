@@ -30,6 +30,8 @@ export interface ToolContext {
   dirs?: string[];
   /** Paths the settings hide (hiddenPaths): the file tools refuse them, wherever a symlink leads. */
   hidden?: string[];
+  /** What the sandbox locks in git, by real path (see lockedGitPaths): write_file and edit_file refuse it too. */
+  gitLocked?: string[];
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */
