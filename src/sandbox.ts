@@ -587,14 +587,16 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
  * (and, run unprivileged, the user namespace bwrap adds on its own). Each command then joins its namespaces
  * with --pidns (and --userns, which owns the PID namespace when unprivileged) and mounts its own /proc, so
  * it sees only the session's processes. A job a command leaves in the background is reparented to the
- * namespace's init and runs on for the session. The keeper's root is read-only with the hidden paths and
- * jig's directory masked, so reaching it through /proc/1/root grants nothing: a command can already read
- * every other path, and can't write through a read-only root. The keeper's life is tied to jig's: it reads
- * a pipe jig holds open, so jig's death sends it end-of-file, and --die-with-parent kills it if jig is
- * killed; either way its init ends and the kernel ends every process in the namespace. If bubblewrap is too
- * old for the join (no --pidns) or the keeper can't start, each command falls back to a PID namespace of its
- * own (--unshare-pid), which is as safe but ends a command's background jobs with the command; jig says so
- * once. jig never runs commands in the host's PID namespace.
+ * namespace's init and runs on for the session. The keeper is pid 1 of the namespace, so a command can reach
+ * its root through /proc/1/root: the keeper mounts its own --proc /proc, so that root's /proc is the session's
+ * too (not the host's, which would be a second hop /proc/1/root/proc/<hostpid>/root into the host's mount
+ * namespace), and its root is read-only with the hidden paths and jig's directory masked, so reaching it
+ * grants nothing: a command can already read every other path, and can't write through a read-only root. The
+ * keeper's life is tied to jig's: it reads a pipe jig holds open, so jig's death sends it end-of-file, and
+ * --die-with-parent kills it if jig is killed; either way its init ends and the kernel ends every process in
+ * the namespace. If bubblewrap is too old for the join (no --pidns) or the keeper can't start, each command
+ * falls back to a PID namespace of its own (--unshare-pid), which is as safe but ends a command's background
+ * jobs with the command; jig says so once. jig never runs commands in the host's PID namespace.
  */
 class Keeper {
   private started = false;
@@ -639,7 +641,12 @@ class Keeper {
     const infoPath = join(tmpdir(), `jig-keeper-${randomBytes(6).toString("hex")}`);
     let infoFd: number | undefined = openSync(infoPath, "wx", 0o600);
     try {
-      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", "read x"];
+      // The keeper is pid 1 of the session's namespace, so a command can reach its root through /proc/1/root.
+      // It mounts its own --proc /proc (it has --unshare-pid) so that root's /proc is the session's, not the
+      // host's: without it, /proc/1/root/proc/<hostpid>/root was a second hop into the host's mount namespace,
+      // where the sandbox's binds don't apply -- the very escape this closes. keeperHiding masks the hidden
+      // paths and jig's directory in the root, so reaching it directly through /proc/1/root grants nothing.
+      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", "read x"];
       // Detached, so the terminal's Ctrl+C doesn't reach it: the session goes on after an interrupted command.
       // Its stdin is a pipe jig holds open; jig's death closes it, and the keeper's `read` then ends.
       this.child = spawn(this.bwrap, args, { stdio: ["pipe", "ignore", "ignore", infoFd], detached: true });

@@ -194,10 +194,22 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       // /proc/1/root led into the host's mount namespace, where the sandbox's binds don't apply: a review's
       // probe read a hidden file and wrote outside the writable directories that way. Now a command sees only
       // the session's processes, each with the hidden paths and jig's directory masked in its root.
-      const roots = `/proc/${process.pid}/root $(for p in $(ls /proc | grep -E '^[0-9]+$'); do echo /proc/$p/root; done)`;
-      assert.doesNotMatch(await run(`for r in ${roots}; do cat $r${answer} 2>/dev/null; done; echo end`, sandbox), /the hidden answer/);
-      assert.match(await run(`for r in ${roots}; do echo bad > $r${target} 2>/dev/null; done; echo end`, sandbox), /\nend\n/);
+      //
+      // Both hops are probed. One hop is /proc/<p>/root of a visible process. Two hops is
+      // /proc/<p>/root/proc/<n>/root: the keeper (pid 1) has its own /proc too, so if it were the host's a
+      // command could reach a host process's root -- and the host mount namespace -- that way. The probe
+      // follows every visible pid, and through each its own /proc's pids, so an exposed host /proc anywhere
+      // is caught, not only at pid 1.
+      const roots =
+        "for p in /proc/$$/.. $(ls /proc | grep -E '^[0-9]+$'); do " +
+        "echo /proc/$p/root; for n in $(ls /proc/$p/root/proc 2>/dev/null | grep -E '^[0-9]+$'); do echo /proc/$p/root/proc/$n/root; done; " +
+        `done; echo /proc/${process.pid}/root`;
+      assert.doesNotMatch(await run(`for r in $(${roots}); do cat $r${answer} 2>/dev/null; done; echo end`, sandbox), /the hidden answer/);
+      assert.match(await run(`for r in $(${roots}); do echo bad > $r${target} 2>/dev/null; done; echo end`, sandbox), /\nend\n/);
       assert.equal(existsSync(target), false);
+      // And directly: the keeper's own /proc (reached through its root) must be the session's, not the host's.
+      const keeperProc = (await run("ls /proc/1/root/proc 2>/dev/null | grep -cE '^[0-9]+$'", sandbox)).split("\n")[0];
+      assert.ok(Number(keeperProc) > 0 && Number(keeperProc) < 50, `the keeper's /proc shows only the session's processes: saw ${keeperProc}`);
       sandbox.close?.();
     } finally {
       await rm(hidden, { recursive: true, force: true });
