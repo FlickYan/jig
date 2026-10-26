@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { jigHome, projectDir } from "./paths.ts";
-import { isInside, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { isInside, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_PROJECT_BYTES = 200_000_000;
 // The most a git command here may take: a first snapshot at the size limit takes seconds. git waits for as
@@ -27,24 +27,28 @@ export interface Restored {
  * Snapshots of a project's files, taken before each task so /undo can put them back. They live in a
  * private git repository (~/.jig/snapshots/<project>) whose work tree is the project, so this works in
  * any directory, honors .gitignore, and never touches the project's own repository, index or stash.
+ * They leave out the `hidden` paths (the settings' hiddenPaths) in the project.
  */
 export class Snapshots {
   private readonly root: string;
+  private readonly hidden: string[];
   private readonly gitDir: string;
   private readonly maxBytes: number;
   private readonly gitSeconds: number;
   private readonly taken: string[] = []; // commits, oldest first
 
-  constructor(root: string, maxBytes = MAX_PROJECT_BYTES, gitSeconds = GIT_SECONDS) {
+  constructor(root: string, hidden: string[] = [], maxBytes = MAX_PROJECT_BYTES, gitSeconds = GIT_SECONDS) {
     this.root = root;
+    this.hidden = hidden;
     this.gitDir = projectDir("snapshots", root);
     this.maxBytes = maxBytes;
     this.gitSeconds = gitSeconds;
   }
 
-  /** Records the project's current files. Throws if the project is too big to snapshot, or git fails. */
+  /** Records the project's current files. Throws if the project is too big to snapshot, or hidden, or git fails. */
   take(label: string): void {
     if (this.root === homedir() || this.root === "/") throw new Error("jig doesn't snapshot your home directory or /");
+    const hidden = this.hiddenPaths();
     if (!existsSync(this.gitDir)) {
       mkdirSync(this.gitDir, { recursive: true });
       // A repository with no work tree of its own: every command passes the project as its work tree.
@@ -57,12 +61,14 @@ export class Snapshots {
     }
     // The index can hold nested repositories as gitlinks (older versions of jig stored them, and git add
     // stores one a command makes during a snapshot): drop them, so they are listed and left out as new ones are.
+    // And the hidden paths, which older versions stored too, or the settings didn't hide when they were taken.
     const { tracked, gitlinks } = this.index();
-    if (gitlinks.length) this.run(["update-index", "-z", "--force-remove", "--stdin"], nul(gitlinks));
-    const { created, nested } = this.others();
+    const dropped = [...gitlinks, ...tracked.filter((path) => within(hidden, path))];
+    if (dropped.length) this.run(["update-index", "-z", "--force-remove", "--stdin"], nul(dropped));
+    const { created, nested } = this.others(hidden);
     // Before every snapshot, not just the first: a project can grow past the limit later (a dataset, say).
-    this.checkSize([...tracked, ...created]);
-    this.run(["add", "--all", ...PATHSPECS_ON_STDIN], allBut(nested));
+    this.checkSize([...tracked.filter((path) => !within(hidden, path)), ...created]);
+    this.run(["add", "--all", ...PATHSPECS_ON_STDIN], allBut([...nested, ...hidden]));
     this.git("-c", "user.name=jig", "-c", "user.email=jig@localhost", "commit", "-q", "--allow-empty", "--no-verify", "-m", label);
     this.taken.push(this.git("rev-parse", "HEAD").trim());
   }
@@ -107,7 +113,24 @@ export class Snapshots {
     // A snapshot can still hold a nested repository a command made while it was taken (see take), and diff
     // takes no pathspecs on its standard input: --ignore-submodules=all keeps git out of them all.
     const diff = this.list("diff", "--name-only", "--no-renames", "--ignore-submodules=all", "-z", snapshot);
-    return { tracked: diff.map(String), created: this.others().created };
+    return { tracked: diff.map(String), created: this.others(this.hiddenPaths()).created };
+  }
+
+  /**
+   * The hidden paths in the project, relative to it, by where they really lead, as the sandbox hides them.
+   * A snapshot that held one would let commands read it back from the store. So snapshots leave them out,
+   * and /undo neither puts them back nor removes them, which costs little: commands can't change them, and
+   * the file tools refuse them. Worked out each time, since where a path leads can change; one that isn't
+   * there is left out where it would be made.
+   */
+  private hiddenPaths(): Buffer[] {
+    const root = realpathSync(this.root);
+    return this.hidden.flatMap((path) => {
+      const real = realTargetSync(path);
+      if (real === undefined) return [];
+      if (isInside(real, root)) throw new Error("the settings' hiddenPaths hide the project");
+      return isInside(root, real) ? [Buffer.from(relative(root, real))] : [];
+    });
   }
 
   /**
@@ -128,11 +151,12 @@ export class Snapshots {
 
   /**
    * The files that are new, and apart from them the new nested repositories, which git lists as "dir/"
-   * without running anything in them.
+   * without running anything in them. Not those in the hidden paths.
    */
-  private others(): { created: Buffer[]; nested: Buffer[] } {
+  private others(hidden: Buffer[]): { created: Buffer[]; nested: Buffer[] } {
     const others = { created: [] as Buffer[], nested: [] as Buffer[] };
     for (const path of this.list("ls-files", "--others", "--exclude-standard", "-z")) {
+      if (within(hidden, path)) continue;
       if (path.at(-1) === SLASH) others.nested.push(path.subarray(0, -1));
       else others.created.push(path);
     }
@@ -207,6 +231,11 @@ export class Snapshots {
 /** Pathspecs, for git's standard input, for the whole project but these paths and what is under them, matched literally. */
 function allBut(paths: Buffer[]): Buffer {
   return nul([Buffer.from("."), ...paths.map((path) => Buffer.concat([Buffer.from(":(exclude,literal)"), path]))]);
+}
+
+/** Whether a path git listed is one of these paths or under one. */
+function within(paths: Buffer[], path: Buffer): boolean {
+  return paths.some((top) => path.subarray(0, top.length).equals(top) && (path.length === top.length || path[top.length] === SLASH));
 }
 
 /** Paths for git's standard input, a NUL after each. */

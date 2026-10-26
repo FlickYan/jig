@@ -147,6 +147,11 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   read-only. A job a command leaves in the background can still do so after jig has looked, and after a
   one-shot run nothing looks again.
 
+  Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs:
+  its snapshots and sessions hold copies of your projects' files, and the snapshots older versions of jig
+  took, of the hidden paths too (see Rules). A project inside it (a skill you are writing, say) stays as
+  it was.
+
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
   a daemon listening on a Unix socket (Docker's, say) is still within reach. And commands share the
@@ -204,7 +209,8 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `"git push"` also catches `git -C repo push origin` and `bash -c "git push"`. A deny rule can also name a
   tool, like `"mcp__github__merge_pull_request"`. The settings can also hold `"sandbox": false` or
   `"network": true` for a project, and `"hiddenPaths"`: files and folders sandboxed commands can't read at
-  all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which).
+  all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which). Snapshots
+  leave out those in the project, by where they really lead, and `/undo` leaves them as they are.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that

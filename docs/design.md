@@ -186,7 +186,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   by running `git status` in it, which runs the programs its config names (a clean filter, say) outside the
   sandbox, and a command can make one. So jig's git only lists them, and `/undo` leaves the files in them
   as they are. Paths go back to git as the bytes it listed, on its standard input: on Linux a command can
-  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing.
+  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing. The
+  hidden paths are left out too, by where they really lead: a command could read a copy back out of the
+  store. And the sandbox hides jig's own directory from commands, but for the skills whose scripts the
+  model runs, since its snapshots (the hidden paths too, in those older versions took) and sessions hold
+  copies of every project's files.
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than

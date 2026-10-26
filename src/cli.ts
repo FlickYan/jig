@@ -307,7 +307,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
   // shell would give.
   for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
-  let snapshots: Snapshots | undefined = new Snapshots(cwd);
+  let snapshots: Snapshots | undefined = new Snapshots(cwd, settings.hiddenPaths);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
   const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
 

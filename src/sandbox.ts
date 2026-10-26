@@ -2,7 +2,8 @@ import { execFileSync } from "node:child_process";
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { isGitControl, isInside, readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { jigHome } from "./paths.ts";
+import { isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
@@ -50,12 +51,14 @@ const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are
  * project, its git directory (not what gitControl lists), the directories added with --add-dir and the
  * temp directories, and without `network` they have no IP network (Unix sockets stay open). Unlike a
  * container, this keeps the user's own toolchain (python, node, compilers) working with no setup. The
- * `hidden` paths they can't read at all. Returns undefined where there is no sandbox; sandboxProblem says why.
+ * `hidden` paths they can't read at all, nor jig's own directory but its skills (see ownRules). Returns
+ * undefined where there is no sandbox; sandboxProblem says why.
  */
 export function createSandbox(root: string, { network, dirs = [], hidden = [] }: { network: boolean; dirs?: string[]; hidden?: string[] }): Sandbox | undefined {
   if (sandboxProblem()) return undefined;
   const project = realpathSync(root); // Seatbelt sees real paths: /var is /private/var
   const unreadable = hidden.filter((path) => existsSync(path)).map((path) => realpathSync(path));
+  const home = realTargetSync(jigHome()); // made with the first session, if it isn't there yet
   const added = dirs.map((dir) => realpathSync(dir));
   const temp = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"].filter((dir) => existsSync(dir));
   const repo = gitDirs(project);
@@ -69,8 +72,8 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
   const guarded = gitControl(project, repo);
   const sandbox =
     process.platform === "darwin"
-      ? seatbelt(writable, network, where, unreadable, guarded)
-      : bubblewrap(writable, network, where, unreadable, guarded);
+      ? seatbelt(writable, network, where, unreadable, guarded, home)
+      : bubblewrap(writable, network, where, unreadable, guarded, home);
   return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project) } : sandbox;
 }
 
@@ -315,17 +318,20 @@ export function sandboxProblem(): string | undefined {
   return `jig has no sandbox for ${process.platform} yet`;
 }
 
-function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl): Sandbox {
-  const profile = seatbeltProfile(writable, network, hidden, git);
+function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string): Sandbox {
+  const profile = seatbeltProfile(writable, network, hidden, git, home);
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}${gitNote(git)}${hiddenNote(hidden)}.`,
+    limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.`,
     wrap: (command) => ({ program: SANDBOX_EXEC, args: ["-p", profile, "/bin/bash", "-c", command] }),
   };
 }
 
-/** The Seatbelt profile: where commands can write, whether they reach the network, what they can't read. */
-export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl): string {
+/**
+ * The Seatbelt profile: where commands can write, whether they reach the network, what they can't read.
+ * `home` is jig's own directory, by its real path.
+ */
+export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string): string {
   return [
     "(version 1)",
     "(allow default)",
@@ -333,6 +339,8 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     `(allow file-write* ${writable.map((dir) => `(subpath ${quote(dir)})`).join(" ")}`,
     '  (literal "/dev/null") (literal "/dev/zero") (regex #"^/dev/tty") (regex #"^/dev/fd/"))',
     ...(network ? [] : ["(deny network-outbound (remote ip))", '(allow network-outbound (remote ip "localhost:*"))']),
+    // Before git's rules, so that they hold in a project in jig's directory too.
+    ...(home ? ownRules(home, writable) : []),
     // After the rule that lets the git directory be written, so they win over it. Unlike bubblewrap's, they
     // hold for files that aren't there yet. The directories holding them can't be moved aside either, or
     // others with files of the command's own could take their place.
@@ -341,6 +349,40 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     // Last, so that it wins over the rules before it: reading and writing alike.
     ...hidden.map((path) => `(deny file-read* file-write* (subpath ${quote(path)}))`),
   ].join("\n");
+}
+
+/**
+ * Seatbelt's rules for jig's own directory, which holds copies of the files of every project jig worked
+ * in: snapshots (with the hidden files in those older versions took), sessions, memories. So commands
+ * can't read it, nor write in it where it lies in a writable directory (a temp directory, say), where
+ * settings could add hooks. Only its skills stay readable: the model runs their scripts by their full path
+ * there, as the skill tool tells it, and nothing else in it is for commands. A writable directory in it (a
+ * project that is a skill being written, say) stays as it was, and so does the metadata of the directory
+ * itself, which resolving a path through it needs (realpath, as Node does for a script it runs).
+ */
+function ownRules(home: string, writable: string[]): string[] {
+  const inside = writable.filter((dir) => isInside(home, dir));
+  return [
+    `(deny file-read* file-write* (subpath ${quote(home)}))`,
+    `(allow file-read-metadata (literal ${quote(home)}))`,
+    `(allow file-read* (subpath ${quote(join(home, "skills"))}))`,
+    ...(inside.length ? [`(allow file-read* file-write* ${inside.map((dir) => `(subpath ${quote(dir)})`).join(" ")})`] : []),
+  ];
+}
+
+/**
+ * bubblewrap's arguments for jig's own directory, as ownRules has it: an empty directory over it, with its
+ * skills bound back in read-only, and then the writable directories in it as they were. Worked out for each
+ * command, as the directory and its skills may be made during the session.
+ */
+function ownBinds(home: string, writable: string[]): string[] {
+  if (!existsSync(home)) return [];
+  const skills = join(home, "skills");
+  return [
+    "--tmpfs", home,
+    ...(existsSync(skills) ? ["--ro-bind", skills, skills] : []),
+    ...writable.filter((dir) => isInside(home, dir)).flatMap((dir) => ["--bind", dir, dir]),
+  ];
 }
 
 /**
@@ -360,14 +402,16 @@ function deny(operation: string, filters: string[] = []): string[] {
  * machine's process IDs, and can signal the user's other processes: in a PID namespace of their own, a
  * job a command leaves running in the background would die with its shell.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string): Sandbox {
   const bwrap = findProgram("bwrap")!;
   // An empty directory over each hidden directory, and an empty file over each hidden file.
   const hiding = hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path]));
+  // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too.
   const args = () => [
     "--ro-bind", "/", "/",
     "--dev", "/dev",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
+    ...(home ? ownBinds(home, writable) : []),
     ...(git ? gitBinds(git) : []),
     ...hiding,
     ...(network ? [] : ["--unshare-net"]),
@@ -378,7 +422,7 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     "machine's ports, or a server an earlier command started (start a server and use it in the same command)";
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}.`,
+    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.`,
     wrap: (command) => ({ program: bwrap, args: [...args(), "--", "/bin/bash", "-c", command] }),
   };
 }
@@ -414,6 +458,11 @@ function gitNote(git?: GitControl): string {
 /** For the model: that some paths are hidden, so their denials make sense (not which: they may be answers). */
 function hiddenNote(hidden: string[]): string {
   return hidden.length ? ". Some paths are hidden from commands by the user's settings" : "";
+}
+
+/** For the model: that jig's own directory is hidden too (not where it is: a benchmark keeps it with its logs). */
+function ownNote(home?: string): string {
+  return home ? ". jig's own directory (its sessions, snapshots and settings) is hidden from commands, but for its skills" : "";
 }
 
 let bubblewrapProblem: string | undefined;

@@ -1,5 +1,5 @@
 import { constants } from "node:buffer";
-import { closeSync, constants as fsConstants, fstatSync, openSync, readSync, type Stats, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats, statSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -71,6 +71,24 @@ export async function realTarget(abs: string): Promise<string | undefined> {
   while (!(await lstat(existing).catch(() => null)) && dirname(existing) !== existing) existing = dirname(existing);
   const real = await realpath(existing).catch(() => undefined);
   return real && join(real, relative(existing, abs));
+}
+
+/** realTarget, for the snapshots and the sandbox, which can't wait for it. */
+export function realTargetSync(abs: string): string | undefined {
+  const there = (path: string) => {
+    try {
+      return !!lstatSync(path, { throwIfNoEntry: false });
+    } catch {
+      return false; // ENOTDIR: a file is where a directory on the way would be
+    }
+  };
+  let existing = abs;
+  while (!there(existing) && dirname(existing) !== existing) existing = dirname(existing);
+  try {
+    return join(realpathSync(existing), relative(existing, abs));
+  } catch {
+    return undefined;
+  }
 }
 
 /**

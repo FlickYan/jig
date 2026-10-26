@@ -76,6 +76,54 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("hides jig's own directory from commands, but for its skills, whose scripts the model runs", async () => {
+    const home = process.env.JIG_HOME!;
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "s.jsonl"), "an earlier session\n");
+    const skill = join(home, "skills", "hello");
+    await mkdir(join(skill, "scripts"), { recursive: true });
+    await writeFile(join(skill, "scripts", "hello.sh"), "echo hello from the skill\n");
+    const sandbox = createSandbox(project, { network: false })!;
+    assert.doesNotMatch(await run(`cat ${join(home, "sessions", "s.jsonl")}`, sandbox), /an earlier session/);
+    assert.doesNotMatch(await run(`ls ${join(home, "sessions")}`, sandbox), /s\.jsonl/);
+    assert.match(await run(`bash ${join(skill, "scripts", "hello.sh")}`, sandbox), /^hello from the skill/);
+    assert.match(sandbox.limits, /jig's own directory \(its sessions, snapshots and settings\) is hidden from commands, but for its skills/);
+    // Here it is in a temp directory, which commands can write in, but not in it: settings there could add hooks.
+    await run(`echo '{}' > ${join(home, "settings.json")}`, sandbox);
+    assert.equal(existsSync(join(home, "settings.json")), false);
+    // A project in it, a skill being written say, stays as it was, its git config read-only too.
+    git(skill, "init", "-q");
+    const inSkill = createSandbox(skill, { network: false })!;
+    assert.match(await runCommand("echo 1 > b.txt && cat b.txt scripts/hello.sh", skill, 20, undefined, inSkill), /^1\necho hello/);
+    const config = await readFile(join(skill, ".git", "config"), "utf8");
+    assert.match(await runCommand(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> .git/config`, skill, 20, undefined, inSkill), denied);
+    assert.equal(await readFile(join(skill, ".git", "config"), "utf8"), config);
+  });
+
+  it("keeps a hidden file out of the snapshots, and those an older jig took out of commands' reach", async () => {
+    const app = join(dir, "app");
+    await mkdir(app);
+    await writeFile(join(app, ".env"), "TOKEN=the-hidden-token\n");
+    await writeFile(join(app, "a.txt"), "1\n");
+    // jig before this change copied it into every snapshot, where a command could read it back.
+    new Snapshots(app).take("an older jig's");
+    const home = process.env.JIG_HOME!;
+    await writeFile(join(home, "settings.json"), JSON.stringify({ hiddenPaths: [join(app, ".env")] }));
+    const store = join(home, "snapshots", projectKey(app));
+    const command = `echo ran; cat .env; git --git-dir=${store} log --all -p; git --git-dir=${store} show HEAD:.env`;
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Look around."], { api, cwd: app, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests[1].messages), /ran\\n/);
+      assert.doesNotMatch(JSON.stringify(api.requests[1].messages), /the-hidden-token/);
+      // The snapshot taken before the task left it out.
+      assert.equal(git(app, `--git-dir=${store}`, "ls-tree", "-r", "--name-only", "HEAD"), "a.txt\n");
+    } finally {
+      api.close();
+    }
+  });
+
   it("lets commands read the whole of a long output, but not send jig's writes to it elsewhere", async () => {
     const sandbox = createSandbox(project, { network: false })!;
     const outputs = new OutputFiles();
@@ -525,6 +573,28 @@ describe("the macOS sandbox's profile", () => {
     assert.doesNotMatch(seatbeltProfile(["/p"], false, []), /\.git/);
   });
 
+  it("hides jig's own directory but its skills, and leaves a project in it as it was", () => {
+    // A skill being written in jig's directory, with a repository of its own and a file the user hides.
+    const project = "/u/.jig/skills/s";
+    const git = { locked: [`${project}/.git/config`], fixed: [`${project}/.git`], gitDirectories: [`${project}/.git`] };
+    const lines = seatbeltProfile([project, "/private/tmp"], false, [`${project}/key`], git, "/u/.jig").split("\n");
+    const at = (line: string) => {
+      assert.ok(lines.includes(line), `${line} is in the profile`);
+      return lines.indexOf(line);
+    };
+    // The last rule that matches wins.
+    const order = [
+      at('(deny file-read* file-write* (subpath "/u/.jig"))'),
+      at('(allow file-read* (subpath "/u/.jig/skills"))'),
+      at('(allow file-read* file-write* (subpath "/u/.jig/skills/s"))'),
+      at('(deny file-write* (literal "/u/.jig/skills/s/.git/config"))'),
+      at('(deny file-read* file-write* (subpath "/u/.jig/skills/s/key"))'),
+    ];
+    assert.deepEqual(order, [...order].sort((a, b) => a - b));
+    assert.ok(at('(allow file-read-metadata (literal "/u/.jig"))') > order[0], "paths through it can be resolved");
+    assert.doesNotMatch(seatbeltProfile(["/p"], false, [], undefined, "/u/.jig"), /\(allow file-read\* file-write\*/);
+  });
+
   it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {
     const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
     try {
@@ -715,6 +785,35 @@ describe("snapshots", () => {
     assert.equal(await readFile(join(dir, "gone.txt"), "utf8"), "x\n");
   });
 
+  it("leaves out the hidden paths in the project, which undo neither puts back nor removes", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    await writeFile(join(dir, ".env"), "e1");
+    await mkdir(join(dir, "secrets"));
+    await writeFile(join(dir, "secrets", "key"), "k1");
+    // An older jig's snapshot holds them, and the index still has them.
+    new Snapshots(dir).take("older jig");
+    // By real path, as the sandbox hides them: here one is named through a link to the project.
+    const link = `${dir}-link`;
+    await symlink(dir, link);
+    try {
+      const snapshots = new Snapshots(dir, [join(link, ".env"), join(dir, "secrets"), join(dir, "not-there")]);
+      snapshots.take("t");
+      assert.equal(snapshotGit("ls-tree", "-r", "--name-only", "HEAD"), "a.txt\n");
+      await writeFile(join(dir, "a.txt"), "2");
+      await writeFile(join(dir, ".env"), "e2");
+      await writeFile(join(dir, "secrets", "new"), "n");
+      await writeFile(join(dir, "not-there"), "made by the task");
+      assert.deepEqual(snapshots.changed(), ["a.txt"]);
+      assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+      assert.equal(await readFile(join(dir, ".env"), "utf8"), "e2");
+      assert.equal(await readFile(join(dir, "secrets", "new"), "utf8"), "n");
+      assert.equal(await readFile(join(dir, "not-there"), "utf8"), "made by the task");
+      assert.throws(() => new Snapshots(join(dir, "secrets"), [link]).take("t"), /hiddenPaths hide the project/);
+    } finally {
+      await rm(link);
+    }
+  });
+
   it("refuses projects too big to copy", async () => {
     await writeFile(join(dir, "data.bin"), Buffer.alloc(201_000_000));
     assert.throws(() => new Snapshots(dir).take("t"), /201 MB of files that aren't ignored/);
@@ -725,7 +824,7 @@ describe("snapshots", () => {
     // with it, in its own thread, past --time-limit, before the next task or for a Stop hook's changed_files.
     await mkdir(join(dir, "sub"));
     await writeFile(join(dir, "sub", "a.txt"), "1");
-    const snapshots = new Snapshots(dir, undefined, 1);
+    const snapshots = new Snapshots(dir, [], undefined, 1);
     snapshots.take("t1");
     execFileSync("mkfifo", [join(dir, "sub", ".gitignore")]);
     assert.throws(() => snapshots.changed(), /git took over 1 seconds/);
@@ -758,7 +857,7 @@ describe("snapshots", () => {
 
   it("checks the size before every snapshot, counting the files already snapshotted", async () => {
     await writeFile(join(dir, "a.bin"), Buffer.alloc(800_000));
-    const snapshots = new Snapshots(dir, 1_000_000);
+    const snapshots = new Snapshots(dir, [], 1_000_000);
     snapshots.take("t1");
     await writeFile(join(dir, "b.bin"), Buffer.alloc(800_000)); // a dataset the task downloaded, say
     assert.throws(() => snapshots.take("t2"), /2 MB of files that aren't ignored, more than the 1 MB/);
@@ -767,7 +866,7 @@ describe("snapshots", () => {
 
   it("undo stores nothing the task created, so a big file can't get past the size check", async () => {
     await writeFile(join(dir, "a.txt"), "1");
-    const snapshots = new Snapshots(dir, 1_000_000);
+    const snapshots = new Snapshots(dir, [], 1_000_000);
     snapshots.take("t");
     await writeFile(join(dir, "data.bin"), Buffer.alloc(2_000_000, 1)); // a dataset the task downloaded, say
     const blob = execFileSync("git", ["hash-object", join(dir, "data.bin")], { encoding: "utf8" }).trim();
@@ -883,7 +982,7 @@ describe("snapshots", () => {
     await mkdir(join(project, "data"), { recursive: true });
     await writeFile(join(project, "data", "a.txt"), "1");
     await writeFile(join(dir, "big.bin"), Buffer.alloc(3_000_000)); // outside the project
-    const snapshots = new Snapshots(project, 1_000_000);
+    const snapshots = new Snapshots(project, [], 1_000_000);
     snapshots.take("t1");
     // A task links in a big file from elsewhere, makes a link that loops, and puts a file where a directory was.
     await symlink(join(dir, "big.bin"), join(project, "big.bin"));
