@@ -176,4 +176,12 @@ describe("redacting secrets", () => {
     const ordinary = "DATABASE_URL=postgres://postgres:postgres@localhost:5432/test\npostgres://app:${DB_PASSWORD}@db.internal/app\nhf_hub_download(x)\nnpm_config_cache=/tmp/npm\napt install xapp-sn-watcher\nhttps://example.com/user@x";
     assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
   });
+
+  it("blanks out the value of a name that ends in a password's, or of a quoted key as in JSON", () => {
+    const text = `DB_PASSWORD=s3cretpass99\nAWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}\n{"password": "hunter2hunter2", "api_key": "abcd1234efgh5678"}\n{\\"MY_API_TOKEN\\": \\"Zx81Qw93Lm\\"}`;
+    const redacted = 'DB_PASSWORD=[REDACTED]\nAWS_SECRET_ACCESS_KEY=[REDACTED]\n{"password": "[REDACTED]", "api_key": "[REDACTED]"}\n{\\"MY_API_TOKEN\\": \\"[REDACTED]\\"}';
+    assert.deepEqual(redactSecrets(text), { text: redacted, count: 5 });
+    const ordinary = 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}\n{"password": "", "token_count": 12345678}\nDB_PASSWORD = os.environ["DB_PASSWORD"]\nMAX_TOKENS=100000000';
+    assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
+  });
 });

@@ -195,6 +195,40 @@ describe("secrets", () => {
     ];
     for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
   });
+
+  it("are recognized assigned to a name that ends in one, or to a quoted key as in JSON", () => {
+    const secrets = [
+      "DB_PASSWORD=hunter22hunter",
+      "POSTGRES_PASSWORD: hunter22hunter",
+      `AWS_SECRET_ACCESS_KEY=${"wJalr/K7".repeat(5)}`,
+      "export MY_API_TOKEN='hunter22hunter'",
+      '{"password": "hunter22hunter"}',
+      "{'api_key': 'hunter22hunter'}",
+      '{"DB_PASSWORD":"hunter22hunter"}',
+      String.raw`curl -d "{\"api_key\": \"hunter22hunter\"}"`,
+      "password=p4ss.w0rd.long",
+    ];
+    for (const text of secrets) assert.equal(findSecret(text), "a password or token", text);
+    // A name inside a word or at the start of one, a type, an empty value, placeholders, and code that
+    // reads a secret from where it is kept, as a skill's script would.
+    const ordinary = [
+      'GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]',
+      'SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY")',
+      "const ACCESS_TOKEN = process.env.ACCESS_TOKEN;",
+      'access_token = resp.json()["access_token"]',
+      "access_token: Optional[str] = None",
+      "client_secret: z.string().optional()",
+      "headers = { 'X-Api-Key': this.apiKey }",
+      "tokenizer.pad_token = tokenizer.eos_token",
+      "passwordField = form.elements.passwordField",
+      "token_count = 12345678 and MAX_TOKENS=100000000",
+      'interface Login { password: string; DB_PASSWORD?: string; "api_key": string }',
+      '{"password": "", "username": "administrator"}',
+      '{"password": "<your password>", "api_key": "${API_KEY}", "secret": "********"}',
+      "POSTGRES_PASSWORD=${POSTGRES_PASSWORD} and MY_API_TOKEN: $MY_API_TOKEN, or token: [REDACTED]",
+    ];
+    for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
+  });
 });
 
 describe("proposals in the agent loop", () => {

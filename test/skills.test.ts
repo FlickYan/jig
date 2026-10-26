@@ -353,7 +353,11 @@ describe("proposing a skill", () => {
     for (const path of [".git", "./.git/config", "scripts/.GIT/hooks/pre-commit"]) {
       await assert.rejects(tool.run({ ...proposal, files: { [path]: "x" } }, context()), /a skill has no \.git/, path);
     }
+    await assert.rejects(tool.run({ ...proposal, files: { "scripts/release.py": 'GITHUB_TOKEN = "hunter22hunter"' } }, context()), /a skill must not contain secrets/);
     assert.equal(asked, false);
+    // As the refusal asks, a script may read its token from where it is kept.
+    await tool.run({ ...proposal, files: { "scripts/release.py": 'import os\nGITHUB_TOKEN = os.environ["GITHUB_TOKEN"]\n' } }, context());
+    assert.equal(asked, true);
   });
 
   it("is saved only where the user says, as a valid skill with its evals", async () => {
