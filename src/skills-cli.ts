@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { mergeSettings, readSettings } from "./settings.ts";
 import { discoverSkills, skillUsage } from "./skills.ts";
 import { testSkill } from "./skill-evals.ts";
 import {
@@ -71,7 +72,9 @@ export async function skillsCommand(args: string[]): Promise<void> {
   }
   if (command === "remove") {
     if (rest.length !== 1) throw new Error("Usage: jig skills remove <name>");
-    const skill = installedSkills(project).find((s) => s.name === rest[0]);
+    const { skills, problems } = installedSkills(project);
+    for (const { message } of problems) ui.notice(message);
+    const skill = skills.find((s) => s.name === rest[0]);
     if (!skill) throw new Error(`No skill "${rest[0]}" was installed with jig skills add. (Skills you wrote yourself are folders: delete the folder.)`);
     await skillDirForChange(skill.scope, project, skill.name); // refused before anyone is asked
     if (!(await confirm(`Remove the skill "${skill.name}" (${skill.dir})? [y/N] `))) return ui.notice("Kept it.");
@@ -96,9 +99,10 @@ async function ask(question: string): Promise<boolean> {
 
 function list(project: string): void {
   const { skills, warnings } = discoverSkills(project);
-  for (const warning of warnings) ui.notice(warning);
+  const locked = installedSkills(project);
+  for (const warning of [...warnings, ...locked.problems.map((problem) => problem.message)]) ui.notice(warning);
   if (!skills.length) return ui.println("No skills yet. Add some with jig skills add, or write one with jig skills new.");
-  const installed = new Map(installedSkills(project).map((skill) => [`${skill.scope}:${skill.name}`, skill]));
+  const installed = new Map(locked.skills.map((skill) => [`${skill.scope}:${skill.name}`, skill]));
   const usage = skillUsage();
   const width = Math.max(...skills.map((skill) => skill.name.length));
   for (const skill of skills) {
@@ -158,22 +162,29 @@ function showSkill(info: SkillInfo): void {
 }
 
 async function update(project: string, names: string[], confirm: (question: string) => Promise<boolean>): Promise<void> {
-  const installed = installedSkills(project).filter((skill) => !names.length || names.includes(skill.name));
+  const { skills, problems } = installedSkills(project);
+  const installed = skills.filter((skill) => !names.length || names.includes(skill.name));
   const unknown = names.filter((name) => !installed.some((skill) => skill.name === name));
+  // A lockfile jig won't read is skipped like an entry it refuses, below, unless the skills named were found.
+  for (const { message } of problems) ui.notice(message);
   if (unknown.length) throw new Error(`Not installed with jig skills add: ${unknown.join(", ")}.`);
-  if (!installed.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
-  const skipped: string[] = [];
+  if (!installed.length && !problems.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
+  const skipped = names.length ? [] : problems.map(({ scope }): string => (scope === "project" ? "the project's skills" : "your skills"));
+  // The hidden paths, which a session's sandbox hides whether the project's settings are trusted or not.
+  const settings = readSettings(project);
+  const hidden = mergeSettings(settings.user, settings.project?.settings, false).hiddenPaths;
   for (const skill of installed) {
     // A skill jig refuses, or can't fetch or install, is skipped with the reason, and the rest are still
     // updated: a command can write the project's lockfile, which is read first, and an entry it put there
-    // (a name or a link jig refuses, a source that isn't there, an entry that isn't one) mustn't keep the
-    // user's own skills from updating. Having no one to ask still stops it, as it does add and remove.
+    // (a name or a link jig refuses, a source that isn't there or that jig won't fetch, an entry that isn't
+    // one) mustn't keep the user's own skills from updating. Having no one to ask still stops it, as it
+    // does add and remove. The question names the source, which such an entry can change too.
     let fetched: Fetched | undefined;
     let asking = false;
     try {
       await skillDirForChange(skill.scope, project, skill.name); // refused before it is fetched, or anyone asked
-      const source = lockedSource(skill.entry);
-      fetched = fetchSource(source);
+      const source = lockedSource(skill.entry, hidden);
+      fetched = fetchSource(source, hidden);
       const [dir] = findSkills(fetched.dir, 0);
       if (!dir) {
         ui.notice(`${skill.name}: ${skill.entry.source} no longer has the skill's folder (${skill.entry.path}); left as it is.`);
@@ -192,7 +203,7 @@ async function update(project: string, names: string[], confirm: (question: stri
       showSkill(info);
       ui.println(ui.dim(`  changed: ${[...changed, ...added.map((f) => `+${f}`), ...removed.map((f) => `-${f}`)].join(", ")}`));
       asking = true;
-      const yes = await confirm(`Update ${skill.name}? [y/N] `);
+      const yes = await confirm(`Update ${skill.name} from ${source.url ?? source.path}? [y/N] `);
       asking = false;
       if (!yes) continue;
       await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });

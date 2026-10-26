@@ -1,11 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
+import { createSandbox } from "./sandbox.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
-import { assertVisible, isInside, realTarget } from "./tools/util.ts";
+import { assertVisible, isInside, readRegularBytes, readRegularFile, realTarget, realTargetSync } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -50,18 +51,34 @@ export interface Fetched {
 }
 
 /**
+ * The git URLs skills are fetched from: https, ssh (or scp-style, user@host:path) and file. A lockfile entry,
+ * which a command can write, could name any other: git runs a program for some (ext::, or <helper>:: for any
+ * git-remote-<helper> installed), and http:// and git:// don't check whom they reach.
+ */
+const FETCHED_URL = /^(https|ssh|file):\/\/|^\w[\w.-]*@[\w.-]+:/;
+
+/**
  * Gets a source's files. A repository is cloned shallow and sparse into a temporary folder: only the
  * commit asked for, and only the files under the folder asked for, so one skill doesn't fetch a monorepo.
+ * With `hidden` paths, git reads a file URL's repository in the sandbox, which hides them (see lockedSource).
  */
-export function fetchSource(source: SkillSource): Fetched {
+export function fetchSource(source: SkillSource, hidden: string[] = []): Fetched {
   if (!source.url) {
     if (!existsSync(source.path) || !statSync(source.path).isDirectory()) throw new Error(`${source.path} isn't a folder.`);
     return { dir: source.path, root: source.path, commit: gitCommit(source.path), cleanup() {} };
   }
+  if (!FETCHED_URL.test(source.url)) throw new Error(`jig fetches skills only from https, ssh and file URLs, not ${source.url}.`);
   const tmp = mkdtempSync(join(tmpdir(), "jig-skills-"));
   const repo = join(tmp, "repo");
   const cleanup = () => rmSync(tmp, { recursive: true, force: true });
-  const git = (args: string[], cwd = tmp) => execFileSync("git", args, { cwd, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 180_000 });
+  const sandbox = hidden.length && source.url.startsWith("file://") ? createSandbox(tmp, { network: false, hidden }) : undefined;
+  // git refuses ext:: URLs, which run a command, unless a config allows them: this keeps them refused. In
+  // the sandbox, git's arguments are bash's own ("$@", after $0), so the shell reads none of them.
+  const git = (args: string[], cwd = tmp) => {
+    const argv = ["-c", "protocol.ext.allow=never", ...args];
+    const { program, args: wrapped } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [] };
+    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, { cwd, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8", timeout: 180_000 });
+  };
   try {
     if (source.ref && /^[0-9a-f]{7,40}$/.test(source.ref)) {
       // A commit can't be cloned by name: fetch it into an empty repository instead.
@@ -158,10 +175,20 @@ export interface LockEntry {
   installed: string;
 }
 
-/** The lockfile's entries, by skill name; empty when there is no lockfile yet. */
+/**
+ * The lockfile's entries, by skill name; empty when there is no lockfile yet. The project's is within a
+ * command's reach, and one that isn't a regular file is refused: jig would wait for good to read or write
+ * a named pipe there (see readRegularFile).
+ */
 export function readLock(scope: InstallScope, project: string): Record<string, LockEntry> {
+  const path = lockPath(scope, project);
+  const text = readRegularFile(path);
+  if (text === undefined) {
+    if (existsSync(path)) throw new Error(`${path} isn't a regular file (a named pipe, say), so jig won't read or change it. A command may have put it there; if so, delete it.`);
+    return {};
+  }
   try {
-    return JSON.parse(readFileSync(lockPath(scope, project), "utf8")).skills ?? {};
+    return JSON.parse(text).skills ?? {};
   } catch {
     return {};
   }
@@ -201,13 +228,15 @@ export async function assertInProject(project: string, path: string, hidden: str
 /**
  * A skill's folder, checked before jig replaces or removes it, and in the project the lockfile with it
  * (see assertInProject). In either scope the name must be a skill's name, since the lockfile's names come
- * from a file commands can write: "../.." would be the project itself.
+ * from a file commands can write: "../.." would be the project itself. And the lockfile, which jig then
+ * rewrites, must be a regular file (see readLock).
  */
 export async function skillDirForChange(scope: InstallScope, project: string, name: string): Promise<string> {
   const dir = join(skillsDir(scope, project), name);
   const lock = lockPath(scope, project);
   if (nameProblems(name).length) throw new Error(`"${name}" in ${lock} isn't a skill's name, so jig won't change ${dir}. A command may have put it there.`);
   if (scope === "project") for (const path of [dir, lock]) await assertInProject(project, path);
+  readLock(scope, project);
   return dir;
 }
 
@@ -240,11 +269,22 @@ export interface Installed {
   dir: string;
 }
 
-/** The skills installed with `jig skills add`, the project's and the user's. */
-export function installedSkills(project: string): Installed[] {
-  return (["project", "user"] as const).flatMap((scope) =>
-    Object.entries(readLock(scope, project)).map(([name, entry]) => ({ name, scope, entry, dir: join(skillsDir(scope, project), name) })),
-  );
+/**
+ * The skills installed with `jig skills add`, the project's and the user's; and the lockfiles left out, and
+ * why (see readLock): a named pipe a command put in place of the project's mustn't keep the user's skills
+ * from being listed or updated.
+ */
+export function installedSkills(project: string): { skills: Installed[]; problems: { scope: InstallScope; message: string }[] } {
+  const skills: Installed[] = [];
+  const problems: { scope: InstallScope; message: string }[] = [];
+  for (const scope of ["project", "user"] as const) {
+    try {
+      for (const [name, entry] of Object.entries(readLock(scope, project))) skills.push({ name, scope, entry, dir: join(skillsDir(scope, project), name) });
+    } catch (err) {
+      problems.push({ scope, message: (err as Error).message });
+    }
+  }
+  return { skills, problems };
 }
 
 /** Uninstalls a skill added with `jig skills add`: its folder and its lockfile entry. */
@@ -255,17 +295,65 @@ export async function removeSkill(skill: Installed, project: string): Promise<vo
   writeLock(skill.scope, project, lock);
 }
 
-/** The source of an installed skill, to fetch it again: the same repository folder at the same ref. */
-export function lockedSource(entry: LockEntry): SkillSource {
-  // The project's lockfile is a file commands can write, so an entry may not be one jig wrote.
+/**
+ * The source of an installed skill, to fetch it again: the same repository folder at the same ref. The
+ * project's lockfile is a file commands can write, so an entry may not be one jig wrote, and may name any
+ * folder on this machine, or by a file URL any repository. One in the settings' hidden paths (`hidden`),
+ * or holding one, is refused, by where it really leads: its files would land where commands can read
+ * them. (fetchSource refuses the URLs jig doesn't fetch from. And git reads a file URL's repository
+ * itself, where a .git file, the alternates or a link can lead it elsewhere: so fetchSource has git do
+ * that in the sandbox, which hides those paths, if there is one.)
+ */
+export function lockedSource(entry: LockEntry, hidden: string[] = []): SkillSource {
   const fields = [entry?.source, entry?.path, entry?.url ?? "", entry?.ref ?? ""];
   if (!fields.every((field) => typeof field === "string")) throw new Error("its lockfile entry doesn't say where to fetch it from.");
+  const folders = !entry.url ? [entry.path] : entry.url.startsWith("file://") ? fileUrlFolders(entry.url) : [];
+  const reals = hidden.map((path) => realTargetSync(path));
+  for (const folder of folders) {
+    // By the system's realpath, as the files are read: Node's own drops link/.. before it follows the link.
+    let real: string;
+    try {
+      real = realpathSync.native(folder);
+    } catch {
+      continue; // nothing there to read
+    }
+    if (reals.some((path) => !!path && (isInside(path, real) || isInside(real, path)))) {
+      throw new Error(`${entry.url || entry.path} is in a path the settings hide (hiddenPaths), or holds one, so jig won't copy it where commands can read it.`);
+    }
+  }
   return entry.url ? { spec: entry.source, url: entry.url, path: entry.path, ...(entry.ref && { ref: entry.ref }) } : { spec: entry.source, path: entry.path };
 }
 
-/** How two versions of a skill differ, file by file. */
+/**
+ * The folders git may read a file URL's repository from: the path the URL names, and that path with .git
+ * added, which git tries as well. git decodes the whole URL, then drops the host, up to the next /. One jig
+ * can't take apart the same way is refused: a % it can't decode, a NUL, or a [, which starts a host that
+ * can hold a / (in file://[a/b]/c, git reads /c).
+ */
+function fileUrlFolders(url: string): string[] {
+  let rest: string | undefined;
+  try {
+    rest = decodeURIComponent(url.slice("file://".length));
+  } catch {
+    // git reads it some other way: it keeps a % without two hex digits after it, and decodes to any bytes
+  }
+  const slash = rest?.indexOf("/") ?? -1;
+  if (rest === undefined || /[[\0]/.test(rest) || slash < 0) throw new Error(`jig can't tell which folder git would read for ${url}, so it won't fetch it.`);
+  const repo = rest.slice(slash).replace(/(.)\/+$/, "$1"); // git drops a trailing / before it adds .git
+  return [repo, `${repo}.git`];
+}
+
+/**
+ * How two versions of a skill differ, file by file. A file in either that isn't a regular file is refused,
+ * not read: a command can put a named pipe in a skill's folder (see readRegularFile).
+ */
 export function compareSkills(installed: string, fetched: string): { added: string[]; removed: string[]; changed: string[] } {
-  const hashes = (dir: string) => new Map(listSkillFiles(dir).map((file) => [file, createHash("sha256").update(readFileSync(join(dir, file))).digest("hex")]));
+  const hash = (path: string) => {
+    const file = readRegularBytes(path);
+    if (!file) throw new Error(`${path} isn't a regular file (a named pipe, say), so jig won't read it. A command may have put it there; if so, delete it.`);
+    return createHash("sha256").update(file.bytes).digest("hex");
+  };
+  const hashes = (dir: string) => new Map(listSkillFiles(dir).map((file) => [file, hash(join(dir, file))]));
   const before = hashes(installed);
   const after = hashes(fetched);
   return {

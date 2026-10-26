@@ -177,13 +177,19 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
   git directory. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
   write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
-  exits non-zero. The `--stats` file is written anew and renamed into place, which replaces a link or a
+  exits non-zero. An entry can point anywhere, so its question names the URL or folder a skill would come
+  from; it refuses a folder, or a file URL's repository, that the hidden paths hide or that holds one, and
+  has git read such a repository in the sandbox, which hides them from git too (a `.git` file in it can
+  lead git elsewhere). Like `add`, it takes only https, ssh and file URLs (git runs a program for some
+  others). The `--stats` file is written anew and renamed into place, which replaces a link or a
   named pipe instead of writing through it (a linked folder on the way to it is still followed); a path in
   `/dev` or `/proc`, such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
-  watches) it reads only if it is a regular file: a named pipe a command made there would have jig wait
-  until it was killed, and a link to `/dev/zero` never ends. Such an AGENTS.md or skill is left out, a
-  settings file is refused, and a git file is reported by what it is. `read_file` and `edit_file` likewise
+  watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
+  named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
+  ends. Such an AGENTS.md or skill is left out, a settings file is refused, a lockfile or a skill's file is
+  reported and its skills left as they are, and a git file is reported by what it is. `read_file` and
+  `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
@@ -326,7 +332,8 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 
   `jig skills add` shows what it is about to install, scripts first, and records the source and commit of
   each skill in a lockfile beside it (`~/.jig/skills-lock.json`, or `.jig/skills-lock.json` with
-  `--project`); nothing runs at install. A skill the model writes (`jig skills new`, or `/skills new` and
+  `--project`); nothing runs at install. A git URL must be https, ssh or file. A skill the model writes
+  (`jig skills new`, or `/skills new` and
   `/learn` in a session) is a proposal: jig checks it against the specification and shows it to you, and
   saves it only where you say, in the project or for all your projects. With no one to ask, it goes to
   `.jig/proposals/skills/`, a folder `jig skills add` can install once you have read it. A skill's evals

@@ -162,6 +162,13 @@ export async function assertFile(abs: string, path: string): Promise<Stats> {
  * and checked again once open, in case something else took its place in between.
  */
 export function readRegularFile(path: string, max = Infinity): string | undefined {
+  const file = readRegularBytes(path, max);
+  // A character the cut ends halfway through is left out, rather than shown as U+FFFD.
+  return file && new TextDecoder("utf-8", { ignoreBOM: true }).decode(file.bytes, { stream: file.bytes.length < file.size });
+}
+
+/** readRegularFile's bytes, not decoded, and the file's size when it was opened. */
+export function readRegularBytes(path: string, max = Infinity): { bytes: Buffer; size: number } | undefined {
   // Any path stat fails on leads nowhere: throwIfNoEntry covers only a missing one, and a link to itself
   // (ELOOP), which a cloned repository can hold, or a folder jig can't search (EACCES) would throw.
   try {
@@ -181,8 +188,7 @@ export function readRegularFile(path: string, max = Infinity): string | undefine
       if (n === 0) break; // it got shorter meanwhile
       read += n;
     }
-    // A character the cut ends halfway through is left out, rather than shown as U+FFFD.
-    return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes.subarray(0, read), { stream: read < size });
+    return { bytes: bytes.subarray(0, read), size };
   } finally {
     closeSync(fd);
   }

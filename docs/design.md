@@ -131,18 +131,26 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   That goes by where the path is, not by what is there: a job an earlier run left in the background can
   leave a link to a device, or a named pipe, anywhere else it can write. So a named pipe elsewhere is
   replaced too. What jig reads from the project to work in it (AGENTS.md, skills, the settings, the git
-  files the sandbox watches) it opens only if it is a regular file, without waiting: in a review, a
-  command's `mkfifo .git`, where jig ran in a subdirectory, had jig wait after the task until it was
-  killed, and a link to `/dev/zero` read without end. `jig skills` still reads the project's lockfile and
-  an installed skill's files as they are, so a named pipe there has `jig skills update` wait until it is
-  killed. `jig skills add`, `update` and `remove` go by real path in the project as well, and refuse a name
-  in the lockfile, which commands can write, that isn't a skill's name: a name of `../..` made `remove`
+  files the sandbox watches, the skills lockfile and the installed skills' files) it opens only if it is a
+  regular file, without waiting: in a review, a command's `mkfifo .git`, where jig ran in a subdirectory,
+  had jig wait after the task until it was killed, and a link to `/dev/zero` read without end; a
+  `mkfifo .jig/skills-lock.json` did the same to `jig skills list`. `jig skills add`, `update` and
+  `remove` go by real path in the project as well, and refuse a name in the lockfile, which commands can
+  write, that isn't a skill's name: a name of `../..` made `remove`
   delete the project. Nor do they, or a skill the model writes, change anything in a `.git` directory: each
   replaces a skill's folder whole, while the file tools' check for `config` and hooks looks at one file,
   and in a review, `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a
   submodule's config. `update` skips an entry it refuses, or can't fetch or install, updates the rest and
   exits non-zero: one entry a command wrote, with a bad name, a missing path or no fields at all, used to
-  stop it before the user's own skills.
+  stop it before the user's own skills. An entry can also point anywhere, and its question named only the
+  skill: it now names the URL or folder, a folder in the hidden paths (or holding one) is refused, since
+  its files would land where commands can read them, and only https, ssh and file URLs are fetched, since
+  git runs a program for some others (`ext::`, which jig keeps refused whatever git's config says). In a
+  review, a file URL to a hidden repository still brought its files in: such a repository is now refused
+  too, read from the URL as git reads it (decoded, without its host), and every path goes by the system's
+  real path (Node's takes `link/..` for the folder holding the link). And with paths hidden, git reads a
+  file URL's repository in the sandbox, since a `.git` file or the alternates there can lead it to a
+  hidden one.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's own
   process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed `git config core.fsmonitor`
   ran a program as jig on the next search, and it copied the API key. So jig runs git with fsmonitor and

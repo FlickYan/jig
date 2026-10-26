@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -7,12 +7,14 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { beforeEach, describe, it } from "node:test";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { evalFileTargets, testSkill } from "../src/skill-evals.ts";
 import { proposeSkillTool, type SkillProposal } from "../src/skill-proposals.ts";
 import { compareSkills, describeSkill, fetchSource, findSkills, installedSkills, installSkill, lockedSource, parseSource, readLock, removeSkill } from "../src/skill-store.ts";
 import { skillsCommand } from "../src/skills-cli.ts";
 import { BUILTIN_SKILLS, discoverSkills, frontmatter, skillProblems } from "../src/skills.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
 
 let dir: string;
@@ -114,7 +116,7 @@ describe("installing skills", () => {
     git(repo, "add", "-A");
     git(repo, "commit", "-qm", "notes");
 
-    const [installed] = installedSkills(dir);
+    const [installed] = installedSkills(dir).skills;
     assert.equal(installed.scope, "user");
     const again = fetchSource(lockedSource(installed.entry));
     try {
@@ -125,7 +127,7 @@ describe("installing skills", () => {
     }
     assert.equal(readLock("user", dir).beta.commit, git(repo, "rev-parse", "HEAD"));
     assert.match(await readFile(join(installed.dir, "SKILL.md"), "utf8"), /New steps/);
-    await removeSkill(installedSkills(dir)[0], dir);
+    await removeSkill(installedSkills(dir).skills[0], dir);
     assert.ok(!existsSync(installed.dir));
     assert.deepEqual(readLock("user", dir), {});
   });
@@ -159,7 +161,7 @@ describe("changing installed skills", () => {
   /** What the last `jig skills ...` printed. */
   let printed: string[] = [];
   /** What marks the lines jig skills prints. */
-  const markers = ["beta", "skill's name", "Not updating", "changed: "];
+  const markers = ["beta", "skill's name", "Not updating", "changed: ", "Fetching "];
 
   /** Runs `jig skills ...` in the project, answering yes to every question. */
   async function jig(...args: string[]): Promise<void> {
@@ -318,7 +320,189 @@ describe("changing installed skills", () => {
     }
     assert.match(await readFile(join(process.env.JIG_HOME!, "skills", "beta", "SKILL.md"), "utf8"), /New steps/);
   });
+
+  it("are listed and updated without waiting on a named pipe for the lockfile, or among a skill's files", async () => {
+    // A command can make either, and jig would wait on it for good: `jig skills list` did. Each is said
+    // instead, and the user's own skills are still listed and updated. In a child process, so that a hang
+    // fails the test rather than stopping the suite.
+    await jig("add", source);
+    await writeFile(join(source, "SKILL.md"), "---\nname: beta\ndescription: Does beta better. Use when asked to beta.\n---\n\nNew steps.\n");
+    await mkdir(join(dir, ".jig"));
+    execFileSync("mkfifo", [join(dir, ".jig", "skills-lock.json")]);
+    const piped = /\.jig\/skills-lock\.json isn't a regular file \(a named pipe, say\), so jig won't read or change it\. A command may have put it there; if so, delete it\./;
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const run = (...args: string[]) => runJig(["skills", ...args], { api, cwd: dir, env: { JIG_HOME: process.env.JIG_HOME }, timeout: 20_000 });
+    try {
+      const listed = await run("list");
+      assert.equal(listed.code, 0, listed.output);
+      assert.match(listed.output, piped);
+      assert.match(listed.output, /user\s+beta\s+Does beta\..*\n.*from \S+\/source\/beta/);
+      const added = await run("add", source, "--project", "--yes");
+      assert.equal(added.code, 1, added.output);
+      assert.match(added.output, piped);
+      assert.ok(!existsSync(join(dir, ".jig", "skills")), "refused before anything was copied");
+      const updated = await run("update", "--yes");
+      assert.equal(updated.code, 1, updated.output);
+      assert.match(updated.output, piped);
+      assert.match(updated.output, /Updated beta\.\nNot updated, as said above: the project's skills\.\n/);
+      assert.match(await readFile(join(process.env.JIG_HOME!, "skills", "beta", "SKILL.md"), "utf8"), /New steps/);
+      // Named, a skill of the user's is updated without the project's lockfile counting against it.
+      const named = await run("update", "beta", "--yes");
+      assert.equal(named.code, 0, named.output);
+      assert.match(named.output, piped);
+      assert.match(named.output, /beta: up to date\./);
+
+      // A named pipe among the installed skill's files, which update compares with the source's.
+      await rm(join(dir, ".jig", "skills-lock.json"));
+      execFileSync("mkfifo", [join(process.env.JIG_HOME!, "skills", "beta", "notes.md")]);
+      await writeFile(join(source, "SKILL.md"), "---\nname: beta\ndescription: Does beta better. Use when asked to beta.\n---\n\nNewer steps.\n");
+      const compared = await run("update", "--yes");
+      assert.equal(compared.code, 1, compared.output);
+      assert.match(compared.output, /Not updating beta: \S+\/skills\/beta\/notes\.md isn't a regular file \(a named pipe, say\), so jig won't read it\./);
+      assert.match(await readFile(join(process.env.JIG_HOME!, "skills", "beta", "SKILL.md"), "utf8"), /New steps/);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("are fetched only from https, ssh and file URLs, and not from a folder the settings hide", async () => {
+    // A command can point an entry of the project's lockfile anywhere: at a URL git runs a program for, or
+    // at a folder the settings hide, or a repository there by a file URL, whose files update would copy
+    // where commands can read them. Each entry has an installed folder too, which a command can make as
+    // well, so only these checks stop it.
+    const marker = join(outside, "ran");
+    await writeSkill(join(outside, "secrets"), "gamma", undefined, { "key.txt": "secret" });
+    git(join(outside, "secrets"), "init", "-q");
+    git(join(outside, "secrets"), "add", "-A");
+    git(join(outside, "secrets"), "commit", "-qm", "gamma");
+    await writeSkill(outside, "epsilon", undefined, { "private/key.txt": "secret" });
+    await symlink(join(outside, "secrets", "gamma"), join(dir, "gamma")); // by where it really leads
+    await mkdir(join(dir, "links"));
+    await symlink(join(outside, "secrets", "gamma"), join(dir, "links", "up"));
+    const entry = (path: string, url?: string) => ({ source: "team/skills", ...(url && { url }), path, installed: "2026-10-01T00:00:00.000Z" });
+    const skills = {
+      epsilon: entry(join(outside, "epsilon")), // holds a hidden path
+      // A file URL to a hidden repository, as git reads it: with a host, and a letter percent-encoded.
+      eta: entry("gamma", `file://localhost${join(outside, "%73ecrets")}`),
+      gamma: entry(join(dir, "gamma")), // in one
+      // git reads the same repository from this one: a [ after an @ starts a host, and the host ends at the ].
+      iota: entry("gamma", `file:///nowhere/a@[b]${join(outside, "secrets")}`),
+      plain: entry("", "http://127.0.0.1:9/skills.git"),
+      remote: entry("", `ext::sh -c touch% ${marker}`),
+      zeta: entry(`${join(dir, "links", "up")}/../gamma`), // .. after a link is the folder above where it leads
+    };
+    for (const name of Object.keys(skills)) await writeSkill(join(dir, ".jig", "skills"), name);
+    await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify({ version: 1, skills }));
+    // The user's hidden paths, and the project's, which apply whether it is trusted or not.
+    await mkdir(process.env.JIG_HOME!, { recursive: true });
+    await writeFile(join(process.env.JIG_HOME!, "settings.json"), JSON.stringify({ hiddenPaths: [join(outside, "secrets")] }));
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: [join(outside, "epsilon", "private")] }));
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: epsilon, eta, gamma, iota, plain, remote, zeta\.$/);
+    const said = printed.join("\n");
+    const hidden = "is in a path the settings hide \\(hiddenPaths\\), or holds one, so jig won't copy it where commands can read it\\.";
+    assert.match(said, new RegExp(`Not updating epsilon: \\S+/epsilon ${hidden}`));
+    assert.match(said, new RegExp(`Not updating eta: file://localhost/\\S+/%73ecrets ${hidden}`));
+    assert.match(said, new RegExp(`Not updating gamma: \\S+/gamma ${hidden}`));
+    assert.match(said, /Not updating iota: jig can't tell which folder git would read for file:\/\/\/nowhere\/a@\[b\]\/\S+\/secrets, so it won't fetch it\./);
+    assert.match(said, /Not updating plain: jig fetches skills only from https, ssh and file URLs, not http:\/\/127\.0\.0\.1:9\/skills\.git\./);
+    assert.match(said, /Not updating remote: jig fetches skills only from https, ssh and file URLs, not ext::sh -c touch% \S+\/ran\./);
+    assert.match(said, new RegExp(`Not updating zeta: \\S+/links/up/\\.\\./gamma ${hidden}`));
+    for (const name of ["epsilon", "eta", "gamma", "iota", "zeta"]) assert.deepEqual(await readdir(join(dir, ".jig", "skills", name)), ["SKILL.md"]);
+
+    // add takes the same URLs, so it doesn't install a skill that update would refuse.
+    await assert.rejects(jig("add", "http://127.0.0.1:9/skills.git"), /^Error: jig fetches skills only from https, ssh and file URLs, not http:\/\/127\.0\.0\.1:9\/skills\.git\.$/);
+    // git refuses ext:: URLs unless its config allows them, and jig keeps them refused when it does: here
+    // for a URL the config rewrites to one (url.<base>.insteadOf).
+    const config = {
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "protocol.ext.allow",
+      GIT_CONFIG_VALUE_0: "always",
+      GIT_CONFIG_KEY_1: `url.ext::sh -c touch% ${marker} #.insteadOf`,
+      GIT_CONFIG_VALUE_1: "https://example.invalid/",
+    };
+    Object.assign(process.env, config);
+    try {
+      await assert.rejects(jig("add", "https://example.invalid/team/skills.git"), /^Error: Couldn't fetch https:\/\/example\.invalid\/team\/skills\.git: fatal: transport 'ext' not allowed$/);
+    } finally {
+      for (const key of Object.keys(config)) delete process.env[key];
+    }
+    assert.ok(!existsSync(marker), "git ran no program");
+  });
+
+  it("are fetched from a file URL by git in the sandbox, where the repository can't lead it to a hidden one", { skip: sandboxProblem() }, async () => {
+    // git reads a file URL's repository itself, and a .git file a command made there can name the git
+    // directory of a repository the settings hide, which the path alone doesn't show. In the sandbox git
+    // can't read that, while a repository that isn't hidden is still fetched.
+    const repo = await skillRepository();
+    await jig("add", `file://${repo}`, "--path", "skills/beta", "--project");
+    await writeFile(join(repo, "skills", "beta", "notes.md"), "more");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-qm", "notes");
+    const vault = join(outside, "vault");
+    await writeSkill(vault, "eta", undefined, { "key.txt": "secret" });
+    git(vault, "init", "-q");
+    git(vault, "add", "-A");
+    git(vault, "commit", "-qm", "eta");
+    await mkdir(join(dir, "pointer"));
+    await writeFile(join(dir, "pointer", ".git"), `gitdir: ${join(vault, ".git")}\n`);
+    await writeSkill(join(dir, ".jig", "skills"), "eta");
+    const lock = JSON.parse(await readFile(join(dir, ".jig", "skills-lock.json"), "utf8"));
+    lock.skills.eta = { source: "team/skills", url: `file://${join(dir, "pointer")}`, path: "eta", installed: "2026-10-01T00:00:00.000Z" };
+    await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify(lock));
+    await mkdir(process.env.JIG_HOME!, { recursive: true });
+    await writeFile(join(process.env.JIG_HOME!, "settings.json"), JSON.stringify({ hiddenPaths: [vault] }));
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: eta\.$/);
+    const said = printed.join("\n");
+    assert.match(said, /Not updating eta: Couldn't fetch team\/skills: fatal: /);
+    assert.match(said, /Updated beta\./);
+    assert.deepEqual(await readdir(join(dir, ".jig", "skills", "eta")), ["SKILL.md"]);
+    assert.equal(await readFile(join(dir, ".jig", "skills", "beta", "notes.md"), "utf8"), "more");
+  });
+
+  it("are updated after a question that names their source", async () => {
+    // An entry a command wrote in the project's lockfile can point anywhere, so the question names the
+    // repository or the folder. At a terminal, which answers no to each question (ANSWER_NO).
+    const repo = await skillRepository();
+    await jig("add", `file://${repo}`, "--path", "skills/beta", "--project");
+    await jig("add", source);
+    for (const skill of [join(repo, "skills", "beta"), source]) await writeFile(join(skill, "notes.md"), "more");
+    git(repo, "add", "-A");
+    git(repo, "commit", "-qm", "notes");
+    const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+    const asked = spawnSync("python3", ["-c", ANSWER_NO, process.execPath, cli, "skills", "update"], { cwd: dir, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: 20_000 });
+    const output = asked.stdout.replace(/\x1b\[[0-9;?]*[A-Za-z]|\r/g, "");
+    assert.equal(asked.status, 0, output);
+    assert.ok(output.includes(`Update beta from file://${repo}? [y/N] n\n`), output);
+    assert.ok(output.includes(`Update beta from ${source}? [y/N] n\n`), output);
+    for (const skills of [join(dir, ".jig", "skills"), join(process.env.JIG_HOME!, "skills")]) assert.ok(!existsSync(join(skills, "beta", "notes.md")));
+  });
 });
+
+/**
+ * A program run at a terminal (a pseudo-terminal python3 makes, as runJig's does) that answers no to each
+ * [y/N] question it asks, then prints all it showed.
+ */
+const ANSWER_NO = `
+import os, pty, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], sys.argv[1:])
+shown, answered = b"", 0
+while True:
+    try:
+        chunk = os.read(fd, 65536)
+    except OSError:  # Linux, once the program has exited
+        chunk = b""
+    if not chunk:
+        break
+    shown += chunk
+    while shown.count(b"[y/N]") > answered:
+        os.write(fd, b"n\\r")
+        answered += 1
+sys.stdout.buffer.write(shown)
+sys.exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))
+`;
 
 describe("finding skills", () => {
   it("adds jig's own skills last, takes the user's from JIG_HOME, and hides what --hide-skill names", async () => {

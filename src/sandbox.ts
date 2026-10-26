@@ -11,7 +11,10 @@ export interface Sandbox {
   description: string;
   /** For the model: what commands can't do. */
   limits: string;
-  /** The program and arguments that run `command` in bash inside the sandbox. */
+  /**
+   * The program and arguments that run `command` in bash inside the sandbox. They end with bash -c and the
+   * command, so arguments added after them are its $0 and "$@" (see fetchSource).
+   */
   wrap(command: string): { program: string; args: string[] };
   /**
    * Those of the files telling git where its config is that commands created or changed since the last call,
