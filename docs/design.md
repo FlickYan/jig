@@ -158,23 +158,28 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   place short of fixing every directory above it in the project. So on Linux a command can still create a
   `commondir` or `config.worktree`, or put another checkout in a submodule's place, and jig warns after the
   task and when a session ends; Seatbelt refuses them (a symlink in a checkout's place gets the warning).
-  With jig started in a subdirectory of a repository, a `.git` a command makes there is the one the user's
-  git there finds; making a repository can be the task, so neither sandbox refuses it, and jig warns of it
-  the same way. The sandbox finds the repository by the nearest `.git`, whatever the git directory it leads
-  to is called, and submodules' git directories by their `config` or `HEAD`, not by whether git takes them
-  for one: git passes over a git directory whose `HEAD`, `objects` or `refs` are gone or broken, and those
-  stay writable, as git changes them all the time. When the sandbox asked git, a command that moved
-  `.git/HEAD` aside had the next session lock nothing there, and a command in that one could change the
-  config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in the background
-  can still do it after jig has looked, and after a one-shot run nothing looks again. The search for the
-  `.git` stops where git's does: at a bare repository, a git directory (`HEAD`, `objects`, `refs`) whose
-  `config` says it is bare, and at `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's
-  dotfiles repository for the project's, and let commands write in it. Stopping at a `config` alone, which
-  a command in a subdirectory of a repository can write, the next session there locked nothing. A command
-  can make the whole bare repository too, so what the repository around a bare one has in the project or
-  the bare one, both writable, stays read-only (the `.git` of a submodule checkout there, say), though
-  that repository's git directory isn't made writable. Commands can still make a repository of their own
-  (a submodule whose git directory is in its checkout is one), so jig's git doesn't rely on any of this.
+  With jig started in a subdirectory of a repository, a `.git` a command makes there, or the directory made
+  a git directory itself (`git init --bare .`), is the repository the user's git there finds, and so is one
+  in a directory between them; making a repository can be the task, so neither sandbox refuses it, and jig
+  warns of it the same way. The sandbox finds the repository by the nearest `.git`, whatever the git
+  directory it leads to is called, and submodules' git directories by their `config` or `HEAD`, not by
+  whether git takes them for one: git passes over a git directory whose `HEAD`, `objects` or `refs` are
+  gone or broken, and those stay writable, as git changes them all the time. When the sandbox asked git, a
+  command that moved `.git/HEAD` aside had the next session lock nothing there, and a command in that one
+  could change the config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in
+  the background can still do it after jig has looked, and after a one-shot run nothing looks again. The
+  search for the `.git` stops where git's does: at a bare repository, a git directory (`HEAD`, and
+  `objects` and `refs` where its `commondir`, if any, leads) whose `config` says it is bare, and at
+  `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's dotfiles repository for the project's,
+  and let commands write in it. Stopping at a `config` alone, which a command in a subdirectory of a
+  repository can write, the next session there locked nothing. A command can make a whole repository too,
+  bare or not, so what the repositories around the project's have where commands can write stays read-only
+  (the `.git` of a submodule checkout in the project, say, or the config of one in a temp directory), and
+  the directories holding it there in place. Their git directories are never made writable, and no bind of
+  git's shows jig's own directory again. The submodules' configs, which say where their checkouts are, are
+  read by one git for all of them, since a dotfiles repository around every project can have dozens.
+  Commands can still make a repository of their own (a submodule whose git directory is in its checkout is
+  one), so jig's git doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.

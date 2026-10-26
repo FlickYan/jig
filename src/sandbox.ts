@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { constants, existsSync, lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
@@ -15,9 +15,10 @@ export interface Sandbox {
   wrap(command: string): { program: string; args: string[] };
   /**
    * Those of the files telling git where its config is that commands created or changed since the last call,
-   * and the HEAD, objects or refs of a git directory they made git pass over. On Linux the sandbox can't keep
-   * a missing one of the former from being created, and neither sandbox refuses a .git made in the project
-   * when jig runs in a subdirectory of the repository, or the latter (see gitWatch), so jig says so after a task.
+   * the HEAD, objects or refs of a git directory they made git pass over, and, ending in a slash, a directory
+   * they made a git directory. On Linux the sandbox can't keep a missing one of the first from being created,
+   * and neither sandbox refuses a .git made in the project when jig runs in a subdirectory of the repository,
+   * or the rest (see gitWatch), so jig says so after a task.
    */
   gitChanges?(): string[];
 }
@@ -30,17 +31,24 @@ export interface GitControl {
   fixed: string[];
   /** The repository's git directories, its linked worktrees' and its submodules', which commands can make git pass over (see gitWatch). */
   gitDirectories: string[];
+  /** Set when they are all a repository's around the project's, which is a bare one left writable (see gitControl). */
+  aroundOnly?: boolean;
 }
 
 /**
  * A repository's git directories: the common one, and the work tree's own (a linked worktree's, under the
- * common one's worktrees/), and whether the repository is bare rather than one with a work tree.
+ * common one's worktrees/), whether the repository is bare rather than one with a work tree, and where the
+ * walk found it: the directory holding its .git, or the bare one itself (not known when git was asked).
  */
 interface GitDirs {
   common: string;
   own: string;
   bare: boolean;
+  tree?: string;
 }
+
+/** The git directories a .git leads to, and the directory holding that .git (see gitDirsOf). */
+type Found = Omit<GitDirs, "bare"> & { tree: string };
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are: it holds a path, or a little config
@@ -69,12 +77,12 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
   // git runs the programs a repository's config and hooks name, outside the sandbox: the user's git after
   // the session (a shell prompt may run it at every line), and jig's own if jig didn't turn them off. So
   // commands can't change them, or the files that say where they are.
-  const guarded = gitControl(project, repo);
+  const guarded = gitControl(project, repo, writable);
   const sandbox =
     process.platform === "darwin"
       ? seatbelt(writable, network, where, unreadable, guarded, home)
       : bubblewrap(writable, network, where, unreadable, guarded, home);
-  return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project) } : sandbox;
+  return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project, repo?.tree) } : sandbox;
 }
 
 /**
@@ -87,62 +95,65 @@ export function createSandbox(root: string, { network, dirs = [], hidden = [] }:
  * directory made with --separate-git-dir has no .git in its path), where setting up a server's hooks can
  * be the task. But not for a bare one named .git, whose config the file tools refuse too, nor for one with
  * linked worktrees, which is no server's: the user runs git in them (a bare clone, its worktrees beside it).
- * And a bare one in another repository's work tree leaves locked what that repository has in the project
- * or the bare one (see aroundBare).
+ * And the repositories around this one leave locked what they have in a writable directory, `writable`
+ * being the sandbox's, or the project and its git directory (see aroundControl).
  */
-export function gitControl(project: string, repo = gitDirs(project)): GitControl | undefined {
+export function gitControl(project: string, repo = gitDirs(project), writable?: string[]): GitControl | undefined {
   if (!repo) return undefined;
-  const around = repo.bare ? aroundBare(project, repo.common) : undefined;
-  if (repo.bare && !worktrees(repo.common).length && !isGitControl(join(repo.common, "config"))) return around;
+  const around = aroundControl(project, repo, writable ?? [realpathSync(project), repo.common]);
+  if (repo.bare && !worktrees(repo.common).length && !isGitControl(join(repo.common, "config"))) return around && { ...around, aroundOnly: true };
   const own = controlOf(repo, dotGitFile(project));
   if (!around) return own;
-  const merged = (key: "locked" | "gitDirectories") => [...new Set([...own[key], ...around[key]])];
-  return { locked: merged("locked"), fixed: own.fixed, gitDirectories: merged("gitDirectories") };
+  const merged = (key: "locked" | "fixed" | "gitDirectories") => [...new Set([...own[key], ...around[key]])];
+  const fixed = merged("fixed").sort((a, b) => a.length - b.length); // a directory before those in it, as controlOf has them
+  return { locked: merged("locked"), fixed, gitDirectories: merged("gitDirectories") };
 }
 
 /**
- * What of the repository around a bare one lies in the project or the bare one, which createSandbox makes
- * writable (the bare one is above the project when jig starts in a subdirectory of it), for gitControl to
- * lock: the .git of a submodule checkout there, say. A command can make the project a bare repository as
- * git takes one (a HEAD, objects, refs, and a config that says it is bare). Made in the directory holding
- * a submodule's checkout, the next session there, or in a subdirectory, locked nothing, and a command in
- * it could point the checkout's .git at a git directory with a config of its own, which the user's git
- * status in the repository around then read. Only locked: that repository's git directory isn't the
- * project's, so it is neither made writable nor bound in place (bubblewrap makes what it binds writable).
+ * What the repositories around the project's have in a writable directory (`writable`, by real path),
+ * for gitControl to lock: the .git of a submodule checkout in the project, say, or the config of one in a
+ * temp directory. A command can make a repository wherever it can write, bare (git init --bare .) or not
+ * (git init). Made in the directory holding a submodule's checkout, the next session there, or in a
+ * subdirectory, took it for the repository and locked nothing of the one around, and a command in it could
+ * point the checkout's .git at a git directory with a config of its own, which the user's git status in
+ * the repository around then read. The directories holding those files are fixed only where they lie in a
+ * writable directory already, as binding them there grants nothing: those repositories' git directories
+ * aren't the project's, so they are never made writable (bubblewrap makes what it binds writable).
  */
-function aroundBare(project: string, bare: string): GitControl | undefined {
-  const outer = repositoryAround(bare);
-  if (!outer) return undefined;
-  const writable = [realpathSync(project), bare]; // the listing has real paths
-  const { locked, gitDirectories } = controlOf(outer.repo, dotGitFile(outer.tree));
+function aroundControl(project: string, repo: GitDirs, writable: string[]): GitControl | undefined {
   const inWritable = (path: string) => writable.some((dir) => isInside(dir, path));
-  const control = { locked: locked.filter(inWritable), fixed: [], gitDirectories: gitDirectories.filter(inWritable) };
-  return control.locked.length ? control : undefined; // any of its git directories there has its config there too
+  const controls = repositoriesAround(repo.tree ?? project, repo.common).map((outer) => controlOf(outer, dotGitFile(outer.tree)));
+  const kept = (key: "locked" | "fixed" | "gitDirectories") => [...new Set(controls.flatMap((control) => control[key].filter(inWritable)))];
+  const locked = kept("locked");
+  // Any of their git directories there has its config there too.
+  return locked.length ? { locked, fixed: kept("fixed"), gitDirectories: kept("gitDirectories") } : undefined;
 }
 
 /**
- * The repository the nearest .git above a bare one leads to, and where that .git is, going no further up
- * than gitDirs does (GIT_CEILING_DIRECTORIES). Not the bare one itself, which a .git beside it can name.
+ * The repositories the .git files above `tree` lead to, going no further up than gitDirs does
+ * (GIT_CEILING_DIRECTORIES): all of them, as a command can make a repository inside one it made before.
+ * Not the one whose git directory is `common`, which a .git above can name too.
  */
-function repositoryAround(bare: string): { repo: GitDirs; tree: string } | undefined {
+function repositoriesAround(tree: string, common: string): Found[] {
   const ceilings = gitCeilings();
-  for (let dir = dirname(bare); !ceilings.includes(dir); dir = dirname(dir)) {
+  const found: Found[] = [];
+  for (let dir = dirname(tree); !ceilings.includes(dir); dir = dirname(dir)) {
     const repo = existsSync(join(dir, ".git")) ? gitDirsOf(join(dir, ".git")) : undefined;
-    if (repo && repo.common !== bare) return { repo, tree: dir };
-    if (dirname(dir) === dir) return undefined;
+    if (repo && repo.common !== common && !found.some((other) => other.common === repo.common)) found.push(repo);
+    if (dirname(dir) === dir) break;
   }
-  return undefined;
+  return found;
 }
 
 /** What gitControl lists for a repository whose work tree's .git, if it is a file, is `dotGit`. */
-function controlOf({ common, own }: GitDirs, dotGit: string | undefined): GitControl {
+function controlOf({ common, own }: Pick<GitDirs, "common" | "own">, dotGit: string | undefined): GitControl {
   const inGitDir = (dir: string) => [
     ...["config", "config.worktree", "commondir", "hooks"].map((name) => join(dir, name)),
     ...worktrees(dir).flatMap((tree) => ["commondir", "gitdir", "config.worktree"].map((name) => join(tree, name))),
   ];
   // A linked worktree's submodules have their git directories in its own (worktrees/<name>/modules).
   const modules = [...new Set([common, own, ...worktrees(common)])].flatMap((dir) => submodules(join(dir, "modules")));
-  const dotGits = [dotGit, ...worktrees(common).map(worktreeDotGit), ...modules.map(checkoutDotGit)];
+  const dotGits = [dotGit, ...worktrees(common).map(worktreeDotGit), ...checkoutDotGits(modules)];
   const locked = [...[common, ...modules].flatMap(inGitDir), ...new Set(dotGits.filter((path) => path !== undefined))];
   // Moved aside, a directory holding them could be replaced by one with files of a command's own.
   const fixed = new Set([common]);
@@ -208,21 +219,62 @@ function worktreeDotGit(tree: string): string | undefined {
 }
 
 /**
- * A submodule checkout's .git file, from where the submodule's config says its checkout is (core.worktree,
+ * Submodule checkouts' .git files, from where each submodule's config says its checkout is (core.worktree,
  * relative to its git directory). The user's git status in the superproject runs git in the checkout,
  * so a .git file there pointing elsewhere would have it run a config of a command's own.
  */
-function checkoutDotGit(module: string): string | undefined {
+function checkoutDotGits(modules: string[]): (string | undefined)[] {
+  const trees = checkoutTrees(modules);
+  return modules.map((module) => {
+    const tree = trees.get(module);
+    return tree === undefined ? undefined : dotGitIn(resolve(module, tree));
+  });
+}
+
+/**
+ * core.worktree in submodules' configs, by submodule, as git config --file reads each. One git reads them
+ * all, as includes of a config on its standard input: a superproject, or a dotfiles repository around the
+ * project's, can have dozens of submodules, and each git takes milliseconds to start. But --file follows
+ * no include a config has itself (one could name a named pipe, which git would wait on), so if any config
+ * has one, each is read alone, as each is if git fails on one. git would wait on a config that is a named
+ * pipe too, as a command can leave in a submodule's directory it made, so only regular files are read.
+ */
+function checkoutTrees(modules: string[]): Map<string, string> {
+  const configs = modules.map((module) => join(module, "config")).filter((config) => {
+    try {
+      return statSync(config).isFile();
+    } catch {
+      return false; // not there, or a link to itself (ELOOP)
+    }
+  });
+  if (!configs.length) return new Map();
+  const list = (args: string[], input?: string) =>
+    execFileSync("git", [...SAFE_GIT, "config", ...args, "--show-origin", "-z", "--list"], { env: withoutKeys(), encoding: "utf8", input, stdio: ["pipe", "pipe", "ignore"] })
+      .split("\0")
+      .slice(0, -1);
+  let fields: string[];
   try {
-    // git would wait on a config that is a named pipe, as a command can leave in a submodule's directory it
-    // made. Inside the try, as a link to itself there makes stat throw (ELOOP).
-    if (!statSync(join(module, "config")).isFile()) return undefined;
-    const args = [...SAFE_GIT, "config", "--file", join(module, "config"), "--get", "core.worktree"];
-    const tree = execFileSync("git", args, { env: withoutKeys(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    return dotGitIn(resolve(module, tree.replace(/\n$/, "")));
+    if (configs.some((config) => /include/i.test(readRegularFile(config) ?? ""))) throw new Error("a config includes another");
+    const quoted = (path: string) => `"${path.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\n")}"`;
+    fields = list(["--file", "-", "--includes"], `[include]\n${configs.map((config) => `\tpath = ${quoted(config)}\n`).join("")}`);
   } catch {
-    return undefined; // no config to read, no checkout, or one git doesn't know of
+    fields = configs.flatMap((config) => {
+      try {
+        return list(["--file", config]);
+      } catch {
+        return []; // one git can't read
+      }
+    });
   }
+  // Each entry is where it is from (file:<path>), then its key and its value, a line apart. The last counts.
+  const trees = new Map<string, string>();
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    const [origin, entry] = [fields[i], fields[i + 1]];
+    const at = entry.indexOf("\n");
+    if (!origin.startsWith("file:") || at === -1 || entry.slice(0, at) !== "core.worktree") continue;
+    trees.set(dirname(origin.slice("file:".length)), entry.slice(at + 1));
+  }
+  return trees;
 }
 
 /** A work tree's .git by its real path (Seatbelt sees no other), unless it is a directory: then it is a repository of its own. */
@@ -241,19 +293,29 @@ function dotGitIn(tree: string): string | undefined {
  * of the command's own. Seatbelt refuses a new commondir or .git alike, short of a symlink in a checkout's
  * place, which shows here as a .git with another real path. One that is removed isn't reported: git then
  * reads no config there. When jig runs in a subdirectory of the repository, a .git a command makes in
- * the project is reported too: the user's git there would then take its config from where that leads.
- * Neither sandbox refuses it, since making a repository there (git init) can be the task. Last, a git
- * directory's HEAD, objects or refs, if a command removed or broke them so that git passes over it (see
- * passedOver): commands can write them, as git changes them all the time. The user's git there then fails,
- * or takes a repository above it for the one it is in. jig still finds it, and locks it (see gitDirs).
+ * the project, or in a directory above it up to the repository's (one in a temp directory, say), is
+ * reported too: the user's git there would then take its config from where that leads. So is the project,
+ * or such a directory, made a git directory (git init --bare .), which git there takes for the repository.
+ * Neither sandbox refuses them, since making a repository there can be the task. Last, a git directory's
+ * HEAD, objects or refs, if a command removed or broke them so that git passes over it (see passedOver):
+ * commands can write them, as git changes them all the time. The user's git there then fails, or takes a
+ * repository above it for the one it is in. jig still finds it, and locks it (see gitDirs).
  */
-function gitWatch({ locked, gitDirectories }: GitControl, project: string): () => string[] {
-  const dotGit = join(project, ".git"); // if there is none, jig runs in a subdirectory of the repository
-  const watched = [...new Set([...locked, ...(existsSync(dotGit) ? [] : [dotGit])])].filter(
+function gitWatch({ locked, gitDirectories }: GitControl, project: string, tree: string | undefined): () => string[] {
+  // The project and the directories above it up to where the repository was found, none of which has a
+  // .git: the project alone where git was asked.
+  const between: string[] = [];
+  for (let dir = project; dir !== tree; dir = dirname(dir)) {
+    between.push(dir);
+    if (!tree || !isInside(tree, dirname(dir))) break;
+  }
+  const dotGits = between.map((dir) => join(dir, ".git")).filter((path) => !existsSync(path));
+  const watched = [...new Set([...locked, ...dotGits])].filter(
     (path) => basename(path) === ".git" || (basename(path) !== "hooks" && !existsSync(path)),
   );
   const seen = new Map(watched.map((path) => [path, contents(path)]));
   const passed = new Map(gitDirectories.map((dir) => [dir, passedOver(dir)]));
+  const made = new Map(between.map((dir) => [dir, isGitDirectory(dir)]));
   return () => [
     ...watched.filter((path) => {
       const now = contents(path);
@@ -267,14 +329,21 @@ function gitWatch({ locked, gitDirectories }: GitControl, project: string): () =
       passed.set(dir, now);
       return now !== undefined && now !== before ? [now] : [];
     }),
+    ...between.flatMap((dir) => {
+      const now = isGitDirectory(dir);
+      const before = made.get(dir);
+      made.set(dir, now);
+      return now && !before ? [`${dir}${sep}`] : [];
+    }),
   ];
 }
 
 /**
  * Why git would pass over a git directory, as its is_git_directory has it: its HEAD, if that is gone or
- * names neither a ref nor a commit, or its objects or refs, if gone (a linked worktree's are in the common
- * directory, which its commondir names). Undefined if git wouldn't, or the directory is gone: the user may
- * remove a worktree during the session, and commands can't move one that was there when it began.
+ * names neither a ref nor a commit, or its objects or refs, if gone. A linked worktree's are in the common
+ * directory, which its commondir names and which is watched itself, as is a commondir a command made.
+ * Undefined if git wouldn't, or the directory is gone: the user may remove a worktree during the session,
+ * and commands can't move one that was there when it began.
  */
 function passedOver(dir: string): string | undefined {
   if (!existsSync(dir)) return undefined;
@@ -282,6 +351,23 @@ function passedOver(dir: string): string | undefined {
   if (!headInOrder(head)) return head;
   if (existsSync(join(dir, "commondir"))) return undefined;
   return ["objects", "refs"].map((name) => join(dir, name)).find((path) => !existsSync(path));
+}
+
+/**
+ * Whether git takes a directory for a git directory, as its is_git_directory has it: a HEAD in order, and
+ * objects and refs in the directory its commondir names (taking only line breaks off its end), or in
+ * itself if it has none. A commondir a command made can name nothing, and git then passes it over.
+ */
+function isGitDirectory(dir: string): boolean {
+  if (!existsSync(dir) || !headInOrder(join(dir, "HEAD"))) return false;
+  let common = dir;
+  try {
+    const named = readRegularFile(join(dir, "commondir"), GIT_FILE_BYTES);
+    if (named !== undefined) common = resolve(dir, named.replace(/[\r\n]+$/, ""));
+  } catch {
+    // not to be read (EACCES), which git fails on
+  }
+  return existsSync(join(common, "objects")) && existsSync(join(common, "refs"));
 }
 
 /** Whether a HEAD names a ref or a commit, as git checks it: a link into refs/, or a file starting "ref: refs/" or with a commit's hash. */
@@ -387,7 +473,7 @@ function ownBinds(home: string, writable: string[]): string[] {
 
 /**
  * A Seatbelt rule denying an operation on what the filters match, if there are any: with none, it would deny
- * it everywhere. A repository around a bare one has no directories fixed (see aroundBare).
+ * it everywhere. A repository around a bare one may have no directories fixed (see aroundControl).
  */
 function deny(operation: string, filters: string[] = []): string[] {
   return filters.length ? [`(deny ${operation} ${filters.join(" ")})`] : [];
@@ -406,13 +492,18 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   const bwrap = findProgram("bwrap")!;
   // An empty directory over each hidden directory, and an empty file over each hidden file.
   const hiding = hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path]));
+  // A bind of git's in jig's directory, outside the writable directories ownBinds shows there, or of one
+  // holding it, would show it again (a .git a command made can lead anywhere): what is hidden there is out
+  // of commands' reach anyway.
+  const shown = (path: string) =>
+    !home || (!isInside(path, home) && (!isInside(home, path) || writable.some((dir) => isInside(home, dir) && isInside(dir, path))));
   // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too.
   const args = () => [
     "--ro-bind", "/", "/",
     "--dev", "/dev",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
     ...(home ? ownBinds(home, writable) : []),
-    ...(git ? gitBinds(git) : []),
+    ...(git ? gitBinds(git, shown) : []),
     ...hiding,
     ...(network ? [] : ["--unshare-net"]),
     "--die-with-parent", // if jig is killed, so are its commands
@@ -428,10 +519,11 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
 }
 
 /**
- * bubblewrap's arguments for what gitControl found, worked out for each command: binding a path that is no
- * longer there fails the command, and the user may remove a worktree or a submodule during the session.
+ * bubblewrap's arguments for what gitControl found, of what is `shown`, worked out for each command: binding a
+ * path that is no longer there fails the command, and the user may remove a worktree or a submodule during the
+ * session.
  */
-function gitBinds({ locked, fixed }: GitControl): string[] {
+function gitBinds({ locked, fixed }: GitControl, shown: (path: string) => boolean): string[] {
   // A hooks directory that isn't there is made, empty as git's default one, so that it can be bound read-only.
   for (const path of locked) {
     if (basename(path) !== "hooks" || existsSync(path)) continue;
@@ -445,14 +537,18 @@ function gitBinds({ locked, fixed }: GitControl): string[] {
   // command can't move aside; then what is locked, read-only. Only what exists: binding a path that doesn't
   // would create it (gitWatch looks out for those).
   return [
-    ...fixed.filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
-    ...locked.filter((path) => existsSync(path)).flatMap((path) => ["--ro-bind", path, path]),
+    ...fixed.filter((dir) => shown(dir) && existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
+    ...locked.filter((path) => shown(path) && existsSync(path)).flatMap((path) => ["--ro-bind", path, path]),
   ];
 }
 
 /** For the model: why changing the git config or a hook fails. */
 function gitNote(git?: GitControl): string {
-  return git ? ". The repository's git config and hooks are read-only, its submodules' too: if one needs changing, ask the user" : "";
+  if (!git) return "";
+  // A server's bare repository is left writable: only what the repository around it has here is locked.
+  return git.aroundOnly
+    ? ". Some git files of the repository around this one are read-only (a submodule checkout's .git, say): if one needs changing, ask the user"
+    : ". The repository's git config and hooks are read-only, its submodules' too: if one needs changing, ask the user";
 }
 
 /** For the model: that some paths are hidden, so their denials make sense (not which: they may be answers). */
@@ -503,10 +599,13 @@ function gitDirs(project: string): GitDirs | undefined {
   const ceilings = gitCeilings();
   for (let dir = project; ; dir = dirname(dir)) {
     const dotGit = join(dir, ".git");
-    if (existsSync(dotGit)) return gitDirsOf(dotGit) ?? gitDirsFromGit(project);
-    if (passedOver(dir) === undefined && isBare(join(dir, "config"))) {
+    if (existsSync(dotGit)) {
+      const found = gitDirsOf(dotGit);
+      return found ? { ...found, bare: isBare(join(found.common, "config")) } : gitDirsFromGit(project);
+    }
+    if (isGitDirectory(dir) && isBare(join(dir, "config"))) {
       const real = realpathSync(dir);
-      return { common: real, own: real, bare: true };
+      return { common: real, own: real, bare: true, tree: real };
     }
     if (dirname(dir) === dir || ceilings.includes(dirname(dir))) return gitDirsFromGit(project);
   }
@@ -530,9 +629,10 @@ function gitCeilings(): string[] {
  * The git directories a .git leads to, if they are a repository's: if the common one has a config, which
  * is locked and so stays, or the work tree's own has a HEAD. A .git file names the work tree's own git
  * directory, relative to where it is (a linked worktree's or a submodule checkout's), and that one's
- * commondir names the common one.
+ * commondir names the common one. Whether it is bare is left to gitDirs: asking git costs a few
+ * milliseconds, and the repositories around the project's don't need it.
  */
-function gitDirsOf(dotGit: string): GitDirs | undefined {
+function gitDirsOf(dotGit: string): Found | undefined {
   try {
     let own = dotGit;
     if (!statSync(dotGit).isDirectory()) {
@@ -544,7 +644,7 @@ function gitDirsOf(dotGit: string): GitDirs | undefined {
     const commondir = readRegularFile(join(own, "commondir"), GIT_FILE_BYTES);
     const common = commondir === undefined ? own : realpathSync(resolve(own, commondir.trimEnd()));
     if (!existsSync(join(common, "config")) && !existsSync(join(own, "HEAD"))) return undefined;
-    return { common, own, bare: isBare(join(common, "config")) };
+    return { common, own, tree: dirname(dotGit) };
   } catch {
     return undefined; // a git directory that isn't there, or a link to itself (ELOOP)
   }

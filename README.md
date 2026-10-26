@@ -135,17 +135,20 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   its submodules', nor the files that tell git where they are: worktrees' and submodule checkouts' `.git`
   files, `commondir`, `config.worktree`, `gitdir`), the directories added with `--add-dir` and the temp
   directories, and they can't reach the network. A bare repository's config and hooks stay writable, unless
-  it has linked worktrees or is named `.git`: setting up a server's hooks can be the task. Some changes to
-  git's files aren't refused, so jig warns of them after the task and when a session ends: on Linux, a
-  `commondir` or `config.worktree` that wasn't there (one can't be made read-only without creating it, and
-  an empty `commondir` breaks git); on both systems, a submodule's checkout moved aside and another put in
-  its place (on macOS, a link to one), a `.git` made in the project when jig was started in a subdirectory
-  of a repository (making a repository can be the task), and a git directory's `HEAD`, `objects` or `refs`
-  removed or broken (git changes them all the time, so commands can too). Your git would then take its
-  config from elsewhere, or pass over the directory and fail or use a repository above it, so look before
-  you run git there; jig still finds the repository by its `.git`, so the next session keeps its config
-  read-only. A job a command leaves in the background can still do so after jig has looked, and after a
-  one-shot run nothing looks again.
+  it has linked worktrees or is named `.git`: setting up a server's hooks can be the task. Those files of a
+  repository around the project's that lie where commands can write (a submodule checkout's `.git` in the
+  project, say, or its config in a temp directory) stay read-only too, so a repository a command makes in
+  the project doesn't unlock them. Some changes to git's files aren't refused, so jig warns of them after
+  the task and when a session ends: on Linux, a `commondir` or `config.worktree` that wasn't there (one
+  can't be made read-only without creating it, and an empty `commondir` breaks git); on both systems, a
+  submodule's checkout moved aside and another put in its place (on macOS, a link to one), a `.git` made in
+  the project, or the project made a git directory (`git init --bare .`), when jig was started in a
+  subdirectory of a repository (the same in a directory between them; making a repository can be the task),
+  and a git directory's `HEAD`, `objects` or `refs` removed or broken (git changes them all the time, so
+  commands can too). Your git would then take its config from elsewhere, or pass over the directory and fail
+  or use a repository above it, so look before you run git there; jig still finds the repository by its
+  `.git`, so the next session keeps its config read-only. A job a command leaves in the background can still
+  do so after jig has looked, and after a one-shot run nothing looks again.
 
   Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs:
   its snapshots and sessions hold copies of your projects' files, and the snapshots older versions of jig

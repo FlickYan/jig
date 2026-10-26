@@ -8,7 +8,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
 import { constants } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
@@ -545,18 +545,21 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   /**
-   * Says which files telling git where its config is commands changed, and which git directories they made
-   * git pass over, where the sandbox doesn't stop them.
+   * Says which files telling git where its config is commands changed, which git directories they made git
+   * pass over, and which directories they made git directories, where the sandbox doesn't stop them.
    */
   function warnOfGitChanges(): void {
     for (const path of sandbox?.gitChanges?.() ?? []) {
       // A commondir or a .git sends git to another git directory's config; a config.worktree adds to the config;
-      // without its HEAD, objects and refs in order, git passes over a git directory, to one above it if any.
+      // without its HEAD, objects and refs in order, git passes over a git directory, to one above it if any;
+      // and a directory made a git directory (its path ends in a slash) is the repository git there finds.
       const name = basename(path);
-      const [done, effect] = ["HEAD", "objects", "refs"].includes(name)
-        ? ["removed or broke", `git no longer takes ${dirname(path)} for a git directory, so it fails there or uses another above it`]
-        : ["created or changed", name === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere"];
-      ui.notice(`A command ${done} ${path}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
+      const [change, effect] = path.endsWith(sep)
+        ? [`made ${path.slice(0, -1)} a git directory`, "git there would now take it for its repository"]
+        : ["HEAD", "objects", "refs"].includes(name)
+          ? [`removed or broke ${path}`, `git no longer takes ${dirname(path)} for a git directory, so it fails there or uses another above it`]
+          : [`created or changed ${path}`, name === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere"];
+      ui.notice(`A command ${change}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
     }
   }
 

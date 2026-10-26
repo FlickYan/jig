@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { after, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
 import { createSandbox, gitControl, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
@@ -314,6 +314,9 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.match(await inLibs("echo planted > ../.git/planted"), denied);
       assert.equal(await readFile(dotGit, "utf8"), pointer);
       assert.equal(existsSync(join(repo, ".git", "planted")), false);
+      // The model is told so, and not that the bare repository's own config and hooks are read-only.
+      assert.match(sandbox.limits, /Some git files of the repository around this one are read-only/);
+      assert.doesNotMatch(sandbox.limits, /The repository's git config and hooks are read-only/);
       // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
       const deep = join(libs, "deep");
       await mkdir(deep);
@@ -326,6 +329,82 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     } finally {
       await rm(base, { recursive: true, force: true });
     }
+  });
+
+  it("keeps a submodule checkout's .git read-only from the directory holding it, though a command made a repository there", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const libs = join(repo, "libs");
+      const real = await realpath(libs);
+      const dotGit = join(real, "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      // Making a repository can be the task, so neither sandbox refuses it, but the sandbox tells.
+      const first = createSandbox(libs, { network: false })!;
+      assert.equal(await runCommand("git init -q && echo made", libs, 20, undefined, first), "made\n\nExit code: 0");
+      assert.deepEqual(first.gitChanges!(), [join(real, ".git")]);
+      // The next session there takes libs for the repository, as git does, and repo's .git for the checkout
+      // in it stays read-only: the user's git status in repo still runs git in the checkout.
+      const next = createSandbox(libs, { network: false })!;
+      const inLibs = (command: string) => runCommand(command, libs, 20, undefined, next);
+      assert.match(await inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      // repo's git directory isn't made writable, and libs's own repository works as any other.
+      assert.match(await inLibs("echo planted > ../.git/planted"), denied);
+      const commit = "echo 1 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inLibs(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the files of a repository around one a command made read-only in a temp directory, and in an added one", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    const added = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      // In a temp directory, which commands can write, around a bare repository a command made in libs.
+      const repo = await repoWithSubmodule(base);
+      const libs = join(repo, "libs");
+      git(libs, "init", "-q", "--bare", ".");
+      const config = await readFile(join(repo, ".git", "config"), "utf8");
+      const inTemp = createSandbox(libs, { network: false })!;
+      const inLibs = (command: string) => runCommand(command, libs, 20, undefined, inTemp);
+      const fsmonitor = `printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ../.git/config`;
+      assert.match(await inLibs(fsmonitor), denied);
+      // Nor can its git directory be moved aside, to put another in its place.
+      assert.match(await inLibs("mv ../.git ../.git-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      // In a directory added with --add-dir, around a repository made in libs.
+      const other = await repoWithSubmodule(added);
+      const otherLibs = join(other, "libs");
+      git(otherLibs, "init", "-q");
+      const otherConfig = await readFile(join(other, ".git", "config"), "utf8");
+      const inAdded = createSandbox(otherLibs, { network: false, dirs: [other] })!;
+      assert.match(await runCommand(fsmonitor, otherLibs, 20, undefined, inAdded), denied);
+      assert.match(await runCommand("mv ../.git ../.git-moved", otherLibs, 20, undefined, inAdded), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(other, ".git", "config"), "utf8"), otherConfig);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+      await rm(added, { recursive: true, force: true });
+    }
+  });
+
+  it("shows commands none of jig's own directory, though a repository around the project's leads there", async () => {
+    // jig's directory is in the temp directory here, which commands can write, as an added one can hold it.
+    const home = process.env.JIG_HOME!;
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "secret"), "a session\n");
+    git(home, "init", "-q", "--bare", "store.git");
+    const project = join(dir, "project");
+    await mkdir(project);
+    git(project, "init", "-q");
+    const look = async (command: string) => runCommand(command, project, 20, undefined, createSandbox(project, { network: false })!);
+    // A .git above the project that leads to a git directory there, or to one holding jig's directory.
+    await writeFile(join(dir, ".git"), `gitdir: ${join(home, "store.git")}\n`);
+    assert.match(await look(`ls ${join(home, "store.git")}`), /No such file|Operation not permitted/);
+    await writeFile(join(dir, ".git"), "gitdir: .\n");
+    await writeFile(join(dir, "HEAD"), "ref: refs/heads/main\n");
+    assert.match(await look(`cat ${join(home, "secret")}`), /No such file|Operation not permitted/);
   });
 
   it("still locks the config of a repository and of a submodule whose HEAD a command moved aside, and says so", async () => {
@@ -460,6 +539,28 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
       await inSub("echo 1 >> .git");
       assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      // So is the subdirectory made a git directory, which git there takes for the repository.
+      await inSub("rm .git && git init -q --bare .");
+      assert.deepEqual(sandbox.gitChanges!(), [`${dirname(dotGit)}${sep}`]);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("says when a command made a .git, or a git directory, above the project, up to the repository", async () => {
+    // In a temp directory, which commands can write.
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      const project = join(repo, "a", "b", "c");
+      await mkdir(project, { recursive: true });
+      const sandbox = createSandbox(project, { network: false })!;
+      const a = join(await realpath(repo), "a");
+      await runCommand("git init -q --bare ../..", project, 20, undefined, sandbox);
+      assert.deepEqual(sandbox.gitChanges!(), [`${a}${sep}`]);
+      await runCommand("git init -q ..", project, 20, undefined, sandbox);
+      assert.deepEqual(sandbox.gitChanges!(), [join(a, "b", ".git")]);
     } finally {
       await rm(repo, { recursive: true, force: true });
     }
@@ -536,6 +637,24 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       assert.equal(code, 0, output);
       const gitDir = join(await realpath(repo), ".git");
       assert.match(output, new RegExp(`A command removed or broke ${join(gitDir, "HEAD")}, .*: git no longer takes ${gitDir} for a git directory, so it fails there or uses another above it`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command made the project, in a subdirectory of a repository, a git directory", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const sub = join(repo, "sub");
+    await mkdir(sub);
+    const command = "git init -q --bare .";
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Make a repository."], { api, cwd: sub });
+      assert.equal(code, 0, output);
+      const made = await realpath(sub);
+      assert.match(output, new RegExp(`A command made ${made} a git directory, which the sandbox doesn't prevent: git there would now take it for its repository`));
     } finally {
       api.close();
       await rm(repo, { recursive: true, force: true });
@@ -665,6 +784,10 @@ describe("the macOS sandbox's profile", () => {
       const real = await realpath(repo);
       // A config a command wrote in a subdirectory, saying it is bare, git takes for no repository.
       for (const dir of ["docs", "libs"]) await writeFile(join(repo, dir, "config"), "[core]\n\tbare = true\n");
+      // Nor with a HEAD and a commondir that names nothing: git looks for the objects and refs where it leads.
+      await writeFile(join(repo, "docs", "HEAD"), "ref: refs/heads/main\n");
+      await writeFile(join(repo, "docs", "commondir"), "nowhere\n");
+      assert.equal(git(join(repo, "docs"), "rev-parse", "--absolute-git-dir").trim(), join(real, ".git"));
       for (const dir of ["docs", "libs"]) assert.ok(gitControl(join(repo, dir))?.locked.includes(join(real, ".git", "config")), `from ${dir}`);
       // With a HEAD, objects and refs too, git does: it is left alone, as a server's would be, but the .git of
       // the checkout in it is denied, and nothing of repo's git directory, which isn't made writable, is fixed.
@@ -678,6 +801,64 @@ describe("the macOS sandbox's profile", () => {
       // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
       await mkdir(join(repo, "libs", "deep"));
       assert.deepEqual(gitControl(join(repo, "libs", "deep"))?.locked, [join(real, "libs", "s", ".git")]);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("covers what the repositories around a repository a command made have where commands can write", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base, "a/b/s");
+      const real = await realpath(repo);
+      const [b, dotGit] = [join(repo, "a", "b"), join(real, "a", "b", "s", ".git")];
+      // A repository made in a/b, which holds the checkout a/b/s: its own files and repo's .git for the checkout.
+      git(b, "init", "-q");
+      for (const path of [join(real, "a", "b", ".git", "config"), dotGit]) assert.ok(gitControl(b)?.locked.includes(path), path);
+      // One made in a as well, nearer than repo, leaves repo's covered all the same.
+      git(join(repo, "a"), "init", "-q");
+      assert.ok(gitControl(b)?.locked.includes(dotGit), "past a/.git");
+      // Given the sandbox's writable directories, repo's files in any of them, and the directories holding them
+      // there, which binding grants nothing; none of those outside one, which binding would make writable.
+      const control = gitControl(b, undefined, [join(real, "a", "b"), real])!;
+      assert.ok(control.locked.includes(join(real, ".git", "config")));
+      assert.ok(control.fixed.includes(join(real, ".git", "modules", "a")));
+      assert.deepEqual(control.fixed, [...control.fixed].sort((x, y) => x.length - y.length), "a directory before those in it");
+      assert.ok(gitControl(b)!.fixed.every((dir) => dir.startsWith(join(real, "a", "b", ".git"))), "only a/b's own");
+      const profile = seatbeltProfile([join(real, "a", "b"), real], false, [], control);
+      const fixed = profile.split("\n").find((line) => line.startsWith("(deny file-write-unlink "))!;
+      assert.ok(fixed.includes(`(literal "${join(real, ".git")}")`));
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("finds every submodule's checkout, though git can't read one's config, and never waits on a pipe one includes", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      git(repo, "submodule", "add", "-q", join(base, "sub"), "libs/t");
+      const real = await realpath(repo);
+      const [s, t] = ["s", "t"].map((name) => join(real, ".git", "modules", "libs", name, "config"));
+      const dotGits = ["s", "t"].map((name) => join(real, "libs", name, ".git"));
+      const config = await readFile(t, "utf8");
+      await appendFile(t, "[core\n");
+      assert.ok(gitControl(repo)?.locked.includes(dotGits[0]), "past the config git can't read");
+      await writeFile(t, config);
+      // git config --file follows no include a config makes, nor does jig: git would wait on a named pipe.
+      const pipe = join(base, "pipe");
+      execFileSync("mkfifo", [pipe]);
+      await appendFile(s, `[include]\n\tpath = ${pipe}\n`);
+      // Something writes to it, once, so that a git that opened it would go on, and leave a mark.
+      const writer = spawn("sh", ["-c", `echo '[core]' > '${pipe}' && touch '${pipe}-opened'`]);
+      try {
+        const locked = gitControl(repo)?.locked;
+        for (const path of dotGits) assert.ok(locked?.includes(path), path);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assert.equal(existsSync(`${pipe}-opened`), false, "git opened the pipe");
+      } finally {
+        writer.kill();
+      }
     } finally {
       await rm(base, { recursive: true, force: true });
     }
@@ -719,8 +900,8 @@ function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@localhost", "-c", "protocol.file.allow=always", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
-/** A repository in `base`/repo with one commit and a submodule at libs/s. */
-async function repoWithSubmodule(base: string): Promise<string> {
+/** A repository in `base`/repo with one commit and a submodule at libs/s, or at `path`. */
+async function repoWithSubmodule(base: string, path = "libs/s"): Promise<string> {
   const [repo, sub] = [join(base, "repo"), join(base, "sub")];
   for (const dir of [repo, sub]) {
     await mkdir(dir);
@@ -729,7 +910,7 @@ async function repoWithSubmodule(base: string): Promise<string> {
     git(dir, "add", "a.txt");
     git(dir, "commit", "-qm", "first");
   }
-  git(repo, "submodule", "add", "-q", sub, "libs/s");
+  git(repo, "submodule", "add", "-q", sub, path);
   git(repo, "commit", "-qm", "submodule");
   return repo;
 }
