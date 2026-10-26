@@ -1,12 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
-import { createSandbox } from "./sandbox.ts";
+import { createSandbox, lockedGitPaths } from "./sandbox.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
-import { assertVisible, isInside, readRegularBytes, readRegularFile, realTarget, realTargetSync } from "./tools/util.ts";
+import { assertVisible, isInside, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -194,11 +194,15 @@ export function readLock(scope: InstallScope, project: string): Record<string, L
   }
 }
 
+/**
+ * Written anew and renamed into place (see writeAnew): the project's lockfile is within a command's reach,
+ * and a named pipe a job left in the background put there after readLock would have jig wait for good.
+ */
 function writeLock(scope: InstallScope, project: string, skills: Record<string, LockEntry>): void {
   const path = lockPath(scope, project);
   mkdirSync(dirname(path), { recursive: true });
   const sorted = Object.fromEntries(Object.entries(skills).sort(([a], [b]) => a.localeCompare(b)));
-  writeFileSync(path, `${JSON.stringify({ version: 1, skills: sorted }, null, 2)}\n`);
+  writeAnew(path, `${JSON.stringify({ version: 1, skills: sorted }, null, 2)}\n`);
 }
 
 /**
@@ -208,11 +212,14 @@ function writeLock(scope: InstallScope, project: string, skills: Record<string, 
  * skill's folder, the lockfile) would take the change out of the project. So the path goes by where it
  * really leads, as write_file's changes do, and stays out of any .git directory: write_file's check is for
  * one file, but a skill's folder is replaced whole, so with .jig/skills linked to .git/modules, a skill
- * named like a submodule would put its files in place of that submodule's config and hooks. The messages
- * are jig's own, not write_file's, as the user reads them too. `dirs`, the --add-dir directories, count
- * as the project.
+ * named like a submodule would put its files in place of that submodule's config and hooks. Nor does it
+ * go into what the sandbox locks in a git directory by another name (`locked`, see sandbox.ts's
+ * lockedGitPaths; a session's, else worked out now), or hold any of it: with .jig/skills linked to the
+ * project, a skill named like a git directory made with --separate-git-dir would replace it whole, config
+ * included. The messages are jig's own, not write_file's, as the user reads them too. `dirs`, the --add-dir
+ * directories, count as the project.
  */
-export async function assertInProject(project: string, path: string, hidden: string[] = [], dirs: string[] = []): Promise<void> {
+export async function assertInProject(project: string, path: string, hidden: string[] = [], dirs: string[] = [], locked = lockedGitPaths(project, dirs)): Promise<void> {
   const shown = relative(project, path);
   const real = await realTarget(path);
   if (!real) throw new Error(`${shown} leads through a broken symlink, so jig won't change it. A command may have put it there; if so, delete it.`);
@@ -220,8 +227,13 @@ export async function assertInProject(project: string, path: string, hidden: str
   const roots = await Promise.all([project, ...dirs].map((dir) => realTarget(dir)));
   if (!roots.some((root) => root && isInside(root, real))) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
   // Without case, as isGitControl: macOS's file systems usually ignore it.
-  if (real.toLowerCase().split(sep).includes(".git")) {
+  const lower = real.toLowerCase();
+  const gitFiles = locked.map((file) => file.toLowerCase());
+  if (lower.split(sep).includes(".git") || gitFiles.some((file) => isInside(file, lower))) {
     throw new Error(`${shown} leads into a git directory, to ${real}, so jig won't change it: what jig writes there could take the place of git's own files, such as a submodule's config. A command may have put a link there.`);
+  }
+  if (gitFiles.some((file) => isInside(lower, file))) {
+    throw new Error(`${shown} leads to ${real}, which holds git's own files, such as a git directory's config, so jig won't change it. A command may have put a link there.`);
   }
 }
 
@@ -298,16 +310,25 @@ export async function removeSkill(skill: Installed, project: string): Promise<vo
 /**
  * The source of an installed skill, to fetch it again: the same repository folder at the same ref. The
  * project's lockfile is a file commands can write, so an entry may not be one jig wrote, and may name any
- * folder on this machine, or by a file URL any repository. One in the settings' hidden paths (`hidden`),
- * or holding one, is refused, by where it really leads: its files would land where commands can read
- * them. (fetchSource refuses the URLs jig doesn't fetch from. And git reads a file URL's repository
- * itself, where a .git file, the alternates or a link can lead it elsewhere: so fetchSource has git do
- * that in the sandbox, which hides those paths, if there is one.)
+ * folder on this machine, or by a file URL any repository: one the settings hide is refused (see
+ * assertShown). (fetchSource refuses the URLs jig doesn't fetch from. And git reads a file URL's
+ * repository itself, where a .git file, the alternates or a link can lead it elsewhere: so fetchSource has
+ * git do that in the sandbox, which hides those paths, if there is one.)
  */
 export function lockedSource(entry: LockEntry, hidden: string[] = []): SkillSource {
   const fields = [entry?.source, entry?.path, entry?.url ?? "", entry?.ref ?? ""];
   if (!fields.every((field) => typeof field === "string")) throw new Error("its lockfile entry doesn't say where to fetch it from.");
-  const folders = !entry.url ? [entry.path] : entry.url.startsWith("file://") ? fileUrlFolders(entry.url) : [];
+  assertShown(entry, hidden);
+  return entry.url ? { spec: entry.source, url: entry.url, path: entry.path, ...(entry.ref && { ref: entry.ref }) } : { spec: entry.source, path: entry.path };
+}
+
+/**
+ * Refuses a source in the settings' hidden paths (`hidden`), or holding one, by where it really leads: a
+ * folder, or a file URL's repository. Its files would land where commands can read them. `jig skills add`
+ * refuses what update does, or it would install a skill that every later update refuses.
+ */
+export function assertShown(source: { url?: string; path: string }, hidden: string[]): void {
+  const folders = !source.url ? [source.path] : source.url.startsWith("file://") ? fileUrlFolders(source.url) : [];
   const reals = hidden.map((path) => realTargetSync(path));
   for (const folder of folders) {
     // By the system's realpath, as the files are read: Node's own drops link/.. before it follows the link.
@@ -318,10 +339,9 @@ export function lockedSource(entry: LockEntry, hidden: string[] = []): SkillSour
       continue; // nothing there to read
     }
     if (reals.some((path) => !!path && (isInside(path, real) || isInside(real, path)))) {
-      throw new Error(`${entry.url || entry.path} is in a path the settings hide (hiddenPaths), or holds one, so jig won't copy it where commands can read it.`);
+      throw new Error(`${source.url || source.path} is in a path the settings hide (hiddenPaths), or holds one, so jig won't copy it where commands can read it.`);
     }
   }
-  return entry.url ? { spec: entry.source, url: entry.url, path: entry.path, ...(entry.ref && { ref: entry.ref }) } : { spec: entry.source, path: entry.path };
 }
 
 /**

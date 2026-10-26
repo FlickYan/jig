@@ -178,15 +178,17 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   path too (the question names the file an AGENTS.md link
   leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
   the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
-  git directory. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
+  git directory, nor into what the sandbox keeps read-only in one by another name, nor replace a folder
+  holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
   write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
   exits non-zero. An entry can point anywhere, so its question names the URL or folder a skill would come
   from; it refuses a folder, or a file URL's repository, that the hidden paths hide or that holds one, and
   has git read such a repository in the sandbox, which hides them from git too (a `.git` file in it can
-  lead git elsewhere). Like `add`, it takes only https, ssh and file URLs (git runs a program for some
-  others). The `--stats` file is written anew and renamed into place, which replaces a link or a
-  named pipe instead of writing through it (a linked folder on the way to it is still followed); a path in
-  `/dev` or `/proc`, such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
+  lead git elsewhere). `add` does the same, so it doesn't install what `update` would refuse, and both take
+  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the skills
+  lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
+  writing through it (a linked folder on the way is still followed); a `--stats` path in `/dev` or `/proc`,
+  such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never

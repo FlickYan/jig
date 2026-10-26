@@ -1,7 +1,7 @@
-import { randomBytes } from "node:crypto";
-import { renameSync, rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import { addUsage, type RunResult, type Usage } from "./agent.ts";
 import type { CallModel } from "./model.ts";
+import { writeAnew } from "./tools/util.ts";
 
 /** Calls made by another model than the session's: the one that took over (--escalate), or the reviewer. */
 export interface Share {
@@ -155,27 +155,16 @@ export class Stats {
   }
 
   /**
-   * Written to a new file beside it, then renamed over it. jig writes it outside the sandbox, often in the
-   * project, where a command can put a symlink or a hard link in its place: writing to that would change a
-   * file of the user's, while a rename replaces the link itself. A reader never sees half a file either.
-   * Only the file itself: a directory on the way to it is still followed. A path in /dev or /proc, /dev/stdout
-   * or a process substitution's /dev/fd/63 say, is written to as it is: jig can't make a file there, or
-   * as root mustn't replace /dev/stdout with one. A named pipe anywhere else is replaced, as a link is.
+   * Written anew and renamed into place (see writeAnew): jig writes it outside the sandbox, often in the
+   * project, where a command can put a symlink or a hard link in its place. A path in /dev or /proc,
+   * /dev/stdout or a process substitution's /dev/fd/63 say, is written to as it is: jig can't make a file
+   * there, or as root mustn't replace /dev/stdout with one. A named pipe anywhere else is replaced, as a
+   * link is.
    */
   private write(): void {
     this.data.seconds = Math.round((Date.now() - this.started) / 100) / 10;
     const json = `${JSON.stringify(this.data, null, 2)}\n`;
-    if (this.direct) {
-      writeFileSync(this.path, json);
-      return;
-    }
-    const temp = `${this.path}.${randomBytes(4).toString("hex")}.tmp`;
-    writeFileSync(temp, json, { flag: "wx" }); // "wx": never through a file already there
-    try {
-      renameSync(temp, this.path);
-    } catch (error) {
-      rmSync(temp, { force: true }); // or each failed write would leave one behind
-      throw error;
-    }
+    if (this.direct) writeFileSync(this.path, json);
+    else writeAnew(this.path, json);
   }
 }

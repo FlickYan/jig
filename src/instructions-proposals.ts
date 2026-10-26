@@ -51,7 +51,7 @@ export function proposeInstructionsTool(approve: Approve): Tool {
       // own words: a symlink (a command can make one) mustn't take the edit out of the project, or into a git
       // directory, to its config. Checked again once approved, since a command left running could make one
       // meanwhile.
-      const check = () => assertInProject(ctx.cwd, path, ctx.hidden, ctx.dirs);
+      const check = () => assertInProject(ctx.cwd, path, ctx.hidden, ctx.dirs, ctx.gitLocked);
       await check();
       // Only a regular file: a named pipe a command made in its place would have jig wait on it forever.
       const current = existsSync(path) ? readRegularFile(path) : "";

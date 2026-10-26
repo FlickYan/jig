@@ -1,5 +1,6 @@
 import { constants } from "node:buffer";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, type Stats, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "../paths.ts";
@@ -216,6 +217,24 @@ export function readRegularBytes(path: string, max = Infinity): { bytes: Buffer;
     return { bytes: bytes.subarray(0, read), size };
   } finally {
     closeSync(fd);
+  }
+}
+
+/**
+ * Writes a file, from outside the sandbox, where a command can put something in its place: to a new file
+ * beside it, then renamed over it. Writing to a symlink or a hard link there would change a file of the
+ * user's, and to a named pipe would have jig wait for a reader for good, while a rename replaces any of
+ * them. A reader never sees half a file either. Only the file itself: a directory on the way to it is still
+ * followed.
+ */
+export function writeAnew(path: string, text: string): void {
+  const temp = `${path}.${randomBytes(4).toString("hex")}.tmp`;
+  writeFileSync(temp, text, { flag: "wx" }); // "wx": never through a file already there
+  try {
+    renameSync(temp, path);
+  } catch (error) {
+    rmSync(temp, { force: true }); // or each failed write would leave one behind
+    throw error;
   }
 }
 

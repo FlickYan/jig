@@ -72,7 +72,7 @@ export function proposeSkillTool(approve: Approver = askInTerminal): Tool {
       // jig writes it itself, outside the sandbox, so in the project it is checked as jig skills add checks
       // a skill's folder: a symlink a command made (.jig, say) mustn't take the files, or the removal of an
       // earlier version, out of the project, or into a submodule's git directory in place of its config.
-      if (decision !== "user") await assertInProject(ctx.cwd, target, ctx.hidden);
+      if (decision !== "user") await assertInProject(ctx.cwd, target, ctx.hidden, [], ctx.gitLocked);
       writeSkill(target, files);
       if (decision === "proposal") {
         return `Nobody could approve the skill now, so it was saved as a proposal in ${target}. The user can read it and install it with: jig skills add ${target}`;

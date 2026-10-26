@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, join, relative } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { sandboxProblem } from "../src/sandbox.ts";
+import { lockedGitPaths, sandboxProblem } from "../src/sandbox.ts";
 import { evalFileTargets, testSkill } from "../src/skill-evals.ts";
 import { proposeSkillTool, type SkillProposal } from "../src/skill-proposals.ts";
 import { compareSkills, describeSkill, fetchSource, findSkills, installedSkills, installSkill, lockedSource, parseSource, readLock, removeSkill } from "../src/skill-store.ts";
@@ -264,6 +264,45 @@ describe("changing installed skills", () => {
     }
   });
 
+  it("aren't changed in a git directory by another name, which the sandbox locks", async () => {
+    // One made with --separate-git-dir has no .git in its path. With .jig/skills linked into it, the skill
+    // hooks would take the place of its hooks; with .jig/skills linked to the project, the skill gitdata
+    // that of the whole git directory, its config included.
+    git(dir, "init", "-q", "--separate-git-dir=gitdata");
+    const gitDir = async () => [(await readdir(join(dir, "gitdata"))).sort(), (await readdir(join(dir, "gitdata", "hooks"))).sort(), await readFile(join(dir, "gitdata", "config"), "utf8")];
+    const before = await gitDir();
+    await mkdir(join(dir, ".jig"));
+    for (const [name, linked, refused] of [
+      ["hooks", join("..", "gitdata", "hooks", ".."), "leads into a git directory, to \\S+/gitdata/hooks, so jig won't change it"],
+      ["gitdata", "..", "leads to \\S+/gitdata, which holds git's own files"],
+    ]) {
+      const skill = await writeSkill(join(dir, "source"), name);
+      await rm(join(dir, ".jig", "skills"), { force: true });
+      await symlink(linked, join(dir, ".jig", "skills"));
+      await assert.rejects(jig("add", skill, "--project"), new RegExp(`\\.jig/skills/${name} ${refused}`));
+      await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify({ version: 1, skills: { [name]: { source: skill, path: skill, installed: "2026-10-01T00:00:00.000Z" } } }));
+      await assert.rejects(jig("update"), new RegExp(`^Error: Not updated, as said above: ${name}\\.$`));
+      assert.match(printed.join("\n"), new RegExp(`Not updating ${name}: \\.jig/skills/${name} ${refused}`));
+      await assert.rejects(jig("remove", name), new RegExp(refused));
+      assert.deepEqual(await gitDir(), before);
+    }
+  });
+
+  it("write the lockfile anew, rather than through what a command put in its place", async () => {
+    // jig rewrites the project's lockfile outside the sandbox, after reading it. A named pipe a command (a
+    // job left in the background) put there meanwhile would have jig wait for good, and a hard link, which
+    // going by real path doesn't show, would have it write the lockfile into a file of the user's: a new
+    // file renamed into place replaces either. Only the link can be put there in time for a test.
+    await mkdir(join(dir, ".jig"));
+    await link(join(outside, "bashrc"), join(dir, ".jig", "skills-lock.json"));
+    await jig("add", source, "--project");
+    const info = await lstat(join(dir, ".jig", "skills-lock.json"));
+    assert.ok(info.isFile() && info.nlink === 1, "a file of its own now");
+    assert.deepEqual(Object.keys(readLock("project", dir)), ["beta"]);
+    assert.deepEqual((await readdir(join(dir, ".jig"))).sort(), ["skills", "skills-lock.json"], "no temporary file is left behind");
+    await assertUntouched();
+  });
+
   it("take only a skill's name from a lockfile, which commands can write", async () => {
     // A name that, joined to the skills folder, is the folder outside: in the project's lockfile, and in the user's.
     for (const [skills, lock] of [
@@ -411,7 +450,13 @@ describe("changing installed skills", () => {
     assert.match(said, new RegExp(`Not updating zeta: \\S+/links/up/\\.\\./gamma ${hidden}`));
     for (const name of ["epsilon", "eta", "gamma", "iota", "zeta"]) assert.deepEqual(await readdir(join(dir, ".jig", "skills", name)), ["SKILL.md"]);
 
-    // add takes the same URLs, so it doesn't install a skill that update would refuse.
+    // add refuses the same folders and repositories, or it would install skills that every later update
+    // refuses. (add resolves the path it is given first, so there link/.. is the folder holding the link.)
+    for (const spec of [join(outside, "epsilon"), join(dir, "gamma"), join(outside, "secrets", "gamma"), `file://localhost${join(outside, "%73ecrets")}`]) {
+      await assert.rejects(jig("add", spec), new RegExp(`^Error: \\S+ ${hidden}$`), spec);
+    }
+    assert.ok(!existsSync(join(process.env.JIG_HOME!, "skills-lock.json")), "nothing was installed");
+    // And it takes the same URLs.
     await assert.rejects(jig("add", "http://127.0.0.1:9/skills.git"), /^Error: jig fetches skills only from https, ssh and file URLs, not http:\/\/127\.0\.0\.1:9\/skills\.git\.$/);
     // git refuses ext:: URLs unless its config allows them, and jig keeps them refused when it does: here
     // for a URL the config rewrites to one (url.<base>.insteadOf).
@@ -459,6 +504,9 @@ describe("changing installed skills", () => {
     assert.match(said, /Updated beta\./);
     assert.deepEqual(await readdir(join(dir, ".jig", "skills", "eta")), ["SKILL.md"]);
     assert.equal(await readFile(join(dir, ".jig", "skills", "beta", "notes.md"), "utf8"), "more");
+    // add fetches it the same way, so it doesn't install what update can't fetch.
+    await assert.rejects(jig("add", `file://${join(dir, "pointer")}`, "--path", "eta"), /^Error: Couldn't fetch file:\/\/\S+\/pointer: fatal: /);
+    assert.ok(!existsSync(join(process.env.JIG_HOME!, "skills", "eta")));
   });
 
   it("are updated after a question that names their source", async () => {
@@ -602,6 +650,27 @@ describe("proposing a skill", () => {
       );
     }
     assert.deepEqual([(await readdir(gitDir)).sort(), await readFile(join(gitDir, "config"), "utf8")], before);
+  });
+
+  it("isn't saved in a git directory by another name, which the sandbox locks", async () => {
+    // One made with --separate-git-dir has no .git in its path. With .jig/proposals/skills linked into it, a
+    // skill named hooks would replace its hooks, without a question when there is no one to ask; with
+    // .jig/skills linked to the project, one named gitdata the whole git directory, with a config whose
+    // core.fsmonitor the user's next git status runs outside the sandbox.
+    git(dir, "init", "-q", "--separate-git-dir=gitdata");
+    const gitDir = async () => [(await readdir(join(dir, "gitdata"))).sort(), (await readdir(join(dir, "gitdata", "hooks"))).sort(), await readFile(join(dir, "gitdata", "config"), "utf8")];
+    const before = await gitDir();
+    await mkdir(join(dir, ".jig", "proposals"), { recursive: true });
+    await symlink(join("..", "..", "gitdata", "hooks", ".."), join(dir, ".jig", "proposals", "skills"));
+    await symlink("..", join(dir, ".jig", "skills"));
+    const files = { config: "[core]\n\tfsmonitor = touch pwned\n", "pre-commit": "touch pwned\n" };
+    const session = { ...context(), gitLocked: lockedGitPaths(dir) };
+    await assert.rejects(
+      proposeSkillTool(async () => "proposal").run({ ...proposal, name: "hooks", files }, session),
+      /\.jig\/proposals\/skills\/hooks leads into a git directory, to \S+\/gitdata\/hooks, so jig won't change it/,
+    );
+    await assert.rejects(proposeSkillTool(async () => "project").run({ ...proposal, name: "gitdata", files }, session), /\.jig\/skills\/gitdata leads to \S+\/gitdata, which holds git's own files/);
+    assert.deepEqual(await gitDir(), before);
   });
 
   it("isn't saved, nor an earlier version removed, in a folder the settings hide", async () => {

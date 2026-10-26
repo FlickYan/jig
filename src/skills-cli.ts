@@ -4,6 +4,7 @@ import { mergeSettings, readSettings } from "./settings.ts";
 import { discoverSkills, skillUsage } from "./skills.ts";
 import { testSkill } from "./skill-evals.ts";
 import {
+  assertShown,
   compareSkills,
   describeSkill,
   fetchSource,
@@ -129,8 +130,11 @@ interface AddOptions {
 
 async function add(spec: string, { project, scope, only, ref, path, force, confirm }: AddOptions): Promise<void> {
   const source = parseSource(spec, { cwd: project, ref, path });
+  // Refused and fetched as update would refuse and fetch it, or update would refuse what add installed.
+  const hidden = hiddenPaths(project);
+  assertShown(source, hidden);
   if (source.url) ui.notice(`Fetching ${spec}…`);
-  const fetched = fetchSource(source);
+  const fetched = fetchSource(source, hidden);
   try {
     let infos = findSkills(fetched.dir).map(describeSkill);
     if (!infos.length) throw new Error(`${spec} holds no skill (no folder with a SKILL.md).`);
@@ -170,9 +174,7 @@ async function update(project: string, names: string[], confirm: (question: stri
   if (unknown.length) throw new Error(`Not installed with jig skills add: ${unknown.join(", ")}.`);
   if (!installed.length && !problems.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
   const skipped = names.length ? [] : problems.map(({ scope }): string => (scope === "project" ? "the project's skills" : "your skills"));
-  // The hidden paths, which a session's sandbox hides whether the project's settings are trusted or not.
-  const settings = readSettings(project);
-  const hidden = mergeSettings(settings.user, settings.project?.settings, false).hiddenPaths;
+  const hidden = hiddenPaths(project);
   for (const skill of installed) {
     // A skill jig refuses, or can't fetch or install, is skipped with the reason, and the rest are still
     // updated: a command can write the project's lockfile, which is read first, and an entry it put there
@@ -217,6 +219,12 @@ async function update(project: string, names: string[], confirm: (question: stri
     }
   }
   if (skipped.length) throw new Error(`Not updated, as said above: ${skipped.join(", ")}.`);
+}
+
+/** The hidden paths, which a session's sandbox hides whether the project's settings are trusted or not. */
+function hiddenPaths(project: string): string[] {
+  const settings = readSettings(project);
+  return mergeSettings(settings.user, settings.project?.settings, false).hiddenPaths;
 }
 
 function short(text: string, max: number): string {
