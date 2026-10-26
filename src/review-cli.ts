@@ -95,8 +95,10 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const changes = values.changes ? clipped(readFileSync(values.changes, "utf8").trim(), MAX_CHANGES) : undefined;
   const work = { task: messages[start].content as string, answer: lastAnswer(messages), log: workLog(messages.slice(start)), changes };
 
-  // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy.
+  // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy. It goes
+  // when jig exits, whether the review ended well or failed.
   const cwd = mkdtempSync(join(tmpdir(), "jig-review-"));
+  process.once("exit", () => rmSync(cwd, { recursive: true, force: true }));
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
   const count = stats && ((event: Mechanism) => stats.count(event));
   const system = reviewerSystem(values.workdir);
@@ -180,7 +182,6 @@ export async function reviewCommand(args: string[]): Promise<void> {
     seconds: Math.round((Date.now() - started) / 100) / 10,
     usage: result.usage,
   };
-  rmSync(cwd, { recursive: true, force: true });
   if (values.out) writeFileSync(resolve(values.out), `${JSON.stringify(verdictJson, null, 2)}\n`);
   else console.log(JSON.stringify(verdictJson));
 }

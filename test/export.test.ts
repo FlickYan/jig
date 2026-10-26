@@ -1,20 +1,22 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import { WRAP_UP } from "../src/agent.ts";
 import { exampleProblems, exportSession } from "../src/export.ts";
 import { redactSecrets } from "../src/secrets.ts";
 import { sessionsCommand } from "../src/sessions-cli.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 const FAKE_KEY = `sk-test${"0".repeat(24)}`;
 const TOOL = { name: "bash", description: "Runs a command.", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } };
 
 async function sessionFile(entries: object[], dir?: string): Promise<string> {
-  const file = join(dir ?? (await mkdtemp(join(tmpdir(), "jig-export-"))), "2026-10-11T10-00-00-abcd.jsonl");
+  const file = join(dir ?? (await tempDir("jig-export-")), "2026-10-11T10-00-00-abcd.jsonl");
   await writeFile(file, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
   return file;
 }
@@ -95,7 +97,7 @@ describe("exporting sessions as fine-tuning data", () => {
   });
 
   it("exports every project's sessions with jig sessions export --all", async () => {
-    const home = await mkdtemp(join(tmpdir(), "jig-export-home-"));
+    const home = await tempDir("jig-export-home-");
     for (const project of ["-a", "-b"]) {
       await mkdir(join(home, "sessions", project), { recursive: true });
       await sessionFile([start, message("user", `Task in ${project}.`), message("assistant", [{ type: "text", text: "Done." }])], join(home, "sessions", project));
@@ -120,8 +122,8 @@ describe("a session jig saves", () => {
       (request.messages as unknown[]).length === 1 ? [{ text: "I'll look." }, { tool: "bash", input: { command: "echo hi" } }] : [{ text: "It says hi." }],
     );
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-export-project-"));
-      const home = await mkdtemp(join(tmpdir(), "jig-export-home-"));
+      const project = await tempDir("jig-export-project-");
+      const home = await tempDir("jig-export-home-");
       await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "What does echo hi print?"], { api, cwd: project, env: { JIG_HOME: home } });
       const out = join(home, "examples.jsonl");
       const { output } = await runJig(["sessions", "export", "--out", out], { api, cwd: project, env: { JIG_HOME: home } });

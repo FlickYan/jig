@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { link, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { link, lstat, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { constants, tmpdir } from "node:os";
+import { constants } from "node:os";
 import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
@@ -23,6 +23,7 @@ import { writeTool } from "../src/tools/write.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, messagesReply, runJig, systemText } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // What running jig without a person at the terminal needs: --add-dir, --stats, and not hanging on the API.
 
@@ -31,13 +32,14 @@ let outside: string;
 const context = (dirs: string[] = []): ToolContext => ({ cwd: project, dirs, versions: new FileVersions() });
 
 beforeEach(async () => {
-  const base = await mkdtemp(join(tmpdir(), "jig-headless-"));
+  const base = await tempDir("jig-headless-");
   project = join(base, "app");
   outside = join(base, "etc");
   await mkdir(join(outside, "nginx"), { recursive: true });
   await mkdir(project);
   await writeFile(join(outside, "nginx", "nginx.conf"), "worker_processes 4;\nlisten 8080;\n");
 });
+afterEach(removeTempDirs);
 
 describe("--add-dir", () => {
   it("lets the file tools work in the added directory, and only there", async () => {
@@ -85,7 +87,7 @@ describe("--add-dir", () => {
 
 describe("hiddenPaths", () => {
   it("reach the file tools too, not only the sandbox", async () => {
-    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const home = await tempDir("jig-home-");
     await writeFile(join(home, "settings.json"), JSON.stringify({ hiddenPaths: [outside] }));
     await symlink(join(outside, "nginx", "nginx.conf"), join(project, "nginx.conf"));
     const api = await fakeMessagesApi((request) =>
@@ -223,7 +225,7 @@ describe("a signal that ends jig", () => {
 
   it("kills the hook still running, which has a process group of its own too, and outside the sandbox", async () => {
     for (const [signal, event] of [["SIGHUP", "Stop"], ["SIGTERM", "PreToolUse"]] as const) {
-      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const home = await tempDir("jig-home-");
       const command = `kill -${signal} $PPID; until [ -e go-${signal} ]; do sleep 0.05; done; touch outlived-${signal}`;
       await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { [event]: [{ command }] } }));
       const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
@@ -335,7 +337,7 @@ describe("--stats", () => {
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
-      const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1" };
+      const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await tempDir("jig-home-"), NO_COLOR: "1" };
       const jig = [process.execPath, cli, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", fd, "Say done."];
       const child = spawn("sh", ["-c", '"$@" 3> stats.json', "sh", ...jig], { cwd: project, env });
       let output = "";
@@ -607,7 +609,7 @@ describe("the task's place on the command line", () => {
     });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     try {
-      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const home = await tempDir("jig-home-");
       const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: home, NO_COLOR: "1" };
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
       const child = spawn(process.execPath, [cli, ...lead, "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", ...args], { cwd: project, env });
@@ -650,8 +652,8 @@ describe("a one-shot run that continues the last session", () => {
   it("goes on from the session's messages, the new task on stdin, as Terminal-Bench's adapter sends a review's problems", async () => {
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
-      const cwd = await mkdtemp(join(tmpdir(), "jig-continue-"));
-      const env = { JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const cwd = await tempDir("jig-continue-");
+      const env = { JIG_HOME: await tempDir("jig-home-") };
       const first = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--", "-"], { api, cwd, env, stdin: "Write out.txt." });
       const second = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--continue", "--", "-"], { api, cwd, env, stdin: "A reviewer found problems: out.txt is empty." });
       assert.deepEqual([first.code, second.code], [0, 0], second.output);
@@ -731,7 +733,7 @@ describe("a one-shot run's exit code", () => {
   it("is 8 when the model gives a second reply with no text or tool call, which no Stop hook checks", async () => {
     const api = await fakeMessagesApi(() => []);
     try {
-      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const home = await tempDir("jig-home-");
       const ran = join(outside, "stop-hook-ran");
       await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { Stop: [{ command: `touch ${JSON.stringify(ran)}; exit 2` }] } }));
       const file = join(outside, "stats.json");
@@ -755,7 +757,7 @@ describe("a one-shot run's exit code", () => {
     });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     try {
-      const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1" };
+      const env = { ...process.env, ANTHROPIC_BASE_URL: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, ANTHROPIC_API_KEY: "test-key", JIG_HOME: await tempDir("jig-home-"), NO_COLOR: "1" };
       const child = spawn(process.execPath, [cli, ...args, "Fix the parser."], { cwd: project, env });
       pid = child.pid!;
       let output = "";
@@ -821,7 +823,7 @@ describe("a one-shot run with --time-limit", () => {
       if (tools.includes("propose_memory")) return [{ tool: "propose_memory", input: { action: "save", scope: "project", name: "tabs", description: "Indent with tabs.", body: "The user said so." } }];
       return [{ text: "Done." }];
     });
-    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const home = await tempDir("jig-home-");
     const limited = ["--no-sandbox", "--model", "claude-haiku-4-5", "--time-limit", "1"];
     const closed = /Keep it\? [^\n]*: \n[^\n]*Nothing was saved: the time limit \(--time-limit\) was reached\.\nStopped at the time limit \(--time-limit\)\.\n/;
     try {
@@ -957,7 +959,7 @@ describe("a one-shot run with no terminal", () => {
       return length < 4 ? ["a", "b"].map((name) => ({ tool: "bash", input: { command: `touch made-${length}-${name}` } })) : [{ text: "Done." }];
     });
     try {
-      const env = { JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")) };
+      const env = { JIG_HOME: await tempDir("jig-home-") };
       const first = await runJig([...args, "Fix the parser."], { api, cwd: project, env });
       assert.equal(first.code, 5, first.output);
       // Continued with --yes, as a script might do next, the model sees what each call was answered.
@@ -1126,7 +1128,7 @@ describe("a hook configured as for Claude Code", () => {
   it('runs around every call with the matcher "*", without jig\'s API key', async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo listed" } }] : [{ text: "Done." }]));
     try {
-      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const home = await tempDir("jig-home-");
       const hook = { matcher: "*", command: 'echo "$JIG_TOOL ${ANTHROPIC_API_KEY:-without a key}" >> "$JIG_PROJECT_DIR/hooked.txt"' };
       await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { PreToolUse: [hook] } }));
       const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "list the files"], { api, cwd: project, env: { JIG_HOME: home } });
@@ -1145,7 +1147,7 @@ describe("a hook configured as for Claude Code", () => {
       (request.messages as unknown[]).length === 3 ? [{ tool: "write_file", input: { path: "done.txt", content: "done\n" } }] : [{ text: "Done." }],
     );
     try {
-      const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+      const home = await tempDir("jig-home-");
       const log = join(outside, "stops.jsonl");
       const check = { command: `{ cat; echo; } >> ${JSON.stringify(log)}; test -f done.txt || { echo "done.txt is missing" >&2; exit 2; }` };
       await writeFile(join(home, "settings.json"), JSON.stringify({ hooks: { SessionStart: [{ command: "echo hi" }], Stop: [check] } }));

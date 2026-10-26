@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readdir, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import type { ModelTurn } from "../src/model.ts";
 import { problemsOf, recheck, reviewer, reviewPrompt, runningReviewPrompt, sentBackWithEvidence, verdictOf, workLog } from "../src/review.ts";
 import { TOOLS } from "../src/tools/index.ts";
 import type { SubagentSetup } from "../src/tools/subagent.ts";
 import { fakeMessagesApi, type Reply, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+afterEach(removeTempDirs);
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
@@ -86,7 +90,7 @@ describe("the reviewer", () => {
   const setupWith = async (replies: ModelTurn[], seen: MessageParam[][]): Promise<SubagentSetup> => ({
     callModel: async (messages) => (seen.push(messages), replies.shift()!),
     tools: TOOLS.filter((tool) => tool.kind === "read"),
-    cwd: await mkdtemp(join(tmpdir(), "jig-review-")),
+    cwd: await tempDir("jig-review-"),
     maxSteps: 4,
     compactAt: 0,
     authorize: async () => null,
@@ -219,7 +223,7 @@ describe("jig review", () => {
   };
 
   async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = [], compacted = false) {
-    const dir = await mkdtemp(join(tmpdir(), "jig-review-cli-"));
+    const dir = await tempDir("jig-review-cli-");
     const api = await fakeMessagesApi(typeof verdict === "function" ? verdict : replies(verdict));
     try {
       const args = ["review", "--session", await session(dir, compacted), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
@@ -308,5 +312,28 @@ describe("jig review", () => {
   it("asks only twice when no verdict comes", async () => {
     const { verdict, requests } = await review("I will check one more thing.", ["--max-steps", "1"]);
     assert.deepEqual([verdict.verdict, requests.length], ["none", 3]);
+  });
+
+  it("leaves nothing in the temp directory, when the review fails too", async () => {
+    // An API that turns every request down, as once the credit has run out. The directory jig review makes
+    // in the temp directory for its own bookkeeping was removed only when the review ended well.
+    const server = createServer((req, res) => {
+      req.resume();
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "Your credit balance is too low." } }));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+    const dir = await tempDir("jig-review-cli-");
+    const temp = await tempDir("jig-review-tmp-"); // jig's temp directory, of its own
+    try {
+      const args = ["review", "--session", await session(dir), "--exec", "bash -c", "--model", "claude-haiku-4-5", "--out", join(dir, "verdict.json")];
+      const { code, output } = await runJig(args, { api, cwd: dir, env: { TMPDIR: temp } });
+      assert.equal(code, 1, output);
+      assert.match(output, /Your credit balance is too low/);
+      assert.deepEqual((await readdir(temp)).filter((name) => name.startsWith("jig-")), []);
+    } finally {
+      api.close();
+    }
   });
 });

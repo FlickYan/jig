@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { after, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions, type Usage } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
@@ -18,6 +17,7 @@ import { TOOLS, type Tool, type ToolContext } from "../src/tools/index.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -55,9 +55,10 @@ const usage = (): Usage => ({ input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-ext-"));
+  dir = await tempDir("jig-ext-");
   process.env.JIG_HOME = join(dir, ".jig-home");
 });
+afterEach(removeTempDirs);
 
 async function writeSkill(base: string, name: string, skillMd: string, files: Record<string, string> = {}) {
   const skillDir = join(base, name);
@@ -215,7 +216,7 @@ describe("MCP", () => {
   });
 
   it("keeps a deny rule that names the name such tools shared", async () => {
-    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const home = await tempDir("jig-home-");
     const server = { command: process.execPath, args: [fixture] };
     await writeFile(join(home, "settings.json"), JSON.stringify({ mcpServers: { "db.prod": server, "db prod": server }, deny: ["mcp__db_prod__add"] }));
     const api = await fakeMessagesApi((request) => {
@@ -235,7 +236,7 @@ describe("MCP", () => {
   });
 
   it("and the hooks whose matcher names that name, before the call and after it", async () => {
-    const home = await mkdtemp(join(tmpdir(), "jig-home-"));
+    const home = await tempDir("jig-home-");
     const server = { command: process.execPath, args: [fixture] };
     const hooks = {
       PreToolUse: [{ matcher: "mcp__db_prod__add", command: "echo 'no adding on prod' >&2; exit 2" }],

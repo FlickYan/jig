@@ -1,19 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { contextWindow, createModel, defaultApi, type ModelOptions } from "../src/model.ts";
 import { toChatMessages, toChatTools } from "../src/openai.ts";
 import { TOOLS } from "../src/tools/index.ts";
 import { runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // jig through an OpenAI-compatible chat completions API: the translation both ways, against a local server.
+
+afterEach(removeTempDirs);
 
 type Chunk = { delta?: Record<string, unknown>; finish?: string; usage?: Record<string, unknown> };
 
@@ -338,8 +340,8 @@ describe("the CLI on an OpenAI-compatible API", () => {
   it("talks chat completions to the server --base-url names, for a model that isn't Claude or DeepSeek", async () => {
     const api = await server([hello]);
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-openai-"));
-      const env = { ...process.env, JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1", OPENAI_API_KEY: "" };
+      const project = await tempDir("jig-openai-");
+      const env = { ...process.env, JIG_HOME: await tempDir("jig-home-"), NO_COLOR: "1", OPENAI_API_KEY: "" };
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
       const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "Say hello."], { cwd: project, env });
       let output = "";
@@ -364,7 +366,7 @@ describe("the CLI on an OpenAI-compatible API", () => {
       [{ delta: { content: "There are no files." } }, { delta: {}, finish: "stop" }],
     ]);
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-openai-"));
+      const project = await tempDir("jig-openai-");
       const stats = join(project, "stats.json");
       const args = ["--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "--compact-at", "1000", "--stats", stats, "List the files."];
       const { code, output } = await runJig(args, { api, cwd: project, env: { OPENAI_API_KEY: "" } });

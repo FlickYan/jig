@@ -4,19 +4,21 @@ import { existsSync, writeFileSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { after, before, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
 import { createSandbox, gitControl, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-safety-"));
+  dir = await tempDir("jig-safety-");
   process.env.JIG_HOME = join(dir, ".jig-home");
 });
+afterEach(removeTempDirs);
 
 describe("sandbox", { skip: sandboxProblem() }, () => {
   // A project under the home directory, so "writes only in the project" isn't just the temp-directory rule.
@@ -31,7 +33,12 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
   it("lets commands write in the project and the temp directories, but nowhere else", async () => {
     const sandbox = createSandbox(project, { network: false })!;
     assert.match(await run("echo ok > inside.txt && cat inside.txt", sandbox), /^ok/);
-    assert.match(await run(`echo ok > ${join(tmpdir(), `jig-sandbox-${process.pid}.txt`)} && echo written`, sandbox), /^written/);
+    const temp = join(tmpdir(), `jig-sandbox-${process.pid}.txt`);
+    try {
+      assert.match(await run(`echo ok > ${temp} && echo written`, sandbox), /^written/);
+    } finally {
+      await rm(temp, { force: true });
+    }
     const probe = join(homedir(), `.jig-sandbox-test-${process.pid}`);
     assert.match(await run(`echo bad > ${probe}`, sandbox), denied);
     assert.equal(existsSync(probe), false);
