@@ -12,7 +12,7 @@ import { connectMcpServers, type McpServers } from "../src/mcp.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
 import { systemPrompt } from "../src/prompt.ts";
-import { discoverSkills, frontmatter, skillCatalog, skillTool } from "../src/skills.ts";
+import { discoverSkills, frontmatter, loadSkill, skillCatalog, skillTool } from "../src/skills.ts";
 import { TOOLS, type Tool, type ToolContext } from "../src/tools/index.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { FileVersions } from "../src/tools/util.ts";
@@ -133,6 +133,35 @@ describe("skills", () => {
     await symlink(join(secrets, "key"), skillMd);
     await assert.rejects(tool.run({ name: "release" }, context({ hidden: [secrets] })), /^Error: SKILL.md is hidden by the user's settings/);
     assert.match(await tool.run({ name: "release" }, context()), /^<skill_content name="release">\nthe hidden key\n/, "where the settings don't hide it");
+  });
+
+  it("leaves out a skill whose SKILL.md leads into a hidden path or jig's own directory, and loads none there", async () => {
+    // A command can link a project skill's SKILL.md to another project's memory, whose name and description
+    // would reach the next session's catalog, or to a file the settings hide.
+    const memory = join(process.env.JIG_HOME!, "memory", "project", "other", "deploy.md");
+    await mkdir(join(memory, ".."), { recursive: true });
+    await writeFile(memory, "---\nname: deploy\ndescription: Deploy with the key in vault 7.\n---\nAnother project's memory.\n");
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "notes.md"), "---\nname: notes\ndescription: The hidden notes.\n---\nHidden.\n");
+    for (const [name, target] of [["noted", join(secrets, "notes.md")], ["remembered", memory]]) {
+      await mkdir(join(dir, ".jig/skills", name), { recursive: true });
+      await symlink(target, join(dir, ".jig/skills", name, "SKILL.md"));
+    }
+    // jig's own skills are found as before.
+    await writeSkill(join(process.env.JIG_HOME!, "skills"), "hello", "---\nname: hello\ndescription: Greet.\n---\nSay hello.\n");
+    const { skills, warnings } = discoverSkills(dir, join(dir, "home"), { builtin: null, hiddenPaths: [secrets] });
+    assert.deepEqual(skills.map((skill) => skill.name), ["hello"]);
+    assert.match(warnings.join("\n"), /^Skipped the skill in \S+\/noted: its SKILL\.md leads into a path the settings hide\.$/m);
+    assert.match(warnings.join("\n"), /^Skipped the skill in \S+\/remembered: its SKILL\.md leads into jig's own directory\.$/m);
+    const found = discoverSkills(dir, join(dir, "home"), { builtin: null }).skills;
+    assert.deepEqual(found.map((skill) => skill.name), ["notes", "hello"], "where the settings don't hide it");
+
+    // /<skill> loads one without the skill tool, so loading looks again: a command can link it after discovery.
+    assert.throws(() => loadSkill(found[0], [secrets], [dir]), /^Error: The skill "notes" isn't loaded: its SKILL\.md leads into a path the settings hide\.$/);
+    await rm(join(dir, ".jig/skills/noted/SKILL.md"));
+    await symlink(memory, join(dir, ".jig/skills/noted/SKILL.md"));
+    assert.throws(() => loadSkill(found[0], [], [dir]), /^Error: The skill "notes" isn't loaded: its SKILL\.md leads into jig's own directory\.$/);
+    assert.match(loadSkill(found[1], [secrets], [dir]), /Say hello\./);
   });
 
   it("reads frontmatter leniently", () => {

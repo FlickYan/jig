@@ -140,7 +140,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   What the sandbox hides from commands the tools refuse by real path instead, with the sandbox off too: the
   hidden paths, and jig's own directory but for its skills (in a review, `read_file` and `grep` read
   another project's session through a link a command made to it; the `skill` tool's files go the same
-  way). A `.git` directory's `config` and hooks, and the files that say where they are, are never
+  way, and so does finding skills, or a `SKILL.md` linked to another project's memory would put its name
+  and description in the next session's catalog). Its skills they read but don't change, as commands
+  can't: in a home-directory project, `write_file` could plant one that every later session offers. But
+  skills linked out of it they change where the link leads, as commands can: refusing them there stopped
+  edits to skills kept in a dotfiles repository. A
+  `.git` directory's `config` and hooks, and the files that say where they are, are never
   changed, since git runs the programs they name outside the sandbox. The tools know a git directory by
   that name, and by what the sandbox locks, worked
   out once a session whether there is a sandbox or not: in a review, `write_file` put a hook in one made
@@ -154,8 +159,13 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   there, or as root would replace `/dev/stdout` with one, and no sandboxed command can put a link there.
   That goes by where the path is, not by what is there: a job an earlier run left in the background can
   leave a link to a device, or a named pipe, anywhere else it can write. So a named pipe elsewhere is
-  replaced too. The skills lockfile is written the same way: jig reads it before it rewrites it, and a
-  named pipe a job left in the background put there in between would have had jig wait for good. What
+  replaced too. The project's skills lockfile is written the same way: jig reads it before it rewrites it,
+  and a named pipe a job left in the background put there in between would have had jig wait for good.
+  The user's own is written through a link: commands can't write jig's directory, and the rename replaced
+  a link to one kept in a dotfiles repository, which then stopped getting updates. An approved AGENTS.md
+  edit, written once the user has read the diff, isn't renamed into place either, as a link from AGENTS.md
+  to CLAUDE.md is how some projects keep one file: it is written to a file opened without waiting and
+  checked to be a regular one, so a named pipe made there meanwhile is refused. What
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git
   files the sandbox watches, the skills lockfile and the installed skills' files) it opens only if it is a
   regular file, without waiting: in a review, a command's `mkfifo .git`, where jig ran in a subdirectory,

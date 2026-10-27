@@ -152,9 +152,12 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 
   Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs,
   nor can the file tools: its snapshots and sessions hold copies of your projects' files, and the
-  snapshots older versions of jig took, of the hidden paths too (see Rules). A project inside it (a skill
-  you are writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in
-  a temp directory, say), they can't move it aside either, nor a directory holding it there.
+  snapshots older versions of jig took, of the hidden paths too (see Rules). Neither can change its
+  skills, even in a home-directory project: each skill there is offered in every project. If
+  `~/.jig/skills` is a link out of it (into a dotfiles repository, say), both change them where the link
+  leads, like any other files there. A project or `--add-dir` directory inside it (a skill you are
+  writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in a temp
+  directory, say), they can't move it aside either, nor a directory holding it there.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
@@ -176,32 +179,36 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
   as commands can read what it leads to too. But wherever a link leads, and with the sandbox off too, they
   refuse what the sandbox hides from commands: the hidden paths in the settings (below), and jig's own
-  directory but for its skills (so does the `skill` tool, for a skill's files). They don't change a
+  directory but for its skills, which they read but don't change. So does the `skill` tool, for a skill's
+  files, and so does finding skills: one whose `SKILL.md` leads there is left out, with a warning (another
+  project's memory has a name and a description too). They don't change a
   `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
   `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
   sandbox; nor what the sandbox keeps read-only in a git directory by another name (one made with
   `--separate-git-dir`, say), with the sandbox off too. An approved AGENTS.md edit goes by real
   path too (the question names the file an AGENTS.md link
   leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
-  the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
-  git directory, nor into what the sandbox keeps read-only in one by another name, nor replace a folder
-  holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
+  the project, which also never go into a path the settings hide or a `.git` directory, where a skill's
+  folder could be a submodule's git directory, nor into what the sandbox keeps read-only in one by another
+  name, nor replace a folder holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
   write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
   exits non-zero. An entry can point anywhere, so its question names the URL or folder a skill would come
   from; it refuses a folder, or a file URL's repository, that the hidden paths hide or that holds one, and
   has git read such a repository in the sandbox, which hides them from git too (a `.git` file in it can
   lead git elsewhere). `add` does the same, so it doesn't install what `update` would refuse, and both take
-  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the skills
-  lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
-  writing through it (a linked folder on the way is still followed); a `--stats` path in `/dev` or `/proc`,
+  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the project's
+  skills lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
+  writing through it (a linked folder on the way is still followed, as is a link in place of your own
+  lockfile, which commands can't write); a `--stats` path in `/dev` or `/proc`,
   such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
   ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows,
-  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. A settings file is
-  refused, a lockfile or a skill's file is reported and its skills left as they are, and a git file is
-  reported by what it is. `read_file` and `edit_file` likewise
+  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. An approved edit is written
+  only to a regular file too, so a named pipe a command makes there while you read the diff is refused.
+  A settings file is refused, a lockfile or a skill's file is reported and its skills left as they are,
+  and a git file is reported by what it is. `read_file` and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
@@ -318,8 +325,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
   provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
   assignment (`password=…`, `DB_PASSWORD=…`, `PGPASSWORD=…`, `"api_key": "…"`, but not a placeholder
-  like `${DB_PASSWORD}` or code that reads one, like `os.environ["DB_PASSWORD"]`), and a password in a URL,
-  unless its host is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
+  like `${DB_PASSWORD}`, code that reads one, like `os.environ["DB_PASSWORD"]`, or a variable or a type,
+  like `this.apiKey = apiKey;` or `token: CancellationToken,`), and a password in a URL, unless its host
+  is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
   `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
   digit in its first 100 characters and doesn't look like code (`token = tokens[i]`).
 

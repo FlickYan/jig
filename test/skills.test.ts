@@ -303,6 +303,57 @@ describe("changing installed skills", () => {
     await assertUntouched();
   });
 
+  it("write the user's lockfile through a link, as to one kept in a dotfiles repository", async () => {
+    // Commands can't write jig's own directory, so renaming a new file into place protects nothing there,
+    // and it replaced the link: the copy the link led to stopped getting updates, without a word.
+    const dotfiles = await tempDir("jig-skills-dotfiles-");
+    await writeFile(join(dotfiles, "skills-lock.json"), JSON.stringify({ version: 1, skills: {} }));
+    await mkdir(process.env.JIG_HOME!, { recursive: true });
+    await symlink(join(dotfiles, "skills-lock.json"), join(process.env.JIG_HOME!, "skills-lock.json"));
+    const kept = async () => {
+      assert.ok((await lstat(join(process.env.JIG_HOME!, "skills-lock.json"))).isSymbolicLink(), "still a link");
+      return Object.keys(JSON.parse(await readFile(join(dotfiles, "skills-lock.json"), "utf8")).skills);
+    };
+    await jig("add", source);
+    assert.deepEqual(await kept(), ["beta"]);
+    await jig("remove", "beta");
+    assert.deepEqual(await kept(), []);
+  });
+
+  it("aren't added, updated or removed in a folder the settings hide", async () => {
+    // A hidden folder in the project is out of commands' reach, but a link to it isn't: with .jig/skills
+    // linked there, jig itself wrote a skill into a folder commands can't even read, which propose_skill
+    // refuses to do.
+    const secrets = join(dir, "secrets");
+    await mkdir(secrets);
+    await mkdir(join(dir, ".jig"));
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: [secrets] }));
+    await symlink(join("..", "secrets"), join(dir, ".jig", "skills"));
+    const hidden = /\.jig\/skills\/beta is hidden by the user's settings\./;
+    await assert.rejects(jig("add", source, "--project"), hidden);
+    assert.deepEqual(await readdir(secrets), []);
+    await mkdir(join(secrets, "beta"));
+    await writeFile(join(secrets, "beta", "work.txt"), "the user's own\n");
+    await writeFile(join(dir, ".jig", "skills-lock.json"), JSON.stringify({ version: 1, skills: { beta: { source, path: source, installed: "2026-10-01T00:00:00.000Z" } } }));
+    await assert.rejects(jig("update"), /^Error: Not updated, as said above: beta\.$/);
+    assert.match(printed.join("\n"), new RegExp(`Not updating beta: ${hidden.source}`));
+    await assert.rejects(jig("remove", "beta"), hidden);
+    await assert.rejects(jig("add", source, "--project", "--force"), hidden);
+    assert.deepEqual(await readdir(join(secrets, "beta")), ["work.txt"]);
+  });
+
+  it("say so when the project given with -C isn't there", async () => {
+    // add --project went as far as showing the skill, then stopped with a bare ENOENT.
+    const { notices, stop } = collectNotices(...markers);
+    try {
+      await assert.rejects(skillsCommand(["add", source, "--project", "-C", join(dir, "missing"), "--yes"]), /^Error: -C: \S+\/missing isn't a folder\.$/);
+    } finally {
+      stop();
+    }
+    assert.deepEqual(notices, [], "refused before the skill was shown");
+    assert.ok(!existsSync(join(dir, "missing")));
+  });
+
   it("take only a skill's name from a lockfile, which commands can write", async () => {
     // A name that, joined to the skills folder, is the folder outside: in the project's lockfile, and in the user's.
     for (const [skills, lock] of [

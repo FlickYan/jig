@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { Worker } from "node:worker_threads";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
@@ -14,7 +16,7 @@ import { Permissions } from "../src/permissions.ts";
 import { loadInstructions } from "../src/prompt.ts";
 import type { Approve } from "../src/proposals.ts";
 import { lockedGitPaths } from "../src/sandbox.ts";
-import { findSecret, redactSecrets } from "../src/secrets.ts";
+import { findSecret } from "../src/secrets.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -108,6 +110,7 @@ describe("AGENTS.md proposals", () => {
     await proposeInstructionsTool(yes).run({ new_string: "Use pnpm." }, context());
     assert.equal(await readFile(join(project, "CLAUDE.md"), "utf8"), "# Notes\n\nUse pnpm.\n");
     assert.ok(!existsSync(join(project, "AGENTS.md")));
+    await assert.rejects(proposeInstructionsTool(yes).run({ new_string: "token = ghp_abcdefghijklmnopqrstuvwxyz0123456789" }, context()), /; CLAUDE\.md must not contain secrets\.$/);
   });
 
   it("edit the CLAUDE.md jig follows in place of an AGENTS.md that isn't a regular file", async () => {
@@ -118,6 +121,29 @@ describe("AGENTS.md proposals", () => {
     assert.match(await proposeInstructionsTool(async (title) => (shown.push(title), true)).run({ new_string: "Use pnpm." }, context()), /^Edited CLAUDE\.md\./);
     assert.deepEqual(shown, ["Edit CLAUDE.md?"]);
     assert.deepEqual(loadInstructions(project).instructions, [{ path: "CLAUDE.md", text: "# Notes\n\nUse pnpm." }]);
+  });
+
+  it("aren't written to a named pipe a command put in the file's place while the user read the diff", async () => {
+    // jig reads the file before it asks and writes it once approved, outside the sandbox, and a job a command
+    // left in the background can make a named pipe there meanwhile: jig waited on it for a reader for good.
+    // The approver here makes it. In a child process, so that a hang fails the test rather than stopping
+    // the suite.
+    const agents = join(project, "AGENTS.md");
+    await writeFile(agents, "# Rules\n");
+    const script = `
+      import { execFileSync } from "node:child_process";
+      import { rmSync } from "node:fs";
+      import { proposeInstructionsTool } from ${JSON.stringify(new URL("../src/instructions-proposals.ts", import.meta.url).href)};
+      const agents = ${JSON.stringify(agents)};
+      const swap = async () => (rmSync(agents), execFileSync("mkfifo", [agents]), true);
+      try {
+        console.log(await proposeInstructionsTool(swap).run({ new_string: "Use pnpm." }, { cwd: ${JSON.stringify(project)} }));
+      } catch (err) {
+        console.log(err.message);
+      }`;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL" });
+    assert.equal(child.signal, null, `it waited on the named pipe until it was killed: ${child.stdout}${child.stderr}`);
+    assert.equal(child.stdout, "AGENTS.md isn't a regular file any more (a named pipe, say), so the edit wasn't made. A command may have put it there.\n", child.stderr);
   });
 
   it("go by where AGENTS.md really leads: never out of the project, and the question names the file", async () => {
@@ -260,15 +286,64 @@ describe("secrets", () => {
     for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
   });
 
-  it("take time in proportion to the text, however it repeats a name", () => {
-    // 400 KB of token= took minutes to redact while a value's digit was looked for to the end of the run,
-    // from every name in it. Now that a name may end a word, a long word would too, read from every letter.
-    for (const piece of ["token=", "x_token=", "PGPASSWORD=", "a"]) {
-      const text = piece.repeat(Math.ceil(400_000 / piece.length));
-      const started = Date.now();
-      findSecret(text);
-      redactSecrets(text);
-      assert.ok(Date.now() - started < 1000, `${piece}: ${Date.now() - started} ms`);
+  it("aren't taken from code that names a variable or a type, as a skill's script would", () => {
+    // Refused, as in node_modules, once a name could end a word (authToken, AsteriskToken): after a space,
+    // a name that ends a statement or an argument, or goes on as a type or an expression.
+    const code = [
+      "this.authToken = authToken;",
+      "isBearerToken: boolean,",
+      "CancellationToken cancellationToken = default)",
+      "export type AsteriskToken = Token<SyntaxKind.AsteriskToken>;",
+      "asteriskToken: AsteriskToken | undefined",
+      "verifyAccessToken(token: string): Promise<AuthInfo>;",
+      "const clientSecret = isPublicClient ? undefined : randomSecret()",
+      "const workSecret = opts?.workSecret || readEnv('WORK_SECRET')",
+    ];
+    for (const text of code) assert.equal(findSecret(text), undefined, text);
+    // A name with a digit still counts, and so does a password that goes on after its ; , ) or < with more
+    // of a name, as Summer;Rain;2024 does, and one with no space before it, as in a command or a connection
+    // string.
+    const secrets = [
+      "this.authToken = hunter22hunter;",
+      "Staging DB: user admin, password: Summer;Rain;2024",
+      "password: Welcome,2024",
+      "(password: P)ssw0rd!)",
+      "secret = Hello<World42",
+      "password = PassWord<12345>",
+      "export PGPASSWORD=correcthorse; psql -h db.internal",
+      "Server=db.internal;Password=correcthorse;",
+    ];
+    for (const text of secrets) assert.equal(findSecret(text), "a password or token", text);
+  });
+
+  it("take time in proportion to the text, however it repeats a name", async () => {
+    // 400 KB of token= took about a minute to redact while a value's digit was looked for to the end of the
+    // run, from every name in it. Now that a name may end a word, 400 KB of one word would take minutes
+    // without the \b before it, read again from every letter. A regular expression can't be stopped in the
+    // thread it runs in, so a worker runs them, and is stopped after 5 seconds on one text.
+    const pieces = ["token=", "x_token=", "PGPASSWORD=", "a"];
+    const worker = new Worker(
+      `const { parentPort, workerData } = require("node:worker_threads");
+      import(workerData.secrets).then(({ findSecret, redactSecrets }) => {
+        for (const piece of workerData.pieces) {
+          const text = piece.repeat(Math.ceil(400_000 / piece.length));
+          const started = Date.now();
+          findSecret(text);
+          redactSecrets(text);
+          parentPort.postMessage(Date.now() - started);
+        }
+      });`,
+      { eval: true, workerData: { secrets: new URL("../src/secrets.ts", import.meta.url).href, pieces } },
+    );
+    try {
+      for (const piece of pieces) {
+        const [ms] = await once(worker, "message", { signal: AbortSignal.timeout(5000) }).catch((err: Error) => {
+          throw err.name === "AbortError" ? new Error(`${piece}: still running after 5 s`) : err;
+        });
+        assert.ok(ms < 1000, `${piece}: ${ms} ms`);
+      }
+    } finally {
+      await worker.terminate();
     }
   });
 });

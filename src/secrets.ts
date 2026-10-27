@@ -41,9 +41,15 @@ const PATTERNS: [string, RegExp][] = [
   ["a private key", /-----BEGIN [A-Z ]*PRIVATE KEY-----/],
   ["a password in a URL", new RegExp(URL_PASSWORD, "i")],
   // Placeholders aren't passwords here either: ${DB_PASSWORD} is how a compose file says where one is kept.
-  // Nor is code that reads one from there, a value that starts with a name and then . ( or [, as in
-  // os.environ["DB_PASSWORD"], process.env.TOKEN or z.string(). The name has no digit, so p4ss.w0rd still is.
-  ["a password or token", new RegExp(String.raw`${ASSIGNMENT}(?![$<{[*]|[A-Za-z_$]+[.([])[^\s"']{8,}`, "i")],
+  // Nor is code that reads one from there, a value that starts with a name and then . ( [ or ?., as in
+  // os.environ["DB_PASSWORD"], process.env.TOKEN, z.string() or opts?.token. Nor is a variable or a type:
+  // after a space, a name that ends a statement or an argument (; , or a closing parenthesis follows, with no
+  // more of a name after it) or goes on as a type (< and a type's name, then > , < [ or a space) or an
+  // expression (| or ?), as in this.authToken = authToken;, isBearerToken: boolean, verify(token: string):
+  // or asteriskToken: AsteriskToken | undefined. So a password like Summer;Rain;2024 or Hello<World42 still
+  // counts, and so does PGPASSWORD=correcthorse; as a command or a connection string puts no space before
+  // it. Neither name has a digit, so p4ss.w0rd still counts too.
+  ["a password or token", new RegExp(String.raw`${ASSIGNMENT}(?![$<{[*]|[A-Za-z_$]+\??[.([]|(?<=\s)[A-Za-z_$]+(?:[;,)](?![\w$])|<[A-Za-z_$][\w$.]*[\s>,<[]| +[?|]))[^\s"']{8,}`, "i")],
 ];
 
 /** What kind of secret the text seems to hold, or undefined. */
@@ -61,7 +67,9 @@ const REDACTIONS: [RegExp, string][] = [
   [new RegExp(URL_PASSWORD, "gi"), "$1[REDACTED]"],
   // The value must look like a secret, with a digit in it, and not like code: `token = tokens[i]` and
   // `token = token.strip()` stay as they are. The digit must be in its first 100 characters: looked for to
-  // the end, a long run like token=token=... was read again from every name in it.
+  // the end, a long run like token=token=... was read again from every name in it. Code with a digit in a
+  // name is blanked out, as findSecret refuses it (exports.exchangeX509Token = [REDACTED];): an export
+  // that loses a name costs less than one that leaks a password.
   [new RegExp(String.raw`(${ASSIGNMENT})(?=[\w+/=~!@#$%^&*-]{0,99}\d)[\w+/=~!@#$%^&*-]{8,}(?![\w.([])`, "gi"), "$1[REDACTED]"],
 ];
 

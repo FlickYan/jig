@@ -83,7 +83,7 @@ export async function firstVisible(
   hidden: string[] = [],
   dirs: string[] = [],
 ): Promise<{ files: string[]; total: number }> {
-  const hides = await hiddenTest(hidden, [root, ...dirs]);
+  const hides = hiddenTest(hidden, [root, ...dirs]);
   const visible: string[] = [];
   let looked = 0;
   while (visible.length < limit && looked < files.length) {

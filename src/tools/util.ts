@@ -1,6 +1,6 @@
 import { constants } from "node:buffer";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "../paths.ts";
@@ -33,7 +33,7 @@ export async function resolveForChange(root: string, path: string, dirs: string[
   const abs = resolveInRoot(root, path, dirs);
   const real = await realTarget(abs);
   if (!real) throw new Error(`${path} leads through a broken symlink. Change the file it should point to instead.`);
-  const hiding = (await hiddenTest(hidden, [root, ...dirs]))(real);
+  const hiding = hiddenTest(hidden, [root, ...dirs], true)(real);
   if (hiding) throw hiddenError(path, hiding); // first, so the message doesn't say where it is
   const allowed = await Promise.all([root, ...dirs].map((dir) => realTarget(dir)));
   if (!allowed.some((dir) => dir && isInside(dir, real))) {
@@ -54,38 +54,50 @@ export async function resolveForChange(root: string, path: string, dirs: string[
 export async function assertVisible(abs: string, path: string, hidden: string[] = [], roots?: string[]): Promise<void> {
   if (!hidden.length && !roots) return;
   const real = await realTarget(abs);
-  const hiding = real && (await hiddenTest(hidden, roots))(real);
+  const hiding = real && hiddenTest(hidden, roots)(real);
   if (hiding) throw hiddenError(path, hiding);
 }
 
-/** What hides a path from the file tools: the settings (hiddenPaths), or its being in jig's own directory. */
-type Hiding = "settings" | "own";
+/**
+ * What hides a path from the file tools: the settings (hiddenPaths), its being in jig's own directory, or,
+ * for a change, its being in jig's skills.
+ */
+export type Hiding = "settings" | "own" | "skills";
 
 /**
  * What hides a real path from the file tools, if anything, as the sandbox hides it from commands: the
  * paths the settings hide, and given the directories the tools work in (`roots`, the project and the
  * --add-dir ones), jig's own directory (see sandbox.ts's ownRules). Its sessions and snapshots hold copies
  * of other projects' files, and of hidden ones, and a link a command made in the project led read_file and
- * grep there. Its skills stay readable, as they do to commands, and so do the roots that lie in it (a
- * project there stays as it was). jig's own changes in the project, which the user approves, give no
- * roots (see skill-store.ts's assertInProject). Worked out once, to check many files against (see
- * firstVisible).
+ * grep there. Its skills stay readable, as they do to commands, but a `change` there is refused, as
+ * commands can't make one either: each skill is offered in every project, and in a home-directory project
+ * write_file could plant one. Only where they really lie in it, though: the sandbox binds them read-only
+ * at their place there, so skills linked out of it (to a dotfiles repository, say) are as writable to
+ * commands as anything else where the link leads, and so to the file tools. The roots that lie in jig's
+ * directory stay as they were (a project there is a skill being written, say). jig's own changes in the
+ * project, which the user approves, give no roots (see skill-store.ts's assertInProject). Worked out once,
+ * to check many files against (see firstVisible, and skills.ts's discoverSkills, which can't wait for it).
  */
-export async function hiddenTest(hidden: string[], roots?: string[]): Promise<(real: string) => Hiding | undefined> {
-  const reals = async (list: string[]) => (await Promise.all(list.map((path) => realTarget(path)))).filter((path) => path !== undefined);
-  const paths = await reals(hidden);
-  const home = roots && (await realTarget(jigHome()));
-  // What stays readable in it: its skills, and the roots that lie in it.
-  const shown = home ? (await reals([join(home, "skills"), ...(roots ?? [])])).filter((dir) => isInside(home, dir)) : [];
+export function hiddenTest(hidden: string[], roots?: string[], change = false): (real: string) => Hiding | undefined {
+  const reals = (list: string[]) => list.map((path) => realTargetSync(path)).filter((path) => path !== undefined);
+  const paths = reals(hidden);
+  const home = roots && realTargetSync(jigHome());
+  const linked = home && realTargetSync(join(home, "skills"));
+  const skills = home && linked && isInside(home, linked) ? linked : undefined;
+  const inside = home ? reals(roots ?? []).filter((dir) => isInside(home, dir)) : [];
   return (real) => {
     if (paths.some((path) => isInside(path, real))) return "settings";
-    if (home && isInside(home, real) && !shown.some((dir) => isInside(dir, real))) return "own";
-    return undefined;
+    if (!home || inside.some((dir) => isInside(dir, real))) return undefined;
+    if (skills && isInside(skills, real)) return change ? "skills" : undefined;
+    return isInside(home, real) ? "own" : undefined;
   };
 }
 
 function hiddenError(path: string, hiding: Hiding): Error {
   if (hiding === "settings") return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
+  if (hiding === "skills") {
+    return new Error(`${path} leads into jig's own skills, which the file tools read but don't change, as commands can't: each is offered in every project. To save a skill, propose it with propose_skill if you have it, or ask the user.`);
+  }
   return new Error(`${path} leads into jig's own directory, which is hidden but for its skills: it holds copies of other projects' files. Don't try to get around it.`);
 }
 
@@ -101,7 +113,7 @@ export async function realTarget(abs: string): Promise<string | undefined> {
   return real && join(real, relative(existing, abs));
 }
 
-/** realTarget, for the snapshots and the sandbox, which can't wait for it. */
+/** realTarget, for the snapshots, the sandbox and hiddenTest, which can't wait for it. */
 export function realTargetSync(abs: string): string | undefined {
   const there = (path: string) => {
     try {
@@ -215,6 +227,32 @@ export function readRegularBytes(path: string, max = Infinity): { bytes: Buffer;
       read += n;
     }
     return { bytes: bytes.subarray(0, read), size };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Writes text to the file a path leads to, through its links, if that is a regular file or nothing yet (it
+ * is then made), and returns false, writing nothing, if it is anything else. readRegularFile's rule, for a
+ * file jig read a while before: a command may have put a named pipe in its place since, and writing to that
+ * would have jig wait for a reader for good. So it is opened without waiting, and checked again once open,
+ * before anything in it changes.
+ */
+export function writeRegularFile(path: string, text: string): boolean {
+  if (statSync(path, { throwIfNoEntry: false })?.isFile() === false) return false;
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENXIO") return false; // a named pipe no one reads
+    throw error;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return false;
+    ftruncateSync(fd);
+    writeFileSync(fd, text);
+    return true;
   } finally {
     closeSync(fd);
   }

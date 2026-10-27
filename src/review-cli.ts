@@ -18,7 +18,7 @@ import { type Problem, problemsOf, recheck, runningReviewPrompt, sentBackWithEvi
 import type { Sandbox } from "./sandbox.ts";
 import { SessionFile } from "./session.ts";
 import { type Mechanism, Stats } from "./stats.ts";
-import { bashOnItsOwn, runCommand } from "./tools/bash.ts";
+import { bashOnItsOwn, killCommands, runCommand } from "./tools/bash.ts";
 import { stoppedBecause, withRequest } from "./tools/subagent.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -97,12 +97,17 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const work = { task: messages[start].content as string, answer: lastAnswer(messages), log: workLog(messages.slice(start)), changes };
 
   // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy. It goes
-  // when jig exits, whether the review ended well or failed.
+  // when jig exits, whether the review ended well or failed. A command still running is killed first, as a
+  // task's are (cli.ts): each runs in a process group of its own, which nothing else stops with jig, and
+  // through an --exec that runs it on this machine, one still making files in the directory would keep it.
   const cwd = mkdtempSync(join(tmpdir(), "jig-review-"));
-  process.once("exit", () => rmSync(cwd, { recursive: true, force: true }));
+  process.once("exit", () => {
+    killCommands();
+    rmSync(cwd, { recursive: true, force: true });
+  });
   // A signal ends jig without the exit event, so a harness stopping a review (SIGTERM), a closed terminal
-  // (SIGHUP) or Ctrl+C would leave the directory behind: they end it with an ordinary exit instead, and the
-  // exit code a shell would give, as in a task (cli.ts).
+  // (SIGHUP) or Ctrl+C would leave the directory behind, and the commands: they end it with an ordinary exit
+  // instead, and the exit code a shell would give, as in a task (cli.ts).
   for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
   const count = stats && ((event: Mechanism) => stats.count(event));
