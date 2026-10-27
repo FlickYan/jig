@@ -241,6 +241,45 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     sandbox.close?.();
   });
 
+  it("starts the session's namespace again when a command ends it", { skip: linuxOnly }, async () => {
+    // kill -1 ends every process a command may signal, the keeper's among them, and the namespace with it:
+    // joining that one failed every later command ("Can't fork for --pidns: Cannot allocate memory").
+    const sandbox = createSandbox(project, { network: false })!;
+    try {
+      await run("kill -TERM -1", sandbox); // what it prints is a race: the namespace's end kills it too
+      assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+      assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
+      assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");
+    } finally {
+      sandbox.close?.();
+      await rm(join(project, "job.pid"), { force: true });
+    }
+  });
+
+  it("keeps jig's API keys out of every process a command can see", { skip: linuxOnly }, async () => {
+    // The keeper (pid 1 and 2 of the session's namespace) shares it with commands, which can read its
+    // environment in /proc: unprivileged too, as they join its user namespace.
+    const key = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-ant-not-a-real-key";
+    try {
+      const sandbox = createSandbox(project, { network: false })!;
+      const out = await run("cat /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n' | grep -c sk-ant-not-a-real-key", sandbox);
+      sandbox.close?.();
+      assert.match(out, /^0\n/);
+    } finally {
+      if (key === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = key;
+    }
+  });
+
+  it("leaves the session's namespace descriptors out of what a command runs", { skip: linuxOnly }, async () => {
+    // bubblewrap leaves the --userns and --pidns descriptors open; the command, and jobs it leaves running, mustn't inherit them.
+    const sandbox = createSandbox(project, { network: false })!;
+    const out = await run("ls -l /proc/self/fd; (ls -l /proc/self/fd &); sleep 0.2", sandbox);
+    sandbox.close?.();
+    assert.doesNotMatch(out, /(pid|user):\[/);
+  });
+
   it("kills a command's whole tree on timeout, inside the session's namespace", { skip: linuxOnly }, async () => {
     // A command that leaves a job in the background and then hangs: its timeout must take the job down too,
     // which the next command in the session confirms through the shared /proc.
@@ -834,16 +873,35 @@ describe("the sandbox's fallback without a session PID namespace", { skip: sandb
     try {
       process.env.PATH = `${fakeBin}${sep === "\\" ? ";" : ":"}${savedPath}`;
       const sandbox = createSandbox(dir, { network: false, onFallback: () => (fellBack = true) })!;
-      const { args, stdio } = sandbox.wrap("echo hi");
+      const { args, stdio, note } = sandbox.wrap("echo hi");
       assert.equal(fellBack, true, "jig told the user it fell back");
       assert.ok(args.includes("--unshare-pid"), "each command gets its own PID namespace");
       assert.ok(args.join(" ").includes("--proc /proc"), "with its own /proc");
       assert.ok(!args.includes("--pidns") && !args.includes("--userns"), "it doesn't try to join a keeper");
       assert.equal(stdio, undefined, "and passes no namespace descriptors");
+      // The bash tool tells the model to leave a server running in the background, which here ends with its command.
+      assert.match(note ?? "", /a job it leaves in the background ends with it/, "and tells the model, with the first command");
+      assert.equal(sandbox.wrap("echo hi").note, undefined, "once");
+      assert.match(await runCommand("echo hi", dir, 20, undefined, sandbox), /^hi\n\nExit code: 0$/, "a command's result has no note after the first");
       sandbox.close?.();
     } finally {
       process.env.PATH = savedPath;
     }
+  });
+
+  it("says there is no sandbox where bubblewrap can't mount a /proc, as in a container that masks its own", async () => {
+    // Docker and Podman mask parts of a container's /proc unless told not to, and the kernel then refuses a user
+    // namespace a fresh one. Every command mounts one, so bubblewrap that could start but not mount it ran nothing.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    const refuse = `echo "bwrap: Can't mount proc on /newroot/proc: Operation not permitted" >&2; exit 1`;
+    await writeFile(join(fakeBin, "bwrap"), `#!/bin/sh\nfor a do [ "$a" = --proc ] && { ${refuse}; }; done\nexec ${real} "$@"\n`, { mode: 0o755 });
+    const sandbox = join(import.meta.dirname, "..", "src", "sandbox.ts");
+    const script = `import(${JSON.stringify(sandbox)}).then((m) => console.log(m.sandboxProblem() ?? "a sandbox"))`;
+    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+    const problem = execFileSync(process.execPath, ["--input-type=module", "-e", script], { env, encoding: "utf8" }).trim();
+    assert.equal(problem, "bubblewrap can't create a sandbox here: Can't mount proc on /newroot/proc: Operation not permitted");
   });
 });
 

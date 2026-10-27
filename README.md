@@ -172,8 +172,10 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   files outside the project or reach the network, in the default `edits` mode commands run without asking
   (a hook that runs the project's code runs outside the sandbox: see Hooks). `--allow-network`, or
   `"network": true`, lets them reach it, so a command that does more than read then asks first. On Linux
-  the sandbox needs bubblewrap installed (`sudo apt install bubblewrap`) and user namespaces allowed; where
-  it can't run, jig says why, and commands ask first. `--no-sandbox` turns it off.
+  the sandbox needs bubblewrap installed (`sudo apt install bubblewrap`), user namespaces allowed and, in a
+  container, a `/proc` it may mount (Docker and Podman mask parts of theirs unless run with `--privileged`,
+  or `--security-opt systempaths=unconfined` and `unmask=ALL`); where it can't run, jig says why, and
+  commands ask first. `--no-sandbox` turns it off.
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
   sandbox, so they keep to the project and the `--add-dir` directories on their own. A change goes by where
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,

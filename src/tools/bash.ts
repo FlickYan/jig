@@ -125,7 +125,7 @@ export function runCommand(
   count?: ToolContext["count"],
 ): Promise<string> {
   return new Promise((resolve, reject) => {
-    const { program, args, stdio } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
+    const { program, args, stdio, note: about } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell. `stdio` carries
     // the session's namespace descriptors on Linux (child fds 3 onwards), for the sandbox to join (see Keeper).
@@ -162,7 +162,9 @@ export function runCommand(
       if (done) return;
       settle();
       if (output.cut) count?.("output.truncated");
-      resolve(`${output.shown().trimEnd() || "(no output)"}\n\n${note ? `${note}\n` : ""}${status}`);
+      // The sandbox's own note, if it has one (see Sandbox.wrap), after the command's.
+      const notes = [note, about].filter(Boolean).map((line) => `${line}\n`).join("");
+      resolve(`${output.shown().trimEnd() || "(no output)"}\n\n${notes}${status}`);
     };
     const status = (code: number | null, killSignal: NodeJS.Signals | null) =>
       killedBecause ? `Killed: ${killedBecause}.` : `Exit code: ${code ?? killSignal}`;

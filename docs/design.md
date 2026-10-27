@@ -131,7 +131,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   since its rules hold whatever path a lookup takes. If bubblewrap is too old for the join (no `--pidns`) or
   the keeper can't start, each command falls back to a namespace of its own (`--unshare-pid` with `--proc`):
   as safe, but a command's background jobs end with it, and jig says so once. jig never runs a command in
-  the host's PID namespace.
+  the host's PID namespace: where bubblewrap can't mount a `/proc` at all (in a container that masks parts
+  of its own, as Docker and Podman do by default), there is no sandbox, jig says why, and commands ask
+  first, since running them without `--proc` would open the hole again. A command can end the keeper too
+  (`kill -1` ends every process it may signal), and the next one then starts another.
 - **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
   they check paths themselves: against the project and the `--add-dir` directories, and a change again by
   where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can
