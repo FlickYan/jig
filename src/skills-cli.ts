@@ -80,7 +80,9 @@ export async function skillsCommand(args: string[]): Promise<void> {
     for (const { message } of problems) ui.notice(message);
     const skill = skills.find((s) => s.name === rest[0]);
     if (!skill) throw new Error(`No skill "${rest[0]}" was installed with jig skills add. (Skills you wrote yourself are folders: delete the folder.)`);
-    const hidden = hiddenPaths(project);
+    // Only the project's skills go by the hidden paths (see skillDirForChange): settings a command broke in
+    // the project mustn't keep the user's own from being removed.
+    const hidden = skill.scope === "project" ? hiddenPaths(project) : [];
     await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before anyone is asked
     if (!(await confirm(`Remove the skill "${skill.name}" (${skill.dir})? [y/N] `))) return ui.notice("Kept it.");
     await removeSkill(skill, project, hidden);
@@ -91,7 +93,7 @@ export async function skillsCommand(args: string[]): Promise<void> {
     if (rest.length !== 1) throw new Error("Usage: jig skills test <name>");
     const attempts = Number(values.attempts);
     if (!Number.isInteger(attempts) || attempts < 1) throw new Error("--attempts must be a positive integer");
-    await testSkill(project, rest[0], { attempts, model: values.model, ...(values.api && { api: values.api }) });
+    await testSkill(project, rest[0], { attempts, model: values.model, hiddenPaths: hiddenPaths(project), ...(values.api && { api: values.api }) });
     return;
   }
   throw new Error(`There is no "jig skills ${command}". See jig skills --help.`);
@@ -102,8 +104,9 @@ async function ask(question: string): Promise<boolean> {
   return (await ui.ask(question))?.trim().toLowerCase().startsWith("y") ?? false;
 }
 
+/** The skills a session in the project sees, and why it would leave any out. */
 function list(project: string): void {
-  const { skills, warnings } = discoverSkills(project);
+  const { skills, warnings } = discoverSkills(project, undefined, { hiddenPaths: hiddenPaths(project) });
   const locked = installedSkills(project);
   for (const warning of [...warnings, ...locked.problems.map((problem) => problem.message)]) ui.notice(warning);
   if (!skills.length) return ui.println("No skills yet. Add some with jig skills add, or write one with jig skills new.");

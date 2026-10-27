@@ -603,9 +603,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   }
 
-  /** Finds the skills and memories again (new ones may have been saved) and gives the model the new lists. */
+  /**
+   * Finds the skills and memories again (new ones may have been saved) and gives the model the new lists,
+   * saying why a skill is left out, as at the start: a command can have changed one since.
+   */
   function refreshSkills(): void {
-    ({ skills } = discoverSkills(cwd, undefined, skillOptions));
+    ({ skills, warnings } = discoverSkills(cwd, undefined, skillOptions));
+    for (const warning of warnings) ui.notice(warning);
     memories = values.memory ? loadMemories(cwd) : [];
     extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
     researchTools = researchFrom(extensions);

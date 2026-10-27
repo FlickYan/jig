@@ -342,6 +342,18 @@ describe("changing installed skills", () => {
     assert.deepEqual(await readdir(join(secrets, "beta")), ["work.txt"]);
   });
 
+  it("are removed from the user's when the project's settings are broken, but not from the project's", async () => {
+    // A command can write the project's settings, whose hidden paths matter only to the project's skills.
+    await jig("add", source);
+    await jig("add", await writeSkill(join(dir, "source"), "gamma"), "--project");
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: "oops" }));
+    await jig("remove", "beta");
+    assert.ok(!existsSync(join(process.env.JIG_HOME!, "skills", "beta")));
+    assert.deepEqual(readLock("user", dir), {});
+    await assert.rejects(jig("remove", "gamma"), /"hiddenPaths" must be a list/);
+    assert.ok(existsSync(join(dir, ".jig", "skills", "gamma", "SKILL.md")));
+  });
+
   it("say so when the project given with -C isn't there", async () => {
     // add --project went as far as showing the skill, then stopped with a bare ENOENT.
     const { notices, stop } = collectNotices(...markers);
@@ -613,6 +625,28 @@ describe("finding skills", () => {
     assert.deepEqual(names(["skill-writer", "mine"]), []);
     assert.ok(existsSync(join(BUILTIN_SKILLS, "skill-writer", "SKILL.md")));
     assert.deepEqual(skillProblems(join(BUILTIN_SKILLS, "skill-writer")), [], "jig's own skill follows the specification");
+  });
+
+  it("leaves out of list and test a skill whose SKILL.md leads into a path the settings hide, as a session does", async () => {
+    // Listed, its description reached the terminal; tested, the model, from a home whose jig hides nothing.
+    const secrets = join(dir, "secrets");
+    await mkdir(secrets);
+    await writeFile(join(secrets, "notes.md"), "---\nname: noted\ndescription: The hidden notes.\n---\nHidden.\n");
+    await mkdir(join(dir, ".jig", "skills", "noted"), { recursive: true });
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: [secrets] }));
+    await symlink(join(secrets, "notes.md"), join(dir, ".jig", "skills", "noted", "SKILL.md"));
+    const { notices, stop } = collectNotices("noted", "hidden notes");
+    try {
+      await skillsCommand(["list", "-C", dir]);
+      // It has no evals, so were it found, the test would fail at once, running nothing.
+      const unseen = /^Error: This project sees no skill "noted" \(jig skills list shows the ones it does\)\.$/;
+      await assert.rejects(skillsCommand(["test", "noted", "-C", dir]), unseen);
+    } finally {
+      stop();
+    }
+    const said = notices.join("\n");
+    assert.match(said, /Skipped the skill in \S+\/noted: its SKILL\.md leads into a path the settings hide\./);
+    assert.doesNotMatch(said, /hidden notes/);
   });
 });
 

@@ -123,7 +123,7 @@ describe("hiddenPaths", () => {
     const link = { tool: "bash", input: { command: `ln -sf ${memory} .jig/skills/release/SKILL.md` } };
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [link] : [{ text: "Done." }]));
     try {
-      const stdin = "Link it.\n/release\n";
+      const stdin = "Link it.\n/release\n/reset\n";
       const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"], { api, cwd: project, stdin, env: { JIG_HOME: home } });
       assert.equal(code, 0, output);
       const system = systemText(api.requests[0] as { system?: string });
@@ -132,6 +132,8 @@ describe("hiddenPaths", () => {
       assert.match(output, /Skipped the skill in \S+\/noted: its SKILL\.md leads into a path the settings hide\./);
       assert.match(output, /Skipped the skill in \S+\/remembered: its SKILL\.md leads into jig's own directory\./);
       assert.match(output, /^> The skill "release" isn't loaded: its SKILL\.md leads into jig's own directory\.$/m);
+      // /reset finds the skills again, and says why the release skill is now left out.
+      assert.match(output, /Skipped the skill in \S+\/release: its SKILL\.md leads into jig's own directory\./);
       assert.equal(api.requests.length, 2, output);
       assert.doesNotMatch(JSON.stringify(api.requests), /Another project's memory/);
     } finally {

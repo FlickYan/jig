@@ -73,11 +73,13 @@ export interface TestOptions {
   env?: NodeJS.ProcessEnv;
   /** Grades expectations (default: the model, asked to judge); tests pass their own. */
   grade?: (evalCase: SkillEval, evidence: string, finalMessage: string) => Promise<Grade[]>;
+  /** The paths the settings hide: a skill whose SKILL.md leads into one is left out, as a session leaves it out. */
+  hiddenPaths?: string[];
 }
 
 /** Runs a skill's evals with and without it, prints the comparison, and saves every run. */
 export async function testSkill(project: string, name: string, options: TestOptions): Promise<EvalRun[]> {
-  const skill = discoverSkills(project).skills.find((s) => s.name === name);
+  const skill = discoverSkills(project, undefined, { hiddenPaths: options.hiddenPaths }).skills.find((s) => s.name === name);
   if (!skill) throw new Error(`This project sees no skill "${name}" (jig skills list shows the ones it does).`);
   const evals = readEvals(skill);
   ui.println(`Testing ${skill.name}: ${evals.length} eval${evals.length === 1 ? "" : "s"} × ${options.attempts} attempt${options.attempts === 1 ? "" : "s"}, with the skill and without it (${options.model})`);
