@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 454 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 517 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -130,52 +130,56 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 ### Safety
 
 - **Sandbox.** Commands run in the operating system's sandbox, as in Codex and Claude Code: Seatbelt on
-  macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but write
-  only inside the project, its git directory (not its config or hooks, which name programs git runs, nor
-  its submodules', nor the files that tell git where they are: worktrees' and submodule checkouts' `.git`
-  files, `commondir`, `config.worktree`, `gitdir`), the directories added with `--add-dir` and the temp
-  directories, and they can't reach the network. A bare repository's config and hooks stay writable, unless
-  it has linked worktrees or is named `.git`: setting up a server's hooks can be the task. Those files of a
-  repository around the project's that lie where commands can write (a submodule checkout's `.git` in the
-  project, say, or its config in a temp directory) stay read-only too, so a repository a command makes in
-  the project doesn't unlock them. Some changes to git's files aren't refused, so jig warns of them after
-  the task and when a session ends: on Linux, a `commondir` or `config.worktree` that wasn't there (one
-  can't be made read-only without creating it, and an empty `commondir` breaks git); on both systems, a
-  submodule's checkout moved aside and another put in its place (on macOS, a link to one), a `.git` made in
-  the project, or the project made a git directory (`git init --bare .`), when jig was started in a
-  subdirectory of a repository (the same in a directory between them; making a repository can be the task),
-  and a git directory's `HEAD`, `objects` or `refs` removed or broken (git changes them all the time, so
-  commands can too). Your git would then take its config from elsewhere, or pass over the directory and fail
-  or use a repository above it, so look before you run git there; jig still finds the repository by its
-  `.git`, so the next session keeps its config read-only. A job a command leaves in the background can still
-  do so after jig has looked, and after a one-shot run nothing looks again.
+  macOS, [bubblewrap](https://github.com/containers/bubblewrap) on Linux. They can read anything but jig's
+  own directory and the hidden paths (both below), and write only inside the project, its git directory
+  (not its config or hooks, which name programs git runs, nor its submodules', nor the files that tell git
+  where they are: worktrees' and submodule checkouts' `.git` files, `commondir`, `config.worktree`,
+  `gitdir`), the directories added with `--add-dir` and the temp directories, and they can't reach the
+  network. A bare repository's config and hooks stay writable, unless it has linked worktrees or is named
+  `.git`: setting up a server's hooks can be the task. Those files of a repository around the project's
+  that lie where commands can write (a submodule checkout's `.git` in the project, say, or its config in a
+  temp directory) stay read-only too, so a repository a command makes in the project doesn't unlock them.
+  Some changes to git's files aren't refused, so jig warns of them after the task and when a session ends:
+  on Linux, a `commondir` or `config.worktree` that wasn't there (one can't be made read-only without
+  creating it, and an empty `commondir` breaks git); on both systems, a submodule's checkout moved aside
+  and another put in its place (on macOS, a link to one), a `.git` made in the project, or the project made
+  a git directory (`git init --bare .`), when jig was started in a subdirectory of a repository (the same
+  in a directory between them; making a repository can be the task), and a git directory's `HEAD`,
+  `objects` or `refs` removed or broken (git changes them all the time, so commands can too). Your git
+  would then take its config from elsewhere, or pass over the directory and fail or use a repository above
+  it, so look before you run git there; jig still finds the repository by its `.git`, so the next session
+  keeps its config read-only. A job a command leaves in the background can still do so after jig has
+  looked: on Linux until jig exits, on macOS after that too.
 
-  Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs,
-  nor can the file tools: its snapshots and sessions hold copies of your projects' files, and the
-  snapshots older versions of jig took, of the hidden paths too (see Rules). Neither can change its
-  skills, even in a home-directory project: each skill there is offered in every project. If
-  `~/.jig/skills` is a link out of it (into a dotfiles repository, say), both change them where the link
-  leads, like any other files there. A project or `--add-dir` directory inside it (a skill you are
-  writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in a temp
-  directory, say), they can't move it aside either, nor a directory holding it there.
+  Commands can't read jig's own directory (`~/.jig`, or `$JIG_HOME`) but for its skills, whose scripts the
+  model runs, nor can the file tools: its sessions and snapshots hold copies of your projects' files, and
+  the snapshots older versions of jig took hold the hidden paths too (see Rules). Neither can change
+  anything in it, its skills included, even in a home-directory project: each skill there is offered in
+  every project. If `~/.jig/skills` is a link out of it (into a dotfiles repository, say), both change
+  them where the link leads, like any other files there. A project or `--add-dir` directory inside it (a
+  skill you are writing, say) stays as it was. Where it lies in a directory commands can write in (a
+  `JIG_HOME` in a temp directory, as `jig skills test` sets one), they can't move it aside either, nor a
+  directory holding it there.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
   a daemon listening on a Unix socket (Docker's, say) is still within reach. On macOS commands share the
-  machine's processes, so they can see yours and signal them; on Linux they run in one PID namespace for
-  the session with a `/proc` of their own, so they see only the session's own processes, not yours, and
-  can't reach outside the sandbox through `/proc/<pid>/root` of a process that is outside it. A job a
-  command leaves in the background runs on, reachable by the next command (a server on a port, or a `sleep`
-  it finds in `/proc`), until jig exits, when the whole namespace ends and the job with it; where
-  bubblewrap is too old to set this up, each command gets a namespace of its own instead and a background
-  job ends with the command that started it, which jig says once. Because a sandboxed command can't change
-  files outside the project or reach the network, in the default `edits` mode commands run without asking
-  (a hook that runs the project's code runs outside the sandbox: see Hooks). `--allow-network`, or
-  `"network": true`, lets them reach it, so a command that does more than read then asks first. On Linux
-  the sandbox needs bubblewrap installed (`sudo apt install bubblewrap`), user namespaces allowed and, in a
-  container, a `/proc` it may mount (Docker and Podman mask parts of theirs unless run with `--privileged`,
-  or `--security-opt systempaths=unconfined` and `unmask=ALL`); where it can't run, jig says why, and
-  commands ask first. `--no-sandbox` turns it off.
+  machine's processes, so they can see yours and signal them, and a job a command leaves in the background
+  runs on after jig exits. On Linux they run in one PID namespace for the session with a `/proc` of their
+  own, so they see only the session's own processes, not yours, and can't reach outside the sandbox through
+  `/proc/<pid>/root` of a process that is outside it. A job a command leaves in the background runs on
+  until jig exits, when the whole namespace ends and the job with it: the next command can find it in
+  `/proc` (a `sleep`, say), but can reach a server left running only with the network allowed, since
+  otherwise each command has a network of its own. Where bubblewrap is too old to set this up, or the
+  kernel won't let it, each command gets a namespace of its own instead and a background job ends with the
+  command that started it, which jig says once. Because a sandboxed command can't change files outside the
+  project or reach the network, in the default `edits` mode commands run without asking (a hook that runs
+  the project's code runs outside the sandbox: see Hooks). `--allow-network`, or `"network": true`, lets
+  them reach it, so a command that does more than read then asks first. On Linux the sandbox needs
+  bubblewrap installed (`sudo apt install bubblewrap`), user namespaces allowed and, in a container, a
+  `/proc` it may mount (Docker and Podman mask parts of theirs unless run with `--privileged`, or
+  `--security-opt systempaths=unconfined` and `unmask=ALL`); where it can't run, jig says why, and commands
+  ask first. `--no-sandbox` turns it off.
 - **File tools.** `read_file`, `grep`, `glob`, `write_file` and `edit_file` run in jig itself, outside the
   sandbox, so they keep to the project and the `--add-dir` directories on their own. A change goes by where
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
@@ -183,46 +187,46 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   refuse what the sandbox hides from commands: the hidden paths in the settings (below), and jig's own
   directory but for its skills, which they read but don't change. So does the `skill` tool, for a skill's
   files, and so does finding skills: one whose `SKILL.md` leads there is left out, with a warning (another
-  project's memory has a name and a description too). They don't change a
-  `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
-  `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
-  sandbox; nor what the sandbox keeps read-only in a git directory by another name (one made with
-  `--separate-git-dir`, say), with the sandbox off too. An approved AGENTS.md edit goes by real
-  path too (the question names the file an AGENTS.md link
+  project's memory has a name and a description too). They don't change a `.git` directory's `config` or
+  hooks, or the files that tell git where they are (`.git` files, `commondir`, `config.worktree`, a
+  worktree's `gitdir`), which could make git run programs outside the sandbox; nor what the sandbox keeps
+  read-only in a git directory by another name (one made with `--separate-git-dir`, say), with the sandbox
+  off too. An approved AGENTS.md edit goes by real path too (the question names the file an AGENTS.md link
   leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
   the project, which also never go into a path the settings hide or a `.git` directory, where a skill's
   folder could be a submodule's git directory, nor into what the sandbox keeps read-only in one by another
-  name, nor replace a folder holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
-  write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
-  exits non-zero. An entry can point anywhere, so its question names the URL or folder a skill would come
-  from; it refuses a folder, or a file URL's repository, that the hidden paths hide or that holds one, and
-  has git read such a repository in the sandbox, which hides them from git too (a `.git` file in it can
-  lead git elsewhere). `add` does the same, so it doesn't install what `update` would refuse, and both take
-  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the project's
-  skills lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
-  writing through it (a linked folder on the way is still followed, as is a link in place of your own
-  lockfile, which commands can't write); a `--stats` path in `/dev` or `/proc`,
-  such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
-  jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
-  watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
-  named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
-  ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows,
-  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. An approved edit is written
-  only to a regular file too, so a named pipe a command makes there while you read the diff is refused.
-  A settings file is refused, a lockfile or a skill's file is reported and its skills left as they are,
-  and a git file is reported by what it is. `read_file` and `edit_file` likewise
-  open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
-  folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
-  they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs
-  with `core.fsmonitor` and hooks turned off; each run stops with the task, or after 30 seconds, and they
-  then walk the files, since a named pipe where git reads (a `.gitignore`, `.git/info/exclude`, a nested
-  repository's config) would have it wait forever. After the 30 seconds they tell the model that what git
-  ignores may be among the files. `grep` matches in a worker thread that Ctrl+C stops, as do 30 seconds on
-  one file, since a regular expression can take exponentially long on some lines.
-  `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or UTF-16 file the model is told to
-  use a command, and `read_file` says when what it shows isn't UTF-8. `read_file` reads a file a chunk at a
-  time and keeps only the page it shows: 5 lines of a 300 MB log used to take 800 MB of memory. `edit_file`
-  and `write_file` refuse a file over 537 MB, V8's longest string, and say to use a command.
+  name, nor replace a folder holding it. `jig skills` refuses a name in the lockfile that isn't a skill's
+  name, since commands can write the lockfile; `update` says why it skips an entry it refuses or can't
+  fetch, updates the rest, and exits non-zero. An entry can point anywhere, so its question names the URL
+  or folder a skill would come from; it refuses a folder, or a file URL's repository, that the hidden paths
+  hide or that holds one, and, with paths hidden, has git read a file URL's repository in the sandbox,
+  where there is one, which hides them from git too (a `.git` file in it can lead git elsewhere). `add`
+  does the same, so it doesn't install what `update` would refuse, and both take only https, ssh and file
+  URLs (git runs a program for some others, and http and git URLs don't check whom they reach). The
+  `--stats` file and the project's skills lockfile are written anew and renamed into place, which replaces
+  a link or a named pipe instead of writing through it (a linked folder on the way is still followed, as is
+  a link in place of your own lockfile, which commands can't write); a `--stats` path in `/dev` or `/proc`,
+  such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What jig reads from the
+  project to work in it (AGENTS.md, skills, the settings, the git files the sandbox watches, the skills
+  lockfile and the installed skills' files) it reads only if it is a regular file: a named pipe a command
+  made there would have jig wait until it was killed, and a link to `/dev/zero` never ends. Such an
+  AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows, and proposes
+  edits to, the `CLAUDE.md` beside it, if that is a regular file. An approved edit is written only to a
+  regular file too, so a named pipe a command makes there while you read the diff is refused. A settings
+  file is refused, a lockfile or a skill's file is reported and its skills left as they are, and a git file
+  is reported by what it is. `read_file` and `edit_file` likewise open only a regular file, and tell the
+  model so. `grep` and `glob` leave out what git ignores, and folders like `node_modules/`, `dist/` and
+  `build/` that git doesn't track, but search such a path when they are given it (`node_modules/pkg`, all
+  of it if git ignores it). The git they run to list files runs with `core.fsmonitor` and hooks turned off;
+  each run stops with the task, or after 30 seconds, and they then walk the files, since a named pipe where
+  git reads (a `.gitignore`, `.git/info/exclude`, a nested repository's config) would have it wait forever.
+  After the 30 seconds they tell the model that what git ignores may be among the files. `grep` matches in
+  a worker thread that Ctrl+C stops, as do 30 seconds on one file, since a regular expression can take
+  exponentially long on some lines. `edit_file` and `write_file` change only UTF-8 files: for a Latin-1 or
+  UTF-16 file the model is told to use a command, and `read_file` says when what it shows isn't UTF-8.
+  `read_file` reads a file a chunk at a time and keeps only the page it shows: 5 lines of a 300 MB log used
+  to take 800 MB of memory. `edit_file` and `write_file` refuse a file over 537 MB, V8's longest string,
+  and say to use a command.
 - **Modes.** `plan` only looks: file changes and commands that change things are refused, and the model is
   told to propose a plan. `ask` asks before every change and command, `edits` (the default) lets file
   changes and contained commands through, and `auto` never asks. Reading never asks: `read_file`, `grep`,
@@ -245,7 +249,7 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which). They are
   hidden by their paths, so where one lies in a directory commands can write in (the project, say), they
   can't move aside a directory holding it there. Snapshots leave out those in the project, by where they
-  really lead, and `/undo` leaves them as they are.
+  really lead, and `/undo` leaves them as they are (with the project itself hidden, `/undo` is off).
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that
@@ -328,12 +332,12 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   names a file, function or command before relying on it, and to propose forgetting one that turned out
   wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
   provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
-  assignment (`password=…`, `DB_PASSWORD=…`, `PGPASSWORD=…`, `"api_key": "…"`, but not a placeholder
-  like `${DB_PASSWORD}`, code that reads one, like `os.environ["DB_PASSWORD"]`, or a variable or a type,
-  like `this.apiKey = apiKey;` or `token: CancellationToken,`), and a password in a URL, unless its host
-  is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
-  `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
-  digit in its first 100 characters and doesn't look like code (`token = tokens[i]`).
+  assignment (`password=…`, `DB_PASSWORD=…`, `PGPASSWORD=…`, `"api_key": "…"`, but not a placeholder like
+  `${DB_PASSWORD}`, code that reads one, like `os.environ["DB_PASSWORD"]`, or a variable or a type, like
+  `this.authToken = authToken;` or `token: CancellationToken,`), and a password in a URL, unless its host
+  is this machine or an example (`postgres://postgres:postgres@localhost` is fine). `jig sessions export`
+  blanks out the same, and JWTs, but a password assignment only when its value has a digit in its first 100
+  characters and doesn't look like code (`token = tokens[i]`).
 
 ### Extensions
 
@@ -359,15 +363,14 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `jig skills add` shows what it is about to install, scripts first, and records the source and commit of
   each skill in a lockfile beside it (`~/.jig/skills-lock.json`, or `.jig/skills-lock.json` with
   `--project`); nothing runs at install. A git URL must be https, ssh or file. A skill the model writes
-  (`jig skills new`, or `/skills new` and
-  `/learn` in a session) is a proposal: jig checks it against the specification and shows it to you, and
-  saves it only where you say, in the project or for all your projects. With no one to ask, it goes to
-  `.jig/proposals/skills/`, a folder `jig skills add` can install once you have read it. A skill's evals
-  live in `evals/evals.json`, in the format of Anthropic's `skill-creator` (a prompt, the expected output,
-  expectations, input files) plus `check`, a shell command whose exit code says whether the result is
-  right; `jig skills test` runs each eval in a fresh project with its own home directory, once with the
-  skill and once with it hidden (`--hide-skill`), and grades it by the check and by the model judging the
-  expectations.
+  (`jig skills new`, or `/skills new` and `/learn` in a session) is a proposal: jig checks it against the
+  specification and shows it to you, and saves it only where you say, in the project or for all your
+  projects. With no one to ask, it goes to `.jig/proposals/skills/`, a folder `jig skills add` can install
+  once you have read it. A skill's evals live in `evals/evals.json`, in the format of Anthropic's
+  `skill-creator` (a prompt, the expected output, expectations, input files) plus `check`, a shell command
+  whose exit code says whether the result is right; `jig skills test` runs each eval in a fresh project
+  with its own home directory, once with the skill and once with it hidden (`--hide-skill`), and grades it
+  by the check and by the model judging the expectations.
 - **MCP servers.** jig is an MCP client over stdio, on the official TypeScript SDK. Servers configured in
   the settings start with jig, and their tools join jig's own as `mcp__<server>__<tool>`:
 
@@ -498,7 +501,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/mcp.ts`](src/mcp.ts) | Starting MCP servers and turning their tools into jig tools |
 | [`src/hooks.ts`](src/hooks.ts) | Running hooks around tool calls, and before a task ends |
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
-| [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments on Linux |
+| [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments and the keeper that holds the session's PID namespace on Linux; what it keeps read-only in git, and the git changes jig warns of |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |

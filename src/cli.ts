@@ -100,9 +100,9 @@ jig sessions list | export lists sessions, or exports them as fine-tuning data (
 jig review reviews an agent's finished work by running it, in a copy (jig review --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
-commands, hooks around tool calls and before a task ends, and MCP servers. A project's settings can
-only run programs or loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without
-asking, for scripts).
+commands, paths to hide from commands and the file tools (hiddenPaths), hooks around tool calls and
+before a task ends, and MCP servers. A project's settings can only run programs or loosen the sandbox
+once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
 Ctrl+C stops the current task (press it again to force quit). At the prompt it clears the line, and

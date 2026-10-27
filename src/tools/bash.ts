@@ -1,8 +1,9 @@
 // bash: runs a command in a fresh shell, in the sandbox when there is one and in a process group of its
 // own, so a timeout, Ctrl+C or jig's exit stops everything it started; jig's API keys are kept out of its
 // environment. The model gets the output and the exit code; a job left in the background keeps running, in
-// the sandbox's session until jig exits (see sandbox.ts's Keeper), and without the sandbox as in a terminal.
-// A long output is cut from the middle, and the whole of it goes to a file the model can search.
+// bubblewrap's session until jig exits (see sandbox.ts's Keeper), and under Seatbelt or with no sandbox as
+// in a terminal, outliving jig. A long output is cut from the middle, and the whole of it goes to a file the
+// model can search.
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";

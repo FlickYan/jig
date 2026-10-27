@@ -106,7 +106,7 @@ Environment:
 - Working directory: ${cwd}${dirs.length && fileTools ? `\n- The file tools also work in: ${dirs.join(", ")}` : ""}
 - Platform: ${os.type()} ${os.release()} (${os.arch()})
 - Git repository: ${gitRoot(cwd) ? "yes" : "no"}
-- Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted" or a connection error.` : "run directly on the user's machine."}
+- Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted", "Read-only file system" or a connection error.` : "run directly on the user's machine."}
 - Today's date: ${new Date().toLocaleDateString("en-CA")}`;
   return [prompt, oneShot ? ON_YOUR_OWN : "", skills, memory, projectInstructions(instructions)].filter(Boolean).join("\n\n");
 }

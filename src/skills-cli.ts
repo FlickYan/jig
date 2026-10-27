@@ -26,8 +26,8 @@ import * as ui from "./ui.ts";
 export const SKILLS_HELP = `Usage: jig skills <command>
 
   list                    the skills this project sees: where each comes from, and how often it was used
-  add <source>            install skills from a folder, a git URL, or GitHub as owner/repo/path[@ref]
-                            (jig skills add anthropics/skills/skills/pdf)
+  add <source>            install skills from a folder, an https, ssh or file git URL, or GitHub as
+                            owner/repo/path[@ref] (jig skills add anthropics/skills/skills/pdf)
       --project             into this project's .jig/skills (default: yours, in ~/.jig/skills)
       --skill <name>        only this one of the skills the source holds (repeatable)
       --ref <ref>           the branch, tag or commit (default: the repository's default branch)

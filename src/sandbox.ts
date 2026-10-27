@@ -588,7 +588,7 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   const offline =
     ", and have no network: each command gets an empty one of its own, so it can't reach the internet, servers on this " +
     "machine's ports, or a server an earlier command started (start a server and use it in the same command)";
-  const processes = " They see only this session's own processes, not the machine's others.";
+  const processes = " Commands see only this session's own processes, not the machine's others.";
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
     limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}`,

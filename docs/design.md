@@ -95,8 +95,8 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   keeps the pipes open while it waits for the server. jig sat out the timeout and then killed the server
   with the process group. On Terminal-Bench that happened in 22 of the 55 calls that started something in
   the background. Now a call returns a second after the shell exits, tells the model that something it
-  started is still running, and leaves it running: in the sandbox for the rest of the session (see the PID
-  namespace entry below), or without it as a terminal would, outliving jig.
+  started is still running, and leaves it running: in bubblewrap's sandbox until jig exits (see the PID
+  namespace entry below), and in Seatbelt's or with no sandbox as a terminal would, outliving jig.
 - **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
   slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
   just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
@@ -109,32 +109,39 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   on macOS it isn't. Killing a command's process group still reaches everything inside, and
   `--die-with-parent` takes the sandbox down if jig dies. `--unshare-net` cuts off IP only: a daemon
   listening on a Unix socket (Docker's, say) stays within reach, and closing that would take seccomp.
-- **One PID namespace per session.** bubblewrap runs commands in the host's PID namespace with the host's
+- **One PID namespace per session.** bubblewrap ran commands in the host's PID namespace, with the host's
   `/proc`, and that was a hole: a command could step through `/proc/<pid>/root` of a process outside the
   sandbox (jig, the user's shell, anything of the same user) into the host's mount namespace, where the
-  sandbox's binds don't apply. A review's probe read a hidden file and, outside the writable directories,
-  wrote one. We had turned `--unshare-pid` down because a per-command namespace would kill a job a command
-  left in the background when its shell exited. The answer is one namespace for the whole session, not one
-  per command: before the first command jig starts a small long-lived bubblewrap (the keeper) with
+  sandbox's binds don't apply. A review's probe read a hidden file that way and, outside the writable
+  directories, wrote one. `--unshare-pid` had been turned down because a namespace for each command ends a
+  job the command leaves in the background when its shell exits. So there is one namespace for the whole
+  session: before the first command jig starts a small bubblewrap that stays up (the keeper) with
   `--unshare-pid`, and each command joins its namespaces (`--pidns`, and `--userns` when run unprivileged,
-  where the user namespace owns the PID one) and mounts its own `--proc /proc`, so it sees only the
-  session's processes. A job left in the background is reparented to the namespace's init and runs on; a
-  server started in one command, a `sleep` the next command finds in `/proc` — both reach the next command,
-  as they would in a shell. The keeper's root is read-only with the hidden paths and jig's directory masked,
-  so reaching it through `/proc/1/root` grants nothing a command hasn't already (it can read every other
-  path, and can't write a read-only root). The keeper's life is tied to jig's — it reads a pipe jig holds
-  open, so jig's death sends end-of-file, and `--die-with-parent` kills it if jig is killed — so when jig
-  exits (normally, by a signal, or by `kill -9`) its init ends and the kernel ends every process in the
-  namespace, background jobs included. That changes documented behaviour: a background job used to outlive
-  jig; now it lasts the session. A timeout, Ctrl+C or the exit kill still kills a running command's whole
-  tree through its process group, which the reparented job stays part of. macOS's Seatbelt is unaffected,
-  since its rules hold whatever path a lookup takes. If bubblewrap is too old for the join (no `--pidns`) or
-  the keeper can't start, each command falls back to a namespace of its own (`--unshare-pid` with `--proc`):
-  as safe, but a command's background jobs end with it, and jig says so once. jig never runs a command in
-  the host's PID namespace: where bubblewrap can't mount a `/proc` at all (in a container that masks parts
-  of its own, as Docker and Podman do by default), there is no sandbox, jig says why, and commands ask
-  first, since running them without `--proc` would open the hole again. A command can end the keeper too
-  (`kill -1` ends every process it may signal), and the next one then starts another.
+  where the user namespace owns the PID one) and mounts a `/proc` of its own, which shows only the
+  session's processes. A job left in the background is taken over by the namespace's init and runs on: the
+  next command finds in `/proc` a `sleep` an earlier one left, and with the network allowed reaches a
+  server one started (without, each command still has a network of its own). The keeper is process 1 there,
+  so a command reaches its root through `/proc/1/root`. That root is read-only, with the hidden paths and
+  jig's directory masked, so it grants nothing a command hasn't already (it can read every other path, and
+  can't write a read-only root); and it has a `/proc` of its own too: the first keeper had the host's
+  there, and `/proc/1/root/proc/<pid>/root` was the same way out in two steps. Its environment, which
+  commands can read in `/proc/1/environ`, is jig's without the API keys, as theirs is: the first keeper had
+  them. The keeper's life is tied to jig's: it reads a pipe jig holds open, which jig's death closes, and
+  `--die-with-parent` kills it if jig is killed. So when jig exits, normally, by a signal or by `kill -9`,
+  the namespace's init ends and the kernel ends every process in it: a background job used to outlive jig,
+  and now lasts the session. A timeout, Ctrl+C or jig's exit still kills a running command's whole tree
+  through its process group, which a job taken over by init stays in. A command can end the keeper too
+  (`kill -1` ends every process it may signal), and the namespace with it; the next command then starts
+  another, as joining the ended one failed every later command. Seatbelt needs none of this, since its
+  rules hold whatever path a lookup takes. Where bubblewrap is too old for the join (no `--pidns`), or the
+  keeper can't start or be joined, each command gets a namespace of its own (`--unshare-pid`, with its own
+  `/proc`): as safe, but a command's background jobs end with it. jig tells the user so once, and the
+  model, whom the bash tool tells to leave a server running in the background, with the first command's
+  result. jig never runs a command in the host's PID namespace: where bubblewrap can't mount a `/proc` at
+  all (in a container that masks parts of its own, as Docker and Podman do by default), there is no
+  sandbox, jig says why, and commands ask first, since running them without `--proc` would open the hole
+  again. jig's check that bubblewrap works mounts one too: it didn't, so in such a container jig said the
+  sandbox was on and every command failed.
 - **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
   they check paths themselves: against the project and the `--add-dir` directories, and a change again by
   where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can
@@ -142,58 +149,56 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   links out, since commands can read what they lead to as well, and refusing would break linked packages.
   What the sandbox hides from commands the tools refuse by real path instead, with the sandbox off too: the
   hidden paths, and jig's own directory but for its skills (in a review, `read_file` and `grep` read
-  another project's session through a link a command made to it; the `skill` tool's files go the same
-  way, and so does finding skills, or a `SKILL.md` linked to another project's memory would put its name
-  and description in the next session's catalog). Its skills they read but don't change, as commands
-  can't: in a home-directory project, `write_file` could plant one that every later session offers. But
-  skills linked out of it they change where the link leads, as commands can: refusing them there stopped
-  edits to skills kept in a dotfiles repository. A
-  `.git` directory's `config` and hooks, and the files that say where they are, are never
-  changed, since git runs the programs they name outside the sandbox. The tools know a git directory by
-  that name, and by what the sandbox locks, worked
-  out once a session whether there is a sandbox or not: in a review, `write_file` put a hook in one made
-  with `--separate-git-dir` in the project, which commands couldn't change. One by another name that a
-  command makes during the session is changed like any other file. Some of jig's own
-  writes into the project are held to the same: in an audit, a command's `ln -sf` sent the `--stats` file
-  and an approved AGENTS.md edit to a file outside it. Those edits and the skills the model writes now go
-  by real path, and the stats file, rewritten all through a run, is written anew and renamed into place,
-  since a rename replaces a link where a write follows it (a linked folder on the way to it is still
-  followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is still written to: jig can't make a file
-  there, or as root would replace `/dev/stdout` with one, and no sandboxed command can put a link there.
-  That goes by where the path is, not by what is there: a job an earlier run left in the background can
-  leave a link to a device, or a named pipe, anywhere else it can write. So a named pipe elsewhere is
-  replaced too. The project's skills lockfile is written the same way: jig reads it before it rewrites it,
-  and a named pipe a job left in the background put there in between would have had jig wait for good.
-  The user's own is written through a link: commands can't write jig's directory, and the rename replaced
-  a link to one kept in a dotfiles repository, which then stopped getting updates. An approved AGENTS.md
-  edit, written once the user has read the diff, isn't renamed into place either, as a link from AGENTS.md
-  to CLAUDE.md is how some projects keep one file: it is written to a file opened without waiting and
-  checked to be a regular one, so a named pipe made there meanwhile is refused. What
-  jig reads from the project to work in it (AGENTS.md, skills, the settings, the git
-  files the sandbox watches, the skills lockfile and the installed skills' files) it opens only if it is a
+  another project's session through a link a command made to it; the `skill` tool's files go the same way,
+  and so does finding skills, or a `SKILL.md` linked to another project's memory would put its name and
+  description in the next session's catalog). Its skills they read but don't change, as commands can't: in
+  a home-directory project, `write_file` could plant one that every later session offers. But skills linked
+  out of it they change where the link leads, as commands can: refusing them there stopped edits to skills
+  kept in a dotfiles repository. A `.git` directory's `config` and hooks, and the files that say where they
+  are, are never changed, since git runs the programs they name outside the sandbox. The tools know a git
+  directory by that name, and by what the sandbox locks, worked out once a session whether there is a
+  sandbox or not: in a review, `write_file` put a hook in one made with `--separate-git-dir` in the
+  project, which commands couldn't change. One by another name that a command makes during the session is
+  changed like any other file. Some of jig's own writes into the project are held to the same: in an audit,
+  a command's `ln -sf` sent the `--stats` file and an approved AGENTS.md edit to a file outside it. Those
+  edits and the skills the model writes now go by real path, and the stats file, rewritten all through a
+  run, is written anew and renamed into place, since a rename replaces a link where a write follows it (a
+  linked folder on the way to it is still followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is
+  still written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
+  sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
+  earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
+  write. So a named pipe elsewhere is replaced too. The project's skills lockfile is written the same way:
+  jig reads it before it rewrites it, and a named pipe a job left in the background put there in between
+  would have had jig wait for good. The user's own is written through a link: commands can't write jig's
+  directory, and the rename replaced a link to one kept in a dotfiles repository, which then stopped
+  getting updates. An approved AGENTS.md edit, written once the user has read the diff, isn't renamed into
+  place either, as a link from AGENTS.md to CLAUDE.md is how some projects keep one file: it is written to
+  a file opened without waiting and checked to be a regular one, so a named pipe made there meanwhile is
+  refused. What jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files
+  the sandbox watches, the skills lockfile and the installed skills' files) it opens only if it is a
   regular file, without waiting: in a review, a command's `mkfifo .git`, where jig ran in a subdirectory,
   had jig wait after the task until it was killed, and a link to `/dev/zero` read without end; a
-  `mkfifo .jig/skills-lock.json` did the same to `jig skills list`. `jig skills add`, `update` and
-  `remove` go by real path in the project as well, and refuse a name in the lockfile, which commands can
-  write, that isn't a skill's name: a name of `../..` made `remove`
-  delete the project. Nor do they, or a skill the model writes, change anything in a `.git` directory: each
-  replaces a skill's folder whole, while the file tools' check for `config` and hooks looks at one file,
-  and in a review, `.jig/skills` linked to `.git/modules` let `update` put a skill's files in place of a
-  submodule's config. Nor what the sandbox locks in a git directory by another name, or a folder holding
-  it: they knew one only by the name `.git`, and with `.jig/proposals/skills` linked into one made with
-  `--separate-git-dir`, a proposal could replace its hooks, or the whole of it. `update` skips an entry it
-  refuses, or can't fetch or install, updates the rest and exits non-zero: one entry a command wrote, with
-  a bad name, a missing path or no fields at all, used to
-  stop it before the user's own skills. An entry can also point anywhere, and its question named only the
-  skill: it now names the URL or folder, a folder in the hidden paths (or holding one) is refused, since
-  its files would land where commands can read them, and only https, ssh and file URLs are fetched, since
-  git runs a program for some others (`ext::`, which jig keeps refused whatever git's config says). In a
-  review, a file URL to a hidden repository still brought its files in: such a repository is now refused
-  too, read from the URL as git reads it (decoded, without its host), and every path goes by the system's
-  real path (Node's takes `link/..` for the folder holding the link). And with paths hidden, git reads a
-  file URL's repository in the sandbox, since a `.git` file or the alternates there can lead it to a
-  hidden one. `add` refuses and fetches the same way: it installed a skill from a hidden folder without
-  a word, which every later `update` then refused.
+  `mkfifo .jig/skills-lock.json` did the same to `jig skills list`. `jig skills add`, `update` and `remove`
+  go by real path in the project as well, and refuse a name in the lockfile, which commands can write, that
+  isn't a skill's name: a name of `../..` made `remove` delete the project. Nor do they, or a skill the
+  model writes, change anything in a `.git` directory: each replaces a skill's folder whole, while the file
+  tools' check for `config` and hooks looks at one file, and in a review, `.jig/skills` linked to
+  `.git/modules` let `update` put a skill's files in place of a submodule's config. Nor what the sandbox
+  locks in a git directory by another name, or a folder holding it: they knew one only by the name `.git`,
+  and with `.jig/proposals/skills` linked into one made with `--separate-git-dir`, a proposal could replace
+  its hooks, or the whole of it. `update` skips an entry it refuses, or can't fetch or install, updates the
+  rest and exits non-zero: one entry a command wrote, with a bad name, a missing path or no fields at all,
+  used to stop it before the user's own skills. An entry can also point anywhere, and its question named
+  only the skill: it now names the URL or folder, a folder in the hidden paths (or holding one) is refused,
+  since its files would land where commands can read them, and only https, ssh and file URLs are fetched,
+  since git runs a program for some others (`ext::`, which jig keeps refused whatever git's config says),
+  and http and git URLs don't check whom they reach. In a review, a file URL to a hidden repository still
+  brought its files in: such a repository is now refused too, read from the URL as git reads it (decoded,
+  without its host), and every path goes by the system's real path (Node's takes `link/..` for the folder
+  holding the link). And with paths hidden, git reads a file URL's repository in the sandbox, where there
+  is one, since a `.git` file or the alternates there can lead it to a hidden one. `add` refuses and
+  fetches the same way: it installed a skill from a hidden folder without a word, which every later
+  `update` then refused.
 - **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's own
   process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed `git config core.fsmonitor`
   ran a program as jig on the next search, and it copied the API key. So jig runs git with fsmonitor and
@@ -220,7 +225,7 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   gone or broken, and those stay writable, as git changes them all the time. When the sandbox asked git, a
   command that moved `.git/HEAD` aside had the next session lock nothing there, and a command in that one
   could change the config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in
-  the background can still do it after jig has looked, and after a one-shot run nothing looks again. The
+  the background can still do it after jig has looked, until jig exits, and on macOS after that too. The
   search for the `.git` stops where git's does: at a bare repository, a git directory (`HEAD`, and
   `objects` and `refs` where its `commondir`, if any, leads) whose `config` says it is bare, and at
   `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's dotfiles repository for the project's,
@@ -244,13 +249,14 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   by running `git status` in it, which runs the programs its config names (a clean filter, say) outside the
   sandbox, and a command can make one. So jig's git only lists them, and `/undo` leaves the files in them
   as they are. Paths go back to git as the bytes it listed, on its standard input: on Linux a command can
-  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing. The
-  hidden paths are left out too, by where they really lead: a command could read a copy back out of the
-  store. And the sandbox hides jig's own directory from commands, but for the skills whose scripts the
-  model runs, since its snapshots (the hidden paths too, in those older versions took) and sessions hold
-  copies of every project's files. It hides it by path, so where it lies in a directory commands can
-  write in (a temp directory, in skill evals), the directories holding it there stay in place, as git's
-  do: in a review, a command moved one aside, and read the snapshots at their new path in the next.
+  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing. The hidden
+  paths are left out too, by where they really lead: a command could read a copy back out of the store.
+  With the project itself hidden, nothing is snapshotted and `/undo` is off. And the sandbox hides jig's
+  own directory from commands, but for the skills whose scripts the model runs, since its sessions and
+  snapshots hold copies of every project's files, and the snapshots older versions took hold the hidden
+  paths too. It hides it by path, so where it lies in a directory commands can write in (a temp directory,
+  in skill evals), the directories holding it there stay in place, as git's do: in a review, a command
+  moved one aside, and read the snapshots at their new path in the next.
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than
