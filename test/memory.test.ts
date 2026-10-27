@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { Worker } from "node:worker_threads";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
@@ -14,7 +16,7 @@ import { Permissions } from "../src/permissions.ts";
 import { loadInstructions } from "../src/prompt.ts";
 import type { Approve } from "../src/proposals.ts";
 import { lockedGitPaths } from "../src/sandbox.ts";
-import { findSecret, redactSecrets } from "../src/secrets.ts";
+import { findSecret } from "../src/secrets.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -260,15 +262,64 @@ describe("secrets", () => {
     for (const text of ordinary) assert.equal(findSecret(text), undefined, text);
   });
 
-  it("take time in proportion to the text, however it repeats a name", () => {
-    // 400 KB of token= took minutes to redact while a value's digit was looked for to the end of the run,
-    // from every name in it. Now that a name may end a word, a long word would too, read from every letter.
-    for (const piece of ["token=", "x_token=", "PGPASSWORD=", "a"]) {
-      const text = piece.repeat(Math.ceil(400_000 / piece.length));
-      const started = Date.now();
-      findSecret(text);
-      redactSecrets(text);
-      assert.ok(Date.now() - started < 1000, `${piece}: ${Date.now() - started} ms`);
+  it("aren't taken from code that names a variable or a type, as a skill's script would", () => {
+    // Refused, as in node_modules, once a name could end a word (authToken, AsteriskToken): after a space,
+    // a name that ends a statement or an argument, or goes on as a type or an expression.
+    const code = [
+      "this.authToken = authToken;",
+      "isBearerToken: boolean,",
+      "CancellationToken cancellationToken = default)",
+      "export type AsteriskToken = Token<SyntaxKind.AsteriskToken>;",
+      "asteriskToken: AsteriskToken | undefined",
+      "verifyAccessToken(token: string): Promise<AuthInfo>;",
+      "const clientSecret = isPublicClient ? undefined : randomSecret()",
+      "const workSecret = opts?.workSecret || readEnv('WORK_SECRET')",
+    ];
+    for (const text of code) assert.equal(findSecret(text), undefined, text);
+    // A name with a digit still counts, and so does a password that goes on after its ; , ) or < with more
+    // of a name, as Summer;Rain;2024 does, and one with no space before it, as in a command or a connection
+    // string.
+    const secrets = [
+      "this.authToken = hunter22hunter;",
+      "Staging DB: user admin, password: Summer;Rain;2024",
+      "password: Welcome,2024",
+      "(password: P)ssw0rd!)",
+      "secret = Hello<World42",
+      "password = PassWord<12345>",
+      "export PGPASSWORD=correcthorse; psql -h db.internal",
+      "Server=db.internal;Password=correcthorse;",
+    ];
+    for (const text of secrets) assert.equal(findSecret(text), "a password or token", text);
+  });
+
+  it("take time in proportion to the text, however it repeats a name", async () => {
+    // 400 KB of token= took about a minute to redact while a value's digit was looked for to the end of the
+    // run, from every name in it. Now that a name may end a word, 400 KB of one word would take minutes
+    // without the \b before it, read again from every letter. A regular expression can't be stopped in the
+    // thread it runs in, so a worker runs them, and is stopped after 5 seconds on one text.
+    const pieces = ["token=", "x_token=", "PGPASSWORD=", "a"];
+    const worker = new Worker(
+      `const { parentPort, workerData } = require("node:worker_threads");
+      import(workerData.secrets).then(({ findSecret, redactSecrets }) => {
+        for (const piece of workerData.pieces) {
+          const text = piece.repeat(Math.ceil(400_000 / piece.length));
+          const started = Date.now();
+          findSecret(text);
+          redactSecrets(text);
+          parentPort.postMessage(Date.now() - started);
+        }
+      });`,
+      { eval: true, workerData: { secrets: new URL("../src/secrets.ts", import.meta.url).href, pieces } },
+    );
+    try {
+      for (const piece of pieces) {
+        const [ms] = await once(worker, "message", { signal: AbortSignal.timeout(5000) }).catch((err: Error) => {
+          throw err.name === "AbortError" ? new Error(`${piece}: still running after 5 s`) : err;
+        });
+        assert.ok(ms < 1000, `${piece}: ${ms} ms`);
+      }
+    } finally {
+      await worker.terminate();
     }
   });
 });

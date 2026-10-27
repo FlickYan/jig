@@ -312,8 +312,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   wrong. `--no-memory` leaves memory out. What counts as a secret here: a key or token in the shape a
   provider gives out (`sk-`, `ghp_`, `glpat-`, `hf_`, `AIza` and others), a private key, a password
   assignment (`password=…`, `DB_PASSWORD=…`, `PGPASSWORD=…`, `"api_key": "…"`, but not a placeholder
-  like `${DB_PASSWORD}` or code that reads one, like `os.environ["DB_PASSWORD"]`), and a password in a URL,
-  unless its host is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
+  like `${DB_PASSWORD}`, code that reads one, like `os.environ["DB_PASSWORD"]`, or a variable or a type,
+  like `this.apiKey = apiKey;` or `token: CancellationToken,`), and a password in a URL, unless its host
+  is this machine or an example (`postgres://postgres:postgres@localhost` is fine).
   `jig sessions export` blanks out the same, and JWTs, but a password assignment only when its value has a
   digit in its first 100 characters and doesn't look like code (`token = tokens[i]`).
 

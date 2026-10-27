@@ -117,6 +117,16 @@ describe("exporting sessions as fine-tuning data", () => {
     assert.deepEqual(exported.example.messages[2], { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: command("[REDACTED]") }) } }] });
   });
 
+  it("blanks out a password on a line of its own in a command, which the call's arguments write after \\n", async () => {
+    // In the arguments' JSON a line break is \n, so \npassword reads as one word, npassword, which counts
+    // as PGPASSWORD does.
+    const command = (password: string, token: string) => `cat > .env <<EOF\nUSER=me\npassword=${password}\ntoken: ${token}\nEOF`;
+    const file = await sessionFile([start, message("user", "Set it up."), message("assistant", [call("t1", command("hunter22x", "abcd1234efgh"))]), message("user", [result("t1", "")]), message("assistant", [{ type: "text", text: "Done." }])]);
+    const exported = exportSession(file)!;
+    assert.equal(exported.redacted, 2);
+    assert.deepEqual(exported.example.messages[2], { role: "assistant", content: null, tool_calls: [{ id: "t1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: command("[REDACTED]", "[REDACTED]") }) } }] });
+  });
+
   it("exports a session from before jig recorded the system prompt and tools, and says so", async () => {
     const { system: _, tools: __, ...old } = start;
     const exported = exportSession(await sessionFile([old, message("user", "Hi."), message("assistant", [{ type: "text", text: "Hello." }])]))!;
@@ -211,5 +221,11 @@ describe("redacting secrets", () => {
     assert.deepEqual(redactSecrets(text), { text: redacted, count: 6 });
     const ordinary = 'POSTGRES_PASSWORD=${POSTGRES_PASSWORD}\n{"password": "", "token_count": 12345678}\nDB_PASSWORD = os.environ["DB_PASSWORD"]\nMAX_TOKENS=100000000';
     assert.deepEqual(redactSecrets(ordinary), { text: ordinary, count: 0 });
+  });
+
+  it("looks for a password's digit in the first 100 characters of its value", () => {
+    const value = (before: number) => `${"a".repeat(before)}1`;
+    assert.deepEqual(redactSecrets(`token=${value(99)}`), { text: "token=[REDACTED]", count: 1 });
+    assert.deepEqual(redactSecrets(`token=${value(100)}`), { text: `token=${value(100)}`, count: 0 });
   });
 });
