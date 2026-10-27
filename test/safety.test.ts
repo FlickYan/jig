@@ -844,14 +844,18 @@ describe("a background job in the session's PID namespace", { skip: sandboxProbl
     const proj = join(dir, "bg-sigkill");
     await mkdir(proj);
     const marker = join(proj, "survived");
+    const started = join(proj, "started");
     // A long command keeps jig busy; runJig's timeout SIGKILLs jig before the job's delay elapses. The keeper
     // dies with jig (--die-with-parent), the kernel ends the namespace, and the job never writes its marker.
-    const command = `(sleep 3; touch ${marker}) & echo started; sleep 30`;
+    // The timeout counts from jig's start: on a runner too slow to reach the command by then, there is no job
+    // to outlive jig, and the test says so rather than passing.
+    const command = `(sleep 3; touch ${marker}) & touch ${started}; sleep 30`;
     const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
     try {
-      const { code } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj, timeout: 1500 });
+      const { code } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj, timeout: 2500 });
       assert.equal(code, null, "jig was killed by the signal, running no handler");
-      await new Promise((done) => setTimeout(done, 3000));
+      assert.equal(existsSync(started), true, "the command, and its job, started before jig was killed");
+      await new Promise((done) => setTimeout(done, 3500));
       assert.equal(existsSync(marker), false, "the background job outlived a killed jig");
     } finally {
       api.close();
