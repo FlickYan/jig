@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
@@ -110,6 +110,7 @@ describe("AGENTS.md proposals", () => {
     await proposeInstructionsTool(yes).run({ new_string: "Use pnpm." }, context());
     assert.equal(await readFile(join(project, "CLAUDE.md"), "utf8"), "# Notes\n\nUse pnpm.\n");
     assert.ok(!existsSync(join(project, "AGENTS.md")));
+    await assert.rejects(proposeInstructionsTool(yes).run({ new_string: "token = ghp_abcdefghijklmnopqrstuvwxyz0123456789" }, context()), /; CLAUDE\.md must not contain secrets\.$/);
   });
 
   it("edit the CLAUDE.md jig follows in place of an AGENTS.md that isn't a regular file", async () => {
@@ -120,6 +121,29 @@ describe("AGENTS.md proposals", () => {
     assert.match(await proposeInstructionsTool(async (title) => (shown.push(title), true)).run({ new_string: "Use pnpm." }, context()), /^Edited CLAUDE\.md\./);
     assert.deepEqual(shown, ["Edit CLAUDE.md?"]);
     assert.deepEqual(loadInstructions(project).instructions, [{ path: "CLAUDE.md", text: "# Notes\n\nUse pnpm." }]);
+  });
+
+  it("aren't written to a named pipe a command put in the file's place while the user read the diff", async () => {
+    // jig reads the file before it asks and writes it once approved, outside the sandbox, and a job a command
+    // left in the background can make a named pipe there meanwhile: jig waited on it for a reader for good.
+    // The approver here makes it. In a child process, so that a hang fails the test rather than stopping
+    // the suite.
+    const agents = join(project, "AGENTS.md");
+    await writeFile(agents, "# Rules\n");
+    const script = `
+      import { execFileSync } from "node:child_process";
+      import { rmSync } from "node:fs";
+      import { proposeInstructionsTool } from ${JSON.stringify(new URL("../src/instructions-proposals.ts", import.meta.url).href)};
+      const agents = ${JSON.stringify(agents)};
+      const swap = async () => (rmSync(agents), execFileSync("mkfifo", [agents]), true);
+      try {
+        console.log(await proposeInstructionsTool(swap).run({ new_string: "Use pnpm." }, { cwd: ${JSON.stringify(project)} }));
+      } catch (err) {
+        console.log(err.message);
+      }`;
+    const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 20_000, killSignal: "SIGKILL" });
+    assert.equal(child.signal, null, `it waited on the named pipe until it was killed: ${child.stdout}${child.stderr}`);
+    assert.equal(child.stdout, "AGENTS.md isn't a regular file any more (a named pipe, say), so the edit wasn't made. A command may have put it there.\n", child.stderr);
   });
 
   it("go by where AGENTS.md really leads: never out of the project, and the question names the file", async () => {

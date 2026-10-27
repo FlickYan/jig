@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -367,6 +368,31 @@ describe("jig review", () => {
       } finally {
         server.closeAllConnections();
         server.close();
+      }
+    }
+  });
+
+  it("kills the command still running when a signal ends it, as a task's exit does", async () => {
+    // A command runs in a process group of its own, which a signal to jig doesn't reach, and through --exec
+    // it may run on this machine, as here: it went on running, and one still making files in jig's directory
+    // kept that from being removed. The command signals jig (--exec runs bash itself, so $PPID is jig), then
+    // waits for the test's word to leave a file behind.
+    for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"] as const) {
+      const dir = await tempDir("jig-review-cli-");
+      const temp = await tempDir("jig-review-tmp-");
+      const [go, outlived] = [join(dir, "go"), join(dir, "outlived")];
+      const command = `kill -${signal} $PPID; until [ -e '${go}' ]; do sleep 0.05; done; touch '${outlived}'`;
+      const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
+      try {
+        const args = ["review", "--session", await session(dir), "--exec", "bash -c", "--model", "claude-haiku-4-5", "--out", join(dir, "verdict.json")];
+        const { code, output } = await runJig(args, { api, cwd: dir, env: { TMPDIR: temp } });
+        await writeFile(go, ""); // first, so a command that outlived jig doesn't wait forever
+        await new Promise((done) => setTimeout(done, 500)); // a moment for the command, had it outlived jig
+        assert.equal(code, 128 + constants.signals[signal], `${signal}: ${output}`);
+        assert.equal(existsSync(outlived), false, `the command outlived jig after ${signal}`);
+        assert.deepEqual((await readdir(temp)).filter((name) => name.startsWith("jig-")), [], `${signal} left jig's directory behind`);
+      } finally {
+        api.close();
       }
     }
   });

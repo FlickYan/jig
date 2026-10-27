@@ -1,3 +1,4 @@
+import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { mergeSettings, readSettings } from "./settings.ts";
@@ -66,6 +67,8 @@ export async function skillsCommand(args: string[]): Promise<void> {
   const confirm = (question: string) => (values.yes ? Promise.resolve(true) : ask(question));
 
   if (values.help || !command) return console.log(SKILLS_HELP);
+  // Checked first: add --project went as far as showing the skills, then stopped with a bare ENOENT.
+  if (!existsSync(project) || !statSync(project).isDirectory()) throw new Error(`-C: ${project} isn't a folder.`);
   if (command === "list") return list(project);
   if (command === "add") {
     if (rest.length !== 1) throw new Error("Usage: jig skills add <source>. See jig skills --help.");
@@ -77,9 +80,10 @@ export async function skillsCommand(args: string[]): Promise<void> {
     for (const { message } of problems) ui.notice(message);
     const skill = skills.find((s) => s.name === rest[0]);
     if (!skill) throw new Error(`No skill "${rest[0]}" was installed with jig skills add. (Skills you wrote yourself are folders: delete the folder.)`);
-    await skillDirForChange(skill.scope, project, skill.name); // refused before anyone is asked
+    const hidden = hiddenPaths(project);
+    await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before anyone is asked
     if (!(await confirm(`Remove the skill "${skill.name}" (${skill.dir})? [y/N] `))) return ui.notice("Kept it.");
-    await removeSkill(skill, project);
+    await removeSkill(skill, project, hidden);
     return ui.notice(`Removed ${skill.name}.`);
   }
   if (command === "update") return update(project, rest, confirm);
@@ -147,10 +151,10 @@ async function add(spec: string, { project, scope, only, ref, path, force, confi
     const valid = infos.filter((info) => !info.problems.length);
     if (!valid.length) throw new Error("None of these skills follows the Agent Skills format, so nothing was installed.");
     const where = skillsDir(scope, project);
-    for (const info of valid) await skillDirForChange(scope, project, info.name); // refused before anyone is asked
+    for (const info of valid) await skillDirForChange(scope, project, info.name, hidden); // refused before anyone is asked
     const what = valid.length === 1 ? `the skill "${valid[0].name}"` : `these ${valid.length} skills`;
     if (!(await confirm(`Install ${what} into ${where}? [y/N] `))) return ui.notice("Nothing installed.");
-    for (const info of valid) ui.notice(`Installed ${info.name} in ${await installSkill(info, source, fetched, { scope, project, force })}.`);
+    for (const info of valid) ui.notice(`Installed ${info.name} in ${await installSkill(info, source, fetched, { scope, project, force, hidden })}.`);
     if (valid.some((info) => info.scripts.length)) ui.println(ui.dim("Its scripts run only when the model runs them, in the sandbox and under your permission mode."));
   } finally {
     fetched.cleanup();
@@ -184,7 +188,7 @@ async function update(project: string, names: string[], confirm: (question: stri
     let fetched: Fetched | undefined;
     let asking = false;
     try {
-      await skillDirForChange(skill.scope, project, skill.name); // refused before it is fetched, or anyone asked
+      await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before it is fetched, or anyone asked
       const source = lockedSource(skill.entry, hidden);
       fetched = fetchSource(source, hidden);
       const [dir] = findSkills(fetched.dir, 0);
@@ -208,7 +212,7 @@ async function update(project: string, names: string[], confirm: (question: stri
       const yes = await confirm(`Update ${skill.name} from ${source.url ?? source.path}? [y/N] `);
       asking = false;
       if (!yes) continue;
-      await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });
+      await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true, hidden });
       ui.notice(`Updated ${skill.name}.`);
     } catch (err) {
       if (asking) throw err;

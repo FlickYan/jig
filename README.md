@@ -177,25 +177,27 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `--separate-git-dir`, say), with the sandbox off too. An approved AGENTS.md edit goes by real
   path too (the question names the file an AGENTS.md link
   leads to), and so do a skill the model wrote and what `jig skills add`, `update` and `remove` change in
-  the project, which also never go into a `.git` directory, where a skill's folder could be a submodule's
-  git directory, nor into what the sandbox keeps read-only in one by another name, nor replace a folder
-  holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
+  the project, which also never go into a path the settings hide or a `.git` directory, where a skill's
+  folder could be a submodule's git directory, nor into what the sandbox keeps read-only in one by another
+  name, nor replace a folder holding it. `jig skills` refuses a name in the lockfile that isn't a skill's name, since commands can
   write the lockfile; `update` says why it skips an entry it refuses or can't fetch, updates the rest, and
   exits non-zero. An entry can point anywhere, so its question names the URL or folder a skill would come
   from; it refuses a folder, or a file URL's repository, that the hidden paths hide or that holds one, and
   has git read such a repository in the sandbox, which hides them from git too (a `.git` file in it can
   lead git elsewhere). `add` does the same, so it doesn't install what `update` would refuse, and both take
-  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the skills
-  lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
-  writing through it (a linked folder on the way is still followed); a `--stats` path in `/dev` or `/proc`,
+  only https, ssh and file URLs (git runs a program for some others). The `--stats` file and the project's
+  skills lockfile are written anew and renamed into place, which replaces a link or a named pipe instead of
+  writing through it (a linked folder on the way is still followed, as is a link in place of your own
+  lockfile, which commands can't write); a `--stats` path in `/dev` or `/proc`,
   such as `/dev/stdout` or a process substitution's `/dev/fd/63`, is written to. What
   jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files the sandbox
   watches, the skills lockfile and the installed skills' files) it reads only if it is a regular file: a
   named pipe a command made there would have jig wait until it was killed, and a link to `/dev/zero` never
   ends. Such an AGENTS.md or skill is left out, and jig says so; in place of such an AGENTS.md it follows,
-  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. A settings file is
-  refused, a lockfile or a skill's file is reported and its skills left as they are, and a git file is
-  reported by what it is. `read_file` and `edit_file` likewise
+  and proposes edits to, the `CLAUDE.md` beside it, if that is a regular file. An approved edit is written
+  only to a regular file too, so a named pipe a command makes there while you read the diff is refused.
+  A settings file is refused, a lockfile or a skill's file is reported and its skills left as they are,
+  and a git file is reported by what it is. `read_file` and `edit_file` likewise
   open only a regular file, and tell the model so. `grep` and `glob` leave out what git ignores, and
   folders like `node_modules/`, `dist/` and `build/` that git doesn't track, but search such a path when
   they are given it (`node_modules/pkg`, all of it if git ignores it). The git they run to list files runs

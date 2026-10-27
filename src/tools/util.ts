@@ -1,6 +1,6 @@
 import { constants } from "node:buffer";
 import { randomBytes } from "node:crypto";
-import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "../paths.ts";
@@ -215,6 +215,32 @@ export function readRegularBytes(path: string, max = Infinity): { bytes: Buffer;
       read += n;
     }
     return { bytes: bytes.subarray(0, read), size };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Writes text to the file a path leads to, through its links, if that is a regular file or nothing yet (it
+ * is then made), and returns false, writing nothing, if it is anything else. readRegularFile's rule, for a
+ * file jig read a while before: a command may have put a named pipe in its place since, and writing to that
+ * would have jig wait for a reader for good. So it is opened without waiting, and checked again once open,
+ * before anything in it changes.
+ */
+export function writeRegularFile(path: string, text: string): boolean {
+  if (statSync(path, { throwIfNoEntry: false })?.isFile() === false) return false;
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_NONBLOCK);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENXIO") return false; // a named pipe no one reads
+    throw error;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) return false;
+    ftruncateSync(fd);
+    writeFileSync(fd, text);
+    return true;
   } finally {
     closeSync(fd);
   }

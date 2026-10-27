@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
@@ -195,14 +195,18 @@ export function readLock(scope: InstallScope, project: string): Record<string, L
 }
 
 /**
- * Written anew and renamed into place (see writeAnew): the project's lockfile is within a command's reach,
- * and a named pipe a job left in the background put there after readLock would have jig wait for good.
+ * The project's lockfile is written anew and renamed into place (see writeAnew): it is within a command's
+ * reach, and a named pipe a job left in the background put there after readLock would have jig wait for
+ * good. The user's is written through a link: commands can't write jig's own directory, and renaming
+ * replaced a link to one kept elsewhere (in a dotfiles repository, say), which then stopped getting updates.
  */
 function writeLock(scope: InstallScope, project: string, skills: Record<string, LockEntry>): void {
   const path = lockPath(scope, project);
   mkdirSync(dirname(path), { recursive: true });
   const sorted = Object.fromEntries(Object.entries(skills).sort(([a], [b]) => a.localeCompare(b)));
-  writeAnew(path, `${JSON.stringify({ version: 1, skills: sorted }, null, 2)}\n`);
+  const text = `${JSON.stringify({ version: 1, skills: sorted }, null, 2)}\n`;
+  if (scope === "project") writeAnew(path, text);
+  else writeFileSync(path, text);
 }
 
 /**
@@ -241,21 +245,28 @@ export async function assertInProject(project: string, path: string, hidden: str
  * A skill's folder, checked before jig replaces or removes it, and in the project the lockfile with it
  * (see assertInProject). In either scope the name must be a skill's name, since the lockfile's names come
  * from a file commands can write: "../.." would be the project itself. And the lockfile, which jig then
- * rewrites, must be a regular file (see readLock).
+ * rewrites, must be a regular file (see readLock). In the project, neither may be in the settings' hidden
+ * paths (`hidden`): with .jig/skills linked into one, jig would write a skill into a folder commands can't
+ * read, or remove one from it.
  */
-export async function skillDirForChange(scope: InstallScope, project: string, name: string): Promise<string> {
+export async function skillDirForChange(scope: InstallScope, project: string, name: string, hidden: string[] = []): Promise<string> {
   const dir = join(skillsDir(scope, project), name);
   const lock = lockPath(scope, project);
   if (nameProblems(name).length) throw new Error(`"${name}" in ${lock} isn't a skill's name, so jig won't change ${dir}. A command may have put it there.`);
-  if (scope === "project") for (const path of [dir, lock]) await assertInProject(project, path);
+  if (scope === "project") for (const path of [dir, lock]) await assertInProject(project, path, hidden);
   readLock(scope, project);
   return dir;
 }
 
 /** Copies a fetched skill into place and records it in the lockfile. Returns where it went. */
-export async function installSkill(info: SkillInfo, source: SkillSource, fetched: Fetched, { scope, project, force = false }: { scope: InstallScope; project: string; force?: boolean }): Promise<string> {
+export async function installSkill(
+  info: SkillInfo,
+  source: SkillSource,
+  fetched: Fetched,
+  { scope, project, force = false, hidden = [] }: { scope: InstallScope; project: string; force?: boolean; hidden?: string[] },
+): Promise<string> {
   if (info.problems.length) throw new Error(`The skill in ${info.dir} doesn't follow the Agent Skills format: ${info.problems.join(" ")}`);
-  const target = await skillDirForChange(scope, project, info.name);
+  const target = await skillDirForChange(scope, project, info.name, hidden);
   if (existsSync(target) && !force) throw new Error(`There is already a skill "${info.name}" in ${target} (--force replaces it).`);
   rmSync(target, { recursive: true, force: true }); // a link in its place is removed, not what it leads to
   mkdirSync(dirname(target), { recursive: true });
@@ -300,8 +311,8 @@ export function installedSkills(project: string): { skills: Installed[]; problem
 }
 
 /** Uninstalls a skill added with `jig skills add`: its folder and its lockfile entry. */
-export async function removeSkill(skill: Installed, project: string): Promise<void> {
-  rmSync(await skillDirForChange(skill.scope, project, skill.name), { recursive: true, force: true });
+export async function removeSkill(skill: Installed, project: string, hidden: string[] = []): Promise<void> {
+  rmSync(await skillDirForChange(skill.scope, project, skill.name, hidden), { recursive: true, force: true });
   const lock = readLock(skill.scope, project);
   delete lock[skill.name];
   writeLock(skill.scope, project, lock);
