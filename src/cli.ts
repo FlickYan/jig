@@ -315,7 +315,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   // Extensions: skills, the MCP servers' tools, hooks, and subagents.
   // jig's own skills are for writing skills; a plain one-shot task (a benchmark's, say) sees only yours.
-  const skillOptions = { hidden: values["hide-skill"], ...(taskText && !skillsVerb && { builtin: null }) };
+  const skillOptions = { hidden: values["hide-skill"], hiddenPaths: settings.hiddenPaths, dirs, ...(taskText && !skillsVerb && { builtin: null }) };
   let { skills, warnings } = discoverSkills(cwd, undefined, skillOptions);
   for (const warning of warnings) ui.notice(warning);
   const mcp = await connectMcpServers(settings.mcpServers, cwd);
@@ -584,12 +584,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   /**
-   * A skill's instructions, or a notice and undefined if its SKILL.md is gone (or is a named pipe) since
-   * jig found it: a command or a checkout can do that mid-session, and it is no reason to end the session.
+   * A skill's instructions, or a notice and undefined if its SKILL.md is gone (or is a named pipe, or a link
+   * where the file tools don't read) since jig found it: a command or a checkout can do that mid-session,
+   * and it is no reason to end the session.
    */
   function skillContent(skill: Skill): string | undefined {
     try {
-      return loadSkill(skill);
+      return loadSkill(skill, settings.hiddenPaths, [cwd, ...dirs]);
     } catch (err) {
       ui.notice((err as Error).message);
       return undefined;

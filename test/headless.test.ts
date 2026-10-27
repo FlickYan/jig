@@ -102,6 +102,42 @@ describe("hiddenPaths", () => {
       api.close();
     }
   });
+
+  it("keep a skill out of the catalog and of /<skill>, as jig's own directory does", async () => {
+    // A command can link a project skill's SKILL.md to a hidden file, or to another project's memory, whose
+    // name and description would otherwise reach the next session's catalog.
+    const home = await tempDir("jig-home-");
+    await writeFile(join(home, "settings.json"), JSON.stringify({ hiddenPaths: [outside] }));
+    await writeFile(join(outside, "notes.md"), "---\nname: notes\ndescription: The hidden notes.\n---\nHidden.\n");
+    const memory = join(home, "memory", "project", "other", "deploy.md");
+    await mkdir(join(memory, ".."), { recursive: true });
+    await writeFile(memory, "---\nname: deploy\ndescription: Deploy with the key in vault 7.\n---\nAnother project's memory.\n");
+    const skills = join(project, ".jig", "skills");
+    for (const [name, target] of [["noted", join(outside, "notes.md")], ["remembered", memory]]) {
+      await mkdir(join(skills, name), { recursive: true });
+      await symlink(target, join(skills, name, "SKILL.md"));
+    }
+    await mkdir(join(skills, "release"));
+    await writeFile(join(skills, "release", "SKILL.md"), "---\nname: release\ndescription: Cut a release.\n---\nBump it.\n");
+    // Mid-session a command links the release skill's SKILL.md too, which /release loads without the skill tool.
+    const link = { tool: "bash", input: { command: `ln -sf ${memory} .jig/skills/release/SKILL.md` } };
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [link] : [{ text: "Done." }]));
+    try {
+      const stdin = "Link it.\n/release\n";
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"], { api, cwd: project, stdin, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      const system = systemText(api.requests[0] as { system?: string });
+      assert.match(system, /<skill name="release">/);
+      assert.doesNotMatch(system, /hidden notes|vault 7/);
+      assert.match(output, /Skipped the skill in \S+\/noted: its SKILL\.md leads into a path the settings hide\./);
+      assert.match(output, /Skipped the skill in \S+\/remembered: its SKILL\.md leads into jig's own directory\./);
+      assert.match(output, /^> The skill "release" isn't loaded: its SKILL\.md leads into jig's own directory\.$/m);
+      assert.equal(api.requests.length, 2, output);
+      assert.doesNotMatch(JSON.stringify(api.requests), /Another project's memory/);
+    } finally {
+      api.close();
+    }
+  });
 });
 
 describe("a git directory by another name", () => {

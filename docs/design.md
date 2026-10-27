@@ -119,7 +119,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   What the sandbox hides from commands the tools refuse by real path instead, with the sandbox off too: the
   hidden paths, and jig's own directory but for its skills (in a review, `read_file` and `grep` read
   another project's session through a link a command made to it; the `skill` tool's files go the same
-  way). A `.git` directory's `config` and hooks, and the files that say where they are, are never
+  way, and so does finding skills, or a `SKILL.md` linked to another project's memory would put its name
+  and description in the next session's catalog). Its skills they read but don't change, as commands
+  can't: in a home-directory project, `write_file` could plant one that every later session offers. But
+  skills linked out of it they change where the link leads, as commands can: refusing them there stopped
+  edits to skills kept in a dotfiles repository. A
+  `.git` directory's `config` and hooks, and the files that say where they are, are never
   changed, since git runs the programs they name outside the sandbox. The tools know a git directory by
   that name, and by what the sandbox locks, worked
   out once a session whether there is a sandbox or not: in a review, `write_file` put a hook in one made

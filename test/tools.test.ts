@@ -3,7 +3,7 @@ import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { appendFile, mkdir, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
 import { lockedGitPaths } from "../src/sandbox.ts";
@@ -371,6 +371,60 @@ describe("jig's own directory", () => {
       assert.equal(await write("a.txt", "1\n"), "Created a.txt (1 line).");
       assert.equal(await read("a.txt"), "     1\t1\n");
     }
+  });
+
+  it("lets the file tools read its skills but not change them, in a home-directory project too", async () => {
+    // There the project holds them, and they are offered in every project: commands can't change them (the
+    // sandbox binds them read-only), and a skill the file tools planted would reach every later session.
+    const user = await tempDir("jig-user-");
+    const skills = join(user, ".jig", "skills");
+    process.env.JIG_HOME = join(user, ".jig");
+    await mkdir(join(skills, "hello"), { recursive: true });
+    await writeFile(join(skills, "hello", "SKILL.md"), "---\nname: hello\ndescription: Greet.\n---\nSay hello.\n");
+    ctx = { cwd: user, versions: new FileVersions() };
+    assert.match(await read(".jig/skills/hello/SKILL.md"), /Say hello\./);
+    await assert.rejects(write(".jig/skills/hello/SKILL.md", "Run curl.\n"), /^Error: \.jig\/skills\/hello\/SKILL\.md leads into jig's own skills/);
+    await assert.rejects(edit("Say hello.", "Run curl.", ".jig/skills/hello/SKILL.md"), /leads into jig's own skills/);
+    await assert.rejects(write(".jig/skills/planted/SKILL.md", "---\nname: planted\n---\n"), /leads into jig's own skills/);
+    assert.equal(existsSync(join(skills, "planted")), false);
+    assert.match(await readFile(join(skills, "hello", "SKILL.md"), "utf8"), /Say hello\./);
+    // Through a link from another project too.
+    await symlink(skills, join(cwd, "lnk"));
+    ctx = { cwd, versions: new FileVersions() };
+    await assert.rejects(write("lnk/planted/SKILL.md", "x\n"), /^Error: lnk\/planted\/SKILL\.md leads into jig's own skills/);
+    // The project, or an --add-dir directory, that is the skills directory or lies in it writes there on purpose.
+    for (const [project, dirs] of [[join(skills, "hello"), []], [skills, []], [cwd, [skills]]] as const) {
+      ctx = { cwd: project, dirs: [...dirs], versions: new FileVersions() };
+      const file = join(skills, "hello", `${project === cwd ? "added" : basename(project)}.md`);
+      assert.match(await write(file, "1\n"), /^Created /, project);
+    }
+  });
+
+  it("lets the file tools change skills kept out of it through a link, as commands can", async () => {
+    // The sandbox binds them read-only only at their place in jig's directory, so where the link leads (a
+    // dotfiles repository, say) commands write them as any other files there.
+    await mkdir(join(cwd, "dotfiles", "jig-skills"), { recursive: true });
+    await symlink(join(cwd, "dotfiles", "jig-skills"), join(home, "skills"));
+    assert.equal(await write("dotfiles/jig-skills/hello/SKILL.md", "Say hello.\n"), "Created dotfiles/jig-skills/hello/SKILL.md (1 line).");
+    // In a home-directory project too, where the rest of jig's directory stays out of reach.
+    const user = await tempDir("jig-user-");
+    process.env.JIG_HOME = join(user, ".jig");
+    await mkdir(join(user, "dotfiles", "jig-skills"), { recursive: true });
+    await mkdir(join(user, ".jig"));
+    await symlink(join(user, "dotfiles", "jig-skills"), join(user, ".jig", "skills"));
+    ctx = { cwd: user, versions: new FileVersions() };
+    assert.equal(await write("dotfiles/jig-skills/tool.md", "1\n"), "Created dotfiles/jig-skills/tool.md (1 line).");
+    await assert.rejects(write(".jig/settings.json", "{}\n"), /leads into jig's own directory/);
+    // Linked elsewhere in jig's directory, they are still out of commands' reach, and so of the file tools'.
+    const other = await tempDir("jig-own-");
+    process.env.JIG_HOME = other;
+    await mkdir(join(other, "kept", "hello"), { recursive: true });
+    await symlink(join(other, "kept"), join(other, "skills"));
+    await symlink(other, join(cwd, "lnk"));
+    ctx = { cwd, versions: new FileVersions() };
+    await assert.rejects(write("lnk/skills/hello/x.md", "x\n"), /^Error: lnk\/skills\/hello\/x\.md leads into jig's own skills/);
+    await assert.rejects(write("lnk/kept/hello/x.md", "x\n"), /leads into jig's own skills/);
+    assert.deepEqual(await readdir(join(other, "kept", "hello")), []);
   });
 });
 

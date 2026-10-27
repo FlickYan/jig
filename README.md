@@ -152,9 +152,12 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
 
   Commands can't read jig's own directory (`~/.jig`) but for its skills, whose scripts the model runs,
   nor can the file tools: its snapshots and sessions hold copies of your projects' files, and the
-  snapshots older versions of jig took, of the hidden paths too (see Rules). A project inside it (a skill
-  you are writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in
-  a temp directory, say), they can't move it aside either, nor a directory holding it there.
+  snapshots older versions of jig took, of the hidden paths too (see Rules). Neither can change its
+  skills, even in a home-directory project: each skill there is offered in every project. If
+  `~/.jig/skills` is a link out of it (into a dotfiles repository, say), both change them where the link
+  leads, like any other files there. A project or `--add-dir` directory inside it (a skill you are
+  writing, say) stays as it was. Where it lies in a directory commands can write in (`JIG_HOME` in a temp
+  directory, say), they can't move it aside either, nor a directory holding it there.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
@@ -170,7 +173,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   its path really leads, so a symlink in the project can't take it outside; reading may follow a link out,
   as commands can read what it leads to too. But wherever a link leads, and with the sandbox off too, they
   refuse what the sandbox hides from commands: the hidden paths in the settings (below), and jig's own
-  directory but for its skills (so does the `skill` tool, for a skill's files). They don't change a
+  directory but for its skills, which they read but don't change. So does the `skill` tool, for a skill's
+  files, and so does finding skills: one whose `SKILL.md` leads there is left out, with a warning (another
+  project's memory has a name and a description too). They don't change a
   `.git` directory's `config` or hooks, or the files that tell git where they are (`.git` files,
   `commondir`, `config.worktree`, a worktree's `gitdir`), which could make git run programs outside the
   sandbox; nor what the sandbox keeps read-only in a git directory by another name (one made with
