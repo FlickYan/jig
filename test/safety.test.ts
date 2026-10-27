@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
-import { createSandbox, gitControl, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
+import { createSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
@@ -80,6 +80,22 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     } finally {
       await rm(hidden, { recursive: true, force: true });
       await rm(shown, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the directories holding a hidden path in place, where commands can write", async () => {
+    // Hidden by its path: moved aside with a directory holding it, a file was out of the next command's mask.
+    const config = join(project, "config");
+    await mkdir(join(config, "keys"), { recursive: true });
+    await writeFile(join(config, "keys", ".env"), "TOKEN=moved-out-of-hiding\n");
+    const sandbox = createSandbox(project, { network: false, hidden: [join(config, "keys", ".env")] })!;
+    try {
+      for (const path of ["config/keys", "config"]) assert.match(await run(`mv ${path} ${path}-moved`, sandbox), /Exit code: [1-9]/, path);
+      assert.doesNotMatch(await run("cat config-moved/keys/.env config/keys-moved/.env config/keys/.env", sandbox), /moved-out-of-hiding/);
+      assert.match(await run("mkdir other && mv other other-moved && echo moved", sandbox), /^moved/);
+    } finally {
+      sandbox.close?.();
+      for (const path of ["config", "config-moved", "other", "other-moved"]) await rm(join(project, path), { recursive: true, force: true });
     }
   });
 
@@ -878,6 +894,14 @@ describe("the macOS sandbox's profile", () => {
     }
   });
 
+  it("keeps the directories holding a hidden path in place, where it lies in a writable directory", () => {
+    // Denied by its path: moved aside with a directory holding it, it would be out of the rule's reach.
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, ["/p/a/b/key", "/p/c", "/u/.ssh"]);
+    const fixed = '(deny file-write-unlink (literal "/p/a") (literal "/p/a/b"))';
+    assert.ok(profile.split("\n").includes(fixed), profile);
+    assert.ok(profile.indexOf(fixed) > profile.indexOf("(allow file-write* "), "after the rule it overrides, since the last rule wins");
+  });
+
   it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {
     const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
     try {
@@ -1024,6 +1048,33 @@ describe("the macOS sandbox's profile", () => {
         writer.kill();
       }
     } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("starts where a submodule's checkout is a file, a link to itself or a directory it can't search, and locks its .git", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    const checkout = join(base, "repo", "libs", "s");
+    try {
+      const repo = await repoWithSubmodule(base);
+      const dotGit = join(await realpath(repo), "libs", "s", ".git");
+      // Looking for its .git threw ENOTDIR, ELOOP or EACCES, which stopped jig starting, with the sandbox or without.
+      const locks = (what: string) => {
+        assert.ok(gitControl(repo)?.locked.includes(dotGit), what);
+        lockedGitPaths(repo);
+      };
+      // git keeps a submodule's git directory, and the core.worktree that names its checkout, once the checkout is gone.
+      await rm(checkout, { recursive: true });
+      await writeFile(checkout, "");
+      locks("a file");
+      await rm(checkout);
+      await symlink("s", checkout); // as a command can leave it
+      locks("a link to itself");
+      await rm(checkout);
+      await mkdir(checkout, { mode: 0 });
+      locks("a directory it can't search");
+    } finally {
+      await chmod(checkout, 0o755).catch(() => {});
       await rm(base, { recursive: true, force: true });
     }
   });

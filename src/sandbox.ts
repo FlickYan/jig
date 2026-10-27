@@ -302,10 +302,19 @@ function checkoutTrees(modules: string[]): Map<string, string> {
   return trees;
 }
 
-/** A work tree's .git by its real path (Seatbelt sees no other), unless it is a directory: then it is a repository of its own. */
+/**
+ * A work tree's .git by its real path (Seatbelt sees no other), unless it is a directory: then it is a
+ * repository of its own. Where the work tree is a file, a link to itself or a directory jig can't search,
+ * as a submodule's checkout can be once git has left its git directory behind, it is locked as one that
+ * isn't there yet: looking threw, which stopped jig starting, the sandbox or not.
+ */
 function dotGitIn(tree: string): string | undefined {
   const path = join(existsSync(tree) ? realpathSync(tree) : tree, ".git");
-  return lstatSync(path, { throwIfNoEntry: false })?.isDirectory() ? undefined : path;
+  try {
+    return lstatSync(path, { throwIfNoEntry: false })?.isDirectory() ? undefined : path;
+  } catch {
+    return path; // ENOTDIR, ELOOP or EACCES
+  }
 }
 
 /**
@@ -457,6 +466,8 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     // others with files of the command's own could take their place.
     ...deny("file-write*", git?.locked.map((path) => `(${basename(path) === "hooks" ? "subpath" : "literal"} ${quote(path)})`)),
     ...deny("file-write-unlink", git?.fixed.map((dir) => `(literal ${quote(dir)})`)),
+    // The hidden paths are denied by path, so the directories holding them in a writable one stay in place.
+    ...deny("file-write-unlink", holding(hidden, writable).map((dir) => `(literal ${quote(dir)})`)),
     // Last, so that it wins over the rules before it: reading and writing alike.
     ...hidden.map((path) => `(deny file-read* file-write* (subpath ${quote(path)}))`),
   ].join("\n");
@@ -519,6 +530,15 @@ function ownFixed(home: string, writable: string[]): string[] {
 }
 
 /**
+ * The directories between each hidden path and a writable directory it lies in, the outermost first, kept
+ * in place as ownFixed has jig's: the sandbox hides a path by its path, so a command could move one aside,
+ * the hidden path with it (config, holding config/.env), and read it at its new path in the next command.
+ */
+function holding(hidden: string[], writable: string[]): string[] {
+  return [...new Set(hidden.flatMap((path) => ownFixed(path, writable)))].sort((a, b) => a.length - b.length);
+}
+
+/**
  * A Seatbelt rule denying an operation on what the filters match, if there are any: with none, it would deny
  * it everywhere. A repository around a bare one may have no directories fixed (see aroundControl).
  */
@@ -554,6 +574,9 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     "--dev", "/dev",
     "--proc", "/proc",
     ...writable.flatMap((dir) => ["--bind", dir, dir]),
+    // Mount points a command can't move aside (see holding), before jig's and git's binds: bound after
+    // them, one would show what those cover again. Only what exists, as binding a path that doesn't fails.
+    ...holding(hidden, writable).filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
     ...(home ? ownBinds(home, writable) : []),
     ...(git ? gitBinds(git, shown) : []),
     ...hiding,
