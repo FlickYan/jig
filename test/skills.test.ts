@@ -1022,6 +1022,63 @@ describe("testing a skill", () => {
     }
   });
 
+  /** A fake API whose model runs `command` once, then is done. */
+  const runsOnce = (command: string) => fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+
+  it("keeps the links among the files of a skill in jig's directory, in its eval's files and in the skill the eval gets", async () => {
+    // cpSync made a relative link absolute, leading back into the skill's folder, which the eval hides
+    // when it lies in the user's jig directory: the eval's link.txt led nowhere, and so did the skill's
+    // scripts/tool.sh, which the skill has the model run.
+    const skillDir = await writeSkill(join(process.env.JIG_HOME!, "skills"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/basic/data.txt": "DATA-OK\n",
+      "bin/tool.sh": "echo TOOL-OK\n",
+      "evals/evals.json": JSON.stringify({ evals: [{ prompt: "Probe.", files: ["evals/files/basic"], check: "grep -q DATA-OK link.txt" }] }),
+    });
+    await symlink("data.txt", join(skillDir, "evals", "files", "basic", "link.txt"));
+    await mkdir(join(skillDir, "scripts"));
+    await symlink(join("..", "bin", "tool.sh"), join(skillDir, "scripts", "tool.sh"));
+    const api = await runsOnce('echo "[$(cat link.txt 2>&1)] [$(bash "$JIG_HOME/skills/probe/scripts/tool.sh" 2>&1)]"');
+    const { stop } = collectNotices("never printed");
+    try {
+      const runs = await testSkill(dir, "probe", testOptions(api));
+      assert.deepEqual(runs.map((run) => [run.arm, run.check]), [["with", true], ["without", true]]);
+      assert.match(JSON.stringify(api.requests[1]), /\[DATA-OK\] \[TOOL-OK\]/, "with the skill, the model read the eval's link and ran the skill's");
+      assert.match(JSON.stringify(api.requests[3]), /\[DATA-OK\] /);
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("makes a link that leads out of what an eval copies lead where it did, from its real folder", async () => {
+    // A skill's folder linked into jig's directory from elsewhere by a relative link, and an eval's file
+    // linking to one beside the folder it copies: kept as they are, these links lead nowhere from their
+    // copies; and the file's, made absolute from its path through the skill's link in jig's directory, led
+    // through the folder the eval hides.
+    const skillDir = await writeSkill(join(dir, "store"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/shared.txt": "SHARED-OK\n",
+      "evals/files/basic/a.txt": "a\n",
+      "bin/tool.sh": "echo TOOL-OK\n",
+      "evals/evals.json": JSON.stringify({ evals: [{ prompt: "Probe.", files: ["evals/files/basic"], check: "grep -q SHARED-OK up.txt" }] }),
+    });
+    await symlink(join("..", "shared.txt"), join(skillDir, "evals", "files", "basic", "up.txt"));
+    await mkdir(join(skillDir, "scripts"));
+    await symlink(join("..", "bin", "tool.sh"), join(skillDir, "scripts", "tool.sh"));
+    await mkdir(join(process.env.JIG_HOME!, "skills"), { recursive: true });
+    await symlink(join("..", "..", "store", "probe"), join(process.env.JIG_HOME!, "skills", "probe"));
+    const api = await runsOnce('echo "[$(cat up.txt 2>&1)] [$(bash "$JIG_HOME/skills/probe/scripts/tool.sh" 2>&1)]"');
+    const { stop } = collectNotices("never printed");
+    try {
+      const runs = await testSkill(dir, "probe", testOptions(api));
+      assert.deepEqual(runs.map((run) => [run.arm, run.check]), [["with", true], ["without", true]]);
+      assert.match(JSON.stringify(api.requests[1]), /\[SHARED-OK\] \[TOOL-OK\]/, "with the skill, the model read the eval's link and ran the skill's");
+      assert.match(JSON.stringify(api.requests[3]), /\[SHARED-OK\] /);
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
   it("refuses an eval's files in jig's own directory, but not in its skills", async () => {
     // jig's own directory lies in a skill's folder only in an odd layout, but where it does, its sessions
     // hold copies of other projects' files, which the file tools don't read; its skills they do.

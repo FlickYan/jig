@@ -1,7 +1,7 @@
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Usage } from "./agent.ts";
 import { type Api, createModel } from "./model.ts";
 import { jigHome } from "./paths.ts";
@@ -184,13 +184,14 @@ async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without
     // (x/../../probe/a.txt) took its copy out of the project, into the folder holding it or further up.
     const files = (evalCase.files ?? []).map((file) => relative(skill.dir, join(skill.dir, file)));
     for (const [from, to] of evalFileTargets(files, (file) => statSync(join(skill.dir, file)).isDirectory())) {
-      cpSync(join(skill.dir, from), join(project, to), { recursive: true, filter });
+      copy(join(skill.dir, from), join(project, to), project, filter);
     }
     const baseline = gitBaseline(project);
     // The skill as a session sees it: without what in its folder the file tools don't read (a file of it the
     // settings hide, say), which, copied to the eval's home, no longer lay where the settings hide it.
     const shown = (src: string) => !hides(realTargetSync(src) ?? src);
-    if (arm === "with") cpSync(skill.dir, join(home, ".jig", "skills", skill.name), { recursive: true, filter: shown });
+    const copied = join(home, ".jig", "skills", skill.name);
+    if (arm === "with") copy(skill.dir, copied, copied, shown);
     const statsFile = join(work, "stats.json");
     // Without the wrap-up at the step limit: an extra call, in the steps and the cost, that earlier results lack.
     const args = [
@@ -243,6 +244,34 @@ async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without
     sandbox?.close?.(); // on Linux, ending what the check left running
     rmSync(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * Copies `from` to `to` as cpSync does, `filter` deciding what, but for links. cpSync made each relative
+ * link absolute, leading back into the skill's folder: for a skill in the user's jig directory, which the
+ * eval hides (see runEval), a link among its own files (link.txt -> data.txt, scripts/tool.sh ->
+ * ../bin/tool.sh) led nowhere, in the eval's files and in the skill the eval got. So a relative link that,
+ * read from its copy, leads into `root` (the eval's project, or its copy of the skill) stays as it is, and
+ * leads to the copy; one that leads out of it, as a skill's folder linked in from elsewhere does, is made
+ * absolute and leads where it did. A link stays a link, and jig reads nothing through it: the eval's
+ * sandbox and file tools hide what it leads to as they would the path itself.
+ */
+function copy(from: string, to: string, root: string, filter: (src: string) => boolean): void {
+  cpSync(from, to, { recursive: true, filter, verbatimSymlinks: true });
+  const relink = (src: string, dest: string) => {
+    const info = lstatSync(dest, { throwIfNoEntry: false });
+    if (info?.isDirectory()) {
+      for (const name of readdirSync(dest)) relink(join(src, name), join(dest, name));
+    } else if (info?.isSymbolicLink()) {
+      const target = readlinkSync(dest);
+      if (isAbsolute(target) || isInside(root, resolve(dirname(dest), target))) return;
+      // From the link's real folder, as the system reads it: from its path, for a skill linked into the
+      // user's jig directory, it led through the folder the eval hides.
+      unlinkSync(dest);
+      symlinkSync(resolve(realTargetSync(dirname(src)) ?? dirname(src), target), dest);
+    }
+  };
+  relink(from, to);
 }
 
 /**
