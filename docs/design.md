@@ -270,7 +270,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   tokens in every request, and a pass rate alone can't tell a helpful skill from an easy eval. So `jig
   skills test` runs each eval twice, with the skill and with it hidden, in a fresh project with a home
   directory of its own, so no other skill or setting takes part. A check command grades what can be
-  checked; a model grades the rest, from the diff and the agent's final message only.
+  checked; a model grades the rest, from the diff and the agent's final message only. The fresh home
+  mustn't free the eval from what your sessions hide: its settings hide the same paths, and your jig
+  directory, and the check and the grader's look at the changes run in the sandbox, as the task's
+  commands did. A skill's evals lie in its folder, which commands can write in a project, so jig copies
+  an eval's files only from that folder, and not from where the file tools wouldn't read.
 - **Installed skills carry their provenance.** A skill can bring scripts the model will run, so `jig
   skills add` lists them before anything is installed, runs nothing, and records the source and commit in
   a lockfile; `update` shows which files changed before replacing any. Repositories are cloned shallow

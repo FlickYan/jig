@@ -1,12 +1,14 @@
 import { execFileSync, spawn } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import type { Usage } from "./agent.ts";
 import { type Api, createModel } from "./model.ts";
 import { jigHome } from "./paths.ts";
 import { costOf } from "./prices.ts";
+import { createSandbox, type Sandbox } from "./sandbox.ts";
 import { discoverSkills, type Skill } from "./skills.ts";
+import { type Hiding, hiddenTest, isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 import * as ui from "./ui.ts";
 
 // `jig skills test`: does a skill help? Each eval runs as a one-shot jig task in a fresh project, once with
@@ -26,16 +28,57 @@ export interface SkillEval {
   check?: string;
 }
 
-/** A skill's evals, from evals/evals.json; throws, saying what to fix, if there are none or one has no prompt. */
-export function readEvals(skill: Skill): SkillEval[] {
+/**
+ * A skill's evals, from evals/evals.json; throws, saying what to fix, if there are none, one has no prompt,
+ * or one lists files jig won't copy (see evalFileRefusal). `hides` is what a session in the project hides
+ * from the file tools (see hiddenTest), where evals.json mustn't lead either.
+ */
+export function readEvals(skill: Skill, hides = hiddenTest([], [])): SkillEval[] {
   const path = join(skill.dir, "evals", "evals.json");
   if (!existsSync(path)) throw new Error(`The skill "${skill.name}" has no evals: write some in ${path} (the skill-writer skill describes the format).`);
-  const { evals } = JSON.parse(readFileSync(path, "utf8")) as { evals?: SkillEval[] };
+  const refusal = evalFileRefusal(skill, path, hides);
+  if (refusal) throw new Error(`${path} ${refusal}, so jig doesn't read it.`);
+  const text = readRegularFile(path);
+  if (text === undefined) throw new Error(`${path} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
+  const { evals } = JSON.parse(text) as { evals?: SkillEval[] };
   if (!Array.isArray(evals) || !evals.length) throw new Error(`${path} lists no evals.`);
   for (const [index, item] of evals.entries()) {
-    if (typeof item.prompt !== "string" || !item.prompt.trim()) throw new Error(`Eval ${item.id ?? index + 1} in ${path} has no prompt.`);
+    const where = `Eval ${item.id ?? index + 1} in ${path}`;
+    if (typeof item.prompt !== "string" || !item.prompt.trim()) throw new Error(`${where} has no prompt.`);
+    if (item.files !== undefined && !(Array.isArray(item.files) && item.files.every((file) => typeof file === "string"))) {
+      throw new Error(`${where}: "files" must be a list of paths in the skill's folder.`);
+    }
+    for (const file of item.files ?? []) assertEvalFile(skill, file, hides, where);
   }
   return evals.map((item, index) => ({ ...item, id: item.id ?? index + 1 }));
+}
+
+/**
+ * Why jig won't copy a file of a skill's into the project an eval starts from, if it won't. jig copies it
+ * itself, outside the sandbox, and a skill's evals lie in its folder, which commands can write in a
+ * project: a file listed as ../../../../secrets/key.txt, or a link, put a file the settings hide where the
+ * eval's model read it. So the file must really lie in the skill's folder, and where the file tools would
+ * read it (see hiddenTest): not in a hidden path, nor in jig's own directory but for its skills. Nor may it
+ * be git's (isGitControl): jig commits the files outside the sandbox, and a .git among them kept its
+ * config, which can name a program for git to run (core.fsmonitor).
+ */
+function evalFileRefusal(skill: Skill, path: string, hides: (real: string) => Hiding | undefined): string | undefined {
+  const real = realTargetSync(path);
+  const root = realTargetSync(skill.dir);
+  if (!real || !root || !isInside(skill.dir, path) || !isInside(root, real)) return "leads outside the skill's folder";
+  const hiding = hides(real);
+  if (hiding) return `leads into ${hiding === "settings" ? "a path the settings hide" : "jig's own directory"}`;
+  return isGitControl(real) ? "is a .git, or git's config or a hook" : undefined;
+}
+
+/** Refuses an eval's file, or anything in a folder given, that jig won't copy (see evalFileRefusal). */
+function assertEvalFile(skill: Skill, file: string, hides: (real: string) => Hiding | undefined, where: string): void {
+  const path = join(skill.dir, file);
+  const refusal = evalFileRefusal(skill, path, hides);
+  if (refusal) throw new Error(`${where}: ${file} ${refusal}, so jig won't copy it into the eval's project.`);
+  const info = lstatSync(path, { throwIfNoEntry: false });
+  if (!info) throw new Error(`${where} lists ${file}, which the skill doesn't have.`);
+  if (info.isDirectory()) for (const name of readdirSync(path).sort()) assertEvalFile(skill, join(file, name), hides, where);
 }
 
 /** What the grader decided about one expectation (the fields of skill-creator's grading.json). */
@@ -73,7 +116,10 @@ export interface TestOptions {
   env?: NodeJS.ProcessEnv;
   /** Grades expectations (default: the model, asked to judge); tests pass their own. */
   grade?: (evalCase: SkillEval, evidence: string, finalMessage: string) => Promise<Grade[]>;
-  /** The paths the settings hide: a skill whose SKILL.md leads into one is left out, as a session leaves it out. */
+  /**
+   * The paths the settings hide, which the evals hide as a session would (see runEval): a skill whose
+   * SKILL.md leads into one is left out, and so is an eval's file there (see evalFileRefusal).
+   */
   hiddenPaths?: string[];
 }
 
@@ -81,13 +127,17 @@ export interface TestOptions {
 export async function testSkill(project: string, name: string, options: TestOptions): Promise<EvalRun[]> {
   const skill = discoverSkills(project, undefined, { hiddenPaths: options.hiddenPaths }).skills.find((s) => s.name === name);
   if (!skill) throw new Error(`This project sees no skill "${name}" (jig skills list shows the ones it does).`);
-  const evals = readEvals(skill);
+  // What a session in the project hides from the file tools, where the evals' files mustn't lead; and what
+  // the evals' sandbox hides: the same paths, and the whole of jig's own directory, which isn't the eval's.
+  const hides = hiddenTest(options.hiddenPaths ?? [], [project]);
+  const hidden = [...(options.hiddenPaths ?? []), realTargetSync(jigHome()) ?? jigHome()];
+  const evals = readEvals(skill, hides);
   ui.println(`Testing ${skill.name}: ${evals.length} eval${evals.length === 1 ? "" : "s"} × ${options.attempts} attempt${options.attempts === 1 ? "" : "s"}, with the skill and without it (${options.model})`);
   const runs: EvalRun[] = [];
   for (const evalCase of evals) {
     for (let attempt = 1; attempt <= options.attempts; attempt++) {
       for (const arm of ["with", "without"] as const) {
-        const run = await runEval(skill, evalCase, arm, attempt, options);
+        const run = await runEval(skill, evalCase, arm, attempt, options, { hides, hidden });
         runs.push(run);
         const verdict = run.error ? `error: ${run.error}` : run.passed ? "passed" : "failed";
         ui.println(ui.dim(`  eval ${evalCase.id}, ${arm.padEnd(7)} ${verdict}${run.loaded ? " (loaded the skill)" : ""} · ${run.steps} steps · ${run.cost === undefined ? "?" : `$${run.cost.toFixed(4)}`}`));
@@ -103,20 +153,44 @@ export async function testSkill(project: string, name: string, options: TestOpti
   return runs;
 }
 
-async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without", attempt: number, options: TestOptions): Promise<EvalRun> {
+/** What the evals hide (see testSkill): `hides` from the file tools, `hidden` in their settings, from commands too. */
+interface EvalHiding {
+  hides: (real: string) => Hiding | undefined;
+  hidden: string[];
+}
+
+async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without", attempt: number, options: TestOptions, { hides, hidden }: EvalHiding): Promise<EvalRun> {
   const work = mkdtempSync(join(tmpdir(), "jig-eval-"));
   const project = join(work, "project");
-  // A home of its own, so the user's other skills and settings play no part.
+  // A home of its own, so the user's other skills and settings play no part, but for the hidden paths.
   const home = join(work, "home");
   const started = Date.now();
+  let sandbox: Sandbox | undefined;
   try {
     mkdirSync(project);
     mkdirSync(join(home, ".jig"), { recursive: true });
-    for (const [from, to] of evalFileTargets(evalCase.files ?? [], (file) => statSync(join(skill.dir, file)).isDirectory())) {
-      cpSync(join(skill.dir, from), join(project, to), { recursive: true });
+    // Settings there hide what a session in the user's project hides (the user's and the project's hidden
+    // paths, which apply without trust), so the eval's sandbox and file tools hide it too, and the whole of
+    // the user's jig directory, which the sandbox's own rule misses, as it isn't the eval's JIG_HOME: its
+    // sessions hold copies of every project's files. Without them, the eval's commands read both.
+    writeFileSync(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths: hidden })}\n`);
+    // Checked once more as they are copied: the skill's folder may have changed since readEvals.
+    const filter = (src: string) => {
+      const refusal = evalFileRefusal(skill, src, hides);
+      if (refusal) throw new Error(`Eval ${evalCase.id}: ${relative(skill.dir, src)} ${refusal}, so jig won't copy it into the eval's project.`);
+      return true;
+    };
+    // By their place in the skill's folder, where readEvals saw that they lie: as listed, a ".." in one
+    // (x/../../probe/a.txt) took its copy out of the project, into the folder holding it or further up.
+    const files = (evalCase.files ?? []).map((file) => relative(skill.dir, join(skill.dir, file)));
+    for (const [from, to] of evalFileTargets(files, (file) => statSync(join(skill.dir, file)).isDirectory())) {
+      cpSync(join(skill.dir, from), join(project, to), { recursive: true, filter });
     }
     const baseline = gitBaseline(project);
-    if (arm === "with") cpSync(skill.dir, join(home, ".jig", "skills", skill.name), { recursive: true });
+    // The skill as a session sees it: without what in its folder the file tools don't read (a file of it the
+    // settings hide, say), which, copied to the eval's home, no longer lay where the settings hide it.
+    const shown = (src: string) => !hides(realTargetSync(src) ?? src);
+    if (arm === "with") cpSync(skill.dir, join(home, ".jig", "skills", skill.name), { recursive: true, filter: shown });
     const statsFile = join(work, "stats.json");
     // Without the wrap-up at the step limit: an extra call, in the steps and the cost, that earlier results lack.
     const args = [
@@ -134,16 +208,21 @@ async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without
     const stats = existsSync(statsFile) ? JSON.parse(readFileSync(statsFile, "utf8")) : {};
     const usage: Usage = stats.usage ?? { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
 
-    const check = evalCase.check === undefined ? undefined : runCheck(evalCase.check, project, env);
+    // Read before the check runs: it can write in the eval's jig directory, which the task's commands
+    // couldn't, and a link it left among the sessions led jig, reading them here, to a file the sandbox hides.
+    const session = sessionRecord(join(home, ".jig"));
+    // The project is the task's now: the check and git's look at it run where its commands ran, as they run
+    // what it could change (a test script, or a program git's config names), and hide what they hid.
+    sandbox = createSandbox(project, { network: false, hidden });
+    const check = evalCase.check === undefined ? undefined : runCheck(evalCase.check, project, env, sandbox);
     const expectations = evalCase.expectations?.length
       ? evalCase.expectations
       : evalCase.check === undefined && evalCase.expected_output
         ? [`The result matches what was expected: ${evalCase.expected_output}`]
         : [];
     const grade = options.grade ?? judge(options);
-    const session = sessionRecord(join(home, ".jig"));
     const grades = expectations.length
-      ? await grade({ ...evalCase, expectations }, `${evidence(project, baseline, expectations)}\n\nWhat the agent ran, with the output:\n${session.transcript || "(nothing)"}`, session.finalMessage)
+      ? await grade({ ...evalCase, expectations }, `${evidence(project, baseline, expectations, sandbox)}\n\nWhat the agent ran, with the output:\n${session.transcript || "(nothing)"}`, session.finalMessage)
       : undefined;
     return {
       eval: evalCase.id,
@@ -161,6 +240,7 @@ async function runEval(skill: Skill, evalCase: SkillEval, arm: "with" | "without
       ...(stats.error && { error: stats.error }),
     };
   } finally {
+    sandbox?.close?.(); // on Linux, ending what the check left running
     rmSync(work, { recursive: true, force: true });
   }
 }
@@ -213,9 +293,15 @@ function runJig(args: string[], { cwd, env, stdin, timeout }: { cwd: string; env
   });
 }
 
-function runCheck(command: string, project: string, env: NodeJS.ProcessEnv): boolean {
+/**
+ * Runs an eval's check in the project, in the sandbox where there is one, as the task's commands ran, and
+ * without jig's keys, as they had it: a check runs the task's work (python3 scripts/check_versions.py),
+ * and run outside, a script the task changed read what the sandbox had hidden from it.
+ */
+function runCheck(command: string, project: string, env: NodeJS.ProcessEnv, sandbox: Sandbox | undefined): boolean {
+  const { program, args, stdio } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
   try {
-    execFileSync("bash", ["-c", command], { cwd: project, env, stdio: "ignore", timeout: 300_000 });
+    execFileSync(program, args, { cwd: project, env: withoutKeys(env), stdio: ["ignore", "ignore", "ignore", ...(stdio ?? [])], timeout: 300_000 });
     return true;
   } catch {
     return false;
@@ -226,25 +312,41 @@ const MAX_EVIDENCE = 30_000;
 
 /**
  * What the task changed, for the grader: commits and tags it made, what it left uncommitted, and the
- * whole diff from the starting point (committed or not, new files included).
+ * whole diff from the starting point (committed or not, new files included). git runs in the sandbox
+ * where there is one (see runEval), with jig's own options (SAFE_GIT) wherever it runs: on Linux the task
+ * can make a commondir, which can't be locked while it isn't there, naming a config of its own.
  */
-function evidence(project: string, baseline: string | undefined, expectations: string[]): string {
+function evidence(project: string, baseline: string | undefined, expectations: string[], sandbox: Sandbox | undefined): string {
   if (!baseline) return "(the changes couldn't be listed: git is missing)";
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: project, encoding: "utf8", maxBuffer: 50_000_000 });
+  // In the sandbox, git's arguments are bash's own ("$@", after $0), as in fetchSource.
+  const git: Git = (args, input) => {
+    const argv = [...SAFE_GIT, ...args];
+    const { program, args: wrapped, stdio } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [], stdio: undefined };
+    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, {
+      cwd: project,
+      env: withoutKeys(),
+      input,
+      stdio: ["pipe", "pipe", "pipe", ...(stdio ?? [])],
+      maxBuffer: 50_000_000,
+      timeout: 120_000,
+    });
+  };
+  const text = (...args: string[]) => git(args).toString("utf8");
   try {
-    const commits = git("log", "--format=%h %s", `${baseline}..HEAD`);
-    const tags = git("tag", "-l", "-n1");
-    const uncommitted = git("status", "--short");
-    git("add", "-A");
-    const diff = clip(git("diff", "--cached", baseline), MAX_EVIDENCE);
-    // A diff shows only changed lines: a statement about a whole file needs the file as it ended up.
-    const changed = git("diff", "--cached", "--name-only", baseline).split("\n").filter(Boolean);
-    const named = (git("ls-files").split("\n").filter(Boolean)).filter((file) => expectations.some((text) => text.includes(file)));
+    const commits = text("log", "--format=%h %s", `${baseline}..HEAD`);
+    const tags = text("tag", "-l", "-n1");
+    const uncommitted = text("status", "--short");
+    text("add", "-A");
+    const diff = clip(text("diff", "--cached", baseline), MAX_EVIDENCE);
+    // A diff shows only changed lines: a statement about a whole file needs the file as it ended up. That is
+    // what git staged, having read it where it ran: read here, outside the sandbox, a link the task made
+    // could lead to a file the sandbox hid from it, and a named pipe would hang jig.
+    const changed = text("diff", "--cached", "--name-only", baseline).split("\n").filter(Boolean);
+    const named = text("ls-files").split("\n").filter(Boolean).filter((file) => expectations.some((statement) => statement.includes(file)));
     let budget = MAX_FILES;
-    const files = [...new Set([...named, ...changed])].flatMap((file) => {
-      const path = join(project, file);
-      if (budget <= 0 || !existsSync(path) || statSync(path).size > 20_000) return [];
-      const content = clip(readFileSync(path, "utf8"), 5000);
+    const files = [...staged(git, [...new Set([...named, ...changed])], 20_000)].flatMap(([file, bytes]) => {
+      if (budget <= 0) return [];
+      const content = clip(bytes.toString("utf8"), 5000);
       budget -= content.length;
       return [`--- ${file}\n${content}`];
     });
@@ -258,6 +360,34 @@ function evidence(project: string, baseline: string | undefined, expectations: s
   } catch (err) {
     return `(the changes couldn't be listed: ${(err as Error).message.split("\n")[0]})`;
   }
+}
+
+/** Runs git in an eval's project with these arguments, and this on its standard input; returns what it printed. */
+type Git = (args: string[], input?: string) => Buffer;
+
+/**
+ * What git staged of each of `files` that it has a blob of at most `max` bytes for (a link's is where it
+ * leads), in their order: two runs of git, however many there are.
+ */
+function staged(git: Git, files: string[], max: number): Map<string, Buffer> {
+  const found = new Map<string, Buffer>();
+  if (!files.length) return found;
+  const checked = git(["cat-file", "--batch-check"], files.map((file) => `:${file}\n`).join("")).toString("utf8").split("\n");
+  const blobs = files.flatMap((file, i) => {
+    const [, id, size] = /^([0-9a-f]+) blob (\d+)$/.exec(checked[i] ?? "") ?? [];
+    return id && Number(size) <= max ? [{ file, id }] : [];
+  });
+  if (!blobs.length) return found;
+  // Each as "<id> blob <size>", a newline, its bytes and another newline.
+  const out = git(["cat-file", "--batch"], blobs.map(({ id }) => `${id}\n`).join(""));
+  let at = 0;
+  for (const { file } of blobs) {
+    const end = out.indexOf(0x0a, at);
+    const size = Number(out.subarray(at, end).toString("latin1").split(" ")[2]);
+    found.set(file, out.subarray(end + 1, end + 1 + size));
+    at = end + 1 + size + 1;
+  }
+  return found;
 }
 
 const MAX_FILES = 20_000;

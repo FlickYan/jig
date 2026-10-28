@@ -167,9 +167,9 @@ export const SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/de
 // into the conversation and the logs, and a prompt injection could send it somewhere instead.
 const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
 
-/** jig's environment without its credentials, for commands and for the git it runs in a project. */
-export function withoutKeys(): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(process.env).filter(([name]) => !PRIVATE_ENV.includes(name)));
+/** jig's environment, or `env`, without its credentials, for commands and for the git it runs in a project. */
+export function withoutKeys(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !PRIVATE_ENV.includes(name)));
 }
 
 /** Whether an absolute path is root itself or below it. */

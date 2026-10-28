@@ -861,10 +861,206 @@ describe("testing a skill", () => {
       assert.equal(byArm.with.steps, 3);
       assert.match(evidence[0], /Commits made:\n\w+ Greet the team/, "the grader sees what the agent committed");
       assert.match(evidence[0], /\+hello from the skill/);
+      assert.match(evidence[0], /--- greeting\.txt\nhello from the skill\n/, "and the file the statement names, as it ended up");
       assert.deepEqual(byArm.with.grades?.map((g) => g.passed), [true]);
       assert.deepEqual(byArm.without.grades?.map((g) => g.passed), [false]);
     } finally {
       stop();
+      api.close();
+    }
+  });
+
+  /** testSkill's options for a run against a fake API, grading every statement as met and keeping the evidence. */
+  const testOptions = (api: { url: string }, evidence: string[] = [], hiddenPaths: string[] = []) => ({
+    grade: async (evalCase: { expectations?: string[] }, changes: string) => {
+      evidence.push(changes);
+      return evalCase.expectations!.map((text) => ({ text, passed: true, evidence: "" }));
+    },
+    attempts: 1,
+    model: "claude-haiku-4-5",
+    cli: join(import.meta.dirname, "..", "src", "cli.ts"),
+    env: { ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key" },
+    timeout: 60,
+    hiddenPaths,
+  });
+
+  it("hides what a session hides, and jig's own directory, from an eval's commands, its check and its grader", { skip: sandboxProblem() }, async () => {
+    // The eval has a home and a JIG_HOME of its own, so its sandbox hid none of the settings' hidden paths,
+    // nor the user's jig directory, whose sessions hold copies of every project's files; the skill's folder
+    // went to the eval's home whole, a file in it the settings hide too; and the check ran outside the
+    // sandbox, with jig's keys, though it runs what the task could change.
+    const secrets = join(await tempDir("jig-skills-outside-"), "secrets");
+    await mkdir(secrets);
+    await writeFile(join(secrets, "key.txt"), "SECRET-HIDDEN-VALUE\n");
+    // One of the user's own sessions, as jig saves it.
+    const session = join(process.env.JIG_HOME!, "sessions", "old.jsonl");
+    await mkdir(dirname(session), { recursive: true });
+    const line = (role: string, content: object[]) => JSON.stringify({ message: { role, content } });
+    await writeFile(session, `${line("assistant", [{ type: "tool_use", id: "t", name: "bash", input: {} }])}\n${line("user", [{ type: "tool_result", tool_use_id: "t", content: "SECRET-OTHER-SESSION" }])}\n`);
+    const read = `cat ${join(secrets, "key.txt")} ${session}`;
+    // The check also leaves a link to that session among the eval's own, which jig reads for the grader.
+    const plant = `mkdir -p "$JIG_HOME/sessions" && ln -s ${session} "$JIG_HOME/sessions/planted.jsonl"`;
+    const skillDir = await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.", {
+      "private/key.txt": "SECRET-IN-THE-SKILL\n",
+      "evals/evals.json": JSON.stringify({
+        evals: [{ id: 1, prompt: "Probe.", check: `${read} > from-check.txt; echo "key=$ANTHROPIC_API_KEY color=$NO_COLOR" > env.txt; ${plant}; true`, expectations: ["from-check.txt, env.txt and linked.txt hold what they read"] }],
+      }),
+    });
+    // The model reads them all, the skill's hidden file with the skill tool too, and links a file the grader
+    // would see to the hidden one.
+    const command = `${read} "$JIG_HOME/skills/probe/private/key.txt"; ln -s ${join(secrets, "key.txt")} linked.txt`;
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }, { tool: "skill", input: { name: "probe", file: "private/key.txt" } }] : [{ text: "Done." }],
+    );
+    const { stop } = collectNotices("never printed");
+    const evidence: string[] = [];
+    try {
+      const runs = await testSkill(dir, "probe", testOptions(api, evidence, [secrets, join(skillDir, "private")]));
+      assert.deepEqual(runs.map((run) => [run.arm, run.check, run.steps]), [["with", true, 2], ["without", true, 2]], "both arms ran the command and the check");
+      assert.equal(evidence.length, 2);
+      assert.match(JSON.stringify(api.requests[1]), /The skill \\"probe\\" has no file private\/key\.txt/, "the skill came without its hidden file");
+      for (const [shown, where] of [[JSON.stringify(api.requests), "the model"], [evidence.join("\n"), "the grader"]]) {
+        assert.ok(!shown.includes("SECRET-HIDDEN-VALUE"), `the hidden file reached ${where}`);
+        assert.ok(!shown.includes("SECRET-OTHER-SESSION"), `jig's own directory reached ${where}`);
+        assert.ok(!shown.includes("SECRET-IN-THE-SKILL"), `the skill's hidden file reached ${where}`);
+      }
+      assert.match(evidence[0], /--- from-check\.txt\n/, "the grader sees what the check wrote");
+      assert.match(evidence[0], /--- env\.txt\nkey= color=1\n/, "the check had the eval's environment, without jig's key");
+      assert.ok(evidence[0].includes(`--- linked.txt\n${join(secrets, "key.txt")}`), "a link shows where it leads");
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("refuses an eval's files out of the skill's folder, in a hidden path, or git's, before it runs any", async () => {
+    // evals.json lies in the skill's folder, which commands can write in a project, and jig copies the
+    // files outside the sandbox: listed as ../ or reached through a link, a hidden file went to the model,
+    // and a .git kept its config, whose fsmonitor jig's commit of the files ran.
+    const secrets = join(await tempDir("jig-skills-outside-"), "secrets");
+    await mkdir(secrets);
+    await writeFile(join(secrets, "key.txt"), "SECRET-HIDDEN-VALUE\n");
+    const skillDir = await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/linked/a.txt": "a\n",
+      "evals/files/private/b.txt": "b\n",
+      "evals/files/repo/.git/config": "[core]\n\tfsmonitor = touch pwned\n",
+    });
+    await symlink(join(secrets, "key.txt"), join(skillDir, "evals", "files", "linked", "key.txt"));
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const { stop } = collectNotices("never printed");
+    // The skill's folder by another way in, which leads back to it: the file lies in it, but not as listed.
+    await symlink(skillDir, join(dir, "alias"));
+    const evals = (files: string[]) => writeFile(join(skillDir, "evals", "evals.json"), JSON.stringify({ evals: [{ prompt: "Probe.", check: "true" }, { prompt: "Probe.", files }] }));
+    try {
+      const refused: [string[], RegExp][] = [
+        [[relative(skillDir, join(secrets, "key.txt"))], /Eval 2 in \S+evals\.json: \.\.\/\S+\/secrets\/key\.txt leads outside the skill's folder, so jig won't copy it/],
+        [["evals/files/linked"], /evals\/files\/linked\/key\.txt leads outside the skill's folder/],
+        [[relative(skillDir, join(dir, "alias", "evals", "files", "linked", "a.txt"))], /\.\.\/alias\/evals\/files\/linked\/a\.txt leads outside the skill's folder/],
+        [["evals/files/private/b.txt"], /evals\/files\/private\/b\.txt leads into a path the settings hide/],
+        [["evals/files/repo"], /evals\/files\/repo\/\.git is a \.git, or git's config or a hook/],
+        [["evals/files/missing.txt"], /Eval 2 in \S+ lists evals\/files\/missing\.txt, which the skill doesn't have/],
+      ];
+      for (const [files, message] of refused) {
+        await evals(files);
+        await assert.rejects(testSkill(dir, "probe", testOptions(api, [], [join(skillDir, "evals", "files", "private")])), message);
+      }
+      // evals.json itself, where the settings hide it, and where it leads out of the skill's folder.
+      await assert.rejects(testSkill(dir, "probe", testOptions(api, [], [join(skillDir, "evals")])), /evals\.json leads into a path the settings hide, so jig doesn't read it/);
+      await rm(join(skillDir, "evals", "evals.json"));
+      await symlink(join(secrets, "key.txt"), join(skillDir, "evals", "evals.json"));
+      await assert.rejects(testSkill(dir, "probe", testOptions(api)), /evals\.json leads outside the skill's folder, so jig doesn't read it/);
+      assert.equal(api.requests.length, 0, "no eval ran");
+      assert.ok(!existsSync(join(dir, "pwned")));
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("checks an eval's files again as it copies them, as the skill's folder can change meanwhile", async () => {
+    const secrets = join(await tempDir("jig-skills-outside-"), "secrets");
+    await mkdir(secrets);
+    await writeFile(join(secrets, "key.txt"), "SECRET-HIDDEN-VALUE\n");
+    const skillDir = await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/later/a.txt": "a\n",
+      "evals/evals.json": JSON.stringify({ evals: [{ prompt: "Probe.", expectations: ["it probed"] }, { prompt: "Probe.", files: ["evals/files/later"], check: "true" }] }),
+    });
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const { stop } = collectNotices("never printed");
+    const options = testOptions(api);
+    // While the first eval runs, a link to a hidden file appears in the folder the second copies.
+    const grade = options.grade;
+    options.grade = async (evalCase, changes) => {
+      await symlink(join(secrets, "key.txt"), join(skillDir, "evals", "files", "later", "key.txt")).catch(() => {});
+      return grade(evalCase, changes);
+    };
+    try {
+      await assert.rejects(testSkill(dir, "probe", options), /Eval 2: evals\/files\/later\/key\.txt leads outside the skill's folder, so jig won't copy it/);
+      assert.equal(api.requests.length, 2, "only the first eval ran, with the skill and without it");
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("copies an eval's files into its project by their place in the skill's folder, one listed with a .. too", async () => {
+    // As listed, x/../../probe/evals/files/sub/b.txt, which lies in the skill's folder, was copied to
+    // ../probe/evals/files/sub/b.txt from the project: out of it, into the folder holding it.
+    await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/a.txt": "a\n",
+      "evals/files/sub/b.txt": "b\n",
+      "evals/evals.json": JSON.stringify({ evals: [{ prompt: "Probe.", files: ["evals/files/a.txt", "x/../../probe/evals/files/sub/b.txt"], check: "test -f a.txt && test -f sub/b.txt && ! test -e ../probe" }] }),
+    });
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const { stop } = collectNotices("never printed");
+    try {
+      const runs = await testSkill(dir, "probe", testOptions(api));
+      assert.deepEqual(runs.map((run) => [run.arm, run.check]), [["with", true], ["without", true]]);
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("refuses an eval's files in jig's own directory, but not in its skills", async () => {
+    // jig's own directory lies in a skill's folder only in an odd layout, but where it does, its sessions
+    // hold copies of other projects' files, which the file tools don't read; its skills they do.
+    const skillDir = await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.", {
+      "evals/files/jig-home/sessions/old.jsonl": "{}\n",
+      "evals/files/jig-home/skills/helper/notes.md": "notes\n",
+    });
+    process.env.JIG_HOME = join(skillDir, "evals", "files", "jig-home");
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const { stop } = collectNotices("never printed");
+    const evals = (files: string[]) => writeFile(join(skillDir, "evals", "evals.json"), JSON.stringify({ evals: [{ prompt: "Probe.", files, check: "test -f notes.md" }] }));
+    try {
+      for (const files of [["evals/files/jig-home"], ["evals/files/jig-home/sessions/old.jsonl"]]) {
+        await evals(files);
+        await assert.rejects(testSkill(dir, "probe", testOptions(api)), new RegExp(`Eval 1 in \\S+: ${files[0]} leads into jig's own directory, so jig won't copy it`));
+      }
+      assert.equal(api.requests.length, 0);
+      await evals(["evals/files/jig-home/skills/helper/notes.md"]);
+      const runs = await testSkill(dir, "probe", testOptions(api));
+      assert.deepEqual(runs.map((run) => run.check), [true, true]);
+    } finally {
+      stop();
+      api.close();
+    }
+  });
+
+  it("refuses an evals.json that isn't a regular file, rather than waiting on it", async () => {
+    // A command can put a named pipe there, which jig would wait on for good. In a child process, so that a
+    // hang fails the test rather than stopping the suite.
+    await writeSkill(join(dir, ".jig", "skills"), "probe", "Probes. Use when asked to probe.");
+    await mkdir(join(dir, ".jig", "skills", "probe", "evals"));
+    execFileSync("mkfifo", [join(dir, ".jig", "skills", "probe", "evals", "evals.json")]);
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig(["skills", "test", "probe", "--model", "claude-haiku-4-5"], { api, cwd: dir, env: { JIG_HOME: process.env.JIG_HOME }, timeout: 20_000 });
+      assert.equal(code, 1, output);
+      assert.match(output, /\.jig\/skills\/probe\/evals\/evals\.json isn't a regular file \(a named pipe, say\), so jig doesn't read it/);
+      assert.equal(api.requests.length, 0);
+    } finally {
       api.close();
     }
   });

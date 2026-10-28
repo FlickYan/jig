@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 517 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 523 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -370,7 +370,11 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `skill-creator` (a prompt, the expected output, expectations, input files) plus `check`, a shell command
   whose exit code says whether the result is right; `jig skills test` runs each eval in a fresh project
   with its own home directory, once with the skill and once with it hidden (`--hide-skill`), and grades it
-  by the check and by the model judging the expectations.
+  by the check and by the model judging the expectations. The eval hides what a session in your project
+  hides, and all of your jig directory; the check, and git's look at the changes for the grader, run in
+  the sandbox too, without jig's keys. An eval's input files must lie in the skill's folder, and not in a
+  hidden path, in jig's own directory (but for its skills) or among git's config and hooks, or jig won't
+  copy them; a file of the skill that the settings hide is left out of its copy.
 - **MCP servers.** jig is an MCP client over stdio, on the official TypeScript SDK. Servers configured in
   the settings start with jig, and their tools join jig's own as `mcp__<server>__<tool>`:
 
