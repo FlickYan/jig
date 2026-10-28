@@ -131,26 +131,28 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   `--die-with-parent` kills it if jig is killed. So when jig exits, normally, by a signal or by `kill -9`,
   the namespace's init ends and the kernel ends every process in it: a background job used to outlive jig,
   and now lasts the session. The commands that joined it end so too, without a `--die-with-parent` of their
-  own: with one, a join just after a namespace had ended was now and then killed as it started. A timeout,
-  Ctrl+C or jig's exit still kills a running command's whole tree through its process group, which a job
-  taken over by init stays in. A command can end the keeper too (`kill -1` ends every process it may
-  signal), and the namespace with it, with the session's jobs and any command running then; the next
-  command starts another, as joining the ended one failed every later command. jig looked for that end only
-  in the namespace's init, which could still be running when the command that ended the keeper had exited:
-  about once in 40 runs of its test, the next command joined a namespace about to end and failed ("Can't
-  fork for `--pidns`"). Now jig looks at the keeper's shell too: gone, exiting, or sent a signal that ends
-  it. And should the namespace end only after jig looked (a job can end it at any time), bubblewrap can't
-  join it: it reports a command's process on a pipe before it lets the command start, and where it reported
-  none, the command never started and runs once more in a new namespace, once. A command bubblewrap started
-  never runs twice. Seatbelt needs none of this, since its rules hold whatever path a lookup takes. Where
-  bubblewrap is too old for the join (no `--pidns`), or the keeper can't start or be joined, each command
-  gets a namespace of its own (`--unshare-pid`, with its own `/proc`): as safe, but a command's background
-  jobs end with it. jig tells the user so once, and the model, whom the bash tool tells to leave a server
-  running in the background, with the first command's result. jig never runs a command in the host's PID
-  namespace: where bubblewrap can't mount a `/proc` at all (in a container that masks parts of its own, as
-  Docker and Podman do by default), there is no sandbox, jig says why, and commands ask first, since
-  running them without `--proc` would open the hole again. jig's check that bubblewrap works mounts one
-  too: it didn't, so in such a container jig said the sandbox was on and every command failed.
+  own: with one, any command that joined was now and then killed as it started, at random under load, as
+  bubblewrap sets it just before it runs the command, whose parent can then still be a process of
+  bubblewrap's that is exiting. A timeout, Ctrl+C or jig's exit still kills a running command's whole tree
+  through its process group, which a job taken over by init stays in. A command can end the keeper too
+  (`kill -1` ends every process it may signal), and the namespace with it, with the session's jobs and any
+  command running then; the next command starts another, as joining the ended one failed every later
+  command. jig looked for that end only in the namespace's init, which could still be running when the
+  command that ended the keeper had exited: about once in 40 runs of its test, the next command joined a
+  namespace about to end and failed ("Can't fork for `--pidns`"). Now jig looks at the keeper's shell too:
+  gone, exiting, or sent a signal that ends it. And should the namespace end only after jig looked (a job
+  can end it at any time), bubblewrap can't join it: it reports a command's process on a pipe before it
+  lets the command start, and where it reported none, the command never started and runs once more in a new
+  namespace, once. A command bubblewrap started never runs twice. Seatbelt needs none of this, since its
+  rules hold whatever path a lookup takes. Where bubblewrap is too old for the join (no `--pidns`), or the
+  keeper can't start or be joined, each command gets a namespace of its own (`--unshare-pid`, with its own
+  `/proc`): as safe, but a command's background jobs end with it. jig tells the user so once, and the
+  model, whom the bash tool tells to leave a server running in the background, with the first command's
+  result. jig never runs a command in the host's PID namespace: where bubblewrap can't mount a `/proc` at
+  all (in a container that masks parts of its own, as Docker and Podman do by default), there is no
+  sandbox, jig says why, and commands ask first, since running them without `--proc` would open the hole
+  again. jig's check that bubblewrap works mounts one too: it didn't, so in such a container jig said the
+  sandbox was on and every command failed.
 - **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
   they check paths themselves: against the project and the `--add-dir` directories, and a change again by
   where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can

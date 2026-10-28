@@ -257,7 +257,8 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     try {
       await run("kill -TERM -1", sandbox); // what it prints is a race: the namespace's end kills it too
       assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
-      // Given --die-with-parent, a join just after a namespace had ended was now and then killed as it started.
+      // Given --die-with-parent, any command that joined, a restarted keeper's or not, was now and then killed as
+      // it started (see Keeper).
       assert.ok(!sandbox.wrap("true").args.includes("--die-with-parent"), "a join ends with the keeper alone");
       assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
       assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");

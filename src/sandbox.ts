@@ -702,18 +702,19 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
  * keeper's life is tied to jig's: it reads a pipe jig holds open, so jig's death sends it end-of-file, and
  * --die-with-parent kills it if jig is killed; either way its init ends and the kernel ends every process in
  * the namespace, the commands that joined it among them. (They don't take --die-with-parent themselves: given
- * it, a join just after a namespace had ended was now and then killed as it started.) A command can end the
- * keeper too (kill -1 ends every process it may signal), and the namespace with it, ending the session's jobs
- * and any command running then. The next command starts another, as the first did: jig sees the namespace's
- * init or the keeper's shell gone, exiting or sent a signal that ends it (see exited). Should the namespace
- * end only after that, as bubblewrap joins it (a job can end it at any time), bubblewrap can't join and starts
- * nothing, which it lets jig know, and the command runs once more in a new one (see join). A command that
- * bubblewrap started never runs again. If bubblewrap is too old for the join (no --pidns) or the keeper can't
- * start, each command falls back to a PID namespace of its own (--unshare-pid), which is as safe but ends a
- * command's background jobs with the command; jig tells the user so once, and the model, whom the bash tool
- * tells to leave a server running in the background, with the first command's result. jig never runs commands
- * in the host's PID namespace. The keeper gets jig's environment without its keys, as commands do: they can
- * read its environment in /proc/1.
+ * it, any command that joined was now and then killed as it started, at random under load: bubblewrap sets it
+ * just before it runs the command, whose parent can then still be a process of bubblewrap's that is exiting.)
+ * A command can end the keeper too (kill -1 ends every process it may signal), and the namespace with it,
+ * ending the session's jobs and any command running then. The next command starts another, as the first did:
+ * jig sees the namespace's init or the keeper's shell gone, exiting or sent a signal that ends it (see
+ * exited). Should the namespace end only after that, as bubblewrap joins it (a job can end it at any time),
+ * bubblewrap can't join and starts nothing, which it lets jig know, and the command runs once more in a new
+ * one (see join). A command that bubblewrap started never runs again. If bubblewrap is too old for the join
+ * (no --pidns) or the keeper can't start, each command falls back to a PID namespace of its own
+ * (--unshare-pid), which is as safe but ends a command's background jobs with the command; jig tells the user
+ * so once, and the model, whom the bash tool tells to leave a server running in the background, with the first
+ * command's result. jig never runs commands in the host's PID namespace. The keeper gets jig's environment
+ * without its keys, as commands do: they can read its environment in /proc/1.
  */
 class Keeper {
   private started = false;
