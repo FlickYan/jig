@@ -256,7 +256,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   snapshots hold copies of every project's files, and the snapshots older versions took hold the hidden
   paths too. It hides it by path, so where it lies in a directory commands can write in (a temp directory,
   in skill evals), the directories holding it there stay in place, as git's do: in a review, a command
-  moved one aside, and read the snapshots at their new path in the next.
+  moved one aside, and read the snapshots at their new path in the next. So does the writable directory
+  itself, where it holds jig's directory, a hidden path or git's config: on macOS the rule that lets
+  commands write in a directory matches the directory too, so a command could move the whole project aside
+  and read, or change, what the other rules deny at its new path (on Linux it is a mount point).
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than

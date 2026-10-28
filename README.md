@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 525 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 526 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -158,8 +158,8 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   every project. If `~/.jig/skills` is a link out of it (into a dotfiles repository, say), both change
   them where the link leads, like any other files there. A project or `--add-dir` directory inside it (a
   skill you are writing, say) stays as it was. Where it lies in a directory commands can write in (a
-  `JIG_HOME` in a temp directory, as `jig skills test` sets one), they can't move it aside either, nor a
-  directory holding it there.
+  `JIG_HOME` in a temp directory, as `jig skills test` sets one), they can't move it aside either, nor
+  that directory, nor one in it holding it.
 
   On macOS, localhost stays open; on Linux each command gets an empty network of its own, so a test can
   still start a server and talk to it, but only within one command. Only IP networking is cut off, though:
@@ -248,8 +248,9 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `"network": true` for a project, and `"hiddenPaths"`: files and folders sandboxed commands can't read at
   all, like `["~/.ssh", "~/.aws"]` (the model is told that some paths are hidden, not which). They are
   hidden by their paths, so where one lies in a directory commands can write in (the project, say), they
-  can't move aside a directory holding it there. Snapshots leave out those in the project, by where they
-  really lead, and `/undo` leaves them as they are (with the project itself hidden, `/undo` is off).
+  can't move aside that directory, nor one in it holding the path. Snapshots leave out those in the
+  project, by where they really lead, and `/undo` leaves them as they are (with the project itself hidden,
+  `/undo` is off).
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that

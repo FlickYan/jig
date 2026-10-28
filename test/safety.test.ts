@@ -89,11 +89,18 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     await mkdir(join(config, "keys"), { recursive: true });
     await writeFile(join(config, "keys", ".env"), "TOKEN=moved-out-of-hiding\n");
     const sandbox = createSandbox(project, { network: false, hidden: [join(config, "keys", ".env")] })!;
+    // Nor the project, which holds it, into a temp directory: on macOS the rule letting commands write in it
+    // matched it too. Renamed by node, as mv copies across file systems, which bubblewrap's mount points are.
+    const away = join(tmpdir(), `jig-sandbox-moved-${process.pid}`);
     try {
       for (const path of ["config/keys", "config"]) assert.match(await run(`mv ${path} ${path}-moved`, sandbox), /Exit code: [1-9]/, path);
+      const moveProject = `node -e 'require("fs").renameSync(process.argv[1], process.argv[2])' ${project} ${away}`;
+      assert.match(await run(moveProject, sandbox), /Exit code: [1-9]/, "the project");
+      assert.equal(existsSync(away), false);
       assert.doesNotMatch(await run("cat config-moved/keys/.env config/keys-moved/.env config/keys/.env", sandbox), /moved-out-of-hiding/);
       assert.match(await run("mkdir other && mv other other-moved && echo moved", sandbox), /^moved/);
     } finally {
+      if (existsSync(away)) await rename(away, project);
       sandbox.close?.();
       for (const path of ["config", "config-moved", "other", "other-moved"]) await rm(join(project, path), { recursive: true, force: true });
     }
@@ -950,10 +957,10 @@ describe("the macOS sandbox's profile", () => {
     // An added directory in a temp directory can be moved too; a writable directory in none can't.
     const added = seatbeltProfile(["/p", "/private/tmp/e", "/private/tmp"], false, [], undefined, "/private/tmp/e/.jig");
     assert.match(added, /^\(deny file-write-unlink \(literal "\/private\/tmp\/e"\)\)$/m);
-    // Nor are there any for ~/.jig, in a home-directory project or in none.
-    for (const writable of [["/p", "/private/tmp"], ["/u", "/private/tmp"]]) {
-      assert.doesNotMatch(seatbeltProfile(writable, false, [], undefined, "/u/.jig"), /file-write-unlink/);
-    }
+    // Nor are there any for ~/.jig in no writable directory, and in a home-directory project only the project itself.
+    assert.doesNotMatch(seatbeltProfile(["/p", "/private/tmp"], false, [], undefined, "/u/.jig"), /file-write-unlink/);
+    const home = seatbeltProfile(["/u", "/private/tmp"], false, [], undefined, "/u/.jig");
+    assert.deepEqual(home.split("\n").filter((line) => line.includes("file-write-unlink")), ['(deny file-write-unlink (literal "/u"))']);
   });
 
   it("keeps the directories holding a hidden path in place, where it lies in a writable directory", () => {
@@ -962,6 +969,34 @@ describe("the macOS sandbox's profile", () => {
     const fixed = '(deny file-write-unlink (literal "/p/a") (literal "/p/a/b"))';
     assert.ok(profile.split("\n").includes(fixed), profile);
     assert.ok(profile.indexOf(fixed) > profile.indexOf("(allow file-write* "), "after the rule it overrides, since the last rule wins");
+  });
+
+  it("keeps a writable directory in place where it holds a hidden path, jig's own directory or git's files", () => {
+    // (subpath "/p"), which lets commands write in the project, matches /p itself: a command moved the project
+    // to /private/tmp/p and made /p again, then read the hidden file at its new path, or changed git's config
+    // there and moved it back, as no rule names those paths. A rename unlinks what moves and creates where it goes.
+    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"], gitDirectories: ["/p/.git"] };
+    const writable = ["/p", "/private/tmp"];
+    const profiles = {
+      "a hidden path": seatbeltProfile(writable, false, ["/p/a/key"]),
+      "jig's own directory": seatbeltProfile(writable, false, [], undefined, "/p/a/.jig"),
+      "git's config and hooks": seatbeltProfile(writable, false, [], git),
+    };
+    for (const [what, profile] of Object.entries(profiles)) {
+      const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
+      assert.equal(allows("file-write-unlink", "/p"), false, `the project, holding ${what}, moved aside`);
+      assert.ok(allows("file-write-create", "/private/tmp/p") && allows("file-write-create", "/p"), "the rest of the move, and making /p again");
+      assert.ok(profile.split("\n").includes('(deny file-write-unlink (literal "/p"))'), profile);
+      // Ordinary work goes on: files and folders are made, changed, removed and renamed in it, and in /p/a too.
+      for (const path of ["/p/b.txt", "/p/src", "/p/src/c.txt", "/p/a/d.txt", "/private/tmp/e.txt"]) {
+        for (const operation of ["file-write-create", "file-write-data", "file-write-unlink"]) assert.ok(allows(operation, path), `${operation} ${path}, with ${what}`);
+      }
+    }
+    // Each writable directory holding any of them once, the outermost first; none for one holding none.
+    const lockedIn = { locked: ["/private/tmp/w/.git/config"], fixed: ["/private/tmp/w/.git"], gitDirectories: ["/private/tmp/w/.git"] };
+    const nested = seatbeltProfile(["/private/tmp/w", "/q", "/private/tmp"], false, ["/private/tmp/w/key"], lockedIn, "/private/tmp/w/.jig");
+    assert.ok(nested.split("\n").includes('(deny file-write-unlink (literal "/private/tmp") (literal "/private/tmp/w"))'), nested);
+    assert.doesNotMatch(nested, /literal "\/q"/);
   });
 
   it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {
@@ -1040,13 +1075,15 @@ describe("the macOS sandbox's profile", () => {
       assert.equal(git(join(repo, "docs"), "rev-parse", "--absolute-git-dir").trim(), join(real, ".git"));
       for (const dir of ["docs", "libs"]) assert.ok(gitControl(join(repo, dir))?.locked.includes(join(real, ".git", "config")), `from ${dir}`);
       // With a HEAD, objects and refs too, git does: it is left alone, as a server's would be, but the .git of
-      // the checkout in it is denied, and nothing of repo's git directory, which isn't made writable, is fixed.
+      // the checkout in it is denied, and nothing of repo's git directory, which isn't made writable, is fixed:
+      // only libs itself stays in place, as it holds that .git.
       git(join(repo, "libs"), "init", "-q", "--bare", ".");
       const control = gitControl(join(repo, "libs"))!;
       const profile = seatbeltProfile([join(real, "libs"), "/private/tmp"], false, [], control);
       const denied = profile.split("\n").find((line) => line.startsWith("(deny file-write* "))!;
       assert.equal(denied, `(deny file-write* (literal "${join(real, "libs", "s", ".git")}"))`);
-      assert.doesNotMatch(profile, /file-write-unlink/);
+      const fixed = profile.split("\n").filter((line) => line.includes("file-write-unlink"));
+      assert.deepEqual(fixed, [`(deny file-write-unlink (literal "${join(real, "libs")}"))`]);
       assert.deepEqual(control.fixed, []);
       // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
       await mkdir(join(repo, "libs", "deep"));
@@ -1175,6 +1212,29 @@ describe("the macOS sandbox's profile", () => {
 /** git with an identity, and allowed to clone a submodule from a local path. */
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@localhost", "-c", "protocol.file.allow=always", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/**
+ * Whether a Seatbelt profile lets a command do an operation on a path, as Seatbelt decides it: by the last
+ * rule that matches. As much of its language as seatbeltProfile writes, so a profile can be checked on Linux
+ * too: operations, one ending in * standing for those it starts and default for all; and literal, subpath and
+ * regex filters, a rule with none matching every path and one with others only (the network's) none.
+ */
+function seatbeltAllows(profile: string, operation: string, path: string): boolean {
+  let allowed = false;
+  for (const rule of profile.split(/\n(?=\()/)) {
+    const [, verdict, body] = /^\((allow|deny) (.*)\)$/s.exec(rule) ?? [];
+    if (!verdict) continue;
+    const operations = body.split(" (")[0].split(" ");
+    const does = operations.some((name) => name === "default" || name === operation || (name.endsWith("*") && operation.startsWith(name.slice(0, -1))));
+    const on = [...body.matchAll(/\((literal|subpath|regex) #?"((?:[^"\\]|\\.)*)"\)/g)].some(([, kind, quoted]) => {
+      const value = quoted.replace(/\\(.)/g, "$1");
+      if (kind === "literal") return path === value;
+      return kind === "subpath" ? path === value || path.startsWith(`${value}/`) : new RegExp(value).test(path);
+    });
+    if (does && (on || !body.includes("("))) allowed = verdict === "allow";
+  }
+  return allowed;
 }
 
 /** A repository in `base`/repo with one commit and a submodule at libs/s, or at `path`. */

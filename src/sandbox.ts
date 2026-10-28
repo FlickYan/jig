@@ -453,6 +453,7 @@ function seatbelt(writable: string[], network: boolean, where: string, hidden: s
  * `home` is jig's own directory, by its real path.
  */
 export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string): string {
+  const denied = [...hidden, ...(home ? [home] : []), ...(git?.locked ?? [])]; // by path, in the rules below
   return [
     "(version 1)",
     "(allow default)",
@@ -469,6 +470,8 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     ...deny("file-write-unlink", git?.fixed.map((dir) => `(literal ${quote(dir)})`)),
     // The hidden paths are denied by path, so the directories holding them in a writable one stay in place.
     ...deny("file-write-unlink", holding(hidden, writable).map((dir) => `(literal ${quote(dir)})`)),
+    // And so do the writable directories holding them, jig's own or what git's lock lists (see writableHolding).
+    ...deny("file-write-unlink", writableHolding(writable, denied).map((dir) => `(literal ${quote(dir)})`)),
     // Last, so that it wins over the rules before it: reading and writing alike.
     ...hidden.map((path) => `(deny file-read* file-write* (subpath ${quote(path)}))`),
   ].join("\n");
@@ -478,11 +481,12 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
  * Seatbelt's rules for jig's own directory, which holds copies of the files of every project jig worked
  * in: snapshots (with the hidden files in those older versions took), sessions, memories. So commands
  * can't read it, nor write in it where it lies in a writable directory (a temp directory, say), where
- * settings could add hooks, nor move it aside, or a directory holding it there (see ownFixed). Only its
- * skills stay readable: the model runs their scripts by their full path there, as the skill tool tells it,
- * and nothing else in it is for commands. A writable directory in it (a project that is a skill being
- * written, say) stays as it was, and so does the metadata of the directory itself, which resolving a path
- * through it needs (realpath, as Node does for a script it runs).
+ * settings could add hooks, nor move it aside, or a directory holding it there (see ownFixed, and
+ * writableHolding for the writable directory itself). Only its skills stay readable: the model runs their
+ * scripts by their full path there, as the skill tool tells it, and nothing else in it is for commands. A
+ * writable directory in it (a project that is a skill being written, say) stays as it was, and so does the
+ * metadata of the directory itself, which resolving a path through it needs (realpath, as Node does for a
+ * script it runs).
  */
 function ownRules(home: string, writable: string[]): string[] {
   const inside = writable.filter((dir) => isInside(home, dir));
@@ -537,6 +541,20 @@ function ownFixed(home: string, writable: string[]): string[] {
  */
 function holding(hidden: string[], writable: string[]): string[] {
   return [...new Set(hidden.flatMap((path) => ownFixed(path, writable)))].sort((a, b) => a.length - b.length);
+}
+
+/**
+ * The writable directories holding any of `paths`, the outermost first, for Seatbelt to keep in place as it
+ * keeps those between (see holding and ownFixed, which stop at a writable directory) and git's (see
+ * controlOf): the (subpath ...) that lets commands write in one matches the directory itself too. So a
+ * command could move the whole project to /private/tmp/p, make /p again, and read a hidden file at its new
+ * path, or change git's config there and move the project back, as no rule names those paths. Only the
+ * directory's own path is denied, so commands still make, remove and rename files and folders in it, as git
+ * does in its git directory under the same rule. On Linux each writable directory is a mount point, which
+ * can't be moved.
+ */
+function writableHolding(writable: string[], paths: string[]): string[] {
+  return [...new Set(writable)].filter((dir) => paths.some((path) => isInside(dir, path))).sort((a, b) => a.length - b.length);
 }
 
 /**
