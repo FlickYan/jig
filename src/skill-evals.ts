@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, type IOType, spawn } from "node:child_process";
 import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -6,7 +6,7 @@ import type { Usage } from "./agent.ts";
 import { type Api, createModel } from "./model.ts";
 import { jigHome } from "./paths.ts";
 import { costOf } from "./prices.ts";
-import { createSandbox, type Sandbox } from "./sandbox.ts";
+import { createSandbox, execInSandbox, type Sandbox } from "./sandbox.ts";
 import { discoverSkills, type Skill } from "./skills.ts";
 import { type Hiding, hiddenTest, isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 import * as ui from "./ui.ts";
@@ -328,9 +328,10 @@ function runJig(args: string[], { cwd, env, stdin, timeout }: { cwd: string; env
  * and run outside, a script the task changed read what the sandbox had hidden from it.
  */
 function runCheck(command: string, project: string, env: NodeJS.ProcessEnv, sandbox: Sandbox | undefined): boolean {
-  const { program, args, stdio } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
+  const options = { cwd: project, env: withoutKeys(env), stdio: ["ignore", "ignore", "ignore"] as IOType[], timeout: 300_000 };
   try {
-    execFileSync(program, args, { cwd: project, env: withoutKeys(env), stdio: ["ignore", "ignore", "ignore", ...(stdio ?? [])], timeout: 300_000 });
+    if (sandbox) execInSandbox(sandbox, command, [], options);
+    else execFileSync("bash", ["-c", command], options);
     return true;
   } catch {
     return false;
@@ -350,15 +351,8 @@ function evidence(project: string, baseline: string | undefined, expectations: s
   // In the sandbox, git's arguments are bash's own ("$@", after $0), as in fetchSource.
   const git: Git = (args, input) => {
     const argv = [...SAFE_GIT, ...args];
-    const { program, args: wrapped, stdio } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [], stdio: undefined };
-    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, {
-      cwd: project,
-      env: withoutKeys(),
-      input,
-      stdio: ["pipe", "pipe", "pipe", ...(stdio ?? [])],
-      maxBuffer: 50_000_000,
-      timeout: 120_000,
-    });
+    const options = { cwd: project, env: withoutKeys(), input, stdio: ["pipe", "pipe", "pipe"] as IOType[], maxBuffer: 50_000_000, timeout: 120_000 };
+    return sandbox ? execInSandbox(sandbox, 'exec git "$@"', ["git", ...argv], options) : execFileSync("git", argv, options);
   };
   const text = (...args: string[]) => git(args).toString("utf8");
   try {

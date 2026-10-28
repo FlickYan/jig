@@ -6,7 +6,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { projectKey } from "../src/paths.ts";
-import { createSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
+import { createSandbox, execInSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
@@ -250,16 +250,80 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
 
   it("starts the session's namespace again when a command ends it", { skip: linuxOnly }, async () => {
     // kill -1 ends every process a command may signal, the keeper's among them, and the namespace with it:
-    // joining that one failed every later command ("Can't fork for --pidns: Cannot allocate memory").
+    // joining that one failed every later command ("Can't fork for --pidns: Cannot allocate memory"). And the
+    // namespace's init could still be running when the command had exited, so now and then the next command
+    // joined a namespace about to end, and failed: jig looks at the keeper's shell too (and see the next test).
     const sandbox = createSandbox(project, { network: false })!;
     try {
       await run("kill -TERM -1", sandbox); // what it prints is a race: the namespace's end kills it too
       assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+      // Given --die-with-parent, a join just after a namespace had ended was now and then killed as it started.
+      assert.ok(!sandbox.wrap("true").args.includes("--die-with-parent"), "a join ends with the keeper alone");
       assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
       assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");
     } finally {
       sandbox.close?.();
       await rm(join(project, "job.pid"), { force: true });
+    }
+  });
+
+  it("runs a command once more when the session's namespace ends as it joins", { skip: linuxOnly }, async () => {
+    // A command, or a job it left, can end the keeper after jig found it running and before bubblewrap joins
+    // its namespace: the join fails ("Can't fork for --pidns: Cannot allocate memory") and nothing runs. That
+    // was a race, lost about once in 40 runs of the test above. A bwrap earlier on the PATH loses it every
+    // time, once: the first command to join after the mark is made ends the namespace first, and waits until
+    // it can't be joined, then joins as bubblewrap does.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const mark = join(dir, "end-the-namespace");
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    const fake = [
+      "#!/bin/sh",
+      "join= prev=",
+      'for a do case $prev in --userns|--pidns) join="$join $prev $a";; esac; prev=$a; done',
+      `if [ -n "$join" ] && rm "${mark}" 2>/dev/null; then`,
+      `  ${real} $join --ro-bind / / -- /bin/sh -c 'kill -KILL -1'`,
+      `  i=0; while [ $i -lt 500 ] && ${real} $join --ro-bind / / -- /bin/true 2>/dev/null; do i=$((i + 1)); sleep 0.01; done`,
+      "fi",
+      `exec ${real} "$@"`,
+    ];
+    await writeFile(join(fakeBin, "bwrap"), `${fake.join("\n")}\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${savedPath}`;
+    const sandbox = createSandbox(project, { network: false })!; // it finds bwrap now
+    process.env.PATH = savedPath;
+    try {
+      assert.match(await run("echo first", sandbox), /^first\n\nExit code: 0$/);
+      await writeFile(mark, "");
+      assert.match(await run("echo ran >> runs.txt && echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+      assert.equal(existsSync(mark), false, "the namespace ended as the command joined it");
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\n", "the command ran once");
+      // And a run that waits for its command, as an eval's check and git in the sandbox do.
+      await writeFile(mark, "");
+      const waited = execInSandbox(sandbox, "echo ran >> runs.txt && echo still runs", [], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
+      assert.equal(waited.toString(), "still runs\n");
+      assert.equal(existsSync(mark), false, "the namespace ended as it joined it too");
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\nran\n", "that command ran once too");
+      assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
+      assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");
+    } finally {
+      sandbox.close?.();
+      for (const file of ["runs.txt", "job.pid"]) await rm(join(project, file), { force: true });
+    }
+  });
+
+  it("never runs a command twice, though it ends the session's namespace and says what bubblewrap would", { skip: linuxOnly }, async () => {
+    // Only a command bubblewrap never started runs once more: a command it started is never run again, even
+    // one that failed with the words of a failed join, its namespace ended under it.
+    const sandbox = createSandbox(project, { network: false })!;
+    try {
+      const failed = `echo ran >> runs.txt; echo "bwrap: Can't fork for --pidns: Cannot allocate memory" >&2; kill -KILL -1; sleep 10; exit 1`;
+      assert.doesNotMatch(await run(failed, sandbox), /Exit code: 0$/);
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\n", "the command ran once");
+      assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+    } finally {
+      sandbox.close?.();
+      await rm(join(project, "runs.txt"), { force: true });
     }
   });
 
@@ -279,12 +343,14 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
-  it("leaves the session's namespace descriptors out of what a command runs", { skip: linuxOnly }, async () => {
+  it("leaves the session's namespace descriptors, and bubblewrap's pipe, out of what a command runs", { skip: linuxOnly }, async () => {
     // bubblewrap leaves the --userns and --pidns descriptors open; the command, and jobs it leaves running, mustn't inherit them.
     const sandbox = createSandbox(project, { network: false })!;
     const out = await run("ls -l /proc/self/fd; (ls -l /proc/self/fd &); sleep 0.2", sandbox);
     sandbox.close?.();
     assert.doesNotMatch(out, /(pid|user):\[/);
+    // Nor the pipe bubblewrap reports the command's process on (--info-fd): only stdin, stdout, stderr and ls's own.
+    assert.doesNotMatch(out, / (?:[4-9]|\d\d+) -> /);
   });
 
   it("kills a command's whole tree on timeout, inside the session's namespace", { skip: linuxOnly }, async () => {
@@ -921,6 +987,7 @@ describe("the sandbox's fallback without a session PID namespace", { skip: sandb
       const { args, stdio, note } = sandbox.wrap("echo hi");
       assert.equal(fellBack, true, "jig told the user it fell back");
       assert.ok(args.includes("--unshare-pid"), "each command gets its own PID namespace");
+      assert.ok(args.includes("--die-with-parent"), "which ends with jig, as there is no keeper to end it");
       assert.ok(args.join(" ").includes("--proc /proc"), "with its own /proc");
       assert.ok(!args.includes("--pidns") && !args.includes("--userns"), "it doesn't try to join a keeper");
       assert.equal(stdio, undefined, "and passes no namespace descriptors");

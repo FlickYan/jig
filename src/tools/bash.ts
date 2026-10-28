@@ -9,6 +9,7 @@ import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, closeSync, openSync, rmSync } from "node:fs";
 import type { Socket } from "node:net";
+import type { Readable } from "node:stream";
 import { stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -96,8 +97,8 @@ export const running = new Set<number>();
 
 /**
  * Kills the commands and hooks still running, with everything they started, as Ctrl+C does: for jig's exit.
- * Each has a session of its own, which closing the terminal doesn't reach, and apart from bubblewrap's
- * --die-with-parent (the Linux sandbox, for commands) nothing else would stop it with jig.
+ * Each has a session of its own, which closing the terminal doesn't reach, and apart from the Linux sandbox,
+ * whose commands end with jig (see sandbox.ts's Keeper), nothing else would stop it with jig.
  */
 export function killCommands(): void {
   for (const group of running) killGroup(group);
@@ -116,7 +117,7 @@ function killGroup(group: number): void {
  * only if it can't be started. Given `files`, the whole of a long output is kept in one of them, and given
  * `count`, cutting it counts as the loop's own cut does (the loop's then has nothing left to cut).
  */
-export function runCommand(
+export async function runCommand(
   command: string,
   cwd: string,
   seconds: number,
@@ -125,14 +126,34 @@ export function runCommand(
   files?: OutputFiles,
   count?: ToolContext["count"],
 ): Promise<string> {
+  // Undefined if bubblewrap couldn't join the session's namespace, which had just ended, and so started
+  // nothing: wrapped again, the command runs in a new one, once (see sandbox.ts's Keeper).
+  const result = await runOnce(command, cwd, seconds, signal, sandbox, files, count, true);
+  return result ?? (await runOnce(command, cwd, seconds, signal, sandbox, files, count, false))!;
+}
+
+function runOnce(
+  command: string,
+  cwd: string,
+  seconds: number,
+  signal: AbortSignal | undefined,
+  sandbox: Sandbox | undefined,
+  files: OutputFiles | undefined,
+  count: ToolContext["count"] | undefined,
+  mayRetry: boolean,
+): Promise<string | undefined> {
   return new Promise((resolve, reject) => {
-    const { program, args, stdio, note: about } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
+    const { program, args, stdio, note: about, couldntJoin } = sandbox?.wrap(command) ?? { program: "bash", args: ["-c", command] };
     // detached puts the command in its own process group, so a timeout or Ctrl+C can kill it together
     // with everything it started (a test runner and its workers, say), not just the shell. `stdio` carries
-    // the session's namespace descriptors on Linux (child fds 3 onwards), for the sandbox to join (see Keeper).
+    // the session's namespace descriptors on Linux (child fds 3 onwards), for the sandbox to join, and a
+    // pipe on which bubblewrap reports the command's process before it starts it (see Keeper).
     const child = spawn(program, args, { cwd, env: withoutKeys(), detached: true, stdio: ["ignore", "pipe", "pipe", ...(stdio ?? [])] });
     const group = child.pid; // none if it couldn't be started
     if (group) running.add(group);
+    let reported = "";
+    const pipe = stdio?.indexOf("pipe") ?? -1;
+    if (pipe >= 0) (child.stdio[3 + pipe] as Readable).setEncoding("utf8").on("data", (chunk: string) => (reported += chunk));
     const output = new Output(files);
     let killedBecause = "";
     let done = false;
@@ -185,7 +206,15 @@ export function runCommand(
         finish(status(code, killSignal), STILL_RUNNING);
       }, LINGER_MS);
     });
-    child.on("close", (code, killSignal) => finish(status(code, killSignal)));
+    child.on("close", (code, killSignal) => {
+      // Only here, with every pipe closed, is all that bubblewrap reported in.
+      if (mayRetry && !done && !killedBecause && code !== 0 && couldntJoin?.(reported)) {
+        settle();
+        resolve(undefined);
+        return;
+      }
+      finish(status(code, killSignal));
+    });
   });
 }
 

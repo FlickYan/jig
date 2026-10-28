@@ -1,10 +1,10 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, type IOType } from "node:child_process";
 import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
-import { createSandbox, lockedGitPaths } from "./sandbox.ts";
+import { createSandbox, execInSandbox, lockedGitPaths } from "./sandbox.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
 import { assertVisible, isInside, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
 
@@ -81,12 +81,11 @@ export function fetchSource(source: SkillSource, hidden: string[] = []): Fetched
     rmSync(tmp, { recursive: true, force: true });
   };
   // git refuses ext:: URLs, which run a command, unless a config allows them: this keeps them refused. In
-  // the sandbox, git's arguments are bash's own ("$@", after $0), so the shell reads none of them. The sandbox
-  // joins the session's namespaces through descriptors the spawn passes on (child fds 3 onwards, see Keeper).
+  // the sandbox, git's arguments are bash's own ("$@", after $0), so the shell reads none of them.
   const git = (args: string[], cwd = tmp) => {
     const argv = ["-c", "protocol.ext.allow=never", ...args];
-    const { program, args: wrapped, stdio } = sandbox ? sandbox.wrap('exec git "$@"') : { program: "git", args: [], stdio: undefined };
-    return execFileSync(program, sandbox ? [...wrapped, "git", ...argv] : argv, { cwd, stdio: ["ignore", "pipe", "pipe", ...(stdio ?? [])], encoding: "utf8", timeout: 180_000 });
+    const options = { cwd, stdio: ["ignore", "pipe", "pipe"] as IOType[], timeout: 180_000 };
+    return sandbox ? execInSandbox(sandbox, 'exec git "$@"', ["git", ...argv], options) : execFileSync("git", argv, options);
   };
   try {
     if (source.ref && /^[0-9a-f]{7,40}$/.test(source.ref)) {
@@ -104,7 +103,7 @@ export function fetchSource(source: SkillSource, hidden: string[] = []): Fetched
     }
   } catch (err) {
     cleanup();
-    const { code, stderr } = err as { code?: string; stderr?: string };
+    const { code, stderr } = err as { code?: string; stderr?: Buffer };
     if (code === "ENOENT") throw new Error("Installing skills from a repository needs git, which isn't on the PATH.");
     const reason = String(stderr ?? (err as Error).message).trim().split("\n").filter((line) => !line.startsWith("warning:"))[0];
     throw new Error(`Couldn't fetch ${source.spec}: ${reason || "git failed"}`);

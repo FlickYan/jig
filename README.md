@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 528 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 530 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.

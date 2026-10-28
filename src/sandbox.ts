@@ -1,7 +1,7 @@
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, execFileSync, type ExecFileSyncOptions, type IOType, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { constants as osConstants, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
@@ -12,14 +12,8 @@ export interface Sandbox {
   description: string;
   /** For the model: what commands can't do. */
   limits: string;
-  /**
-   * The program and arguments that run `command` in bash inside the sandbox, and on Linux the file
-   * descriptors the spawn must pass on beyond stdio (the session's namespaces, see Keeper), at child
-   * descriptors 3 onwards. They end with the command, run by bash -c, so arguments added after them are its $0
-   * and "$@" (see fetchSource). `note` is for the model, with the command's result: on Linux, once, that a
-   * job left in the background ends with its command here (see Keeper).
-   */
-  wrap(command: string): { program: string; args: string[]; stdio?: number[]; note?: string };
+  /** How to run `command` in bash inside the sandbox (see Wrapped, and execInSandbox for a run that waits). */
+  wrap(command: string): Wrapped;
   /** Ends the session's keeper (Linux) and frees what it holds: for jig's exit (see Keeper). */
   close?(): void;
   /**
@@ -30,6 +24,48 @@ export interface Sandbox {
    * or the rest (see gitWatch), so jig says so after a task.
    */
   gitChanges?(): string[];
+}
+
+/** How a command runs in the sandbox (see Sandbox.wrap). */
+export interface Wrapped {
+  /**
+   * The program and its arguments. They end with the command, run by bash -c, so arguments added after them
+   * are its $0 and "$@" (see fetchSource).
+   */
+  program: string;
+  args: string[];
+  /**
+   * On Linux, what the spawn must pass on beyond stdio, at child descriptors 3 onwards: the session's
+   * namespaces, and a pipe on which bubblewrap reports the command's process before it starts it (see Keeper).
+   */
+  stdio?: (number | "pipe")[];
+  /** For the model, with the command's result: on Linux, once, that a job left in the background ends with its command here (see Keeper). */
+  note?: string;
+  /**
+   * For a run that failed, given what came out of the pipe: whether bubblewrap couldn't join the session's
+   * namespace, which had just ended, and so started nothing. Then the command, wrapped again, runs in a new
+   * one; once, whatever comes of it (see Keeper).
+   */
+  couldntJoin?(reported: string): boolean;
+}
+
+/**
+ * Runs `command` in the sandbox, `args` after it (bash's $0 and "$@"), as execFileSync runs a program, `stdio`
+ * being its first three descriptors: once more, wrapped again, if bubblewrap couldn't join the session's
+ * namespace (see Wrapped.couldntJoin).
+ */
+export function execInSandbox(sandbox: Sandbox, command: string, args: string[], options: Omit<ExecFileSyncOptions, "encoding" | "stdio"> & { stdio: IOType[] }): Buffer {
+  for (let again = false; ; again = true) {
+    const { program, args: wrapped, stdio = [], couldntJoin } = sandbox.wrap(command);
+    try {
+      return execFileSync(program, [...wrapped, ...args], { ...options, stdio: [...options.stdio, ...stdio] });
+    } catch (err) {
+      if (again || !couldntJoin) throw err;
+      // execFileSync's error holds what came out of each descriptor, the pipe bubblewrap reports on among them.
+      const reported = (err as { output?: (Buffer | null)[] }).output?.[3 + stdio.indexOf("pipe")];
+      if (!couldntJoin(reported?.toString() ?? "")) throw err;
+    }
+  }
 }
 
 /** What the sandbox keeps commands from changing in a repository (see gitControl). */
@@ -622,9 +658,10 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     ...(home ? ownBinds(home, writable) : []),
     ...(git ? gitBinds(git, shown) : []),
     ...hiding,
-    ...join, // join the session's namespaces, or --unshare-pid in the fallback
+    // Join the session's namespaces, or in the fallback --unshare-pid and --die-with-parent: if jig is killed,
+    // so are its commands, which a joined one is with the keeper (see Keeper).
+    ...join,
     ...(network ? [] : ["--unshare-net"]),
-    "--die-with-parent", // if jig is killed, so are its commands
   ];
   const offline =
     ", and have no network: each command gets an empty one of its own, so it can't reach the internet, servers on this " +
@@ -634,13 +671,13 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
     limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}`,
     wrap: (command) => {
-      const { args: join, stdio, note } = keeper.join();
+      const { args: join, stdio, note, couldntJoin } = keeper.join();
       // bubblewrap leaves the namespace descriptors open in what it runs, so a shell closes them before bash
       // runs the command: the command, and the jobs it leaves running, don't inherit them. The command is that
       // shell's $0, so what follows it is still bash's $0 and "$@".
       const close = stdio.map((_, i) => `${i + 3}<&-`).join(" ");
       const run = stdio.length ? ["/bin/sh", "-c", `exec ${close} /bin/bash -c "$0" "$@"`] : ["/bin/bash", "-c"];
-      return { program: bwrap, args: [...args(join), "--", ...run, command], stdio: stdio.length ? stdio : undefined, note };
+      return { program: bwrap, args: [...args(join), "--", ...run, command], stdio: stdio.length ? stdio : undefined, note, couldntJoin };
     },
     close: () => keeper.close(),
   };
@@ -664,13 +701,19 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
  * grants nothing: a command can already read every other path, and can't write through a read-only root. The
  * keeper's life is tied to jig's: it reads a pipe jig holds open, so jig's death sends it end-of-file, and
  * --die-with-parent kills it if jig is killed; either way its init ends and the kernel ends every process in
- * the namespace. A command can end the keeper too (kill -1 ends every process it may signal), and the next
- * command then starts another, as the first did. If bubblewrap is too old for the join (no --pidns) or the
- * keeper can't start, each command falls back to a PID namespace of its own (--unshare-pid), which is as safe
- * but ends a command's background jobs with the command; jig tells the user so once, and the model, whom the
- * bash tool tells to leave a server running in the background, with the first command's result. jig never
- * runs commands in the host's PID namespace. The keeper gets jig's environment without its keys, as commands
- * do: they can read its environment in /proc/1.
+ * the namespace, the commands that joined it among them. (They don't take --die-with-parent themselves: given
+ * it, a join just after a namespace had ended was now and then killed as it started.) A command can end the
+ * keeper too (kill -1 ends every process it may signal), and the namespace with it, ending the session's jobs
+ * and any command running then. The next command starts another, as the first did: jig sees the namespace's
+ * init or the keeper's shell gone, exiting or sent a signal that ends it (see exited). Should the namespace
+ * end only after that, as bubblewrap joins it (a job can end it at any time), bubblewrap can't join and starts
+ * nothing, which it lets jig know, and the command runs once more in a new one (see join). A command that
+ * bubblewrap started never runs again. If bubblewrap is too old for the join (no --pidns) or the keeper can't
+ * start, each command falls back to a PID namespace of its own (--unshare-pid), which is as safe but ends a
+ * command's background jobs with the command; jig tells the user so once, and the model, whom the bash tool
+ * tells to leave a server running in the background, with the first command's result. jig never runs commands
+ * in the host's PID namespace. The keeper gets jig's environment without its keys, as commands do: they can
+ * read its environment in /proc/1.
  */
 class Keeper {
   private started = false;
@@ -695,7 +738,7 @@ class Keeper {
    * How a command joins the session's namespaces: the bubblewrap arguments and the descriptors they name, and
    * in the fallback, the first time, a note for the model.
    */
-  join(): { args: string[]; stdio: number[]; note?: string } {
+  join(): Pick<Wrapped, "note" | "couldntJoin"> & { args: string[]; stdio: (number | "pipe")[] } {
     // A command can end the keeper, and the namespace ends with it: joining that one would fail every later
     // command ("Can't fork for --pidns"), so start another, as at the first command.
     if (this.exited()) {
@@ -704,14 +747,20 @@ class Keeper {
     }
     this.ensure();
     if (this.pidFd < 0) {
-      // The fallback: a PID namespace per command.
+      // The fallback: a PID namespace per command, which ends with jig only by --die-with-parent.
       const note = this.told ? undefined : PER_COMMAND;
       this.told = true;
-      return { args: ["--unshare-pid"], stdio: [], note };
+      return { args: ["--unshare-pid", "--die-with-parent"], stdio: [], note };
     }
-    return this.userFd >= 0
-      ? { args: ["--userns", "3", "--pidns", "4"], stdio: [this.userFd, this.pidFd] }
-      : { args: ["--pidns", "3"], stdio: [this.pidFd] };
+    const fds = this.userFd >= 0 ? [this.userFd, this.pidFd] : [this.pidFd];
+    const args = this.userFd >= 0 ? ["--userns", "3", "--pidns", "4"] : ["--pidns", "3"];
+    // The namespace can still end as bubblewrap joins it, by a job, say: bubblewrap then can't join ("Can't
+    // fork for --pidns", "Unexpected short read from pid socket") and starts nothing. It reports the command's
+    // process on the pipe once it has joined, before it lets the command start: so a run that reported nothing,
+    // in a namespace that has since ended, started nothing, and runs once more in a new one.
+    const joined = this.child;
+    const couldntJoin = (reported: string) => !reported && (this.child !== joined || this.exited());
+    return { args: [...args, "--info-fd", String(3 + fds.length)], stdio: [...fds, "pipe"], couldntJoin };
   }
 
   private ensure(): void {
@@ -736,11 +785,13 @@ class Keeper {
       // host's: without it, /proc/1/root/proc/<hostpid>/root was a second hop into the host's mount namespace,
       // where the sandbox's binds don't apply -- the very escape this closes. keeperHiding masks the hidden
       // paths and jig's directory in the root, so reaching it directly through /proc/1/root grants nothing.
-      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", "read x"];
+      // Its shell says it runs, after bwrap's report in the same file (see keeperChildPid), and closes its output.
+      const shell = `echo ${KEEPER_RUNNING}; exec >&-; read x`;
+      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", shell];
       // Detached, so the terminal's Ctrl+C doesn't reach it: the session goes on after an interrupted command.
       // Its stdin is a pipe jig holds open; jig's death closes it, and the keeper's `read` then ends. Without
       // jig's keys, as commands get: they share its PID namespace and can read its environment in /proc/1.
-      this.child = spawn(this.bwrap, args, { env: withoutKeys(), stdio: ["pipe", "ignore", "ignore", infoFd], detached: true });
+      this.child = spawn(this.bwrap, args, { env: withoutKeys(), stdio: ["pipe", infoFd, "ignore", infoFd], detached: true });
       this.child.unref();
       this.child.stdin?.on("error", () => {}); // the write end can outlive the keeper; ignore EPIPE
       closeSync(infoFd);
@@ -767,18 +818,13 @@ class Keeper {
   /**
    * Whether the session's namespace has ended, or is ending. Node sees the keeper exit only on a later turn
    * of its event loop, which can come after the end of the command that ended it, so the namespace's init is
-   * asked too: gone, or exiting (PF_EXITING in its flags, set before the kernel ends the namespace's processes).
+   * asked too, and the keeper's shell, its pid 2, as the keeper's own /proc shows it: a command that killed it
+   * can exit before it has, and before the init has seen it, and the next command would then join a
+   * namespace about to end, to be ended with it.
    */
   private exited(): boolean {
     if (!this.child || !this.initPid) return false;
-    if (this.ended()) return true;
-    try {
-      const stat = readFileSync(`/proc/${this.initPid}/stat`, "utf8");
-      const [state, , , , , , flags] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      return state === "Z" || state === "X" || (Number(flags) & PF_EXITING) !== 0;
-    } catch {
-      return true; // reaped
-    }
+    return this.ended() || ending(`/proc/${this.initPid}`) || ending(`/proc/${this.initPid}/root/proc/2`);
   }
 
   /** Ends the keeper and the whole session's namespace, and frees the descriptors jig held open. */
@@ -792,8 +838,35 @@ class Keeper {
   }
 }
 
+/**
+ * Whether the process with this /proc directory has gone, is exiting (PF_EXITING in its flags, set before
+ * the kernel ends a namespace's processes with its init), or has a signal pending that ends it: one it
+ * doesn't block, catch or ignore, and that ends a process. The kernel marks it so as the signal is sent, but
+ * the process exits only once it runs, which under load can be a while. Where /proc won't say, it isn't.
+ */
+function ending(dir: string): boolean {
+  let stat: string, status: string;
+  try {
+    stat = readFileSync(join(dir, "stat"), "utf8");
+    status = readFileSync(join(dir, "status"), "utf8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT"; // reaped
+  }
+  const [state, , , , , , flags] = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+  if (state === "Z" || state === "X" || (Number(flags) & PF_EXITING) !== 0) return true;
+  const mask = (field: string) => BigInt(`0x${new RegExp(`^${field}:\\s*([0-9a-f]+)$`, "m").exec(status)?.[1] ?? "0"}`);
+  const spared = mask("SigBlk") | mask("SigCgt") | mask("SigIgn") | NOT_ENDING;
+  return ((mask("SigPnd") | mask("ShdPnd")) & ~spared) !== 0n;
+}
+
 const KEEPER_START_MS = 5000; // how long to wait for the keeper to report its PID before falling back
+const KEEPER_RUNNING = "running"; // what the keeper's shell says once it runs
 const PF_EXITING = 0x4; // in a process's flags in /proc/<pid>/stat: it has begun to exit
+// The signals that by default leave a process running, as bits of /proc/<pid>/status's masks.
+const NOT_ENDING = (["SIGCHLD", "SIGCONT", "SIGSTOP", "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGWINCH"] as const).reduce(
+  (bits, name) => bits | (1n << BigInt(osConstants.signals[name] - 1)),
+  0n,
+);
 const PER_COMMAND =
   "(Each command here runs in a process namespace of its own, so a job it leaves in the background ends with it: " +
   "start a server and use it in the same command.)";
@@ -808,13 +881,17 @@ function keeperSupported(bwrap: string): boolean {
   }
 }
 
-/** The keeper's PID, read from the --info-fd file it writes early; undefined if it never does (it failed to start). */
+/**
+ * The PID of the keeper's init, read from the --info-fd file bwrap writes early, once the keeper's shell has
+ * said in it that it runs: it is the namespace's process 2 then, as nothing else can be in the namespace before
+ * jig has it (see Keeper.exited). Undefined if that never comes (it failed to start).
+ */
 function keeperChildPid(infoPath: string): number | undefined {
   const deadline = Date.now() + KEEPER_START_MS;
   const sleeper = new Int32Array(new SharedArrayBuffer(4));
   while (Date.now() < deadline) {
     try {
-      const pid = /"child-pid":\s*(\d+)/.exec(readFileSync(infoPath, "utf8"))?.[1];
+      const pid = new RegExp(`"child-pid":\\s*(\\d+)[^]*\\n${KEEPER_RUNNING}\\n`).exec(readFileSync(infoPath, "utf8"))?.[1];
       if (pid) return Number(pid);
     } catch {
       // not written yet
@@ -828,7 +905,7 @@ function keeperChildPid(infoPath: string): number | undefined {
 function probeJoin(bwrap: string, userFd: number, pidFd: number): boolean {
   const { args, stdio } = userFd >= 0 ? { args: ["--userns", "3", "--pidns", "4"], stdio: [userFd, pidFd] } : { args: ["--pidns", "3"], stdio: [pidFd] };
   try {
-    execFileSync(bwrap, [...args, "--ro-bind", "/", "/", "--proc", "/proc", "--die-with-parent", "--", "/bin/true"], {
+    execFileSync(bwrap, [...args, "--ro-bind", "/", "/", "--proc", "/proc", "--", "/bin/true"], {
       stdio: ["ignore", "ignore", "ignore", ...stdio],
       timeout: 5000,
     });
