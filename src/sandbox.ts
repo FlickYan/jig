@@ -36,7 +36,10 @@ export interface Sandbox {
 export interface GitControl {
   /** Config, hooks and the files that say where they are, whether they exist or not. */
   locked: string[];
-  /** The git directory and the directories between it and those, which can't be moved aside either. */
+  /**
+   * The git directory and the directories between it and those, which can't be moved aside either, and
+   * those between them and a writable directory they lie in (see keptInPlace).
+   */
   fixed: string[];
   /** The repository's git directories, its linked worktrees' and its submodules', which commands can make git pass over (see gitWatch). */
   gitDirectories: string[];
@@ -108,17 +111,37 @@ export function createSandbox(
  * be the task. But not for a bare one named .git, whose config the file tools refuse too, nor for one with
  * linked worktrees, which is no server's: the user runs git in them (a bare clone, its worktrees beside it).
  * And the repositories around this one leave locked what they have in a writable directory, `writable`
- * being the sandbox's, or the project and its git directory (see aroundControl).
+ * being the sandbox's, or the project and its git directory (see aroundControl). Where a writable
+ * directory holds what is locked, the directories between them can't be moved aside (see keptInPlace).
  */
 export function gitControl(project: string, repo = gitDirs(project), writable?: string[]): GitControl | undefined {
   if (!repo) return undefined;
-  const around = aroundControl(project, repo, writable ?? [realpathSync(project), repo.common]);
-  if (repo.bare && !worktrees(repo.common).length && !isGitControl(join(repo.common, "config"))) return around && { ...around, aroundOnly: true };
+  const dirs = writable ?? [realpathSync(project), repo.common];
+  const around = aroundControl(project, repo, dirs);
+  if (repo.bare && !worktrees(repo.common).length && !isGitControl(join(repo.common, "config"))) {
+    return around && keptInPlace({ ...around, aroundOnly: true }, dirs);
+  }
   const own = controlOf(repo, dotGitFile(project));
-  if (!around) return own;
+  if (!around) return keptInPlace(own, dirs);
   const merged = (key: "locked" | "fixed" | "gitDirectories") => [...new Set([...own[key], ...around[key]])];
-  const fixed = merged("fixed").sort((a, b) => a.length - b.length); // a directory before those in it, as controlOf has them
-  return { locked: merged("locked"), fixed, gitDirectories: merged("gitDirectories") };
+  return keptInPlace({ locked: merged("locked"), fixed: merged("fixed"), gitDirectories: merged("gitDirectories") }, dirs);
+}
+
+/**
+ * A control with the directories between what it locks and the outermost writable directory it lies in
+ * fixed too, as holding has them for a hidden path, the outermost first. controlOf fixes only those in the
+ * git directory, so with the project in a directory in a temp one (a clone in /tmp/work/repo), a command
+ * could move work aside, put a copy of the repository with a config of its own in its place, and leave the
+ * user's git to run what that names: no rule named the new config's path, and gitWatch doesn't look at a
+ * config. Binding them grants nothing, as they lie in a writable directory already. Not for the .git files
+ * of worktrees and submodule checkouts: fixing every directory above a checkout in the project would keep
+ * commands from renaming them, and a .git put in one's place is refused by Seatbelt, which denies the path,
+ * or reported by gitWatch, which looks at every one.
+ */
+function keptInPlace(control: GitControl, writable: string[]): GitControl {
+  const between = holding(control.locked.filter((path) => basename(path) !== ".git"), writable);
+  const fixed = [...new Set([...control.fixed, ...between])].sort((a, b) => a.length - b.length); // a directory before those in it
+  return { ...control, fixed };
 }
 
 /**
@@ -546,7 +569,7 @@ function holding(hidden: string[], writable: string[]): string[] {
 /**
  * The writable directories holding any of `paths`, the outermost first, for Seatbelt to keep in place as it
  * keeps those between (see holding and ownFixed, which stop at a writable directory) and git's (see
- * controlOf): the (subpath ...) that lets commands write in one matches the directory itself too. So a
+ * keptInPlace): the (subpath ...) that lets commands write in one matches the directory itself too. So a
  * command could move the whole project to /private/tmp/p, make /p again, and read a hidden file at its new
  * path, or change git's config there and move the project back, as no rule names those paths. Only the
  * directory's own path is denied, so commands still make, remove and rename files and folders in it, as git
@@ -848,9 +871,12 @@ function gitBinds({ locked, fixed }: GitControl, shown: (path: string) => boolea
       // If jig can't, commands, which run as the same user, can't either; nor where its git directory is gone.
     }
   }
-  // The git directory and those between it and what is locked bound once more, so they are mount points a
-  // command can't move aside; then what is locked, read-only. Only what exists: binding a path that doesn't
-  // would create it (gitWatch looks out for those).
+  // The git directory, those between it and what is locked, and those between them and a writable directory
+  // they lie in (see keptInPlace) bound once more, so they are mount points a command can't move aside. A
+  // directory bound before in one of the last (holding a hidden path, see holding) stays in place too: a mount
+  // on a directory keeps it from being moved, whatever is bound later over one holding it. Then what is
+  // locked, read-only. Only what exists: binding a path that doesn't would create it (gitWatch looks out for
+  // those).
   return [
     ...fixed.filter((dir) => shown(dir) && existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
     ...locked.filter((path) => shown(path) && existsSync(path)).flatMap((path) => ["--ro-bind", path, path]),

@@ -321,6 +321,40 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("keeps the directories between a repository and a temp directory holding it in place", async () => {
+    // A clone in a directory in a temp directory: only the project and its git directory stayed in place, so a
+    // command could move work aside and put a copy with a config of its own where the repository was.
+    const [work, repo] = [join(dir, "work"), join(dir, "work", "repo")];
+    await mkdir(join(repo, "config", "keys"), { recursive: true });
+    git(repo, "init", "-q");
+    await writeFile(join(repo, "config", "keys", ".env"), "TOKEN=moved-out-of-hiding\n");
+    const config = await readFile(join(repo, ".git", "config"), "utf8");
+    const moved = [work, repo, join(repo, ".git"), join(repo, "config")];
+    // Hiding nothing first, as a hidden path in the project keeps work in place for itself.
+    const sandbox = createSandbox(repo, { network: false })!;
+    const hiding = createSandbox(repo, { network: false, hidden: [join(repo, "config", "keys", ".env")] })!;
+    try {
+      for (const path of moved.slice(0, 3)) {
+        assert.match(await runCommand(`mv ${path} ${path}-moved`, repo, 20, undefined, sandbox), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      assert.deepEqual(sandbox.gitChanges?.(), []);
+      // Ordinary work goes on in the project and beside it.
+      const ordinary = "mkdir src && mv src lib && echo 1 > lib/a.txt && rm -r lib && mkdir ../notes && mv ../notes ../n && rmdir ../n && echo done";
+      assert.match(await runCommand(ordinary, repo, 20, undefined, sandbox), /^done/);
+      // With config/keys/.env hidden, config stays in place too, though git's binds of those holding it come later.
+      for (const path of moved) {
+        assert.match(await runCommand(`mv ${path} ${path}-moved`, repo, 20, undefined, hiding), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+    } finally {
+      sandbox.close?.();
+      hiding.close?.();
+      for (const path of moved) await rm(`${path}-moved`, { recursive: true, force: true });
+    }
+  });
+
   it("makes a repository's missing hooks directory, so that it is read-only too", async () => {
     const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
     try {
@@ -997,6 +1031,43 @@ describe("the macOS sandbox's profile", () => {
     const nested = seatbeltProfile(["/private/tmp/w", "/q", "/private/tmp"], false, ["/private/tmp/w/key"], lockedIn, "/private/tmp/w/.jig");
     assert.ok(nested.split("\n").includes('(deny file-write-unlink (literal "/private/tmp") (literal "/private/tmp/w"))'), nested);
     assert.doesNotMatch(nested, /literal "\/q"/);
+  });
+
+  it("keeps the directories between git's files and a writable directory holding the project in place", async () => {
+    // A clone in a directory in a temp directory: only the project and its git directory stayed in place, so
+    // a command could move work aside and put a copy with a config of its own where the repository was.
+    const base = await realpath(await mkdtemp(join(tmpdir(), "jig-profile-")));
+    try {
+      const [work, repo] = [join(base, "work"), join(base, "work", "repo")];
+      await mkdir(repo, { recursive: true });
+      git(repo, "init", "-q");
+      const writable = [repo, base];
+      const control = gitControl(repo, undefined, writable)!;
+      assert.deepEqual(control.fixed, [work, repo, join(repo, ".git")], "outermost first");
+      const profile = seatbeltProfile(writable, false, [], control);
+      assert.ok(profile.split("\n").includes(`(deny file-write-unlink (literal "${work}") (literal "${repo}") (literal "${join(repo, ".git")}"))`), profile);
+      const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
+      for (const path of [work, repo, join(repo, ".git")]) assert.equal(allows("file-write-unlink", path), false, path);
+      // Ordinary work goes on: files and folders are made, removed and renamed in the project and beside it.
+      for (const path of [join(repo, "src"), join(repo, "src", "a.txt"), join(work, "notes.txt"), join(base, "other")]) {
+        for (const operation of ["file-write-create", "file-write-unlink"]) assert.ok(allows(operation, path), `${operation} ${path}`);
+      }
+      // With the project in no other writable directory, only its git directory, as before.
+      assert.deepEqual(gitControl(repo, undefined, [repo])!.fixed, [join(repo, ".git")]);
+      // A git directory made with --separate-git-dir in a folder of the project: that folder too.
+      const [separate, gitDir] = [join(base, "separate"), join(base, "separate", "meta", "gd")];
+      await mkdir(dirname(gitDir), { recursive: true });
+      git(separate, "init", "-q", `--separate-git-dir=${gitDir}`);
+      const separated = seatbeltProfile([separate, base], false, [], gitControl(separate, undefined, [separate, base])!);
+      assert.equal(seatbeltAllows(separated, "file-write-unlink", join(separate, "meta")), false);
+      // A folder holding a submodule's checkout is still renamed: a .git put in the checkout's place is reported.
+      const outer = await repoWithSubmodule(base);
+      const withSubmodule = seatbeltProfile([outer, base], false, [], gitControl(outer, undefined, [outer, base])!);
+      assert.ok(seatbeltAllows(withSubmodule, "file-write-unlink", join(outer, "libs")));
+      assert.equal(seatbeltAllows(withSubmodule, "file-write-unlink", outer), false, "the project, which holds its git directory");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
   });
 
   it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {

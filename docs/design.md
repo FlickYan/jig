@@ -208,8 +208,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   not only the one jig runs in: the user runs git in the others too) or add config (`config.worktree`); and
   the directories holding them in the git directory in place, since one moved aside could be replaced. So
   `git worktree remove`, and `git rm` or `git mv` of a submodule, fail in the sandbox for one that was
-  there when the session began. A bare repository's config and hooks stay writable, since setting up a
-  server's hooks can be the task, unless it is named `.git` or has worktrees, where the user runs git.
+  there when the session began. Where a directory commands can write in holds the git directory, those
+  between them stay in place too: in a review, a command moved aside the folder holding a clone in a temp
+  directory and put a copy with a config of its own in its place, which no rule named and jig didn't warn
+  of. A bare repository's config and hooks stay writable, since setting up a server's hooks can be the
+  task, unless it is named `.git` or has worktrees, where the user runs git.
   bubblewrap can only make a path read-only by binding something over it, which creates a missing one: a
   missing hooks directory is created empty, which runs nothing (git's default one holds only samples, which
   never run either), but an empty `commondir` would break git. Nor can it keep a submodule's checkout in

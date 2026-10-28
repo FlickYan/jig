@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 526 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 528 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -139,17 +139,19 @@ all: in milestone 28, two candidates' changes never ran, which only reading the 
   `.git`: setting up a server's hooks can be the task. Those files of a repository around the project's
   that lie where commands can write (a submodule checkout's `.git` in the project, say, or its config in a
   temp directory) stay read-only too, so a repository a command makes in the project doesn't unlock them.
-  Some changes to git's files aren't refused, so jig warns of them after the task and when a session ends:
-  on Linux, a `commondir` or `config.worktree` that wasn't there (one can't be made read-only without
-  creating it, and an empty `commondir` breaks git); on both systems, a submodule's checkout moved aside
-  and another put in its place (on macOS, a link to one), a `.git` made in the project, or the project made
-  a git directory (`git init --bare .`), when jig was started in a subdirectory of a repository (the same
-  in a directory between them; making a repository can be the task), and a git directory's `HEAD`,
-  `objects` or `refs` removed or broken (git changes them all the time, so commands can too). Your git
-  would then take its config from elsewhere, or pass over the directory and fail or use a repository above
-  it, so look before you run git there; jig still finds the repository by its `.git`, so the next session
-  keeps its config read-only. A job a command leaves in the background can still do so after jig has
-  looked: on Linux until jig exits, on macOS after that too.
+  Where a repository's git directory lies in a directory commands can write in (a clone in a temp
+  directory, say), they can't move aside the directories holding it there either, to put another in its
+  place. Some changes to git's files aren't refused, so jig warns of them after the task and when a
+  session ends: on Linux, a `commondir` or `config.worktree` that wasn't there (one can't be made
+  read-only without creating it, and an empty `commondir` breaks git); on both systems, a submodule's
+  checkout moved aside and another put in its place (on macOS, a link to one), a `.git` made in the
+  project, or the project made a git directory (`git init --bare .`), when jig was started in a
+  subdirectory of a repository (the same in a directory between them; making a repository can be the
+  task), and a git directory's `HEAD`, `objects` or `refs` removed or broken (git changes them all the
+  time, so commands can too). Your git would then take its config from elsewhere, or pass over the
+  directory and fail or use a repository above it, so look before you run git there; jig still finds the
+  repository by its `.git`, so the next session keeps its config read-only. A job a command leaves in the
+  background can still do so after jig has looked: on Linux until jig exits, on macOS after that too.
 
   Commands can't read jig's own directory (`~/.jig`, or `$JIG_HOME`) but for its skills, whose scripts the
   model runs, nor can the file tools: its sessions and snapshots hold copies of your projects' files, and
