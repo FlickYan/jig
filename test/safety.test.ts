@@ -365,6 +365,27 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     sandbox.close?.();
   });
 
+  it("stops a command run that waits when it times out or its output overflows", async () => {
+    // execFileSync kills only bubblewrap, which left a command that joined the session's namespace running: an
+    // eval's check that timed out went on changing the project as git read it for the grader. The command's
+    // process is killed too now (see execInSandbox), so neither command here gets as far as its touch.
+    const sandbox = createSandbox(project, { network: false })!;
+    const files = ["started", "after-timeout", "after-overflow"];
+    try {
+      const timedOut = "touch started; sleep 4; touch after-timeout";
+      assert.throws(() => execInSandbox(sandbox, timedOut, [], { cwd: project, stdio: ["ignore", "ignore", "ignore"], timeout: 2000 }), { code: "ETIMEDOUT" });
+      assert.ok(existsSync(join(project, "started")), "the command had started");
+      const overflows = "printf '%2000s' x; sleep 2; touch after-overflow";
+      assert.throws(() => execInSandbox(sandbox, overflows, [], { cwd: project, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1000 }), { code: "ENOBUFS" });
+      await new Promise((resolve) => setTimeout(resolve, 3000)); // past both sleeps
+      assert.equal(existsSync(join(project, "after-timeout")), false, "the command that timed out went no further");
+      assert.equal(existsSync(join(project, "after-overflow")), false, "nor did the one whose output overflowed");
+    } finally {
+      sandbox.close?.();
+      for (const file of files) await rm(join(project, file), { force: true });
+    }
+  });
+
   it("keeps the repository's git config and hooks read-only, and its git directory in place", async () => {
     const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
     try {

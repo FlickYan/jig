@@ -52,7 +52,9 @@ export interface Wrapped {
 /**
  * Runs `command` in the sandbox, `args` after it (bash's $0 and "$@"), as execFileSync runs a program, `stdio`
  * being its first three descriptors: once more, wrapped again, if bubblewrap couldn't join the session's
- * namespace (see Wrapped.couldntJoin).
+ * namespace (see Wrapped.couldntJoin). A timeout, or output past maxBuffer, kills the command's process (bash,
+ * or the program bash runs in its place), so the command goes no further; what it started runs on, as it
+ * would outside the sandbox, on Linux until the session's namespace ends (see Keeper).
  */
 export function execInSandbox(sandbox: Sandbox, command: string, args: string[], options: Omit<ExecFileSyncOptions, "encoding" | "stdio"> & { stdio: IOType[] }): Buffer {
   for (let again = false; ; again = true) {
@@ -60,10 +62,20 @@ export function execInSandbox(sandbox: Sandbox, command: string, args: string[],
     try {
       return execFileSync(program, [...wrapped, ...args], { ...options, stdio: [...options.stdio, ...stdio] });
     } catch (err) {
-      if (again || !couldntJoin) throw err;
       // execFileSync's error holds what came out of each descriptor, the pipe bubblewrap reports on among them.
-      const reported = (err as { output?: (Buffer | null)[] }).output?.[3 + stdio.indexOf("pipe")];
-      if (!couldntJoin(reported?.toString() ?? "")) throw err;
+      const { output, signal } = err as { output?: (Buffer | null)[]; signal?: string | null };
+      const pipe = stdio.indexOf("pipe");
+      const reported = pipe < 0 ? "" : (output?.[3 + pipe]?.toString() ?? "");
+      if (signal) {
+        // execFileSync killed bubblewrap (a timeout, or output past maxBuffer), which leaves a command that joined
+        // the session's namespace running: so kill the process bubblewrap reported, the command's, as the
+        // --die-with-parent that joins leave out did (see Keeper). In the fallback that flag does it, and on
+        // macOS the program execFileSync ran is the command's own. A run killed so never runs again.
+        const pid = /"child-pid":\s*(\d+)/.exec(reported)?.[1];
+        if (pid) try { process.kill(Number(pid), "SIGKILL"); } catch {} // it has exited
+        throw err;
+      }
+      if (again || !couldntJoin?.(reported)) throw err;
     }
   }
 }
@@ -703,14 +715,15 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
  * --die-with-parent kills it if jig is killed; either way its init ends and the kernel ends every process in
  * the namespace, the commands that joined it among them. (They don't take --die-with-parent themselves: given
  * it, any command that joined was now and then killed as it started, at random under load: bubblewrap sets it
- * just before it runs the command, whose parent can then still be a process of bubblewrap's that is exiting.)
- * A command can end the keeper too (kill -1 ends every process it may signal), and the namespace with it,
- * ending the session's jobs and any command running then. The next command starts another, as the first did:
- * jig sees the namespace's init or the keeper's shell gone, exiting or sent a signal that ends it (see
- * exited). Should the namespace end only after that, as bubblewrap joins it (a job can end it at any time),
- * bubblewrap can't join and starts nothing, which it lets jig know, and the command runs once more in a new
- * one (see join). A command that bubblewrap started never runs again. If bubblewrap is too old for the join
- * (no --pidns) or the keeper can't start, each command falls back to a PID namespace of its own
+ * just before it runs the command, whose parent can then still be a process of bubblewrap's that is exiting.
+ * So a run that waits for its command, an eval's check say, kills it itself when bubblewrap is killed: see
+ * execInSandbox.) A command can end the keeper too (kill -1 ends every process it may signal), and the
+ * namespace with it, ending the session's jobs and any command running then. The next command starts another,
+ * as the first did: jig sees the namespace's init or the keeper's shell gone, exiting or sent a signal that
+ * ends it (see exited). Should the namespace end only after that, as bubblewrap joins it (a job can end it at
+ * any time), bubblewrap can't join and starts nothing, which it lets jig know, and the command runs once more
+ * in a new one (see join). A command that bubblewrap started never runs again. If bubblewrap is too old for
+ * the join (no --pidns) or the keeper can't start, each command falls back to a PID namespace of its own
  * (--unshare-pid), which is as safe but ends a command's background jobs with the command; jig tells the user
  * so once, and the model, whom the bash tool tells to leave a server running in the background, with the first
  * command's result. jig never runs commands in the host's PID namespace. The keeper gets jig's environment
