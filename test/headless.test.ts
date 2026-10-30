@@ -781,6 +781,36 @@ describe("--budget-notes", () => {
   });
 });
 
+describe("--finish-gate", () => {
+  it("sends the model back once, at its first stop, naming a file a command changed with nothing run after, and counts it", async () => {
+    // The model writes solve.py with a command, runs nothing, and says it is done, twice.
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'print(1)\\n' > solve.py" } }] : [{ text: "Done." }],
+    );
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      const { code, output } = await runJig([...args, "--finish-gate", "Write solve.py."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      assert.equal(api.requests.length, 3);
+      const told = "(Note from jig: you changed solve.py without running anything: run it, or its tests, before you finish.)";
+      assert.deepEqual((api.requests[2].messages as Anthropic.Beta.BetaMessageParam[]).at(-1), { role: "user", content: told });
+      assert.match(output, /Sending the model back once \(--finish-gate\): "you changed solve\.py without running anything/);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { finishGate: 1 });
+      // Off by default.
+      await rm(join(project, "solve.py"));
+      const off = await runJig([...args, "Write solve.py."], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(api.requests.length, 5);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--finish-gate/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

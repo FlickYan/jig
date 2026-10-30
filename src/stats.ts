@@ -68,7 +68,11 @@ export type Mechanism =
   // --budget-notes' note after a step's tool results on the steps (and time) used, and the one before the
   // last step instead.
   | "budgetNote"
-  | "budgetNote.lastStep";
+  | "budgetNote.lastStep"
+  // --finish-gate sending the model back at its first stop: a file changed after it last ran anything, or its
+  // last test run failed; and not looking, too close to --time-limit.
+  | "finishGate"
+  | "finishGate.skipped";
 
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,

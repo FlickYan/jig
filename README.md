@@ -91,6 +91,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
       --budget-notes    once half the steps or the time is used, tell the model after each step what is left
+      --finish-gate     at its first stop, send the model back once if it changed files after it last ran
+                        anything, or its last test run failed
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
@@ -547,6 +549,17 @@ much time is left, and, before its last step, that its next reply is the last wh
 note goes in the results' message, so the cached prefix stays the same; subagents and the reviewer get
 none. It is off by default, so a benchmark can measure the same build with it and without, and `--stats`
 counts the notes (`budgetNote`, `budgetNote.lastStep`).
+
+With `--finish-gate`, the first time the model says it is done with a step left, and not in `--time-limit`'s
+last quarter, jig looks at what the task's calls did, with no model call, and sends the model back once,
+saying what it saw: files changed after the last command that ran something (or with none run at all), or
+else a last test run that failed. A command made only of programs that look at files, change them or wait
+(`cat`, `grep`, `sed`, `cp`, `git`, `sleep` and the like; a heredoc's lines are a file's, and quoted text an
+argument, but for a `$(...)` in double quotes) runs nothing. The file tools' changes count, and so
+do the project's files the task changed, by its snapshot, that were last modified after that command ended
+(by a later command, or by a job left running in the background). It goes before `--check` and the
+reviewer, and is off by default, so a benchmark can measure it; `--stats` counts it (`finishGate`, and
+`finishGate.skipped` in that last quarter).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at

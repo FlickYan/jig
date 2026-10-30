@@ -3,6 +3,8 @@
 // drive the same loop; what differs between them comes in through AgentOptions.
 
 import type Anthropic from "@anthropic-ai/sdk";
+import { lstatSync } from "node:fs";
+import { basename, join, relative, resolve } from "node:path";
 import { compact, type CompactOptions } from "./compact.ts";
 import type { Conversation } from "./conversation.ts";
 import { type CallModel, tooLong } from "./model.ts";
@@ -11,6 +13,7 @@ import type { Sandbox } from "./sandbox.ts";
 import type { Mechanism } from "./stats.ts";
 import { type OutputFiles, whyStopped, withoutOutputFileNames } from "./tools/bash.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
+import { isInside } from "./tools/util.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -62,8 +65,8 @@ export interface AgentOptions {
   reviewer?: Reviewer;
   /**
    * With --time-limit, the time (as Date.now() gives it) after which neither the reviewer nor `review`'s
-   * request starts: closer to the limit, there may be no time to act on what they find (in milestone 9,
-   * --check ran tasks out of time), so the answer stands.
+   * request starts, nor does finishGate look: closer to the limit, there may be no time to act on what they
+   * find (in milestone 9, --check ran tasks out of time), so the answer stands.
    */
   checkUntil?: number;
   /**
@@ -73,6 +76,14 @@ export interface AgentOptions {
    * has them: a subagent's or the reviewer's steps are their own.
    */
   budgetNotes?: { begun: number; deadline?: number };
+  /**
+   * --finish-gate: the first time the model stops with a step left, before checkUntil, what the task's own
+   * calls did, with no model call, may send it back once (see finishGap): a file changed after the last
+   * command that ran something, or a last test run that failed. `changed` lists the project's files the task
+   * changed (by the snapshot taken before it, relative to `cwd`), so that changes commands made count too.
+   * Only a task's own loop has it: a subagent's or the reviewer's answer doesn't end the task.
+   */
+  finishGate?: { changed?(): string[] | undefined };
   /**
    * The settings' Stop hooks (see hooks.ts), asked each time the model gives its final answer with a step
    * left (and, once they have sent the model back, on the last step too, only to say whether they still
@@ -179,6 +190,9 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   // The last step's calls and results, and how many steps in a row have had the same.
   let lastStep = "";
   let sameSteps = 0;
+  // --finish-gate: whether it has looked at the work yet, and what the task's calls did (see Trail).
+  let gated = false;
+  const trail: Trail = { changed: [] };
 
   /**
    * Compacts; resolves to whether there was anything to compact. Unless the task is the request kept after
@@ -291,6 +305,21 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
         conversation.push({ role: "user", content: CONTINUE });
         continue;
       }
+      // Once, at the first stop with a step left, before --check and the reviewer: if the task's own calls
+      // show work the model hasn't checked, it is told what, and goes on. Not too close to the time limit,
+      // where --check and the reviewer don't start either: what it is sent back for might not get done.
+      if (opts.finishGate && !gated && reply.stop_reason === "end_turn" && step < opts.maxSteps) {
+        gated = true;
+        const late = opts.checkUntil !== undefined && Date.now() >= opts.checkUntil;
+        const gap = late ? undefined : finishGap(trail, opts.cwd, opts.finishGate.changed?.());
+        if (late) opts.count?.("finishGate.skipped");
+        if (gap) {
+          opts.count?.("finishGate");
+          opts.ui.notice(`Sending the model back once (--finish-gate): "${gap}"`);
+          conversation.push({ role: "user", content: `(Note from jig: ${gap})` });
+          continue;
+        }
+      }
       // Too close to the time limit, the work isn't checked, now or at a later stop, which would be closer still.
       const checking = !!(opts.reviewer || opts.review) && !reviewed && reply.stop_reason === "end_turn" && step < opts.maxSteps;
       if (checking && opts.checkUntil !== undefined && Date.now() >= opts.checkUntil) {
@@ -378,12 +407,14 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       earlier.set(keys[i], i);
       return undefined;
     });
-    // How long each call took, by id, for the session file.
+    // How long each call took, by id, for the session file, and when it ended, for --finish-gate.
     const toolMs: Record<string, number> = {};
+    const ended: Record<string, number> = {};
     const handle = (call: ToolUse, i: number) => {
       const started = Date.now();
       return handleToolCall(call, { cutOff, malformed: malformed.get(call.id), offered, repeats: repeats[i] }, conversation, opts, usage, signal).finally(() => {
-        toolMs[call.id] = Date.now() - started;
+        ended[call.id] = Date.now();
+        toolMs[call.id] = ended[call.id] - started;
       });
     };
     // Calls that only read (searches, file reads, subagents) can't interfere with each other, so they
@@ -408,6 +439,8 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     if (note) opts.count?.(note === LAST_STEP ? "budgetNote.lastStep" : "budgetNote");
     const content: MessageParam["content"] = note ? [...results, { type: "text", text: note }] : results;
     conversation.push({ role: "user", content }, { toolMs }); // all results for one reply go in one message
+    // What each call did, in the order they ran, for --finish-gate to look at when the model stops.
+    if (opts.finishGate) for (const [i, call] of calls.entries()) follow(trail, call, results[i], ended[call.id]);
 
     // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
     // the steps left, with the whole conversation, so it starts where the first one stopped.
@@ -722,6 +755,166 @@ export function failedTestRun(call: ToolUse, result: ToolResult): boolean {
   if (call.name !== "bash" || !TEST_COMMAND.test(String((call.input as ToolInput).command ?? ""))) return false;
   const content = typeof result.content === "string" ? result.content : "";
   return /Exit code: [1-9]\d*\s*$/.test(content) || TESTS_FAILED.test(content);
+}
+
+/**
+ * Programs that only look at files, change them or wait, and the shell's words that come where a program
+ * would (for, done, fi): a command made of nothing else ran nothing that could check the work (see
+ * runsSomething). git is here too: diff, status and apply check nothing.
+ */
+const LOOKS_OR_CHANGES = new Set([
+  ...["cat", "ls", "grep", "egrep", "rg", "head", "tail", "less", "more", "nl", "wc", "diff", "cmp", "find", "tree", "stat", "file", "du", "df"],
+  ...["pwd", "cd", "echo", "printf", "sed", "awk", "sort", "uniq", "cut", "tr", "tee", "jq", "xxd", "od", "hexdump", "basename", "dirname"],
+  ...["realpath", "readlink", "cp", "mv", "rm", "mkdir", "rmdir", "touch", "chmod", "ln", "patch", "git", "true", "false", "sleep", "which"],
+  ...["test", "[", "[[", "export", "unset", "for", "done", "fi", "esac", "case"],
+]);
+/** Words a command's program can follow: the shell's own. */
+const BEFORE_PROGRAM = new Set(["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"]);
+
+/**
+ * Whether a bash command runs something: a program other than those that only look at files, change them or
+ * wait (LOOKS_OR_CHANGES), in any of its commands, substitutions and pipes included. A heredoc's lines are a
+ * file's content, and what is in quotes is an argument, so neither counts, but for a substitution in double
+ * quotes (`echo "Result: $(python3 solve.py)"`), which runs. A program it can't tell (a variable, say)
+ * counts as running something, so --finish-gate stays quiet.
+ */
+export function runsSomething(command: string): boolean {
+  // `cat > solve.py << 'EOF'` writes solve.py, whatever its lines say, up to the line with the delimiter.
+  const lines: string[] = [];
+  let heredoc: string | undefined;
+  for (const line of command.split("\n")) {
+    if (heredoc !== undefined) {
+      if (line.trim() === heredoc) heredoc = undefined;
+      continue;
+    }
+    lines.push(line);
+    heredoc = /(?<!<)<<(?!<)-?\s*["'\\]?(\w+)/.exec(line)?.[1];
+  }
+  // Each command of a list, a pipe or a substitution (but not 2>&1's &), by its first word that is no variable
+  // assignment, redirection or keyword.
+  return withoutQuotedText(lines.join("\n")).split(/&&|\|\||[;|\n()`]|(?<![<>])&(?!>)/).some((part) => {
+    const words = part.trim().split(/\s+/);
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i];
+      if (!word || /^\w+=/.test(word) || BEFORE_PROGRAM.has(word)) continue;
+      if (/^\d*[<>]/.test(word)) {
+        if (/^\d*[<>]+&?$/.test(word)) i++; // `> out.txt`: the file comes next
+        continue;
+      }
+      return !LOOKS_OR_CHANGES.has(basename(word));
+    }
+    return false;
+  });
+}
+
+/**
+ * A command with each quoted string made `''`, but for the substitutions in double quotes, which stay as they
+ * are: `[ "$(./solve 3)" = "6" ]` becomes `[ ''$(./solve 3) = '' ]`.
+ */
+function withoutQuotedText(command: string): string {
+  let out = "";
+  // What the scanner is in, innermost last: double quotes ('"'), parentheses, a substitution's included
+  // ("("), or a substitution in backquotes ("`").
+  const within: string[] = [];
+  for (let i = 0; i < command.length; i++) {
+    const c = command[i];
+    if (within.at(-1) === '"') {
+      // In double quotes all is text, but for a substitution (`$((` is arithmetic) and the closing quote.
+      if (c === "\\") i++;
+      else if (c === '"') within.pop();
+      else if (c === "`" || (command.startsWith("$(", i) && command[i + 2] !== "(")) {
+        within.push(c === "`" ? c : "(");
+        out += c === "`" ? c : "$(";
+        if (c === "$") i++;
+      }
+      continue;
+    }
+    if (c === "'") {
+      // In single quotes nothing is special, up to the next.
+      const end = command.indexOf("'", i + 1);
+      i = end < 0 ? command.length : end;
+      out += "''";
+      continue;
+    }
+    if (c === '"') {
+      within.push(c);
+      out += "''";
+      continue;
+    }
+    if (c === "\\") {
+      out += command.slice(i, i + 2); // an escaped quote is no quote
+      i++;
+      continue;
+    }
+    if (c === "(") within.push(c);
+    else if (c === ")" && within.at(-1) === "(") within.pop();
+    else if (c === "`" && within.at(-1) === "`") within.pop();
+    else if (c === "`") within.push(c);
+    out += c;
+  }
+  return out;
+}
+
+/** What --finish-gate keeps of a task's tool calls, as they run (see follow). */
+interface Trail {
+  /** When the last command that ran something (see runsSomething) ended, as Date.now() gives it. */
+  ran?: number;
+  /** The paths write_file and edit_file changed since then, as the model gave them. */
+  changed: string[];
+  /** The last test run's command, if it failed (see failedTestRun). */
+  failedTest?: string;
+}
+
+/** Adds a call that ended at `ended` to the trail. One that didn't run (an error result) adds nothing. */
+function follow(trail: Trail, call: ToolUse, result: ToolResult, ended: number): void {
+  if (result.is_error) return;
+  const input = call.input as ToolInput;
+  if (call.name === "write_file" || call.name === "edit_file") trail.changed.push(String(input.path));
+  const command = String(input.command ?? "");
+  if (call.name !== "bash" || !runsSomething(command)) return;
+  trail.ran = ended;
+  trail.changed = [];
+  if (TEST_COMMAND.test(command)) trail.failedTest = failedTestRun(call, result) ? command : undefined;
+}
+
+/**
+ * What --finish-gate tells the model, or undefined if its trail shows nothing unchecked. First, the files
+ * changed after the last command that ran something, or with none run at all: those the file tools changed
+ * since, and of the project's files the task changed (`changed`, by its snapshot), those still there that
+ * were last modified after that command ended, which commands changed. Else the last test run, if it failed.
+ */
+function finishGap(trail: Trail, cwd: string, changed: string[] = []): string | undefined {
+  // Named as the snapshot names them: relative to the project, if they are in it.
+  const byTools = trail.changed.map((path) => {
+    const abs = resolve(cwd, path);
+    return isInside(cwd, abs) ? relative(cwd, abs) : abs;
+  });
+  const byCommands = changed.filter((path) => changedSince(join(cwd, path), trail.ran));
+  const files = [...new Set([...byTools, ...byCommands])];
+  if (files.length) {
+    const [it, its] = files.length === 1 ? ["it", "its"] : ["them", "their"];
+    const when = trail.ran === undefined ? "without running anything" : "after you last ran anything";
+    return `you changed ${listed(files)} ${when}: run ${it}, or ${its} tests, before you finish.`;
+  }
+  if (trail.failedTest === undefined) return undefined;
+  const command = trail.failedTest.trim().replace(/\s+/g, " ");
+  return `your last test run failed (\`${command.length > 100 ? `${command.slice(0, 100)}…` : command}\`): fix what it reports, or say why it can't pass, before you finish.`;
+}
+
+/** Whether a file is there and was last modified after `time`, or at all if there is no time. */
+function changedSince(path: string, time: number | undefined): boolean {
+  try {
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    return !!stat && (time === undefined || stat.mtimeMs > time);
+  } catch {
+    return false; // ENOTDIR: a file has replaced its directory
+  }
+}
+
+/** "a", "a and b", "a, b, c and d", or the first three and how many more. */
+function listed(names: string[]): string {
+  const shown = names.length > 4 ? [...names.slice(0, 3), `${names.length - 3} other files`] : names;
+  return shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
 }
 
 /** The text of a message: a string, or its text blocks joined. */

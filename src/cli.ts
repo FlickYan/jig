@@ -74,6 +74,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --budget-notes      once half the steps, or half of --time-limit, are used, tell the model after each
                           step how many steps it has used and how much time is left, and before its last step
                           that it is the last
+      --finish-gate       the first time the model says it is done, with a step left, send it back once if it
+                          changed files after it last ran anything, or its last test run failed (not in
+                          --time-limit's last quarter)
       --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
                           changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
@@ -134,9 +137,9 @@ const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2,
 const MAX_UNAPPROVED = 3;
 const NO_APPROVER = `${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it (see --yes)`;
 
-// With --time-limit, the share of it, at the end, in which --check and the reviewer no longer start: what is
-// left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts into their time
-// limit, against 4 without it.
+// With --time-limit, the share of it, at the end, in which --check, the reviewer and --finish-gate no longer
+// start: what is left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts
+// into their time limit, against 4 without it.
 const CHECK_SHARE = 0.25;
 // What a command, a hook or a tool call stopped at --time-limit is said to have been stopped by.
 const TIME_UP = "the time limit (--time-limit) was reached";
@@ -232,6 +235,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "max-steps": { type: "string", default: "50" },
       "time-limit": { type: "string" },
       "budget-notes": { type: "boolean", default: false },
+      "finish-gate": { type: "boolean", default: false },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
@@ -489,6 +493,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     stopHooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
+    // The files the task changed, by its snapshot, so that the gate sees what commands changed too.
+    finishGate: values["finish-gate"] ? { changed: changedFiles } : undefined,
     wrapUp: values["wrap-up"],
     count,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,

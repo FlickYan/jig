@@ -4,7 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
-import { failedTestRun, MAX_STOP_BLOCKS, runAgent, SAME_STEPS, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
+import { failedTestRun, MAX_STOP_BLOCKS, runAgent, runsSomething, SAME_STEPS, WRAP_UP, type AgentOptions, type Reviewer, type ReviewVerdict } from "../src/agent.ts";
 import { Conversation } from "../src/conversation.ts";
 import { OutputFiles } from "../src/tools/bash.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
@@ -947,6 +947,150 @@ describe("telling the model its budget (--budget-notes)", () => {
     setTimeout(() => controller.abort("the time limit (--time-limit) was reached"), 100);
     assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
     assert.deepEqual(notesIn(messages), [""]);
+  });
+});
+
+describe("looking at the trace before finishing (--finish-gate)", () => {
+  const notices: string[] = [];
+  const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+  beforeEach(() => {
+    notices.length = 0;
+  });
+  const bash = (id: string, command: string) => toolUse(id, "bash", { command });
+  const done = (t = "Done.") => reply([text(t)]);
+  /** What the loop said to the model on its own, in order: the user's messages after the task. */
+  const told = (messages: MessageParam[]) => messages.slice(1).flatMap((m) => (m.role === "user" && typeof m.content === "string" ? [m.content] : []));
+  const changedAfterRun = "(Note from jig: you changed solve.sh after you last ran anything: run it, or its tests, before you finish.)";
+
+  it("sends the model back once when it changed a file after it last ran anything, naming the file", async () => {
+    const events: string[] = [];
+    const { options, conversation, messages } = setup(
+      [
+        reply([toolUse("t1", "write_file", { path: "solve.sh", content: "echo 1\n" })]),
+        reply([bash("t2", "sh solve.sh")]),
+        reply([toolUse("t3", "edit_file", { path: "solve.sh", old_string: "1", new_string: "2" })]),
+        done(),
+        reply([bash("t4", "sh solve.sh")]),
+        done("Done: it prints 2."),
+      ],
+      { finishGate: {}, count: (event) => events.push(event), ui },
+    );
+    const result = await runAgent(conversation, options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["end_turn", 6, "Done: it prints 2."]);
+    assert.deepEqual(messages[8], { role: "user", content: changedAfterRun });
+    assert.deepEqual(told(messages), [changedAfterRun], "once a task");
+    assert.deepEqual(events, ["finishGate"]);
+    assert.deepEqual(notices, ['Sending the model back once (--finish-gate): "you changed solve.sh after you last ran anything: run it, or its tests, before you finish."']);
+  });
+
+  it("stays quiet when something ran after the last change, and when it is off", async () => {
+    const ran = setup([reply([toolUse("t1", "write_file", { path: "solve.sh", content: "echo 1\n" })]), reply([bash("t2", "sh solve.sh")]), done()], { finishGate: {} });
+    assert.deepEqual(await runAgent(ran.conversation, ran.options).then((r) => [r.stop, r.steps]), ["end_turn", 3]);
+    assert.deepEqual(told(ran.messages), []);
+    const off = setup([reply([toolUse("t1", "write_file", { path: "solve.sh", content: "echo 1\n" })]), done()]);
+    assert.deepEqual(await runAgent(off.conversation, off.options).then((r) => [r.stop, r.steps]), ["end_turn", 2]);
+    assert.deepEqual(told(off.messages), []);
+  });
+
+  it("doesn't count commands that only look or change files as running anything, and says when nothing ran at all", async () => {
+    const { options, conversation, messages } = setup(
+      [
+        reply([toolUse("t1", "write_file", { path: "./solve.sh", content: "echo 1\n" }), toolUse("t2", "write_file", { path: "lib.sh", content: "x=1\n" })]),
+        reply([bash("t3", "cat solve.sh && ls -l | grep solve; sed -i 's/1/2/' lib.sh")]),
+        done(),
+        done("Still done."),
+      ],
+      { finishGate: {} },
+    );
+    await runAgent(conversation, options);
+    assert.deepEqual(told(messages), ["(Note from jig: you changed solve.sh and lib.sh without running anything: run them, or their tests, before you finish.)"]);
+  });
+
+  it("names the files commands changed after the last run, by the snapshot's list and the files' times", async () => {
+    await writeFile(join(cwd, "early.txt"), "changed before the run\n");
+    const changed = () => ["early.txt", "gone.txt", "solve.sh"];
+    const replies = [reply([bash("t1", "sh -c :")]), reply([bash("t2", "sleep 0.1; printf 'echo 2\\n' > solve.sh")]), done(), done("Ran it.")];
+    const { options, conversation, messages } = setup(replies, { finishGate: { changed } });
+    await runAgent(conversation, options);
+    assert.deepEqual(told(messages), [changedAfterRun]);
+    // With nothing run at all, every file the snapshot lists that is still there.
+    const never = setup([done(), done("Ran it.")], { finishGate: { changed } });
+    await runAgent(never.conversation, never.options);
+    assert.deepEqual(told(never.messages), ["(Note from jig: you changed early.txt and solve.sh without running anything: run them, or their tests, before you finish.)"]);
+  });
+
+  it("sends the model back when its last test run failed, and not once a later one passed", async () => {
+    const failed = setup([reply([bash("t1", "false && pytest")]), done(), done("It can't pass: pytest isn't installed.")], { finishGate: {} });
+    await runAgent(failed.conversation, failed.options);
+    assert.deepEqual(told(failed.messages), ["(Note from jig: your last test run failed (`false && pytest`): fix what it reports, or say why it can't pass, before you finish.)"]);
+    const passed = setup([reply([bash("t1", "false && pytest")]), reply([bash("t2", "true || pytest")]), done()], { finishGate: {} });
+    await runAgent(passed.conversation, passed.options);
+    assert.deepEqual(told(passed.messages), []);
+  });
+
+  it("looks only at the first stop with a step left, before --check", async () => {
+    // Each run writes a file of its own: they share the project, and write_file won't overwrite one unread.
+    const write = (path: string) => reply([toolUse("t1", "write_file", { path, content: "echo 1\n" })]);
+    const REVIEW = "Check your work.";
+    const both = setup([write("solve.sh"), done(), done("Ran it."), done("Checked.")], { finishGate: {}, review: REVIEW });
+    assert.equal((await runAgent(both.conversation, both.options)).text, "Checked.");
+    assert.deepEqual(told(both.messages), ["(Note from jig: you changed solve.sh without running anything: run it, or its tests, before you finish.)", REVIEW]);
+    // Nothing to say at the first stop: --check asks there, and a change after it isn't looked at.
+    const later = setup([done(), write("later.sh"), done("Changed it.")], { finishGate: {}, review: REVIEW });
+    assert.equal((await runAgent(later.conversation, later.options)).text, "Changed it.");
+    assert.deepEqual(told(later.messages), [REVIEW]);
+    assert.ok(existsSync(join(cwd, "later.sh")));
+    // On the last step, the answer stands.
+    const last = setup([write("last.sh"), done()], { finishGate: {}, maxSteps: 2 });
+    assert.deepEqual(await runAgent(last.conversation, last.options).then((r) => [r.stop, r.text]), ["end_turn", "Done."]);
+    assert.deepEqual(told(last.messages), []);
+    assert.ok(existsSync(join(cwd, "last.sh")));
+  });
+
+  it("doesn't look too close to the time limit, then or at a later stop, and counts that", async () => {
+    const events: string[] = [];
+    const write = (path: string) => reply([toolUse("t1", "write_file", { path, content: "echo 1\n" })]);
+    const verdicts = ["tests fail", null];
+    const late = setup([write("late.sh"), done(), done("Fixed.")], { finishGate: {}, checkUntil: 0, stopHooks: async () => verdicts.shift()!, count: (event) => events.push(event) });
+    const result = await runAgent(late.conversation, late.options);
+    assert.deepEqual([result.stop, result.steps, result.text], ["end_turn", 3, "Fixed."]);
+    assert.ok(!told(late.messages).some((message) => message.startsWith("(Note from jig")));
+    assert.deepEqual(events, ["finishGate.skipped", "hook.stopBlocked"]);
+    // With time left, it looks as before.
+    const early = setup([write("early.sh"), done(), done("Ran it.")], { finishGate: {}, checkUntil: Date.now() + 60_000 });
+    await runAgent(early.conversation, early.options);
+    assert.deepEqual(told(early.messages), ["(Note from jig: you changed early.sh without running anything: run it, or its tests, before you finish.)"]);
+  });
+
+  it("tells a command that runs something from one that only looks at files or changes them", () => {
+    const runs = [
+      ...["sh solve.sh", "python3 solve.py", "./a.out < input.txt", "cd app && npm test", "cat in.txt | node main.js", "FOO=1 make", "echo $(python3 -c 'print(1)')"],
+      ...["for f in *.py; do python3 $f; done", "timeout 5 ./server", "if true; then ./check; fi"],
+      // A substitution in double quotes runs too.
+      'echo "Result: $(python3 solve.py)"',
+      'out="$(python3 solve.py)"; echo "$out"',
+      '[ "$(python3 solve.py)" = "42" ] && echo PASS || echo FAIL',
+      'test "$(./solve 3)" = 6 && echo ok',
+      'echo "status: $(curl -s localhost:8080/health)"',
+      'echo "`python3 solve.py`"',
+      'echo "$(python3 "solve.py")"',
+    ];
+    const doesnt = [
+      'echo "lines: $(wc -l < solve.py)"',
+      'echo "x; ./solve" "total: $((1 + 2))"',
+      "cat solve.py",
+      "ls -la && grep -rn TODO .",
+      "sed -n 1,20p a.py; head -5 b.py",
+      "mkdir -p out && cp a.txt out/ && mv out/a.txt out/b.txt",
+      "cat > solve.py << 'EOF'\nimport os\nos.system('make')\nEOF",
+      "cat <<EOF > run.sh\n./build\nEOF\nchmod +x run.sh",
+      "/bin/rm -f x.txt",
+      "git diff --stat && git status",
+      "echo done > status.txt",
+      "for f in *.txt; do wc -l $f; done",
+    ];
+    assert.deepEqual(runs.filter((command) => !runsSomething(command)), []);
+    assert.deepEqual(doesnt.filter(runsSomething), []);
   });
 });
 
