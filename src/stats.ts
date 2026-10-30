@@ -55,6 +55,9 @@ export type Mechanism =
   // that look like placeholders for code left out, in a file write_file made much shorter.
   | "write.syntaxError"
   | "write.placeholder"
+  // An edit_file call --tolerant-edits applied: its old_string matched one place only once typographic
+  // punctuation, or trailing whitespace too, didn't count.
+  | "edit.tolerant"
   // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
   // on the last step, so the task ended anyway.
   | "hook.stopBlocked"

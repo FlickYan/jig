@@ -34,6 +34,8 @@ export interface ToolContext {
   gitLocked?: string[];
   /** --check-writes: write_file and edit_file check what they wrote, and say what is wrong (see write-check.ts). */
   checkWrites?: boolean;
+  /** --tolerant-edits: edit_file applies a unique match that differs in typographic punctuation or trailing whitespace. */
+  tolerantEdits?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */

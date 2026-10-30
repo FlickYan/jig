@@ -837,6 +837,33 @@ describe("--check-writes", () => {
   });
 });
 
+describe("--tolerant-edits", () => {
+  it("lets edit_file apply a match that differs in trailing whitespace, and counts it in --stats; without it, the edit fails", async () => {
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "edit_file", input: { path: "app.py", old_string: "x = 1\ny = 2", new_string: "x = 3\ny = 2" } }] : [{ text: "Done." }],
+    );
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      const result = (request: number) => JSON.stringify((api.requests[request].messages as unknown[])[2]);
+      await writeFile(join(project, "app.py"), "x = 1  \ny = 2\n");
+      const off = await runJig([...args, "Change x."], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.match(result(1), /"is_error":true/);
+      assert.equal(await readFile(join(project, "app.py"), "utf8"), "x = 1  \ny = 2\n");
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+
+      const on = await runJig([...args, "--tolerant-edits", "Change x."], { api, cwd: project });
+      assert.equal(on.code, 0, on.output);
+      assert.match(result(3), /Edited app\.py: replaced 2 lines at line 1 with 2 lines \(old_string matched only ignoring trailing whitespace\)\./);
+      assert.equal(await readFile(join(project, "app.py"), "utf8"), "x = 3\ny = 2\n");
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "edit.tolerant": 1 });
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

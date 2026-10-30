@@ -253,6 +253,84 @@ describe("edit_file", () => {
   });
 });
 
+describe("--tolerant-edits", () => {
+  let events: Mechanism[];
+  beforeEach(() => {
+    events = [];
+    ctx = { ...ctx, tolerantEdits: true, count: (event) => void events.push(event) };
+  });
+  const contents = (path: string) => readFile(join(cwd, path), "utf8");
+
+  it("applies a unique match that differs only in curly quotes, dashes or no-break spaces, and counts it", async () => {
+    await givenFile("notes.md", "# Notes\n\nIt\u2019s \u201Cfast\u201D \u2014 really.\nx\u00A0= 1\n");
+    assert.equal(
+      await edit(`It's "fast" - really.`, "It's quick.", "notes.md"),
+      "Edited notes.md: replaced 1 line at line 3 with 1 line (old_string matched only taking curly quotes, dashes and no-break spaces as ASCII).",
+    );
+    await edit("x = 1", "x = 2", "notes.md");
+    assert.equal(await contents("notes.md"), "# Notes\n\nIt's quick.\nx = 2\n");
+    // The other way round: the model's typographic punctuation, the file's ASCII.
+    await givenFile("app.py", "print(\"hi\")  # don't\n");
+    await edit("print(\u201Chi\u201D)  # don\u2019t", 'print("bye")', "app.py");
+    assert.equal(await contents("app.py"), 'print("bye")\n');
+    assert.deepEqual(events, ["edit.tolerant", "edit.tolerant", "edit.tolerant"]);
+  });
+
+  it("applies a unique match that differs only in trailing whitespace, keeping the file's line endings", async () => {
+    await givenFile("code.py", "def f():\n    x = 1   \n    return x\n");
+    assert.equal(
+      await edit("    x = 1\n    return x", "    x = 2\n    return x", "code.py"),
+      "Edited code.py: replaced 2 lines at line 2 with 2 lines (old_string matched only ignoring trailing whitespace).",
+    );
+    assert.equal(await contents("code.py"), "def f():\n    x = 2\n    return x\n");
+    // Trailing whitespace that old_string has and the file hasn't, in a file with Windows line endings; $& stays.
+    await givenFile("win.py", "a = 1\r\nb = 2\r\nc = 3\r\n");
+    await edit("a = 1 \nb = 2\t", 'a = "$&"\nb = 2', "win.py");
+    assert.equal(await contents("win.py"), 'a = "$&"\r\nb = 2\r\nc = 3\r\n');
+    // Both at once.
+    await givenFile("both.py", "s = \u201Cx\u201D  \nt = 1\n");
+    assert.match(await edit('s = "x"\nt = 1', 's = "y"\nt = 1', "both.py"), /\(old_string matched only ignoring trailing whitespace and taking curly quotes, dashes and no-break spaces as ASCII\)\.$/);
+    assert.equal(await contents("both.py"), 's = "y"\nt = 1\n');
+    assert.deepEqual(events, ["edit.tolerant", "edit.tolerant", "edit.tolerant"]);
+  });
+
+  it("takes a blank first line as the end of the line before, and a blank last line as indentation", async () => {
+    // With Windows line endings, every line ends in whitespace (its \r) before the \n old_string starts with.
+    await givenFile("win.py", "x = 0\r\nif a:  \r\n    b()\r\n");
+    assert.match(await edit("\nif a:\n    b()", "\nif c:\n    b()", "win.py"), /\(old_string matched only ignoring trailing whitespace\)\.$/);
+    assert.equal(await contents("win.py"), "x = 0\r\nif c:\r\n    b()\r\n");
+    // The whitespace old_string ends with, on a line of its own, starts the next line, and must match.
+    await givenFile("code.py", "if a:  \n    b()\n");
+    await assert.rejects(edit("if a:\n\t", "if c:\n\t", "code.py"), /not found/);
+    await edit("if a:\n    ", "if c:\n    ", "code.py");
+    assert.equal(await contents("code.py"), "if c:\n    b()\n");
+    assert.deepEqual(events, ["edit.tolerant", "edit.tolerant"]);
+  });
+
+  it("still counts indentation, and applies a looser match only where it is the only one", async () => {
+    const code = "if a:\n  x = 1 \n  y()\nif b:\n  x = 1\t\n  y()\n";
+    await givenFile("code.py", code);
+    await assert.rejects(edit("  x = 1\n  y()", "  x = 2\n  y()", "code.py"), /Ignoring whitespace it matches 2 places \(starting at lines 2, 5\)/);
+    await assert.rejects(edit("if a:\n    x = 1\n    y()", "if a:\n    x = 2", "code.py"), /not found/);
+    assert.equal(await contents("code.py"), code);
+    await givenFile("quotes.py", "a = \u2018x\u2019\nb = \u2018x\u2019\n");
+    await assert.rejects(edit("'x'", "'y'", "quotes.py"), /not found/);
+    // Whitespace old_string ends with stands for the end of a line: here the file's line goes on.
+    await givenFile("sum.py", "total = 1+2\n");
+    await assert.rejects(edit("total = 1 ", "total = 3", "sum.py"), /not found/);
+    assert.equal(await contents("sum.py"), "total = 1+2\n");
+    assert.deepEqual(events, []);
+  });
+
+  it("isn't on unless asked for, and an exact match comes first", async () => {
+    await givenFile("code.py", "x = 1 \ny = 2\nx = 1\ny = 2\n");
+    assert.equal(await edit("x = 1\ny = 2", "x = 3\ny = 2", "code.py"), "Edited code.py: replaced 2 lines at line 3 with 2 lines.");
+    ctx = { ...ctx, tolerantEdits: false };
+    await assert.rejects(edit("x = 1\ny = 2", "x = 0", "code.py"), /Lines 1-2 match it except for whitespace/);
+    assert.deepEqual(events, []);
+  });
+});
+
 describe("--check-writes", () => {
   let events: Mechanism[];
   beforeEach(() => {

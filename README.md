@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 541 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 547 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -105,6 +105,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
       --check-writes    after write_file and edit_file, tell the model of a syntax error the change made, or of
                         lines write_file left that look like placeholders for code left out (see below)
+      --tolerant-edits  let edit_file apply an old_string that matches one place only once curly quotes, dashes
+                        and no-break spaces count as ASCII, or then trailing whitespace doesn't (see below)
   -v, --version         print jig's version
   -h, --help            show this help
 ```
@@ -136,6 +138,14 @@ syntax error the change made in a Python, JavaScript, shell or JSON file (python
 `JSON.parse` in jig), but not one the file had before; and lines like `// ... existing code ...` that
 `write_file` left in a file it made at least a quarter shorter, which stand for code a whole-file rewrite
 dropped. It is off until benchmarks show whether it helps; `--stats` counts what it finds.
+
+`--tolerant-edits` lets `edit_file` apply an `old_string` that isn't in the file but matches one place once
+curly quotes, en and em dashes and no-break spaces count as their ASCII look-alikes, or failing that, once
+trailing whitespace on each line doesn't count either. Indentation always counts, an exact match comes
+first, and a looser one applies only where it is the only one; the result says what was ignored, and
+`--stats` counts it as `edit.tolerant`. It is off until benchmarks show whether it helps: deepseek-flash's
+edits rarely fail at all (2 of 1,709 in the stored benchmark runs of milestone 4 and later), unlike
+milestone 27's 7B models' (527 of 623).
 
 ## What it does
 

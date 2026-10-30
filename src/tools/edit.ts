@@ -1,7 +1,9 @@
 // edit_file: replaces a string that must occur exactly once in the file. When it doesn't match, the error
 // points at the nearest thing the file does hold (leftover line numbers, other indentation or spacing, a
 // first line that matches), and when it matches more than once, it says where, so the model can fix its
-// next try in one step. A file's Windows line endings are kept.
+// next try in one step. A file's Windows line endings are kept. With --tolerant-edits, an old_string the
+// file doesn't hold is applied where it matches one place once typographic punctuation, or then trailing
+// whitespace, doesn't count.
 
 import { writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
@@ -56,22 +58,26 @@ export const editTool: Tool = {
     const replacement = crlf ? toCRLF(newText) : newText;
 
     const count = countOccurrences(text, search);
-    if (count === 0) throw new Error(explainMissing(path, text, oldText));
+    const loose = count === 0 && ctx.tolerantEdits ? looseMatch(text, search) : undefined;
+    if (count === 0 && !loose) throw new Error(explainMissing(path, text, oldText));
     if (count > 1) {
       throw new Error(
         `old_string occurs ${count} times in ${path} (starting at ${listLines(matchLines(text, search))}), ` +
           "but must occur exactly once. Include more surrounding lines to make it unique.",
       );
     }
-    const at = text.indexOf(search);
+    const at = loose?.at ?? text.indexOf(search);
     // With --check-writes, the file is checked as it is now, and again once written (see write-check.ts).
     const check = ctx.checkWrites ? await checkChange(file, path, text, ctx) : undefined;
     // Splice instead of text.replace(), which would expand patterns like $& and $1 in new_string.
-    const edited = text.slice(0, at) + replacement + text.slice(at + search.length);
+    const edited = text.slice(0, at) + replacement + text.slice(loose?.end ?? at + search.length);
     await writeFile(file, edited);
     await versions.record(file);
+    if (loose) ctx.count?.("edit.tolerant");
     const line = text.slice(0, at).split("\n").length;
-    const done = `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}.`;
+    // A loose match is said to be one, so the model copies the file's own text next time.
+    const how = loose ? ` (old_string matched only ${loose.ignoring})` : "";
+    const done = `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}${how}.`;
     return check ? done + (await check(edited)) : done;
   },
 };
@@ -81,6 +87,61 @@ function countOccurrences(text: string, search: string): number {
   let count = 0;
   for (let i = text.indexOf(search); i !== -1; i = text.indexOf(search, i + 1)) count++;
   return count;
+}
+
+// Curly quotes, en and em dashes and no-break spaces, as the ASCII a model may type in their place.
+const ASCII: Record<string, string> = { "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"', "\u2013": "-", "\u2014": "-", "\u00A0": " " };
+const TYPOGRAPHIC = "taking curly quotes, dashes and no-break spaces as ASCII";
+
+/** The text with that punctuation as ASCII. Each character stays one, so a match's offsets are the file's. */
+function plain(text: string): string {
+  return text.replace(/[\u2018\u2019\u201C\u201D\u2013\u2014\u00A0]/g, (c) => ASCII[c]);
+}
+
+/** Each line of a text, without its trailing whitespace (a \r included). */
+function trimmedLines(text: string): string[] {
+  return text.split("\n").map((line) => line.trimEnd());
+}
+
+/**
+ * --tolerant-edits: where an old_string the file doesn't hold matches one place once curly quotes, dashes
+ * and no-break spaces count as ASCII, or failing that once trailing whitespace on each line doesn't count
+ * either, and what was ignored to match it. Indentation always counts, and each step is taken only if it
+ * finds exactly one place, so a looser match never chooses between places.
+ */
+function looseMatch(text: string, search: string): { at: number; end: number; ignoring: string } | undefined {
+  // Whitespace alone would match wherever a line ends.
+  if (!search.trim()) return undefined;
+  const [file, old] = [plain(text), plain(search)];
+  const count = countOccurrences(file, old);
+  if (count > 1) return undefined;
+  if (count === 1) {
+    const at = file.indexOf(old);
+    return { at, end: at + old.length, ignoring: TYPOGRAPHIC };
+  }
+  // Each line of old_string, then any trailing whitespace before the line break (a \r too). A last line of
+  // whitespace alone is the next line's indentation, which counts. Trailing whitespace after text on the
+  // last line stands for the end of a line, which it then must reach, short of the \r.
+  const lines = old.split("\n");
+  const indentation = lines.length > 1 && !lines.at(-1)!.trim() ? lines.pop()! : undefined;
+  const escaped = lines.map((line) => line.trimEnd().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const lineBreak = String.raw`[^\S\n]*\n`;
+  const lineEnd = String.raw`[^\S\n]*?(?=\r?\n|$)`;
+  const ending = indentation !== undefined ? lineBreak + indentation : /[^\S\n]$/.test(old) ? lineEnd : "";
+  // A blank first line matches from the start of the whitespace before a line break (a \r too), so one
+  // place isn't found again from each character of it.
+  const start = escaped[0] === "" ? String.raw`(?<![^\S\n])` : "";
+  const pattern = new RegExp(start + escaped.join(lineBreak) + ending, "g");
+  const found: RegExpExecArray[] = [];
+  for (let match = pattern.exec(file); match && found.length < 2; match = pattern.exec(file)) {
+    found.push(match);
+    pattern.lastIndex = match.index + 1; // overlapping matches count, as in countOccurrences
+  }
+  if (found.length !== 1) return undefined;
+  const [{ index: at, 0: matched }] = found;
+  const end = at + matched.length;
+  const punctuation = trimmedLines(text.slice(at, end)).join("\n") !== trimmedLines(search).join("\n");
+  return { at, end, ignoring: `ignoring trailing whitespace${punctuation ? ` and ${TYPOGRAPHIC}` : ""}` };
 }
 
 /** The lines that matches start on, each once, so the model can tell which context sets its own apart. */

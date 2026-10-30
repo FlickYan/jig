@@ -5,7 +5,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
 - **Exact-string edits.** `edit_file` replaces `old_string` only if it occurs exactly once, counting
   overlapping matches. Line numbers go stale after the first edit, and whole-file rewrites are slow, cost
   output tokens and can silently drop code. The replacement is spliced in by index: `String.replace` would
-  expand `$&` and `$1` inside the new code.
+  expand `$&` and `$1` inside the new code. `--tolerant-edits` also takes a match that differs only in
+  typographic punctuation or trailing whitespace, where it is the only one. It is off until a benchmark
+  shows it helps, and deepseek-flash's edits rarely fail at all (2 of 1,709 in the runs of milestone 4 and
+  later).
 - **Errors are written for the model.** A failed tool call returns an error that says how to fix it. When
   `old_string` doesn't match, jig looks for the nearest thing in the file: leftover line numbers from
   `read_file`, the same lines with different indentation (shown exactly as they are), failing that the

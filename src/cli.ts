@@ -97,6 +97,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --check-writes      after write_file and edit_file, tell the model of a syntax error the change made
                           (Python, JavaScript, shell and JSON files), and of lines write_file left that look
                           like placeholders for code left out
+      --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
+                          dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -250,6 +252,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       check: { type: "boolean", default: false },
       reviewer: { type: "string" },
       "check-writes": { type: "boolean", default: false },
+      "tolerant-edits": { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -489,6 +492,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     gitLocked,
     // Not the subagents' or the reviewer's: they don't change files.
     checkWrites: values["check-writes"],
+    tolerantEdits: values["tolerant-edits"],
     maxSteps,
     compactAt: compactLimit,
     authorize,
