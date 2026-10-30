@@ -358,14 +358,23 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     // jig passes on what its own parent left open (a CI runner's pipes, say), and the sandbox passes on what it
     // gets: one more descriptor, after those the sandbox asks for, stands for such a pipe.
     const sandbox = createSandbox(project, { network: false })!;
-    try {
+    const listing = async (extra: boolean) => {
       const { program, args, stdio = [] } = sandbox.wrap("ls /dev/fd; (ls /dev/fd &); sleep 0.2");
-      const child = spawn(program, args, { cwd: project, stdio: ["ignore", "pipe", "pipe", ...stdio, "pipe"] });
+      const given: ("ignore" | "pipe" | number)[] = ["ignore", "pipe", "pipe", ...stdio];
+      // The extra one is descriptor 9, which neither the sandbox nor ls uses.
+      if (extra) given.push(...Array<"ignore">(9 - given.length).fill("ignore"), "pipe");
+      const child = spawn(program, args, { cwd: project, stdio: given });
       let out = "";
       child.stdout!.setEncoding("utf8").on("data", (chunk: string) => (out += chunk));
       await new Promise((resolve) => child.on("close", resolve));
-      // 3 is ls's own, for reading /dev/fd: nothing else past stderr, in the command or in a job it leaves.
-      assert.deepEqual(out.trim().split(/\s+/), ["0", "1", "2", "3", "0", "1", "2", "3"]);
+      return out.trim().split(/\s+/);
+    };
+    try {
+      // What ls lists past stderr is its own (one on Linux, two on macOS): the extra one changes nothing, in the
+      // command or in a job it leaves.
+      const listed = await listing(true);
+      assert.ok(!listed.includes("9"), listed.join(" "));
+      assert.deepEqual(listed, await listing(false));
     } finally {
       sandbox.close?.();
     }
