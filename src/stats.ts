@@ -51,6 +51,10 @@ export type Mechanism =
   | "hook.blocked"
   | "hook.feedback"
   | "output.truncated"
+  // What --check-writes added to a write_file or edit_file result: a syntax error the change made, and lines
+  // that look like placeholders for code left out, in a file write_file made much shorter.
+  | "write.syntaxError"
+  | "write.placeholder"
   // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
   // on the last step, so the task ended anyway.
   | "hook.stopBlocked"

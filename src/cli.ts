@@ -94,6 +94,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           work against the task before it finishes (costs turns; see the README)
       --reviewer <model>  before the task ends, this model checks the work against the task (it can only
                           look) and sends the problems it finds back to the model
+      --check-writes      after write_file and edit_file, tell the model of a syntax error the change made
+                          (Python, JavaScript, shell and JSON files), and of lines write_file left that look
+                          like placeholders for code left out
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -246,6 +249,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       memory: { type: "boolean", default: true },
       check: { type: "boolean", default: false },
       reviewer: { type: "string" },
+      "check-writes": { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -483,6 +487,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     dirs,
     hidden: settings.hiddenPaths,
     gitLocked,
+    // Not the subagents' or the reviewer's: they don't change files.
+    checkWrites: values["check-writes"],
     maxSteps,
     compactAt: compactLimit,
     authorize,

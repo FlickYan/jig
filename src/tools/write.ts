@@ -5,6 +5,7 @@ import { mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { Tool } from "./index.ts";
 import { lineCount, readUTF8, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
+import { checkChange } from "./write-check.ts";
 
 export const writeTool: Tool = {
   definition: {
@@ -25,7 +26,8 @@ export const writeTool: Tool = {
   kind: "edit",
   describe: ({ path, content }) => `${path} (${lineCount(String(content))})`,
 
-  async run(input, { cwd, versions, dirs, hidden, gitLocked }) {
+  async run(input, ctx) {
+    const { cwd, versions, dirs, hidden, gitLocked } = ctx;
     const { path, content } = input as { path: string; content: string };
     const file = await resolveForChange(cwd, path, dirs, hidden, gitLocked);
     const existing = await stat(file).catch(() => null);
@@ -33,19 +35,23 @@ export const writeTool: Tool = {
 
     let text = content;
     let note = "";
+    let current: string | undefined;
     if (existing) {
       await versions.assertCurrent(file, path);
       // A file that isn't UTF-8 is refused: the model saw its other characters as �, and would write them so.
-      const current = await readUTF8(file, path);
+      current = await readUTF8(file, path);
       // Keep a file's Windows line endings when the new content doesn't choose any itself.
       if (!content.includes("\r\n") && usesCRLF(current)) {
         text = toCRLF(content);
         note = ", kept its CRLF line endings";
       }
     }
+    // With --check-writes, the file is checked as it is now, and again once written (see write-check.ts).
+    const check = ctx.checkWrites ? await checkChange(file, path, current, ctx, true) : undefined;
     await mkdir(dirname(file), { recursive: true });
     await writeFile(file, text);
     await versions.record(file);
-    return `${existing ? "Overwrote" : "Created"} ${path} (${lineCount(content)}${note}).`;
+    const done = `${existing ? "Overwrote" : "Created"} ${path} (${lineCount(content)}${note}).`;
+    return check ? done + (await check(text)) : done;
   },
 };

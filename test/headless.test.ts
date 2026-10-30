@@ -812,6 +812,31 @@ describe("--finish-gate", () => {
   });
 });
 
+describe("--check-writes", () => {
+  it("tells the model of a syntax error a write made, and counts it in --stats; without it, nothing is checked", async () => {
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "write_file", input: { path: "app.py", content: "def f(:\n" } }] : [{ text: "Done." }],
+    );
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      const result = (request: number) => JSON.stringify((api.requests[request].messages as unknown[])[2]);
+      const off = await runJig([...args, "Write app.py."], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.match(result(1), /Created app\.py \(1 line\)\."/);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+
+      await rm(join(project, "app.py"));
+      const on = await runJig([...args, "--check-writes", "Write app.py."], { api, cwd: project });
+      assert.equal(on.code, 0, on.output);
+      assert.match(result(3), /Created app\.py \(1 line\)\.\\n\\nA syntax check of app\.py \(python3's ast\.parse\) failed:\\n/);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "write.syntaxError": 1 });
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

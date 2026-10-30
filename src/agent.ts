@@ -52,6 +52,8 @@ export interface AgentOptions {
   hidden?: string[];
   /** What the sandbox locks in the repository, which the file tools refuse too (see lockedGitPaths). */
   gitLocked?: string[];
+  /** After write_file and edit_file, check what they wrote and tell the model what is wrong (--check-writes). */
+  checkWrites?: boolean;
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
@@ -669,7 +671,7 @@ async function handleToolCall(
     // child process's event handler), a counter that throws would leave the call unanswered.
     const counted: Mechanism[] = [];
     const count = (event: Mechanism) => void counted.push(event);
-    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, gitLocked: opts.gitLocked, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
+    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, gitLocked: opts.gitLocked, checkWrites: opts.checkWrites, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
     const whole = await tool.run(input, context);
     for (const event of counted) opts.count?.(event);
     output = truncate(whole);

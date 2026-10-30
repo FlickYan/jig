@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 532 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 541 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -103,6 +103,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
+      --check-writes    after write_file and edit_file, tell the model of a syntax error the change made, or of
+                        lines write_file left that look like placeholders for code left out (see below)
   -v, --version         print jig's version
   -h, --help            show this help
 ```
@@ -127,6 +129,13 @@ included), the main loop's tool calls by name (those that didn't run included), 
 often each of jig's mechanisms fired (retries, compactions, calls that didn't run as asked, hooks' blocks,
 the reviewer, the wrap-up and more: `src/stats.ts` lists them). So you can see that a change to one runs at
 all: in milestone 28, two candidates' changes never ran, which only reading the sessions showed.
+
+`--check-writes` checks what `write_file` and `edit_file` wrote, and adds what is wrong to their result: a
+syntax error the change made in a Python, JavaScript, shell or JSON file (python3's `ast.parse`,
+`node --check` and `bash -n`, run as commands are, for 5 seconds at most and only where they are installed;
+`JSON.parse` in jig), but not one the file had before; and lines like `// ... existing code ...` that
+`write_file` left in a file it made at least a quarter shorter, which stand for code a whole-file rewrite
+dropped. It is off until benchmarks show whether it helps; `--stats` counts what it finds.
 
 ## What it does
 
@@ -500,7 +509,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/compact.ts`](src/compact.ts) | Replacing a conversation with the model's summary of it |
 | [`src/model.ts`](src/model.ts) | Talks to the API: request settings per provider, streaming, checking streamed tool input, retries |
 | [`src/openai.ts`](src/openai.ts) | The OpenAI-compatible API: the conversation as chat messages on the way out, the streamed reply as Messages API blocks on the way in |
-| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent`; grep reads and matches in a worker thread (`grep-worker.ts`) |
+| [`src/tools/`](src/tools) | `read_file`, `grep`, `glob`, `write_file`, `edit_file`, `bash`, and `subagent`; grep reads and matches in a worker thread (`grep-worker.ts`); `--check-writes`'s checks (`write-check.ts`) |
 | [`src/skills.ts`](src/skills.ts) | Finding skills (the project's, the user's, jig's own), checking them against the specification, the catalog in the system prompt, and the `skill` tool |
 | [`src/skill-store.ts`](src/skill-store.ts), [`src/skills-cli.ts`](src/skills-cli.ts) | `jig skills`: installing skills from folders and git repositories, the lockfile, updating and removing |
 | [`src/skill-proposals.ts`](src/skill-proposals.ts) | `propose_skill`: a skill the model wrote, checked and shown to the user, saved where they say |

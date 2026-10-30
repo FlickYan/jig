@@ -6,13 +6,15 @@ import { appendFile, mkdir, readdir, readFile, symlink, truncate as setSize, uti
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
-import { lockedGitPaths } from "../src/sandbox.ts";
+import { lockedGitPaths, type Sandbox } from "../src/sandbox.ts";
+import type { Mechanism } from "../src/stats.ts";
 import { bashTool, OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
 import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
 import { FileVersions, readRegularFile } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
+import { checkLimits } from "../src/tools/write-check.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let ctx: ToolContext;
@@ -248,6 +250,148 @@ describe("edit_file", () => {
     await assert.rejects(edit("line 1\n", "line one\n", "app.log"), /^Error: app\.log is 537 MB, too big .*bash/);
     await assert.rejects(write("app.log", "line one\n"), /^Error: app\.log is 537 MB, too big/);
     assert.match(await read("app.log", { limit: 1 }), /^ {5}1\tline 1\n/);
+  });
+});
+
+describe("--check-writes", () => {
+  let events: Mechanism[];
+  beforeEach(() => {
+    events = [];
+    ctx = { ...ctx, checkWrites: true, count: (event) => void events.push(event) };
+  });
+  const through = (wrap: Sandbox["wrap"]): Sandbox => ({ description: "a test sandbox", limits: "", wrap });
+
+  it("tells the model of a syntax error a change made in a Python, JavaScript, shell or JSON file, and counts it", async () => {
+    assert.match(await write("app.py", "def f(:\n    pass\n"), /^Created app\.py \(2 lines\)\.\n\nA syntax check of app\.py \(python3's ast\.parse\) failed:\n {2}File "app\.py", line 1\n.*\nSyntaxError: /s);
+    await givenFile("code.js", "const a = 1;\n");
+    assert.match(await edit("= 1;", "= (1;"), /^Edited code\.js: .*\n\nA syntax check of code\.js \(node --check\) failed after this change, though it passed before:\ncode\.js:1\n.*\nSyntaxError: [^\n]*$/s);
+    assert.match(await write("run.sh", "if true; then\n"), /\n\nA syntax check of run\.sh \(bash -n\) failed:\nrun\.sh: line \d+: syntax error/);
+    await givenFile("data.json", '{"a": 1}\n');
+    assert.match(await write("data.json", '{"a": 1,}\n'), /\n\nA syntax check of data\.json \(JSON\.parse\) failed after this change, though it passed before:\n\S/);
+    assert.deepEqual(events, ["write.syntaxError", "write.syntaxError", "write.syntaxError", "write.syntaxError"]);
+    // No finding, no text.
+    assert.equal(await write("ok.py", "x = 1\n"), "Created ok.py (1 line).");
+    assert.equal(await edit("= (1;", "= 2;"), "Edited code.js: replaced 1 line at line 1 with 1 line.");
+    assert.equal(await write("notes.txt", "def f(:\n"), "Created notes.txt (1 line).");
+    assert.equal(events.length, 4);
+  });
+
+  it("checks as a module a .js file that node runs as one, on Node 22 too", async () => {
+    // Where no package.json gives it a "type", Node 22's node --check passes it whatever its syntax.
+    await givenFile("esm.js", "export const x = 1;\n");
+    assert.match(await edit("= 1;", "= ;", "esm.js"), /^Edited esm\.js: .*\n\nA syntax check of esm\.js \(node --check\) failed after this change, though it passed before:\nesm\.js:1\nexport const x = ;\n.*\nSyntaxError: Unexpected token ';'$/s);
+    assert.equal(await edit("= ;", "= 2;", "esm.js"), "Edited esm.js: replaced 1 line at line 1 with 1 line.");
+    // CommonJS that a module can't hold, a return outside a function, is still CommonJS.
+    assert.equal(await write("main.js", "if (!process.env.CI) return;\nmodule.exports = 1;\n"), "Created main.js (2 lines).");
+    assert.deepEqual(events, ["write.syntaxError"]);
+  });
+
+  it("reads a Python syntax error with a python3 before 3.10 too", async () => {
+    // Its traceback.format_exception_only takes the error's type and the error: a python3 first on the PATH
+    // that runs the check with one like it.
+    const bin = await tempDir("jig-python-");
+    const python = execFileSync("python3", ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim();
+    const shim = [
+      `#!${python}`,
+      "import sys, traceback",
+      "given = traceback.format_exception_only",
+      "traceback.format_exception_only = lambda etype, value: given(etype, value)",
+      'code, sys.argv = sys.argv[3], ["-c", *sys.argv[4:]]', // python3 -I -c <code> <file>
+      "exec(code)",
+    ];
+    await writeFile(join(bin, "python3"), `${shim.join("\n")}\n`, { mode: 0o755 });
+    ctx.sandbox = through((command) => ({ program: "/usr/bin/env", args: [`PATH=${bin}:${process.env.PATH}`, "bash", "-c", command] }));
+    assert.match(await write("app.py", "def f(:\n"), /^Created app\.py \(1 line\)\.\n\nA syntax check of app\.py \(python3's ast\.parse\) failed:\n {2}File "app\.py", line 1\n.*\nSyntaxError: [^\n]*$/s);
+  });
+
+  it("leaves alone an error the file had before the change, checked where it lies", async () => {
+    // A package.json that makes .js files CommonJS fails an import there, though node --check passes it in a
+    // directory without one: so the old content is checked in its place, before the change.
+    await writeFile(join(cwd, "package.json"), '{"type": "commonjs"}\n');
+    await givenFile("code.js", 'import fs from "node:fs";\nconst a = 1;\n');
+    assert.equal(await edit("const a = 1;", "const a = 2;"), "Edited code.js: replaced 1 line at line 2 with 1 line.");
+    // The old error on another line is still the old one; another error is the change's.
+    await givenFile("old.py", "def f(:\n    pass\nx = 1\n");
+    assert.equal(await write("old.py", "x = 0\ndef f(:\n    pass\n"), "Overwrote old.py (3 lines).");
+    assert.match(await edit("def f(:\n    pass", "def f():\npass", "old.py"), /\(python3's ast\.parse\) failed after this change, with another error than before:\n.*\nIndentationError: /s);
+    assert.deepEqual(events, ["write.syntaxError"]);
+  });
+
+  it("isn't on unless asked for", async () => {
+    ctx = { cwd, versions: new FileVersions() };
+    assert.equal(await write("app.py", "def f(:\n"), "Created app.py (1 line).");
+  });
+
+  it("runs the check in the sandbox, only where the program is, and stops it at the time limit", async () => {
+    const commands: string[] = [];
+    ctx.sandbox = through((command) => {
+      commands.push(command);
+      return { program: "bash", args: ["-c", command] };
+    });
+    assert.match(await write("a.py", "def f(:\n"), /python3's ast\.parse/);
+    assert.match(commands.join("\n"), /python3 -I -c /);
+    // The sandbox tells the model some things once, with a command's result: if a check took the note, it comes here.
+    ctx.sandbox = through((command) => ({ program: "bash", args: ["-c", command], note: "(A note from the sandbox.)" }));
+    assert.equal(await write("noted.py", "x = 1\n"), "Created noted.py (1 line).\n\n(A note from the sandbox.)");
+    // Where commands can't find python3, nothing is checked.
+    ctx.sandbox = through((command) => ({ program: "/usr/bin/env", args: ["PATH=/nonexistent", "/bin/bash", "-c", command] }));
+    assert.equal(await write("b.py", "def f(:\n"), "Created b.py (1 line).");
+    // A check that runs past its time is stopped, and finds nothing.
+    const seconds = checkLimits.seconds;
+    checkLimits.seconds = 1;
+    try {
+      ctx.sandbox = through(() => ({ program: "bash", args: ["-c", "sleep 10; echo 'SyntaxError: too late'; exit 1"] }));
+      const started = Date.now();
+      assert.equal(await write("c.py", "def f(:\n"), "Created c.py (1 line).");
+      assert.ok(Date.now() - started < 5000);
+    } finally {
+      checkLimits.seconds = seconds;
+    }
+    assert.deepEqual(events, ["write.syntaxError"]);
+  });
+
+  it("tells the model of placeholders for code left out when write_file makes a file much shorter", async () => {
+    const old = Array.from({ length: 40 }, (_, i) => `function f${i}() {\n  return ${i};\n}\n`).join("");
+    await givenFile("lib.ts", old);
+    const placeholders = [
+      "// ... rest of the code ...",
+      "  // ... existing code ...",
+      "... rest of the file",
+      "(unchanged)",
+      "# Rest of the module unchanged",
+      "/* ... other methods ... */",
+      "<!-- ... rest of the page ... -->",
+    ];
+    // Lines like them that aren't: an ellipsis alone or ending code, a spread, comments that say something else,
+    // some with the same words.
+    const others = [
+      "  ...",
+      "const g = () => [...];",
+      "...existing,",
+      "// Rest of the args are passed through",
+      "// Returns the input unchanged when it has no tabs.",
+      "# Leave the order unchanged.",
+      "/* Same as before, but async. */",
+      "-- columns unchanged",
+      "// ...rest of args are forwarded",
+    ];
+    const result = await write("lib.ts", ["function f0() {", "  return 0;", "}", ...placeholders, ...others, ""].join("\n"));
+    assert.equal(
+      result,
+      "Overwrote lib.ts (19 lines).\n\n" +
+        "lib.ts went from 120 lines to 19, and has lines that look like placeholders for code left out, which it didn't have before:\n" +
+        "  line 4: // ... rest of the code ...\n  line 5: // ... existing code ...\n  line 6: ... rest of the file\n  line 7: (unchanged)\n" +
+        "  line 8: # Rest of the module unchanged\n  and 2 more\n" +
+        "write_file writes the content as given, so the code they stand for is gone from the file: if you left code out, write it back in.",
+    );
+    assert.deepEqual(events, ["write.placeholder"]);
+
+    // Not a placeholder the file had already, nor in a file about as long as before.
+    await givenFile("kept.ts", `${old}// ... rest of the code ...\n`);
+    assert.equal(await write("kept.ts", "f();\n// ... rest of the code ...\n"), "Overwrote kept.ts (2 lines).");
+    await givenFile("long.ts", old);
+    assert.equal(await write("long.ts", `${old.split("\n").slice(0, -4).join("\n")}\n// ... rest of the code ...\n`), "Overwrote long.ts (118 lines).");
+    assert.equal(events.length, 1);
   });
 });
 

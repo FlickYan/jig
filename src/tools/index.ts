@@ -32,6 +32,8 @@ export interface ToolContext {
   hidden?: string[];
   /** What the sandbox locks in git, by real path (see lockedGitPaths): write_file and edit_file refuse it too. */
   gitLocked?: string[];
+  /** --check-writes: write_file and edit_file check what they wrote, and say what is wrong (see write-check.ts). */
+  checkWrites?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */

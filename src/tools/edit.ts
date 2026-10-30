@@ -7,6 +7,7 @@ import { writeFile } from "node:fs/promises";
 import type { Tool } from "./index.ts";
 import { shownLine } from "./read.ts";
 import { assertFile, lineCount, numbered, readUTF8, resolveForChange, toCRLF, usesCRLF } from "./util.ts";
+import { checkChange } from "./write-check.ts";
 
 export const editTool: Tool = {
   definition: {
@@ -30,7 +31,8 @@ export const editTool: Tool = {
   describe: ({ path, old_string, new_string }) =>
     [String(path), ...prefixLines(String(old_string), "- "), ...prefixLines(String(new_string), "+ ")].join("\n"),
 
-  async run(input, { cwd, versions, dirs, hidden, gitLocked }) {
+  async run(input, ctx) {
+    const { cwd, versions, dirs, hidden, gitLocked } = ctx;
     const { path, old_string: oldText, new_string: newText } = input as {
       path: string;
       old_string: string;
@@ -62,11 +64,15 @@ export const editTool: Tool = {
       );
     }
     const at = text.indexOf(search);
+    // With --check-writes, the file is checked as it is now, and again once written (see write-check.ts).
+    const check = ctx.checkWrites ? await checkChange(file, path, text, ctx) : undefined;
     // Splice instead of text.replace(), which would expand patterns like $& and $1 in new_string.
-    await writeFile(file, text.slice(0, at) + replacement + text.slice(at + search.length));
+    const edited = text.slice(0, at) + replacement + text.slice(at + search.length);
+    await writeFile(file, edited);
     await versions.record(file);
     const line = text.slice(0, at).split("\n").length;
-    return `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}.`;
+    const done = `Edited ${path}: replaced ${lineCount(oldText)} at line ${line} with ${lineCount(newText)}.`;
+    return check ? done + (await check(edited)) : done;
   },
 };
 

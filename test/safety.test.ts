@@ -10,6 +10,8 @@ import { createSandbox, execInSandbox, gitControl, lockedGitPaths, type Sandbox,
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
+import { FileVersions } from "../src/tools/util.ts";
+import { writeTool } from "../src/tools/write.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -341,6 +343,19 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     } finally {
       if (key === undefined) delete process.env.ANTHROPIC_API_KEY;
       else process.env.ANTHROPIC_API_KEY = key;
+    }
+  });
+
+  it("runs --check-writes' syntax checks in it", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const ctx = { cwd: project, versions: new FileVersions(), sandbox, checkWrites: true };
+    try {
+      assert.match(await writeTool.run({ path: "checked.py", content: "def f(:\n" }, ctx), /\(python3's ast\.parse\) failed:\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked.js", content: "function (\n" }, ctx), /\(node --check\) failed:\nchecked\.js:1\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked-esm.js", content: "export const x = ;\n" }, ctx), /\(node --check\) failed:\nchecked-esm\.js:1\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked.sh", content: "if true; then\n" }, ctx), /\(bash -n\) failed:\nchecked\.sh: line \d+: syntax error/);
+    } finally {
+      sandbox.close?.();
     }
   });
 
