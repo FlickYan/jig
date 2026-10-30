@@ -515,9 +515,19 @@ function seatbelt(writable: string[], network: boolean, where: string, hidden: s
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
     limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.`,
-    wrap: (command) => ({ program: SANDBOX_EXEC, args: ["-p", profile, "/bin/bash", "-c", command] }),
+    wrap: (command) => ({ program: SANDBOX_EXEC, args: ["-p", profile, "/bin/bash", "-c", CLEAN_START, command] }),
   };
 }
+
+/**
+ * How a sandboxed command starts: a bash that closes every descriptor but stdin, stdout and stderr, then
+ * runs the command in a fresh one. bubblewrap leaves the session's namespace descriptors open in what it
+ * runs, and jig passes on whatever its own parent left open (a CI runner's pipes, an eval harness's): the
+ * command, and the jobs it leaves running, inherit none of them. The command is this shell's $0, so what
+ * follows it is still bash's $0 and "$@". (Closing a descriptor that isn't open, as /dev/fd's own is once
+ * listed, does nothing.)
+ */
+const CLEAN_START = 'for fd in /dev/fd/*; do fd=${fd##*/}; case $fd in [3-9]|[1-9][0-9]*) eval "exec $fd<&-";; esac; done; exec /bin/bash -c "$0" "$@"';
 
 /**
  * The Seatbelt profile: where commands can write, whether they reach the network, what they can't read.
@@ -684,11 +694,8 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}`,
     wrap: (command) => {
       const { args: join, stdio, note, couldntJoin } = keeper.join();
-      // bubblewrap leaves the namespace descriptors open in what it runs, so a shell closes them before bash
-      // runs the command: the command, and the jobs it leaves running, don't inherit them. The command is that
-      // shell's $0, so what follows it is still bash's $0 and "$@".
-      const close = stdio.map((_, i) => `${i + 3}<&-`).join(" ");
-      const run = stdio.length ? ["/bin/sh", "-c", `exec ${close} /bin/bash -c "$0" "$@"`] : ["/bin/bash", "-c"];
+      // bubblewrap leaves the namespace descriptors open in what it runs: CLEAN_START closes them.
+      const run = ["/bin/bash", "-c", CLEAN_START];
       return { program: bwrap, args: [...args(join), "--", ...run, command], stdio: stdio.length ? stdio : undefined, note, couldntJoin };
     },
     close: () => keeper.close(),

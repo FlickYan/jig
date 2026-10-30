@@ -354,6 +354,23 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     assert.doesNotMatch(out, / (?:[4-9]|\d\d+) -> /);
   });
 
+  it("starts a command with only stdin, stdout and stderr open, whatever jig itself was given", async () => {
+    // jig passes on what its own parent left open (a CI runner's pipes, say), and the sandbox passes on what it
+    // gets: one more descriptor, after those the sandbox asks for, stands for such a pipe.
+    const sandbox = createSandbox(project, { network: false })!;
+    try {
+      const { program, args, stdio = [] } = sandbox.wrap("ls /dev/fd; (ls /dev/fd &); sleep 0.2");
+      const child = spawn(program, args, { cwd: project, stdio: ["ignore", "pipe", "pipe", ...stdio, "pipe"] });
+      let out = "";
+      child.stdout!.setEncoding("utf8").on("data", (chunk: string) => (out += chunk));
+      await new Promise((resolve) => child.on("close", resolve));
+      // 3 is ls's own, for reading /dev/fd: nothing else past stderr, in the command or in a job it leaves.
+      assert.deepEqual(out.trim().split(/\s+/), ["0", "1", "2", "3", "0", "1", "2", "3"]);
+    } finally {
+      sandbox.close?.();
+    }
+  });
+
   it("kills a command's whole tree on timeout, inside the session's namespace", { skip: linuxOnly }, async () => {
     // A command that leaves a job in the background and then hangs: its timeout must take the job down too,
     // which the next command in the session confirms through the shared /proc.
