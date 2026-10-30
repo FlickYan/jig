@@ -747,6 +747,40 @@ describe("a run that reaches --max-steps", () => {
   });
 });
 
+describe("--budget-notes", () => {
+  it("tells the model, after its results, what is used of its steps and its time from half of them on, and counts each note", async () => {
+    const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
+    // What followed the tool results in each request's last message.
+    const notes = (requests: Record<string, unknown>[]) =>
+      requests.map((request) => {
+        const last = (request.messages as Anthropic.Beta.BetaMessageParam[]).at(-1)!.content;
+        return typeof last === "string" ? "" : last.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+      });
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file];
+      const { code, output } = await runJig([...args, "--budget-notes", "--time-limit", "600", "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 2, output);
+      assert.deepEqual(notes(api.requests), [
+        "",
+        "",
+        "(Note from jig: you have used 2 of your 4 steps, with 9 of 10 minutes left.)",
+        "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)",
+      ]);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { budgetNote: 1, "budgetNote.lastStep": 1 });
+      // Off by default.
+      const off = await runJig([...args, "Fix the parser."], { api, cwd: project });
+      assert.equal(off.code, 2, off.output);
+      assert.deepEqual(notes(api.requests.slice(4)), ["", "", "", ""]);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--budget-notes/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

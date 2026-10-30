@@ -71,6 +71,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --max-steps <n>     most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
                           included, and --check and --reviewer don't start in its last quarter (default: none)
+      --budget-notes      once half the steps, or half of --time-limit, are used, tell the model after each
+                          step how many steps it has used and how much time is left, and before its last step
+                          that it is the last
       --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
                           changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
@@ -228,6 +231,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
       "time-limit": { type: "string" },
+      "budget-notes": { type: "boolean", default: false },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
@@ -539,7 +543,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
       // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
       const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
-      const result = await runAgent(conversation, { ...agent, checkUntil }, signal).finally(() => clearTimeout(timer));
+      const budgetNotes = values["budget-notes"] ? { begun, deadline } : undefined;
+      const result = await runAgent(conversation, { ...agent, checkUntil, budgetNotes }, signal).finally(() => clearTimeout(timer));
       // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
       // after a Ctrl+C the task can still be stopping when the deadline passes.
       if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";

@@ -64,7 +64,11 @@ export type Mechanism =
   | "review.problems"
   | "escalated"
   | "loop"
-  | "wrapUp";
+  | "wrapUp"
+  // --budget-notes' note after a step's tool results on the steps (and time) used, and the one before the
+  // last step instead.
+  | "budgetNote"
+  | "budgetNote.lastStep";
 
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,

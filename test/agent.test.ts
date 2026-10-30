@@ -897,6 +897,59 @@ describe("Stop hooks before finishing", () => {
   });
 });
 
+describe("telling the model its budget (--budget-notes)", () => {
+  const LAST_STEP = "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)";
+  /** What follows the tool results in each message of them: the note, if there was one. */
+  const notesIn = (messages: MessageParam[]) =>
+    messages
+      .filter((m) => Array.isArray(m.content) && m.content.some((b) => b.type === "tool_result"))
+      .map((m) => (m.content as { type: string; text?: string }[]).flatMap((b) => (b.type === "text" ? [b.text] : [])).join(""));
+  // Calls that start no process, so a step takes milliseconds: the times below allow up to 900.
+  const steps = (n: number) => Array.from({ length: n }, (_, i) => reply([toolUse(`t${i}`, "read_file", { path: `missing-${i}.txt` })]));
+  /** A task that began `gone` milliseconds ago and has `total` in all. */
+  const clock = (gone: number, total: number) => ({ begun: Date.now() - gone, deadline: Date.now() - gone + total });
+
+  it("says how many steps are used from half of them on, and before the last that it is the last, never changing what was sent", async () => {
+    const events: string[] = [];
+    const { options, conversation, messages } = setup(steps(4), { maxSteps: 4, budgetNotes: { begun: Date.now() }, count: (event) => events.push(event) });
+    const sent: string[][] = [];
+    const callModel = options.callModel;
+    options.callModel = (history, signal, how) => (sent.push(history.map((m) => JSON.stringify(m))), callModel(history, signal, how));
+    assert.equal((await runAgent(conversation, options)).stop, "max_steps");
+    // None after the first step, nor after the last: no step follows it whose calls run.
+    assert.deepEqual(notesIn(messages), ["", "(Note from jig: you have used 2 of your 4 steps.)", LAST_STEP, ""]);
+    assert.deepEqual((messages[4].content as { type: string }[]).map((b) => b.type), ["tool_result", "text"], "the note follows the results, in their message");
+    for (const [i, request] of sent.entries()) if (i > 0) assert.deepEqual(request.slice(0, sent[i - 1].length), sent[i - 1], "the cached prefix stays as it was");
+    assert.deepEqual(events, ["budgetNote", "budgetNote.lastStep"]);
+    // Off, nothing is said.
+    const off = setup(steps(4), { maxSteps: 4 });
+    await runAgent(off.conversation, off.options);
+    assert.deepEqual(notesIn(off.messages), ["", "", "", ""]);
+  });
+
+  it("with --time-limit, says how much time is left too, from half of it on, whatever the steps", async () => {
+    const minute = 60_000;
+    const told = async (budgetNotes: AgentOptions["budgetNotes"]) => {
+      const { options, conversation, messages } = setup([...steps(1), reply([text("Done.")])], { maxSteps: 50, budgetNotes });
+      await runAgent(conversation, options);
+      return notesIn(messages)[0];
+    };
+    assert.equal(await told(clock(20.5 * minute, 30 * minute)), "(Note from jig: you have used 1 of your 50 steps, with 9 of 30 minutes left.)");
+    assert.equal(await told(clock(30 * minute - 30_900, 30 * minute)), "(Note from jig: you have used 1 of your 50 steps, with 30 seconds of 30 minutes left.)");
+    assert.equal(await told(clock(39_100, minute)), "(Note from jig: you have used 1 of your 50 steps, with 20 of 60 seconds left.)");
+    assert.equal(await told(clock(58_100, minute)), "(Note from jig: you have used 1 of your 50 steps, with 1 second of 60 seconds left.)");
+    assert.equal(await told(clock(1_000, 30 * minute)), "", "less than half the time and the steps are used");
+  });
+
+  it("says nothing after a step the task was stopped in", async () => {
+    const controller = new AbortController();
+    const { options, conversation, messages } = setup([reply([toolUse("slow", "bash", { command: "sleep 30" })])], { maxSteps: 2, budgetNotes: { begun: Date.now() } });
+    setTimeout(() => controller.abort("the time limit (--time-limit) was reached"), 100);
+    assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
+    assert.deepEqual(notesIn(messages), [""]);
+  });
+});
+
 describe("counting the loop's mechanisms (--stats)", () => {
   /** The mechanisms a run counted, in order. */
   async function counted(replies: ModelTurn[], overrides: Partial<AgentOptions> = {}): Promise<string[]> {

@@ -90,6 +90,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
+      --budget-notes    once half the steps or the time is used, tell the model after each step what is left
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents    leave out the subagent tool
@@ -539,6 +540,13 @@ what is left, and prints the reply: the model's own report, not evidence. Its to
 and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/` and `jig skills test` do, so
 that their steps and costs compare with earlier runs. A `Stop` hook can send the model back to work from
 its final answer, after `--check` and the reviewer (see Hooks).
+
+The model isn't told these limits unless you ask: with `--budget-notes`, once half its steps, or half of
+`--time-limit`, are used, a note after each step's tool results says how many steps it has used and how
+much time is left, and, before its last step, that its next reply is the last whose tool calls run. The
+note goes in the results' message, so the cached prefix stays the same; subagents and the reviewer get
+none. It is off by default, so a benchmark can measure the same build with it and without, and `--stats`
+counts the notes (`budgetNote`, `budgetNote.lastStep`).
 
 **What if the API stops answering?** jig waits 2 minutes for a reply to start and, once it has started,
 5 minutes between one part of it and the next, saying so after a minute; then it asks again, twice at

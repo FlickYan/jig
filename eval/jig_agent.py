@@ -88,6 +88,9 @@ class JigOptions(InstalledAgentOptions):
     check: Annotated[bool | None, Cli("--check")] = Field(
         default=None, description="ask the model to check its work before finishing"
     )
+    budget_notes: Annotated[bool | None, Cli("--budget-notes")] = Field(
+        default=None, description="jig's --budget-notes: tell the model what is left of its steps and time"
+    )
     tools: Annotated[str | None, Cli("--tools")] = Field(
         default=None, description="jig's --tools: only these of its tools, e.g. bash"
     )

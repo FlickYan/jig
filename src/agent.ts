@@ -67,6 +67,13 @@ export interface AgentOptions {
    */
   checkUntil?: number;
   /**
+   * --budget-notes: once half the steps are used, or half the time when there is a `deadline` (--time-limit;
+   * with `begun`, when the task began, as Date.now() gives them), a note after each step's tool results says
+   * how much is used, and before the last step that it is the last (see budgetNote). Only a task's own loop
+   * has them: a subagent's or the reviewer's steps are their own.
+   */
+  budgetNotes?: { begun: number; deadline?: number };
+  /**
    * The settings' Stop hooks (see hooks.ts), asked each time the model gives its final answer with a step
    * left (and, once they have sent the model back, on the last step too, only to say whether they still
    * object): resolves to why the task isn't done, which the model is told, or null. `active` says whether they
@@ -395,7 +402,12 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       conversation.push({ role: "user", content: [...results, ...open] }, { toolMs });
       throw err;
     }
-    conversation.push({ role: "user", content: results }, { toolMs }); // all results for one reply go in one message
+    // With --budget-notes, what is left of the budget goes in the results' message, after them: an earlier
+    // message would change the cached prefix. Not once the task is stopped: the model won't see it.
+    const note = opts.budgetNotes && !signal?.aborted ? budgetNote(step, opts.maxSteps, opts.budgetNotes) : undefined;
+    if (note) opts.count?.(note === LAST_STEP ? "budgetNote.lastStep" : "budgetNote");
+    const content: MessageParam["content"] = note ? [...results, { type: "text", text: note }] : results;
+    conversation.push({ role: "user", content }, { toolMs }); // all results for one reply go in one message
 
     // A failed test run is the model's own check saying the work isn't right yet: the stronger model takes
     // the steps left, with the whole conversation, so it starts where the first one stopped.
@@ -468,6 +480,35 @@ export const AFTER_EMPTY = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER];
  * report the loop asked for, not a finished answer: export.ts knows it by this request.
  */
 export const WRAP_UP = "You have run out of steps. Don't call any tools: say what you changed, what you verified and how, and what is left undone.";
+
+/** --budget-notes' note before the last step whose tool calls run (a wrap-up may follow it, without tools). */
+const LAST_STEP = "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)";
+
+/**
+ * --budget-notes' note after a step's tool results: the steps used, and with a deadline the time left, once
+ * half of either is used; before the last step, LAST_STEP instead; nothing after it, where no step follows.
+ */
+function budgetNote(step: number, maxSteps: number, { begun, deadline }: { begun: number; deadline?: number }): string | undefined {
+  if (step >= maxSteps) return undefined;
+  if (step === maxSteps - 1) return LAST_STEP;
+  const now = Date.now();
+  if (2 * step < maxSteps && (deadline === undefined || 2 * (now - begun) < deadline - begun)) return undefined;
+  let time = "";
+  if (deadline !== undefined) {
+    // "9 of 30 minutes", or "45 seconds of 30 minutes".
+    const [left, unit] = inUnits(deadline - now);
+    const [all, allUnit] = inUnits(deadline - begun);
+    time = `, with ${left}${unit === allUnit ? "" : ` ${unit}`} of ${all} ${allUnit} left`;
+  }
+  return `(Note from jig: you have used ${step} of your ${maxSteps} steps${time}.)`;
+}
+
+/** A time as the model is told it, rounded down: in minutes from 2 minutes up, else in seconds. */
+function inUnits(ms: number): [number, string] {
+  if (ms >= 120_000) return [Math.floor(ms / 60_000), "minutes"];
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  return [seconds, seconds === 1 ? "second" : "seconds"];
+}
 
 /** How many steps after a failed compaction the next one is tried. */
 const COMPACT_AGAIN_AFTER = 3;
