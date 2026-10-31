@@ -5,11 +5,18 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
 - **Exact-string edits.** `edit_file` replaces `old_string` only if it occurs exactly once, counting
   overlapping matches. Line numbers go stale after the first edit, and whole-file rewrites are slow, cost
   output tokens and can silently drop code. The replacement is spliced in by index: `String.replace` would
-  expand `$&` and `$1` inside the new code.
+  expand `$&` and `$1` inside the new code. `--tolerant-edits` also takes a match that differs only in
+  typographic punctuation or trailing whitespace, where it is the only one. It is off until a benchmark
+  shows it helps, and deepseek-flash's edits rarely fail at all (2 of 1,709 in the runs of milestone 4 and
+  later).
 - **Errors are written for the model.** A failed tool call returns an error that says how to fix it. When
   `old_string` doesn't match, jig looks for the nearest thing in the file: leftover line numbers from
-  `read_file`, the same lines with different indentation (shown exactly as they are), or where its first
-  line appears. The next attempt usually succeeds.
+  `read_file`, the same lines with different indentation (shown exactly as they are), failing that the
+  same text with other spacing, even within a line, or where its first line appears. Where it is only
+  part of a line, the error shows just that part: told to copy the whole line, a model that kept
+  `new_string` to the part would delete the rest. Lines shown only for context are cut as `read_file`
+  cuts them, so one line of minified code can't fill the conversation. When it occurs more than once, the
+  error says on which lines. The next attempt usually succeeds.
 - **Read before overwrite.** jig remembers each file's modification time and size as of the model's last
   read (`read_file`, or printing it with `cat`, `head` or `tail`). `write_file` refuses to replace a file the
   model hasn't read, or one that changed since (a formatter, a command or the user edited it), so it never
@@ -18,10 +25,25 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   refused 22 edits, all false alarms, so M4 narrowed it.
 - **Line endings are the file's business.** The model writes `\n`; in a file that uses `\r\n`, edits are
   matched and written with `\r\n` (including lines an edit adds), and `write_file` keeps an existing file's
-  CRLF endings.
+  CRLF endings. Encodings are not converted: `edit_file` and `write_file` change only UTF-8 files.
+  Decoding a Latin-1 file as UTF-8 and writing it back turned each `é` in it into `�`, also in lines the
+  edit never touched, and writing in the file's own 8-bit encoding would mean guessing which one it is. So
+  for those, and for UTF-16, the error says to use a command.
 - **Search that respects `.gitignore`.** `grep` and `glob` list files with `git ls-files` when the project
   is a git repository (so ignored files are skipped for free), and walk the directory otherwise. They are
-  plain Node, with no dependency on ripgrep being installed.
+  plain Node, with no dependency on ripgrep being installed. Everything git tracks is listed, and a nested
+  repository (a submodule, a clone) through its own git; the built-in list of directories not worth
+  searching (`node_modules`, `build`, `target`, ...) is only for what git doesn't track. A path that git
+  ignores, and tracks nothing in, is walked when the model names it (`grep` in `node_modules/pkg`): git
+  lists nothing there, and grep said "No matches." for text that was in it. Only `.git` is skipped in it,
+  since most packages keep their code in `dist/` or `build/`; the project itself, which a home directory's
+  git may ignore whole, still skips the list. A search cut short of the file list says so: `grep` reads
+  20,000 files at most, the first by name, and a walk outside git stops there too. The cut used to be
+  silent: in a large repository, grep said "No matches." for code that was there. Binary files and files
+  over 5 MB are still skipped without a word. `grep` matches in a worker thread that Ctrl+C stops, as do 30
+  seconds on one file: a regular expression can take exponentially long on some lines, and in jig's own
+  thread nothing can stop it. The limit is for one file because a whole search can take that long just
+  reading, from a cold disk in a fresh container.
 - **Streamed tool input is checked twice.** For Claude, tool input streams as it is generated
   (`eager_input_streaming`), so the API no longer validates it. The SDK's lenient parser can turn
   `"say "hi" now"` into `"say "`, which would silently write a truncated file. jig re-parses the raw JSON
@@ -35,16 +57,36 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   stay fixed for the whole session. This keeps the prompt cache hitting (each call pays full price only
   for what is new) and keeps the model's earlier thinking blocks valid (the API can reject them once the
   history before them has changed).
-- **Compaction replaces the history; it never edits it.** The summary request repeats the last request
-  with one extra message, so it is served from the prompt cache. Afterwards only the summary is sent:
-  keeping the last few turns verbatim would replay thinking blocks whose earlier history is gone, which
-  the API can reject, and a fresh start is valid for both providers. A request the user just typed is
-  kept word for word after the summary, and the model must read files again before editing them.
+- **Compaction replaces the history; it never edits it.** The summary request repeats the last request with
+  one extra message, and allows no tool call (`tool_choice: none`). For Claude, that change keeps only the
+  tools and the system prompt in the prompt cache: the history is written to it again. Afterwards only the
+  summary is sent: keeping the last few turns verbatim would replay thinking blocks whose earlier history
+  is gone, which the API can reject, and a fresh start is valid for every provider. A request the user just
+  typed is kept word for word after the summary, and the model must read a file again before `write_file`
+  replaces it. Mid-task, the task is restated after the summary, word for word up to 20,000 characters (a
+  longer one by its start and its end, since what it asks for is often last), with the log of file changes
+  and commands a reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
+- **The API says when the conversation is too long.** jig doesn't know every server's window, so it
+  doesn't compact before a request that won't fit (milestone 28); when the API rejects one as too long,
+  by one of a few specific wordings, it compacts and makes the call again, once. The summary request is
+  the history plus one message, so it would be rejected as well: it gets a copy whose tool results are
+  cut to their start and end, the oldest first, until it is 0.7, then 0.5, of the size (`/compact` does
+  this once its whole request is rejected). The copy is only sent; the history is still replaced
+  whole. Past `--compact-at`, a summary that fails doesn't end the task, since the conversation may
+  still fit: it goes on as it is, and compaction waits 3 steps before it is tried again.
 - **Every tool call gets a result.** Even calls that never ran (declined, interrupted, cut off at
   `max_tokens`, invalid input) get an error result, so the next request is always valid.
+- **Only a reply with something in it joins the history.** A reply with no text and no tool call (empty,
+  or only thinking) would be an assistant message the API rejects in every later request. It is left out,
+  and a note after the last user message asks the model to go on: two user messages in a row, which the
+  Messages API merges into one turn, as with compaction's summary request.
 - **Commands run in their own process group.** A timeout or Ctrl+C kills the whole group, so a test
-  runner's worker processes die too. Commands get no stdin, so an interactive prompt gets end-of-file
-  instead of hanging the agent.
+  runner's worker processes die too. So does jig's exit, which closing the terminal (SIGHUP) and a plain
+  `kill` (SIGTERM) bring about too: the group is a session of its own, which closing the terminal doesn't
+  reach, so without bubblewrap's `--die-with-parent` (the keeper's, for a command that joins its namespace:
+  see the PID namespace entry below) a command ran on after jig was killed. Without it, one still does
+  after a `kill -9`, which jig can't catch. Commands get no stdin, so an interactive prompt gets
+  end-of-file instead of hanging the agent.
 - **jig hides its arguments.** Models stop programs by matching their command lines
   (`pkill -f server.py`), and jig's arguments hold the task, which names the very files and programs a
   model might stop: twice in milestone 10 the model's command killed jig. So jig sets its process title to
@@ -57,7 +99,8 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   keeps the pipes open while it waits for the server. jig sat out the timeout and then killed the server
   with the process group. On Terminal-Bench that happened in 22 of the 55 calls that started something in
   the background. Now a call returns a second after the shell exits, tells the model that something it
-  started is still running, and leaves it running.
+  started is still running, and leaves it running: in bubblewrap's sandbox until jig exits (see the PID
+  namespace entry below), and in Seatbelt's or with no sandbox as a terminal would, outliving jig.
 - **The OS sandbox, not Docker.** A container would need an image with every project's toolchain and
   slow bind mounts on macOS. Seatbelt applies a profile to the user's own shell, so python, node and git
   just work, startup is instant, and the policy (write here, no network) is a few lines jig generates.
@@ -66,15 +109,177 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   in one command jig can run: the file system mounted read-only with the writable directories bound back
   in, a fresh `/dev`, and with `--unshare-net` a network namespace with nothing but loopback. It is small,
   packaged everywhere (Flatpak uses it), and needs no privileges where user namespaces are allowed.
-  Each command gets its own namespace, so a server one command starts is out of reach of the next; on
-  macOS it isn't. Killing a command's process group still reaches everything inside, and
-  `--die-with-parent` takes the sandbox down if jig dies.
+  Each command gets its own network namespace, so a server one command starts is out of reach of the next;
+  on macOS it isn't. Killing a command's process group still reaches everything inside, and
+  `--die-with-parent` takes the sandbox down if jig dies. `--unshare-net` cuts off IP only: a daemon
+  listening on a Unix socket (Docker's, say) stays within reach, and closing that would take seccomp.
+- **One PID namespace per session.** bubblewrap ran commands in the host's PID namespace, with the host's
+  `/proc`, and that was a hole: a command could step through `/proc/<pid>/root` of a process outside the
+  sandbox (jig, the user's shell, anything of the same user) into the host's mount namespace, where the
+  sandbox's binds don't apply. A review's probe read a hidden file that way and, outside the writable
+  directories, wrote one. `--unshare-pid` had been turned down because a namespace for each command ends a
+  job the command leaves in the background when its shell exits. So there is one namespace for the whole
+  session: before the first command jig starts a small bubblewrap that stays up (the keeper) with
+  `--unshare-pid`, and each command joins its namespaces (`--pidns`, and `--userns` when run unprivileged,
+  where the user namespace owns the PID one) and mounts a `/proc` of its own, which shows only the
+  session's processes. A job left in the background is taken over by the namespace's init and runs on: the
+  next command finds in `/proc` a `sleep` an earlier one left, and with the network allowed reaches a
+  server one started (without, each command still has a network of its own). The keeper is process 1 there,
+  so a command reaches its root through `/proc/1/root`. That root is read-only, with the hidden paths and
+  jig's directory masked, so it grants nothing a command hasn't already (it can read every other path, and
+  can't write a read-only root); and it has a `/proc` of its own too: the first keeper had the host's
+  there, and `/proc/1/root/proc/<pid>/root` was the same way out in two steps. Its environment, which
+  commands can read in `/proc/1/environ`, is jig's without the API keys, as theirs is: the first keeper had
+  them. The keeper's life is tied to jig's: it reads a pipe jig holds open, which jig's death closes, and
+  `--die-with-parent` kills it if jig is killed. So when jig exits, normally, by a signal or by `kill -9`,
+  the namespace's init ends and the kernel ends every process in it: a background job used to outlive jig,
+  and now lasts the session. The commands that joined it end so too, without a `--die-with-parent` of their
+  own: with one, any command that joined was now and then killed as it started, at random under load, as
+  bubblewrap sets it just before it runs the command, whose parent can then still be a process of
+  bubblewrap's that is exiting. A timeout, Ctrl+C or jig's exit still kills a running command's whole tree
+  through its process group, which a job taken over by init stays in. Node stops a run jig waits for (an
+  eval's check, or git for the grader or a skill's install) on a timeout, or once its output passes a
+  limit, by killing bubblewrap alone, which leaves a command that joined running: so jig kills the
+  command's process too, which bubblewrap reported, as the flag did, and the command goes no further. A
+  command can end the keeper too (`kill -1` ends every process it may signal), and the namespace with it,
+  with the session's jobs and any command running then; the next command starts another, as joining the
+  ended one failed every later command. jig looked for that end only in the namespace's init, which could
+  still be running when the command that ended the keeper had exited: about once in 40 runs of its test,
+  the next command joined a namespace about to end and failed ("Can't fork for `--pidns`"). Now jig looks
+  at the keeper's shell too: gone, exiting, or sent a signal that ends it. And should the namespace end
+  only after jig looked (a job can end it at any time), bubblewrap can't join it: it reports a command's
+  process on a pipe before it lets the command start, and where it reported none, the command never started
+  and runs once more in a new namespace, once. A command bubblewrap started never runs twice. Seatbelt
+  needs none of this, since its rules hold whatever path a lookup takes. Where bubblewrap is too old for
+  the join (no `--pidns`), or the keeper can't start or be joined, each command gets a namespace of its own
+  (`--unshare-pid`, with its own `/proc`): as safe, but a command's background jobs end with it. jig tells
+  the user so once, and the model, whom the bash tool tells to leave a server running in the background,
+  with the first command's result. jig never runs a command in the host's PID namespace: where bubblewrap
+  can't mount a `/proc` at all (in a container that masks parts of its own, as Docker and Podman do by
+  default), there is no sandbox, jig says why, and commands ask first, since running them without `--proc`
+  would open the hole again. jig's check that bubblewrap works mounts one too: it didn't, so in such a
+  container jig said the sandbox was on and every command failed.
+- **The file tools confine themselves.** They run in jig's own process, where the sandbox doesn't reach, so
+  they check paths themselves: against the project and the `--add-dir` directories, and a change again by
+  where its path really leads. Without that, a symlink (a cloned repository can carry one, a command can
+  make one) let an audit's edit reach `~/.bashrc`, with no question in `edits` mode. Reading still follows
+  links out, since commands can read what they lead to as well, and refusing would break linked packages.
+  What the sandbox hides from commands the tools refuse by real path instead, with the sandbox off too: the
+  hidden paths, and jig's own directory but for its skills (in a review, `read_file` and `grep` read
+  another project's session through a link a command made to it; the `skill` tool's files go the same way,
+  and so does finding skills, or a `SKILL.md` linked to another project's memory would put its name and
+  description in the next session's catalog). Its skills they read but don't change, as commands can't: in
+  a home-directory project, `write_file` could plant one that every later session offers. But skills linked
+  out of it they change where the link leads, as commands can: refusing them there stopped edits to skills
+  kept in a dotfiles repository. A `.git` directory's `config` and hooks, and the files that say where they
+  are, are never changed, since git runs the programs they name outside the sandbox. The tools know a git
+  directory by that name, and by what the sandbox locks, worked out once a session whether there is a
+  sandbox or not: in a review, `write_file` put a hook in one made with `--separate-git-dir` in the
+  project, which commands couldn't change. One by another name that a command makes during the session is
+  changed like any other file. Some of jig's own writes into the project are held to the same: in an audit,
+  a command's `ln -sf` sent the `--stats` file and an approved AGENTS.md edit to a file outside it. Those
+  edits and the skills the model writes now go by real path, and the stats file, rewritten all through a
+  run, is written anew and renamed into place, since a rename replaces a link where a write follows it (a
+  linked folder on the way to it is still followed). A path in `/dev` or `/proc`, such as `/dev/stdout`, is
+  still written to: jig can't make a file there, or as root would replace `/dev/stdout` with one, and no
+  sandboxed command can put a link there. That goes by where the path is, not by what is there: a job an
+  earlier run left in the background can leave a link to a device, or a named pipe, anywhere else it can
+  write. So a named pipe elsewhere is replaced too. The project's skills lockfile is written the same way:
+  jig reads it before it rewrites it, and a named pipe a job left in the background put there in between
+  would have had jig wait for good. The user's own is written through a link: commands can't write jig's
+  directory, and the rename replaced a link to one kept in a dotfiles repository, which then stopped
+  getting updates. An approved AGENTS.md edit, written once the user has read the diff, isn't renamed into
+  place either, as a link from AGENTS.md to CLAUDE.md is how some projects keep one file: it is written to
+  a file opened without waiting and checked to be a regular one, so a named pipe made there meanwhile is
+  refused. What jig reads from the project to work in it (AGENTS.md, skills, the settings, the git files
+  the sandbox watches, the skills lockfile and the installed skills' files) it opens only if it is a
+  regular file, without waiting: in a review, a command's `mkfifo .git`, where jig ran in a subdirectory,
+  had jig wait after the task until it was killed, and a link to `/dev/zero` read without end; a
+  `mkfifo .jig/skills-lock.json` did the same to `jig skills list`. `jig skills add`, `update` and `remove`
+  go by real path in the project as well, and refuse a name in the lockfile, which commands can write, that
+  isn't a skill's name: a name of `../..` made `remove` delete the project. Nor do they, or a skill the
+  model writes, change anything in a `.git` directory: each replaces a skill's folder whole, while the file
+  tools' check for `config` and hooks looks at one file, and in a review, `.jig/skills` linked to
+  `.git/modules` let `update` put a skill's files in place of a submodule's config. Nor what the sandbox
+  locks in a git directory by another name, or a folder holding it: they knew one only by the name `.git`,
+  and with `.jig/proposals/skills` linked into one made with `--separate-git-dir`, a proposal could replace
+  its hooks, or the whole of it. `update` skips an entry it refuses, or can't fetch or install, updates the
+  rest and exits non-zero: one entry a command wrote, with a bad name, a missing path or no fields at all,
+  used to stop it before the user's own skills. An entry can also point anywhere, and its question named
+  only the skill: it now names the URL or folder, a folder in the hidden paths (or holding one) is refused,
+  since its files would land where commands can read them, and only https, ssh and file URLs are fetched,
+  since git runs a program for some others (`ext::`, which jig keeps refused whatever git's config says),
+  and http and git URLs don't check whom they reach. In a review, a file URL to a hidden repository still
+  brought its files in: such a repository is now refused too, read from the URL as git reads it (decoded,
+  without its host), and every path goes by the system's real path (Node's takes `link/..` for the folder
+  holding the link). And with paths hidden, git reads a file URL's repository in the sandbox, where there
+  is one, since a `.git` file or the alternates there can lead it to a hidden one. `add` refuses and
+  fetches the same way: it installed a skill from a hidden folder without a word, which every later
+  `update` then refused.
+- **jig's own git runs none of a repository's programs.** `grep` and `glob` run `git ls-files` in jig's own
+  process, and git runs `core.fsmonitor` on every one: in an audit, a sandboxed `git config core.fsmonitor`
+  ran a program as jig on the next search, and it copied the API key. So jig runs git with fsmonitor and
+  hooks turned off and without its API keys. The sandbox also keeps read-only, for the user's own git after
+  the session, the repository's git config and hooks and its submodules', and the files that point git at a
+  git directory (every worktree's and submodule checkout's `.git` file, and every worktree's `commondir`,
+  not only the one jig runs in: the user runs git in the others too) or add config (`config.worktree`); and
+  the directories holding them in the git directory in place, since one moved aside could be replaced. So
+  `git worktree remove`, and `git rm` or `git mv` of a submodule, fail in the sandbox for one that was
+  there when the session began. Where a directory commands can write in holds the git directory, those
+  between them stay in place too: in a review, a command moved aside the folder holding a clone in a temp
+  directory and put a copy with a config of its own in its place, which no rule named and jig didn't warn
+  of. A bare repository's config and hooks stay writable, since setting up a server's hooks can be the
+  task, unless it is named `.git` or has worktrees, where the user runs git.
+  bubblewrap can only make a path read-only by binding something over it, which creates a missing one: a
+  missing hooks directory is created empty, which runs nothing (git's default one holds only samples, which
+  never run either), but an empty `commondir` would break git. Nor can it keep a submodule's checkout in
+  place short of fixing every directory above it in the project. So on Linux a command can still create a
+  `commondir` or `config.worktree`, or put another checkout in a submodule's place, and jig warns after the
+  task and when a session ends; Seatbelt refuses them (a symlink in a checkout's place gets the warning).
+  With jig started in a subdirectory of a repository, a `.git` a command makes there, or the directory made
+  a git directory itself (`git init --bare .`), is the repository the user's git there finds, and so is one
+  in a directory between them; making a repository can be the task, so neither sandbox refuses it, and jig
+  warns of it the same way. The sandbox finds the repository by the nearest `.git`, whatever the git
+  directory it leads to is called, and submodules' git directories by their `config` or `HEAD`, not by
+  whether git takes them for one: git passes over a git directory whose `HEAD`, `objects` or `refs` are
+  gone or broken, and those stay writable, as git changes them all the time. When the sandbox asked git, a
+  command that moved `.git/HEAD` aside had the next session lock nothing there, and a command in that one
+  could change the config and put `HEAD` back. jig warns of such a move as well. A job a command leaves in
+  the background can still do it after jig has looked, until jig exits, and on macOS after that too. The
+  search for the `.git` stops where git's does: at a bare repository, a git directory (`HEAD`, and
+  `objects` and `refs` where its `commondir`, if any, leads) whose `config` says it is bare, and at
+  `GIT_CEILING_DIRECTORIES`. Going on, it took a home directory's dotfiles repository for the project's,
+  and let commands write in it. Stopping at a `config` alone, which a command in a subdirectory of a
+  repository can write, the next session there locked nothing. A command can make a whole repository too,
+  bare or not, so what the repositories around the project's have where commands can write stays read-only
+  (the `.git` of a submodule checkout in the project, say, or the config of one in a temp directory), and
+  the directories holding it there in place. Their git directories are never made writable, and no bind of
+  git's shows jig's own directory again. The submodules' configs, which say where their checkouts are, are
+  read by one git for all of them, since a dotfiles repository around every project can have dozens.
+  Commands can still make a repository of their own (a submodule whose git directory is in its checkout is
+  one), so jig's git doesn't rely on any of this.
 - **Deny rules are a guardrail, not a boundary.** No pattern catches every disguise (`g\it push`,
   `$(echo git) push`), so deny rules err on the side of refusing and the sandbox is what actually limits
   what a command can do.
-- **Snapshots in a private repository.** `git stash` would change the user's repository and miss
-  untracked files; a second git directory with the project as its work tree snapshots everything that
-  isn't ignored, deduplicates unchanged files, and leaves the project untouched.
+- **Snapshots in a private repository.** `git stash` would change the user's repository and miss untracked
+  files; a second git directory with the project as its work tree snapshots everything that isn't ignored,
+  deduplicates unchanged files, and leaves the project untouched. It never copies `node_modules/`, `dist/`,
+  `build/`, `target/`, `.jig/` and the like, even where the project's own git tracks them, so `/undo`
+  leaves those as they are. Nested repositories (submodules, clones) are left out: git checks one it stores
+  by running `git status` in it, which runs the programs its config names (a clean filter, say) outside the
+  sandbox, and a command can make one. So jig's git only lists them, and `/undo` leaves the files in them
+  as they are. Paths go back to git as the bytes it listed, on its standard input: on Linux a command can
+  give one a name that isn't UTF-8, and decoded, the pathspec that left it out matched nothing. The hidden
+  paths are left out too, by where they really lead: a command could read a copy back out of the store.
+  With the project itself hidden, nothing is snapshotted and `/undo` is off. And the sandbox hides jig's
+  own directory from commands, but for the skills whose scripts the model runs, since its sessions and
+  snapshots hold copies of every project's files, and the snapshots older versions took hold the hidden
+  paths too. It hides it by path, so where it lies in a directory commands can write in (a temp directory,
+  in skill evals), the directories holding it there stay in place, as git's do: in a review, a command
+  moved one aside, and read the snapshots at their new path in the next. So does the writable directory
+  itself, where it holds jig's directory, a hidden path or git's config: on macOS the rule that lets
+  commands write in a directory matches the directory too, so a command could move the whole project aside
+  and read, or change, what the other rules deny at its new path (on Linux it is a mount point).
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than
@@ -88,7 +293,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   tokens in every request, and a pass rate alone can't tell a helpful skill from an easy eval. So `jig
   skills test` runs each eval twice, with the skill and with it hidden, in a fresh project with a home
   directory of its own, so no other skill or setting takes part. A check command grades what can be
-  checked; a model grades the rest, from the diff and the agent's final message only.
+  checked; a model grades the rest, from the diff and the agent's final message only. The fresh home
+  mustn't free the eval from what your sessions hide: its settings hide the same paths, and your jig
+  directory, and the check and the grader's look at the changes run in the sandbox, as the task's
+  commands did. A skill's evals lie in its folder, which commands can write in a project, so jig copies
+  an eval's files only from that folder, and not from where the file tools wouldn't read.
 - **Installed skills carry their provenance.** A skill can bring scripts the model will run, so `jig
   skills add` lists them before anything is installed, runs nothing, and records the source and commit in
   a lockfile; `update` shows which files changed before replacing any. Repositories are cloned shallow
@@ -110,7 +319,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   (their questions would overlap, as `propose_skill`'s could in milestone 12), and subagents don't get them.
 - **Nothing that looks like a secret is written down.** A memory goes into every later prompt, so a key
   pasted into one would leak from then on. Memories, AGENTS.md edits and skills are refused if they hold
-  something shaped like an API key, a token, a private key or a password assignment.
+  something shaped like an API key, a token, a private key or a password assignment, or a password in a
+  URL whose host isn't this machine or an example, since `postgres://postgres:postgres@localhost` is the
+  kind of local convention AGENTS.md is for. A JWT is blanked out of exports only: tests hold made-up ones.
 - **jig never judges its own changes.** Reading a change to a prompt says little about whether it helps,
   and a judge the change could reach could be changed with it. So a candidate may change only `src/` and
   `skills/`; it works on a copy that has no benchmarks and, being a new repository, no history to find
@@ -155,7 +366,18 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
 - **MCP servers come back.** Ctrl+C in a terminal reaches every process in the foreground group, MCP
   servers included, and servers crash. A tool call to a server that has stopped starts it again.
 - **A subagent that runs out of steps still reports.** Hitting its step limit mid-research would waste
-  everything it read, so it gets one more call, without tools, to write up what it found.
+  everything it read, so it gets one more call, without tools, to write up what it found, as it does when
+  it is stopped for repeating itself or for replying twice with nothing. So does the main loop at its step
+  limit, with what it changed, verified and left undone: without it, a run that hit the limit left the user
+  "Stopped after 50 steps" and a diff to read (Python-Markdown's second attempt). The reply is a report,
+  not evidence, and not a finished answer to train on. The runs in `bench/` leave it out (`--no-wrap-up`):
+  at evolve2's four steps every attempt would make the extra call, and costs would no longer compare with
+  earlier runs.
+- **The model is told its budget.** A step limit or a deadline the model can't see is one it can't plan
+  for: on evolve2's 4 steps flash read until the calls ran out. Once half the steps, or half of
+  `--time-limit`, are used, a note after each step's results says what is used, and before the last step
+  that it is the last: 92 of 105 against 66 and 66 (milestone 30). Unlike `--check` it adds no model call,
+  and it goes in the results' own message, so the cached prefix stays the same.
 - **Checking before finishing is opt-in.** With nobody to look at the result, a model that declares a
   task done after a quick look has the last word; on Terminal-Bench, 15 of jig's 18 failures were tasks it
   finished on its own and got wrong. `--check` makes one-shot runs tell the model nobody can answer and
@@ -177,7 +399,12 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   DeepSeek outage in milestone 6, jig had sat silent for half an hour. The SDK retries only requests that
   fail before their reply begins, so jig itself asks again, up to twice, when a reply breaks off partway:
   the connection drops, the stream ends early, or an overload error arrives mid-stream. In milestone 10
-  one dropped connection had ended a Terminal-Bench task.
+  one dropped connection had ended a Terminal-Bench task. Once a reply has started, nothing in the SDK
+  bounds the wait for the rest of it: a server can hold the connection open and send nothing, and
+  DeepSeek, under load, sends only keep-alive comments for up to 30 minutes. So jig watches each reply's
+  events (comments and pings don't count): after a minute without one it says so, and after 5 minutes it
+  asks again, as for a reply that broke off. The limit is generous because a model can think for minutes
+  without showing anything, and `JIG_STREAM_IDLE_MS` changes it.
 - **One message format, translated at the edge.** DeepSeek's Anthropic-compatible API lets the same SDK
   and message format serve Claude and DeepSeek. DeepSeek does not support `is_error` on tool results, so
   for DeepSeek failures are marked with `Error:` in the text instead, and the Claude-only settings

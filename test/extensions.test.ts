@@ -1,21 +1,23 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { existsSync } from "node:fs";
+import { mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { after, beforeEach, describe, it } from "node:test";
+import { after, afterEach, beforeEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { runAgent, type AgentOptions, type Usage } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
-import { runHooks } from "../src/hooks.ts";
+import { runHooks, runStopHooks } from "../src/hooks.ts";
 import { connectMcpServers, type McpServers } from "../src/mcp.ts";
 import type { CallModel, ModelTurn } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
 import { systemPrompt } from "../src/prompt.ts";
-import { discoverSkills, frontmatter, skillCatalog, skillTool } from "../src/skills.ts";
+import { discoverSkills, frontmatter, loadSkill, skillCatalog, skillTool } from "../src/skills.ts";
 import { TOOLS, type Tool, type ToolContext } from "../src/tools/index.ts";
 import { subagentTool } from "../src/tools/subagent.ts";
 import { FileVersions } from "../src/tools/util.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -23,10 +25,10 @@ type ToolResult = Anthropic.Beta.BetaToolResultBlockParam;
 
 const text = (t: string) => ({ type: "text", text: t, citations: null }) as Block;
 const toolUse = (id: string, name: string, input: unknown) => ({ type: "tool_use", id, name, input }) as Block;
-const reply = (content: Block[]): ModelTurn => ({
+const reply = (content: Block[], stopReason?: Anthropic.Beta.BetaStopReason): ModelTurn => ({
   message: {
     content,
-    stop_reason: content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn",
+    stop_reason: stopReason ?? (content.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn"),
     usage: { input_tokens: 100, output_tokens: 10 },
   } as Anthropic.Beta.BetaMessage,
   malformed: new Map(),
@@ -34,10 +36,10 @@ const reply = (content: Block[]): ModelTurn => ({
 const quietUI = { toolCall() {}, toolResult() {}, notice() {} };
 
 /** A fake model that plays back scripted replies (a summary for summary requests) and records what it was sent. */
-function fakeModel(replies: ModelTurn[], seen: MessageParam[][] = []): CallModel {
+function fakeModel(replies: ModelTurn[], seen: MessageParam[][] = [], summary = [text("SUMMARY: so far, so good.")]): CallModel {
   return async (messages, _signal, options) => {
     seen.push(structuredClone(messages));
-    if (options?.summarize) return reply([text("SUMMARY: so far, so good.")]);
+    if (options?.summarize) return reply(summary);
     const next = replies.shift();
     if (!next) throw new Error("the fake model ran out of replies");
     return next;
@@ -53,9 +55,10 @@ const usage = (): Usage => ({ input: 0, cacheWrite: 0, cacheRead: 0, output: 0 }
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-ext-"));
+  dir = await tempDir("jig-ext-");
   process.env.JIG_HOME = join(dir, ".jig-home");
 });
+afterEach(removeTempDirs);
 
 async function writeSkill(base: string, name: string, skillMd: string, files: Record<string, string> = {}) {
   const skillDir = join(base, name);
@@ -104,6 +107,61 @@ describe("skills", () => {
     assert.equal(pinned.get("skill:release"), content);
     assert.equal(await tool.run({ name: "release", file: "references/policy.md" }, context()), "Never release on Fridays.");
     await assert.rejects(tool.run({ name: "release", file: "../../../etc/passwd" }, context()), /has no file/);
+  });
+
+  it("reads a skill's files, SKILL.md too, only where the file tools would, wherever a link in it leads", async () => {
+    // A command can make a link in a project's skill: to a hidden path, or into jig's own directory.
+    await writeSkill(join(dir, ".jig/skills"), "release", "---\nname: release\ndescription: Cut a release.\n---\n");
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key"), "the hidden key");
+    const session = join(process.env.JIG_HOME!, "sessions", "other", "s.jsonl");
+    await mkdir(join(session, ".."), { recursive: true });
+    await writeFile(session, "another project's session");
+    await symlink(join(secrets, "key"), join(dir, ".jig/skills/release/key"));
+    await symlink(session, join(dir, ".jig/skills/release/session"));
+    const tool = skillTool(discoverSkills(dir, join(dir, "home")).skills);
+    await assert.rejects(tool.run({ name: "release", file: "key" }, context({ hidden: [secrets] })), /^Error: key is hidden by the user's settings/);
+    await assert.rejects(tool.run({ name: "release", file: "session" }, context()), /^Error: session leads into jig's own directory/);
+    assert.equal(await tool.run({ name: "release", file: "key" }, context()), "the hidden key", "where the settings don't hide it");
+
+    // Its SKILL.md too, which loads without `file`, linked after discovery read it.
+    const skillMd = join(dir, ".jig/skills/release/SKILL.md");
+    await rm(skillMd);
+    await symlink(session, skillMd);
+    await assert.rejects(tool.run({ name: "release" }, context()), /^Error: SKILL.md leads into jig's own directory/);
+    await rm(skillMd);
+    await symlink(join(secrets, "key"), skillMd);
+    await assert.rejects(tool.run({ name: "release" }, context({ hidden: [secrets] })), /^Error: SKILL.md is hidden by the user's settings/);
+    assert.match(await tool.run({ name: "release" }, context()), /^<skill_content name="release">\nthe hidden key\n/, "where the settings don't hide it");
+  });
+
+  it("leaves out a skill whose SKILL.md leads into a hidden path or jig's own directory, and loads none there", async () => {
+    // A command can link a project skill's SKILL.md to another project's memory, whose name and description
+    // would reach the next session's catalog, or to a file the settings hide.
+    const memory = join(process.env.JIG_HOME!, "memory", "project", "other", "deploy.md");
+    await mkdir(join(memory, ".."), { recursive: true });
+    await writeFile(memory, "---\nname: deploy\ndescription: Deploy with the key in vault 7.\n---\nAnother project's memory.\n");
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "notes.md"), "---\nname: notes\ndescription: The hidden notes.\n---\nHidden.\n");
+    for (const [name, target] of [["noted", join(secrets, "notes.md")], ["remembered", memory]]) {
+      await mkdir(join(dir, ".jig/skills", name), { recursive: true });
+      await symlink(target, join(dir, ".jig/skills", name, "SKILL.md"));
+    }
+    // jig's own skills are found as before.
+    await writeSkill(join(process.env.JIG_HOME!, "skills"), "hello", "---\nname: hello\ndescription: Greet.\n---\nSay hello.\n");
+    const { skills, warnings } = discoverSkills(dir, join(dir, "home"), { builtin: null, hiddenPaths: [secrets] });
+    assert.deepEqual(skills.map((skill) => skill.name), ["hello"]);
+    assert.match(warnings.join("\n"), /^Skipped the skill in \S+\/noted: its SKILL\.md leads into a path the settings hide\.$/m);
+    assert.match(warnings.join("\n"), /^Skipped the skill in \S+\/remembered: its SKILL\.md leads into jig's own directory\.$/m);
+    const found = discoverSkills(dir, join(dir, "home"), { builtin: null }).skills;
+    assert.deepEqual(found.map((skill) => skill.name), ["notes", "hello"], "where the settings don't hide it");
+
+    // /<skill> loads one without the skill tool, so loading looks again: a command can link it after discovery.
+    assert.throws(() => loadSkill(found[0], [secrets], [dir]), /^Error: The skill "notes" isn't loaded: its SKILL\.md leads into a path the settings hide\.$/);
+    await rm(join(dir, ".jig/skills/noted/SKILL.md"));
+    await symlink(memory, join(dir, ".jig/skills/noted/SKILL.md"));
+    assert.throws(() => loadSkill(found[0], [], [dir]), /^Error: The skill "notes" isn't loaded: its SKILL\.md leads into jig's own directory\.$/);
+    assert.match(loadSkill(found[1], [secrets], [dir]), /Say hello\./);
   });
 
   it("reads frontmatter leniently", () => {
@@ -184,6 +242,76 @@ describe("MCP", () => {
     assert.equal(servers.tools.length, 5);
     assert.match(servers.errors.join(), /The MCP server "missing" failed to start: .*ENOENT/);
   });
+
+  it("adds a hash to tools whose names come out the same, so each call reaches its own server", async () => {
+    const servers = await connect({
+      "db.prod": { command: process.execPath, args: [fixture], env: { DATABASE: "prod database" } },
+      "db prod": { command: process.execPath, args: [fixture], env: { DATABASE: "test database" } },
+      test: { command: process.execPath, args: [fixture] },
+    });
+    const names = servers.tools.map((tool) => tool.definition.name);
+    assert.equal(new Set(names).size, 15);
+    assert.ok(names.includes("mcp__test__fail"), "a name no other tool has stays as it is");
+    // The model tells the two apart by the description, which names the server.
+    const fail = (server: string) =>
+      servers.tools.find((tool) => /^mcp__db_prod__fail_[0-9a-f]{8}$/.test(tool.definition.name) && tool.definition.description!.includes(`"${server}"`))!;
+    await assert.rejects(fail("db.prod").run({}, context()), /the prod database is locked/);
+    await assert.rejects(fail("db prod").run({}, context()), /the test database is locked/);
+    assert.deepEqual(servers.errors, ['Tools of the MCP servers "db.prod" and "db prod" come out with the same names, so each has a short hash added (/mcp lists them).']);
+    assert.equal(servers.renamed.get(fail("db.prod").definition.name)?.was, "mcp__db_prod__fail");
+  });
+
+  it("and to tools whose names are cut to the same 64 characters", async () => {
+    const servers = await connect({ [`server-${"x".repeat(60)}`]: { command: process.execPath, args: [fixture] } });
+    const names = servers.tools.map((tool) => tool.definition.name);
+    assert.equal(new Set(names).size, 5);
+    assert.ok(names.every((name) => /^mcp__server-x+_[0-9a-f]{8}$/.test(name) && name.length === 64), names.join());
+    const add = servers.tools.find((tool) => tool.definition.description!.includes('"add" tool'))!;
+    assert.equal(await add.run({ a: 2, b: 3 }, context()), "5");
+  });
+
+  it("keeps a deny rule that names the name such tools shared", async () => {
+    const home = await tempDir("jig-home-");
+    const server = { command: process.execPath, args: [fixture] };
+    await writeFile(join(home, "settings.json"), JSON.stringify({ mcpServers: { "db.prod": server, "db prod": server }, deny: ["mcp__db_prod__add"] }));
+    const api = await fakeMessagesApi((request) => {
+      const adds = (request.tools as { name: string }[]).map((tool) => tool.name).filter((name) => name.startsWith("mcp__db_prod__add_"));
+      return (request.messages as unknown[]).length === 1 ? adds.map((tool) => ({ tool, input: { a: 2, b: 3 } })) : [{ text: "Done." }];
+    });
+    try {
+      const { output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Add 2 and 3."], { api, cwd: dir, env: { JIG_HOME: home } });
+      assert.match(output, /Tools of the MCP servers "db\.prod" and "db prod" come out with the same names/);
+      const names = (api.requests[0].tools as { name: string }[]).map((tool) => tool.name);
+      assert.equal(new Set(names).size, names.length, "every tool the model is offered has a name of its own");
+      const results = JSON.stringify(api.requests[1].messages);
+      assert.equal(results.match(/the mcp__db_prod__add_[0-9a-f]{8} tool is denied in jig's settings/g)?.length, 2);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("and the hooks whose matcher names that name, before the call and after it", async () => {
+    const home = await tempDir("jig-home-");
+    const server = { command: process.execPath, args: [fixture] };
+    const hooks = {
+      PreToolUse: [{ matcher: "mcp__db_prod__add", command: "echo 'no adding on prod' >&2; exit 2" }],
+      PostToolUse: [{ matcher: "mcp__db_prod__pid", command: "echo 'pid checked' >&2; exit 2" }],
+    };
+    await writeFile(join(home, "settings.json"), JSON.stringify({ mcpServers: { "db.prod": server, "db prod": server }, hooks }));
+    const api = await fakeMessagesApi((request) => {
+      const calls = (request.tools as { name: string }[]).map((tool) => tool.name).filter((name) => /^mcp__db_prod__(add|pid)_/.test(name));
+      const input = (tool: string) => (tool.includes("add") ? { a: 2, b: 3 } : {});
+      return (request.messages as unknown[]).length === 1 ? calls.map((tool) => ({ tool, input: input(tool) })) : [{ text: "Done." }];
+    });
+    try {
+      await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Add 2 and 3."], { api, cwd: dir, env: { JIG_HOME: home } });
+      const results = JSON.stringify(api.requests[1].messages);
+      assert.equal(results.match(/Blocked by a hook: no adding on prod/g)?.length, 2);
+      assert.equal(results.match(/A hook checked this result and reported:\\npid checked/g)?.length, 2);
+    } finally {
+      api.close();
+    }
+  });
 });
 
 describe("permissions for MCP tools", () => {
@@ -228,6 +356,57 @@ describe("hooks", () => {
     }
   });
 
+  it('takes "*" for every tool, as Claude Code does', async () => {
+    const outcome = await runHooks([{ event: "PreToolUse", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(outcome.block, "the hook exited with code 2");
+  });
+
+  it("keeps jig's API keys out of a hook's environment", async () => {
+    const env = { ...process.env };
+    process.env.ANTHROPIC_API_KEY = "sk-secret";
+    try {
+      const outcome = await runHooks(preEdit('echo "key: ${ANTHROPIC_API_KEY:-none}" >&2; exit 2'), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+      assert.equal(outcome.block, "key: none");
+    } finally {
+      process.env = env;
+    }
+  });
+
+  it("stops a hook that runs too long, or on Ctrl+C, with everything it started", async () => {
+    // The job in the background holds stderr open, so jig used to wait for it whatever the timeout.
+    const hooks = preEdit(`(sleep 0.5; touch "$JIG_PROJECT_DIR/survived") & sleep 30`);
+    const call = { tool: "edit_file", input: {} };
+    let started = Date.now();
+    const timedOut = await runHooks(hooks, "PreToolUse", call, dir, { timeout: 200 });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.match(timedOut.warnings.join(), /\(killed: it timed out after 0.2s\)/);
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    started = Date.now();
+    // Two of them: after Ctrl+C the next hook doesn't start, since nothing could stop it once it had.
+    const interrupted = await runHooks([...hooks, ...hooks], "PreToolUse", call, dir, { signal: controller.signal });
+    assert.ok(Date.now() - started < 1500, `${Date.now() - started} ms`);
+    assert.equal(interrupted.warnings.length, 1, "the second hook never started");
+    assert.match(interrupted.warnings[0], /\(killed: the user interrupted it\)/);
+    await new Promise((done) => setTimeout(done, 1000));
+    assert.ok(!existsSync(join(dir, "survived")), "the background jobs were stopped too");
+  });
+
+  it("doesn't wait for a job a hook leaves running in the background", async () => {
+    const started = Date.now();
+    const outcome = await runHooks(preEdit(`sleep 5 & echo "not now" >&2; exit 2`), "PreToolUse", { tool: "edit_file", input: {} }, dir);
+    assert.equal(outcome.block, "not now");
+    assert.ok(Date.now() - started < 3000, `${Date.now() - started} ms`);
+  });
+
+  it("doesn't even wait a moment for a job that holds only a tool hook's stdout, which nothing reads", async () => {
+    // Waiting for a background job's last words takes a second; a tool hook's stdout has none to give.
+    const started = Date.now();
+    const outcome = await runHooks([{ event: "PostToolUse", command: "sleep 5 2>/dev/null &" }], "PostToolUse", { tool: "edit_file", input: {}, output: "ok" }, dir);
+    assert.deepEqual(outcome, { warnings: [] });
+    assert.ok(Date.now() - started < 800, `${Date.now() - started} ms`);
+  });
+
   it("passes on PostToolUse feedback, and only warns about a hook that fails", async () => {
     const hooks = [
       { event: "PostToolUse" as const, command: "echo 'lint: missing semicolon' >&2; exit 2" },
@@ -240,6 +419,62 @@ describe("hooks", () => {
     const pre = await runHooks(hooks, "PreToolUse", { tool: "bash", input: {} }, dir);
     assert.equal(pre.block, undefined);
     assert.match(pre.warnings.join(), /failed: broken/);
+  });
+
+  it("keeps only the start and end of a long report, however much a hook prints", async () => {
+    // It used to keep all of it and cut it afterwards: half a billion characters crashed jig.
+    const hooks = preEdit("echo first >&2; head -c 20000000 /dev/zero | tr '\\0' x >&2; echo >&2; echo last >&2; exit 2");
+    const block = (await runHooks(hooks, "PreToolUse", { tool: "edit_file", input: {} }, dir)).block ?? "";
+    assert.ok(block.length < 40_000, `${block.length} characters`);
+    assert.match(block, /^first\nx{19494}\n\n\[\.\.\. 19961012 characters truncated \.\.\.\]\n\nx{19494}\nlast$/);
+  });
+
+  const stop = { task: "fix the tests", last_message: "Done.", stop_hook_active: false, changed_files: ["a.py"] };
+
+  it("keeps the task from ending when a Stop hook exits with code 2 or prints a block decision, and tells it the task", async () => {
+    const hooks = [
+      { event: "Stop" as const, command: `cat > "$JIG_PROJECT_DIR/stop.json"; echo "$JIG_EVENT: 2 tests failed" >&2; exit 2` },
+      { event: "Stop" as const, command: `echo '{"decision": "block", "reason": "lint: a.py:3 unused import"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'` },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [], block: "Stop: 2 tests failed\nlint: a.py:3 unused import\nthe hook gave no reason" });
+    assert.deepEqual(JSON.parse(await readFile(join(dir, "stop.json"), "utf8")), { event: "Stop", ...stop, cwd: dir });
+  });
+
+  it("lets the task end when the Stop hooks pass, or fail otherwise, and runs them only then", async () => {
+    const hooks = [
+      { event: "Stop" as const, matcher: "bash", command: "echo 'all 9 tests passed'" }, // output that isn't a decision, and a matcher, which doesn't apply
+      { event: "Stop" as const, command: `echo '{"decision": "approve"}'` },
+      { event: "Stop" as const, command: `echo '{"decision": "block"}'; exit 1` },
+      { event: "PreToolUse" as const, command: "exit 2" },
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome, { warnings: [`Hook "echo '{"decision": "block"}'; exit 1" failed: the hook exited with code 1`] });
+    const pre = await runHooks([{ event: "Stop", matcher: "*", command: "exit 2" }], "PreToolUse", { tool: "bash", input: {} }, dir);
+    assert.equal(pre.block, undefined, "a Stop hook doesn't run around tool calls");
+  });
+
+  it("reads a Stop hook's decision whole, with a reason far longer than a command's output is kept", async () => {
+    // A failing test log wrapped in JSON. Kept only to a command's 39,000 characters, it couldn't be read, and
+    // the task would end as finished; the loop cuts the reason instead.
+    const hooks = [{ event: "Stop" as const, command: `printf '{"decision": "block", "reason": "tests failed: '; head -c 3900000 /dev/zero | tr '\\0' x; printf '"}'` }];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    assert.deepEqual(outcome.warnings, []);
+    assert.ok(outcome.block === `tests failed: ${"x".repeat(3_900_000)}`, `${outcome.block?.slice(0, 40)}…, ${outcome.block?.length} characters`);
+  });
+
+  it("keeps only the start and end of a Stop hook's stdout past millions of characters, and says when a decision is too long to read", async () => {
+    const lots = "head -c 20000000 /dev/zero | tr '\\0' x";
+    const hooks = [
+      { event: "Stop" as const, command: lots }, // a test runner's report, say: its own business
+      { event: "Stop" as const, command: `yes '{"Action":"pass","Package":"example.com/pkg","Test":"TestCase","Elapsed":0.01}' | head -n 80000` }, // go test -json
+      { event: "Stop" as const, command: `printf '{"decision": "block", "reason": "'; ${lots}; printf '"}'` },
+      { event: "Stop" as const, command: `printf '{"reason": "'; ${lots}; printf '", "decision": "block"}'` }, // the end is kept too
+    ];
+    const outcome = await runStopHooks(hooks, stop, dir);
+    const tooLong = (hook: { command: string }) => `Hook "${hook.command}" printed too much on stdout to read it as a decision`;
+    assert.deepEqual(outcome, { warnings: [tooLong(hooks[2]), tooLong(hooks[3])] });
   });
 
   it("are applied around tool calls by the agent loop", async () => {
@@ -257,6 +492,23 @@ describe("hooks", () => {
     const [read, bash] = conversation.messages[2].content as ToolResult[];
     assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nlint: all clear$/);
     assert.deepEqual([bash.is_error, bash.content], [true, "Blocked by a hook: no commands today"]);
+  });
+
+  it("have what they tell the model cut, as a tool's output is", async () => {
+    // A hook that prints a whole test log mustn't put megabytes into one result.
+    await writeFile(join(dir, "a.txt"), "hello\n");
+    const log = "FAIL test_parse\n".repeat(10_000);
+    const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
+    const model = fakeModel([
+      reply([toolUse("t1", "read_file", { path: "a.txt" }), toolUse("t2", "bash", { command: "echo hi" })]),
+      reply([text("Done.")]),
+    ]);
+    const hooks = { before: async (tool: string) => (tool === "bash" ? log : null), after: async () => log };
+    await runAgent(conversation, agentOptions(model, { hooks }));
+    const [read, bash] = conversation.messages[2].content as ToolResult[];
+    assert.match(String(read.content), /hello\n\nA hook checked this result and reported:\nFAIL test_parse\n[\s\S]*characters truncated/);
+    assert.match(String(bash.content), /^Blocked by a hook: FAIL test_parse\n[\s\S]*characters truncated/);
+    for (const result of [read, bash]) assert.ok(String(result.content).length < 41_000, `${String(result.content).length} characters`);
   });
 });
 
@@ -294,6 +546,52 @@ describe("subagents", () => {
     assert.equal(last.role, "user");
     assert.match(JSON.stringify(last.content), /tool_result.*run out of steps/, "the request rides on the tool results");
   });
+
+  it("report what they found when they are stopped for repeating themselves", async () => {
+    const seen: MessageParam[][] = [];
+    const again = Array.from({ length: 8 }, (_, i) => reply([toolUse(`s${i}`, "glob", { pattern: "*" })]));
+    const answer = await subagentTool(setup(fakeModel(again, seen), 10)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: loop.)");
+    assert.equal(seen.length, 6, "five steps, then the request for what it found");
+  });
+
+  it("report what they found when they reply twice with nothing, and are told only that", async () => {
+    const seen: MessageParam[][] = [];
+    // The first of them cut off at the output limit, so the note after it is the one that says so.
+    const model = fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([], "max_tokens"), reply([])], seen);
+    const answer = await subagentTool(setup(model)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: empty.)");
+    // The loop's note after the first empty reply asked it to go on: the request takes its place.
+    const request = JSON.stringify(seen.at(-1));
+    assert.match(request, /tool_result.*Two of your replies were empty\. Don't call any more tools: reply now with what you found so far/);
+    assert.doesNotMatch(request, /continue the task|run out of steps/);
+    // The first cut off at the output limit while still thinking: its own note gives way too.
+    const cut: MessageParam[][] = [];
+    const thinking = { type: "thinking", thinking: "Every file, one by one", signature: "sig" } as Block;
+    await subagentTool(setup(fakeModel([reply([toolUse("s1", "glob", { pattern: "*" })]), reply([thinking], "max_tokens"), reply([])], cut))).run({ description: "look", prompt: "Look around." }, context());
+    assert.match(JSON.stringify(cut.at(-1)), /tool_result.*Two of your replies were empty\. Don't call any more tools/);
+    assert.doesNotMatch(JSON.stringify(cut.at(-1)), /continue the task/);
+  });
+
+  it("keep the text they gave before replying twice with nothing, when their report has none", async () => {
+    const seen: MessageParam[][] = [];
+    // Empty, then text cut off at the output limit, then empty when asked to continue it: the run holds that text.
+    const model = fakeModel([reply([]), reply([text("PARTIAL: the needle is in hay")], "max_tokens"), reply([])], seen, []);
+    const answer = await subagentTool(setup(model)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "PARTIAL: the needle is in hay\n\n(The subagent stopped early: empty.)");
+    assert.equal(seen.length, 4, "three steps, then the request for what it found");
+  });
+
+  it("are asked only for what they found when an empty reply on the last step runs their steps out", async () => {
+    const seen: MessageParam[][] = [];
+    const answer = await subagentTool(setup(fakeModel([reply([]), reply([])], seen), 2)).run({ description: "look", prompt: "Look around." }, context());
+
+    assert.equal(answer, "SUMMARY: so far, so good.\n\n(The subagent stopped early: max_steps.)");
+    assert.deepEqual(seen.at(-1), [{ role: "user", content: [{ type: "text", text: "Look around." }, { type: "text", text: "You have run out of steps. Don't call any more tools: reply now with what you found so far, and what you didn't get to." }] }]);
+  });
 });
 
 describe("parallel tool calls", () => {
@@ -317,7 +615,8 @@ describe("parallel tool calls", () => {
   it("runs calls that only read at the same time, and the rest in order", async () => {
     for (const [kind, expected] of [["read", 3], ["edit", 1]] as const) {
       const { tool, stats } = slowTool(kind);
-      const calls = [toolUse("a", "slow", {}), toolUse("b", "slow", {}), toolUse("c", "slow", {})];
+      // Different inputs: a call identical to an earlier one in the reply wouldn't run.
+      const calls = [toolUse("a", "slow", { n: 1 }), toolUse("b", "slow", { n: 2 }), toolUse("c", "slow", { n: 3 })];
       const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
       await runAgent(conversation, agentOptions(fakeModel([reply(calls), reply([text("Done.")])]), { tools: [tool] }));
       assert.equal(stats.most, expected, kind);

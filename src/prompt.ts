@@ -2,9 +2,10 @@
 // guidance, the environment, and what the project and the user add (AGENTS.md files, skills, memory).
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import os from "node:os";
 import { dirname, join, relative } from "node:path";
+import { readRegularFile, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_INSTRUCTIONS_CHARS = 20_000; // per file
 const FILE_TOOLS = ["read_file", "grep", "glob", "write_file", "edit_file"];
@@ -17,9 +18,11 @@ export interface Instructions {
 
 /**
  * The project's instructions for agents: AGENTS.md (or CLAUDE.md where there is none) in each directory
- * from the repository root down to the working directory, outermost first so the more specific come last.
+ * from the repository root down to the working directory, outermost first so the more specific come last;
+ * and what was left out, for the user. One that isn't a regular file (a named pipe a command made, say) is
+ * left out, unread, and a CLAUDE.md beside an AGENTS.md like that is read instead.
  */
-export function loadInstructions(cwd: string): Instructions[] {
+export function loadInstructions(cwd: string): { instructions: Instructions[]; warnings: string[] } {
   const here = realpathSync(cwd);
   const root = gitRoot(here) ?? here;
   const dirs: string[] = [];
@@ -27,13 +30,22 @@ export function loadInstructions(cwd: string): Instructions[] {
     dirs.unshift(dir);
     if (dir === root || dir === dirname(dir)) break;
   }
-  return dirs.flatMap((dir) => {
-    const path = ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).find((file) => existsSync(file));
-    if (!path) return [];
-    let text = readFileSync(path, "utf8").trim();
-    if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
-    return text ? [{ path: relative(here, path), text }] : [];
+  const warnings: string[] = [];
+  const instructions = dirs.flatMap((dir) => {
+    for (const path of ["AGENTS.md", "CLAUDE.md"].map((name) => join(dir, name)).filter((file) => existsSync(file))) {
+      // As many bytes as the characters kept can take (UTF-8 takes 4 bytes a character at most), so a longer
+      // file reads longer and is marked truncated.
+      let text = readRegularFile(path, 4 * MAX_INSTRUCTIONS_CHARS)?.trim();
+      if (text === undefined) {
+        warnings.push(`${relative(here, path)} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
+        continue;
+      }
+      if (text.length > MAX_INSTRUCTIONS_CHARS) text = `${text.slice(0, MAX_INSTRUCTIONS_CHARS)}\n[... truncated]`;
+      return text ? [{ path: relative(here, path), text }] : [];
+    }
+    return [];
   });
+  return { instructions, warnings };
 }
 
 /** What a system prompt holds besides jig's own guidance. */
@@ -94,7 +106,7 @@ Environment:
 - Working directory: ${cwd}${dirs.length && fileTools ? `\n- The file tools also work in: ${dirs.join(", ")}` : ""}
 - Platform: ${os.type()} ${os.release()} (${os.arch()})
 - Git repository: ${gitRoot(cwd) ? "yes" : "no"}
-- Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted" or a connection error.` : "run directly on the user's machine."}
+- Commands: ${sandboxLimits ? `run in a sandbox. ${sandboxLimits} Anything else fails with "Operation not permitted", "Read-only file system" or a connection error.` : "run directly on the user's machine."}
 - Today's date: ${new Date().toLocaleDateString("en-CA")}`;
   return [prompt, oneShot ? ON_YOUR_OWN : "", skills, memory, projectInstructions(instructions)].filter(Boolean).join("\n\n");
 }
@@ -125,7 +137,8 @@ Environment:
 
 function gitRoot(cwd: string): string | null {
   try {
-    return execFileSync("git", ["rev-parse", "--show-toplevel"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    const args = [...SAFE_GIT, "rev-parse", "--show-toplevel"];
+    return execFileSync("git", args, { cwd, env: withoutKeys(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
   } catch {
     return null;
   }

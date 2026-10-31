@@ -1,18 +1,21 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { createServer, type ServerResponse } from "node:http";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import { describe, it } from "node:test";
+import { afterEach, describe, it } from "node:test";
 import type Anthropic from "@anthropic-ai/sdk";
 import { contextWindow, createModel, defaultApi, type ModelOptions } from "../src/model.ts";
 import { toChatMessages, toChatTools } from "../src/openai.ts";
 import { TOOLS } from "../src/tools/index.ts";
+import { runJig } from "./fake-api.ts";
 import { collectNotices } from "./notices.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // jig through an OpenAI-compatible chat completions API: the translation both ways, against a local server.
+
+afterEach(removeTempDirs);
 
 type Chunk = { delta?: Record<string, unknown>; finish?: string; usage?: Record<string, unknown> };
 
@@ -32,10 +35,12 @@ function sse(chunks: Chunk[]): string {
 }
 
 /**
- * A local chat completions server that answers each request with the next of `replies`: a stream, or
- * "drop" to cut the connection after the first chunk. Returns the request bodies it received.
+ * A local chat completions server that answers each request with the next of `replies`: a stream, "drop"
+ * to cut the connection after the first chunk, "quiet" to send nothing more after it, or "queued" to send
+ * no chunk at all, only keep-alive comments, as DeepSeek does while it holds a request under load.
+ * Returns the request bodies it received.
  */
-async function server(replies: (Chunk[] | "drop")[]): Promise<{ url: string; requests: Record<string, unknown>[]; close: () => void }> {
+async function server(replies: (Chunk[] | "drop" | "quiet" | "queued")[]): Promise<{ url: string; requests: Record<string, unknown>[]; close: () => void }> {
   const requests: Record<string, unknown>[] = [];
   const http = createServer((req, res: ServerResponse) => {
     let body = "";
@@ -44,9 +49,14 @@ async function server(replies: (Chunk[] | "drop")[]): Promise<{ url: string; req
       requests.push(JSON.parse(body));
       const reply = replies[requests.length - 1] ?? replies.at(-1)!;
       res.writeHead(200, { "content-type": "text/event-stream" });
-      if (reply === "drop") {
+      if (reply === "queued") {
+        const keepAlive = setInterval(() => res.write(": keep-alive\n\n"), 50);
+        // Closed in the end, as DeepSeek does after 30 minutes: a call still waiting then fails, not hangs.
+        const close = setTimeout(() => res.end(), 2000);
+        res.on("close", () => (clearInterval(keepAlive), clearTimeout(close)));
+      } else if (reply === "drop" || reply === "quiet") {
         res.write(sse([{ delta: { content: "Hel" } }]).split("data: [DONE]")[0]);
-        setTimeout(() => res.socket?.destroy(), 20);
+        if (reply === "drop") setTimeout(() => res.socket?.destroy(), 20);
       } else {
         res.end(sse(reply));
       }
@@ -209,6 +219,52 @@ describe("a chat completions reply", () => {
     }
   });
 
+  it("takes tool calls streamed without an index, as some servers send them", async () => {
+    const api = await server([
+      [
+        { delta: { tool_calls: [{ id: "call_a", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } }] } },
+        { delta: { tool_calls: [{ id: "call_b", type: "function", function: { name: "bash", arguments: '{"comm' } }] } },
+        { delta: { tool_calls: [{ function: { arguments: 'and":"pwd"}' } }] } },
+        { delta: {}, finish: "tool_calls" },
+      ],
+    ]);
+    try {
+      const { message, malformed } = await createModel(options(api.url))([{ role: "user", content: "hi" }]);
+      assert.deepEqual(message.content, [
+        { type: "tool_use", id: "call_a", name: "bash", input: { command: "ls" } },
+        { type: "tool_use", id: "call_b", name: "bash", input: { command: "pwd" } },
+      ]);
+      assert.equal(message.stop_reason, "tool_use");
+      assert.equal(malformed.size, 0);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("asks again when a reply ends for tool calls it didn't send", async () => {
+    const api = await server([[{ delta: { content: "Listing them." } }, { delta: {}, finish: "tool_calls" }], hello]);
+    try {
+      const { result, notices } = await capturing("broke off", () => createModel(options(api.url))([{ role: "user", content: "hi" }]));
+      assert.deepEqual(result.message.content, [{ type: "text", text: "Hello", citations: null }]);
+      assert.equal(notices.length, 1);
+      assert.equal(api.requests.length, 2);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("estimates the usage when the server sends none, so the conversation's size still counts", async () => {
+    // A server that ignores stream_options.include_usage, as some local ones do.
+    const api = await server([[{ delta: { content: "A long answer." } }, { delta: {}, finish: "stop" }]]);
+    try {
+      const { message } = await createModel(options(api.url))([{ role: "user", content: "x".repeat(400_000) }]);
+      assert.ok(message.usage.input_tokens >= 100_000, `input_tokens: ${message.usage.input_tokens}`);
+      assert.ok(message.usage.output_tokens > 0);
+    } finally {
+      api.close();
+    }
+  });
+
   it("maps a reply cut off at the output limit to max_tokens", async () => {
     const api = await server([[{ delta: { content: "Long" } }, { delta: {}, finish: "length" }]]);
     try {
@@ -224,6 +280,24 @@ describe("a chat completions reply", () => {
       const { result, notices } = await capturing("broke off", () => createModel(options(api.url))([{ role: "user", content: "hi" }]));
       assert.deepEqual(result.message.content, [{ type: "text", text: "Hello", citations: null }]);
       assert.equal(notices.length, 2);
+      assert.equal(api.requests.length, 3);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("asks again when the stream goes quiet, partway or before any chunk, keep-alive comments or not", async () => {
+    // Queued, no chunk comes at all: the clock has to start with the response itself.
+    const api = await server(["quiet", "queued", hello]);
+    try {
+      const { result, notices } = await capturing("No output", () => createModel(options(api.url, { idle: 400 }))([{ role: "user", content: "hi" }]));
+      assert.deepEqual(result.message.content, [{ type: "text", text: "Hello", citations: null }]);
+      assert.deepEqual(notices, [
+        "No output from the API for 0.2 seconds; still waiting, for up to 0.4 seconds.",
+        "No output from the API for 0.4 seconds; trying again (2 tries left).",
+        "No output from the API for 0.2 seconds; still waiting, for up to 0.4 seconds.",
+        "No output from the API for 0.4 seconds; trying again (1 try left).",
+      ]);
       assert.equal(api.requests.length, 3);
     } finally {
       api.close();
@@ -266,8 +340,8 @@ describe("the CLI on an OpenAI-compatible API", () => {
   it("talks chat completions to the server --base-url names, for a model that isn't Claude or DeepSeek", async () => {
     const api = await server([hello]);
     try {
-      const project = await mkdtemp(join(tmpdir(), "jig-openai-"));
-      const env = { ...process.env, JIG_HOME: await mkdtemp(join(tmpdir(), "jig-home-")), NO_COLOR: "1", OPENAI_API_KEY: "" };
+      const project = await tempDir("jig-openai-");
+      const env = { ...process.env, JIG_HOME: await tempDir("jig-home-"), NO_COLOR: "1", OPENAI_API_KEY: "" };
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
       const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "Say hello."], { cwd: project, env });
       let output = "";
@@ -279,6 +353,28 @@ describe("the CLI on an OpenAI-compatible API", () => {
       const [request] = api.requests as { model: string; messages: { role: string; content: string }[] }[];
       assert.equal(request.model, "local-model");
       assert.deepEqual(request.messages.at(-1), { role: "user", content: "Say hello." });
+    } finally {
+      api.close();
+    }
+  });
+
+  it("estimates the conversation's size when the server reports no usage, so it is still compacted", async () => {
+    // A server that ignores stream_options.include_usage: a tool call, the summary compaction asks for, the answer.
+    const api = await server([
+      [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "glob", arguments: '{"pattern":"*"}' } }] } }, { delta: {}, finish: "tool_calls" }],
+      [{ delta: { content: "The user asked for the files; there are none." } }, { delta: {}, finish: "stop" }],
+      [{ delta: { content: "There are no files." } }, { delta: {}, finish: "stop" }],
+    ]);
+    try {
+      const project = await tempDir("jig-openai-");
+      const stats = join(project, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "--compact-at", "1000", "--stats", stats, "List the files."];
+      const { code, output } = await runJig(args, { api, cwd: project, env: { OPENAI_API_KEY: "" } });
+      assert.equal(code, 0, output);
+      // The system prompt and the tools alone come to more than 1000 tokens, so the second request is the summary's.
+      assert.equal(api.requests[1].tool_choice, "none", output);
+      assert.equal(output.match(/reports no token usage/g)?.length, 1, output); // said once, for three replies
+      assert.ok(JSON.parse(await readFile(stats, "utf8")).usage.input > 1000);
     } finally {
       api.close();
     }

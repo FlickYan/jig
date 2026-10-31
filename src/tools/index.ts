@@ -4,12 +4,13 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Usage } from "../agent.ts";
-import { bashOnItsOwn, bashTool } from "./bash.ts";
+import { bashOnItsOwn, bashTool, type OutputFiles } from "./bash.ts";
 import { editTool } from "./edit.ts";
 import { globTool } from "./glob.ts";
 import { grepTool } from "./grep.ts";
 import { readTool } from "./read.ts";
 import type { Sandbox } from "../sandbox.ts";
+import type { Mechanism } from "../stats.ts";
 import type { FileVersions } from "./util.ts";
 import { writeTool } from "./write.ts";
 
@@ -23,12 +24,32 @@ export interface ToolContext {
   signal?: AbortSignal;
   /** Where commands run, if not directly on the machine. */
   sandbox?: Sandbox;
+  /** Where bash keeps the whole of an output too long to show, for the model to search. */
+  outputs?: OutputFiles;
   /** Directories outside the project the file tools may use too (--add-dir). */
   dirs?: string[];
+  /** Paths the settings hide (hiddenPaths): the file tools refuse them, wherever a symlink leads. */
+  hidden?: string[];
+  /** What the sandbox locks in git, by real path (see lockedGitPaths): write_file and edit_file refuse it too. */
+  gitLocked?: string[];
+  /** --check-writes: write_file and edit_file check what they wrote, and say what is wrong (see write-check.ts). */
+  checkWrites?: boolean;
+  /**
+   * Whether the model could run a bash command itself without asking: it has the bash tool, no PreToolUse
+   * hook covers it, the permission policy as it is now (after a /mode, say) would run `command` so (see
+   * Permissions.decide), and no deny rule matches `script`, what runs in its place. --check-writes runs a
+   * program on a file only where it could (`command` is `python3 <file>`, say, and `script` the check that
+   * runs it); without this, it runs none.
+   */
+  mayRun?(command: string, script: string): boolean;
+  /** --tolerant-edits: edit_file applies a unique match that differs in typographic punctuation or trailing whitespace. */
+  tolerantEdits?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;
   /** The current task's token counts, for tools that call the model themselves (subagents). */
   usage?: Usage;
+  /** Counts a mechanism that fired, as the loop does (see stats.ts): bash cuts a long output itself. */
+  count?(event: Mechanism): void;
 }
 
 export type ToolInput = Record<string, unknown>;

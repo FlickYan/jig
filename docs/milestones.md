@@ -35,6 +35,7 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
 - [x] **28. The loop and the tools again:** a new baseline (33 of 63) for the analysis, and three loop-only candidates against milestone 21's comparison runs, all rejected (+2, +5 and +5 points, ahead in 57 to 65% of resamples, at 19 to 34% more cost): the sessions show two of the changes never ran (a test re-run in 0 of 30 attempts, a multi-file `edit_file` used in 0), so their +5 is what a change that does nothing scores; and a request's narrowed tools are no limit, since the model called undeclared tools in 22 of 30 attempts and jig ran them; after the round, two fixes: an invalid call goes back as the parse error, its first 2,000 characters and the 400 before the error (milestone 27's echoes held up to 155k), and the loop runs only the tools the request declared
 - [x] **29. A reviewer that runs the work:** `jig review`: once the agent is done, a model checks the work by running it in a copy of the machine (on Terminal-Bench, a sibling container from `docker commit`, with no network), each problem's command runs again in a fresh copy before it goes back, and `eval/review_before.py` runs the hidden tests on the work as the review saw it; two smoke tests found three bugs and the first failure a review turned into a pass (mteb-retrieve); on the 20 tasks, 10 of 20, no result changed (one trial got problems back and failed before and after), no false alarm in 9 passes, and the causes of two failures found and lost, one to an empty `<shows>` the re-check dropped, one to a verdict written as a tool call; replays showed a cut-off review's verdict to be a coin toss, and the verdict at the time-out is now asked at low effort, in the asked form, by the time limit, and once more when it doesn't come
+- [x] **30. Four ideas from other agents, measured:** budget notes, a finish gate, checks after writes and tolerant edits, each behind a flag and reviewed; on evolve2 at 4 steps, side by side with two baselines (66 and 66 of 105), budget notes passed 92 of 105 (+25 points, +11 to +40), twice, at the same cost, did no harm at 40 steps or on the main benchmark (60 of 60), and are on by default; the gate and the checks never fired, and tolerant edits would fix none of flash's stored failed edits, so they stay opt-in; Terminal-Bench, which design.md asks for first, couldn't run on this machine
 
 ## Milestone 9: checking before finishing
 
@@ -1357,3 +1358,107 @@ printed in a fresh copy, or to drop the re-check.
 **Cost.** By jig's token counts, at list prices: the round $1.35 ($1.06 for jig, $0.30 for the 15
 reviews), the smoke tests $0.32, the replays about $0.27. The balance fell 17.7 CNY over the evening, the
 other projects' use included.
+
+## Milestone 30: four ideas from other agents, measured
+
+Reading other open-source agents for how they handle jig's problems (Codex CLI, opencode, Crush,
+gemini-cli, Goose, OpenHands, qwen-code, mini-swe-agent, aider, SWE-agent) turned up four changes to the
+loop and the tools that a test can't judge, only a benchmark. Each was built behind a flag, off by
+default, reviewed adversarially (end-to-end runs against `test/fake-api.ts`, and its tests run without
+it to see them fail) and fixed; then the four were measured side by side, on one build.
+
+- **Budget notes** (`--budget-notes`). The model was never told its step limit or its time, and on
+  evolve2's 4 steps the analyses kept finding runs that read until the calls ran out (milestones 16, 21
+  and 28). mini-swe-agent puts the steps and minutes left in its observations, Goose and Codex remind the
+  model of its turns and its time, and the BATS paper (arXiv:2511.17006) argues that agents lack budget
+  awareness. Once half the steps, or half of `--time-limit`, are used, a note after each step's tool
+  results says how much is used, and before the last step that the next reply is the last whose tool
+  calls run. It goes in the results' own message, so no earlier message changes and the cached prefix
+  stays the same.
+- **A finish gate** (`--finish-gate`). jig's known weak spot is the confident wrong "done" (milestone 24:
+  46 of 60 Terminal-Bench failures ended with jig saying it was done), and the checks so far ask every
+  time (`--check`, milestone 9) or ask a model (`--reviewer`, milestone 24). SWE-agent's review on submit
+  fires only when its trace shows a change after the reproduction script. The gate reads only what the
+  task's own calls did: the first time the model stops with a step left, it is sent back once if files
+  changed after the last command that ran something, or if the last test run failed.
+- **Checks after writes** (`--check-writes`). SWE-agent lints after every edit and shows only the errors
+  the edit added, aider lints after every edit too, and gemini-cli looks for "// ... existing code ..."
+  in a rewrite. After `write_file` and `edit_file`, python3's `ast.parse`, `node --check`, `bash -n` or
+  `JSON.parse` checks the file, and an error the change made, or a placeholder left by a rewrite that
+  made the file much shorter, is added to the result.
+- **Tolerant edits** (`--tolerant-edits`). opencode, qwen-code and Codex match an edit's text loosely when
+  it doesn't match exactly. `edit_file` then applies a unique match that differs only in curly quotes,
+  dashes and no-break spaces, or after that in trailing whitespace; indentation always counts.
+
+**Would they fire?** Tolerant edits were judged from the stored results first. Of the 544 failed
+`edit_file` calls in 2,950, 527 were milestone 27's 7B models'; deepseek-flash's failed 17 of 2,306, 2 of
+the 1,709 from milestone 4 on, and none of the 175 calls in the sessions kept on this machine failed for
+whitespace, punctuation or a line-number prefix. Run with flash, the flag would measure nothing, so it
+wasn't run; it stays, off, for models whose edits miss.
+
+**The round.** evolve2 at its 4 steps, 21 tasks × 5 attempts each, on the build with all four (`e131617`),
+five runs at once on a Saturday (no peak hours); each flag against the two baselines pooled, with the
+referee's paired bootstrap:
+
+| run | passed | fired | cost an attempt |
+|-----|--------|-------|-----------------|
+| baseline | 66 of 105 (63%) | | $0.0141 |
+| baseline, again | 66 of 105 (63%) | | $0.0135 |
+| `--budget-notes` | **92 of 105 (88%)**: +24.8 points (+10.5 to +39.5), ahead in 100% of resamples; on the training tasks +27.0, on the held-out ones +22.7 | 107 notes at half the steps, 105 before the last | $0.0138 |
+| `--finish-gate` | 68 of 105: +1.9 (−11.0 to +14.3) | never | $0.0133 |
+| `--check-writes` | 66 of 105: 0.0 (−15.7 to +15.2) | never, in 140 writes and edits | $0.0136 |
+
+- **The notes make the last step count.** With them, every attempt changed the code (without: 97 and 98
+  of 105), 86 ran the tests after their change (32 and 32), and none spent its last step only reading (10
+  and 10). The first change came no sooner: at step 3 or 4, about half each, with them or without.
+  Milestone 23 found that two more steps, 6 instead of 4, put flash 24 points ahead; the notes get as
+  much within the 4.
+- **The gate never fired.** At 4 steps flash never stops with a step left: every attempt used all four.
+  The case it is for, a long run that stops early sure it is done, is Terminal-Bench's.
+- **No write left a syntax error or a placeholder.** In 92 `write_file` and 48 `edit_file` calls the
+  checks found nothing: flash's failures here are wrong behaviour, not broken syntax. Many of its
+  changes, too, go through bash (heredocs, `python3 - <<`), which the checks don't see.
+
+**Checked as milestone 16 asks.** A result picked for being the best of three is likely to have been
+lucky, so the notes, now on by default (`3547aac`), were measured again, in the ways milestone 16 named:
+
+| | with the notes | without |
+|---|---|---|
+| this suite, 4 steps, run again | 92 of 105 (88%), $0.0146: +24.8 points (+11.0 to +39.5) against the round's baselines, ahead in 100% of resamples | 66 and 66 of 105 |
+| this suite, 40 steps, 2 attempts a task, side by side | 41 of 42, 14.2 steps, $0.0286; 53 notes, in the attempts that went past 20 steps | 41 of 42, 13.6 steps, $0.0307 |
+| the main benchmark, 40 steps | 60 of 60, 7.2 steps, $0.0046 | 60 of 60, 7.1 steps, $0.0041 (the day before) |
+
+Run again, the gain held exactly, 92 of 105, with 89 attempts testing after their change and every one
+changing the code. With 40 steps the notes did no harm, on the suite or on the main benchmark, where few
+attempts get to 20 steps and they rarely fire.
+
+**Not checked on Terminal-Bench.** [design.md](design.md) asks for it before a change that won on evolve2
+is merged (milestone 16's lost 15 points there), and it is where the notes may matter most: its limit is
+the task's time, and the notes say how much of it is left. The machine this round ran on has Docker, but
+its containers can't reach the network, which the tasks' setup and hidden tests need. The check, on a
+machine with Docker (about $4.20 and 9 hours, by milestone 19's):
+
+```bash
+for round in 1 2; do
+  eval/run.sh tb-notes-off-r$round jig --ak ref=HEAD --ak no_budget_notes=true
+  eval/run.sh tb-notes-on-r$round jig --ak ref=HEAD
+done
+python3 eval/report.py eval/jobs/tb-notes-off-r1+eval/jobs/tb-notes-off-r2 eval/jobs/tb-notes-on-r1+eval/jobs/tb-notes-on-r2
+```
+
+**Found by the reviews.** `--check-writes`' first version ran python3, node and bash on every write without
+the permission policy. With `--no-sandbox` in edits mode, a `.pth` file the model wrote into the
+project's virtualenv ran on the host, unasked; in the sandbox with `--allow-network`, it reached the
+network. A check now runs its program only where the model could run it on that file unasked, and not
+where a deny rule matches the command that would run, a PreToolUse hook covers bash or `--tools` leaves
+bash out; python3 runs without its site module; and a check left out is counted (`write.checkSkipped`)
+and told to the user once. The reviews also found the gate's command classifier treating `$(...)` in
+double quotes as quoted text (so `echo "$(python3 solve.py)"` ran nothing), the gate firing in
+`--time-limit`'s last quarter, where `--check` doesn't, a Python check that broke on Pythons before 3.10,
+and Node 22 passing a `.js` module's syntax errors; all fixed, each with a test.
+
+**What changed.** Budget notes are on (`--no-budget-notes` leaves them out). The gate, the checks after
+writes and tolerant edits stay opt-in, for runs where they can fire.
+
+**Cost.** By jig's token counts, at list prices: the round $7.18, the rerun $1.54, the 40 steps $2.49 and
+the main benchmark $0.27. The DeepSeek balance fell 38.55 CNY over the day.

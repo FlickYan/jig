@@ -1,19 +1,26 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, writeFileSync } from "node:fs";
+import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
-import { after, before, beforeEach, describe, it } from "node:test";
-import { createSandbox, type Sandbox, sandboxProblem } from "../src/sandbox.ts";
+import { dirname, join, sep } from "node:path";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { projectKey } from "../src/paths.ts";
+import { createSandbox, execInSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
-import { runCommand } from "../src/tools/bash.ts";
+import { OutputFiles, runCommand } from "../src/tools/bash.ts";
+import { FileVersions } from "../src/tools/util.ts";
+import { writeTool } from "../src/tools/write.ts";
+import { fakeMessagesApi, runJig } from "./fake-api.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-safety-"));
+  dir = await tempDir("jig-safety-");
   process.env.JIG_HOME = join(dir, ".jig-home");
 });
+afterEach(removeTempDirs);
 
 describe("sandbox", { skip: sandboxProblem() }, () => {
   // A project under the home directory, so "writes only in the project" isn't just the temp-directory rule.
@@ -28,7 +35,12 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
   it("lets commands write in the project and the temp directories, but nowhere else", async () => {
     const sandbox = createSandbox(project, { network: false })!;
     assert.match(await run("echo ok > inside.txt && cat inside.txt", sandbox), /^ok/);
-    assert.match(await run(`echo ok > ${join(tmpdir(), `jig-sandbox-${process.pid}.txt`)} && echo written`, sandbox), /^written/);
+    const temp = join(tmpdir(), `jig-sandbox-${process.pid}.txt`);
+    try {
+      assert.match(await run(`echo ok > ${temp} && echo written`, sandbox), /^written/);
+    } finally {
+      await rm(temp, { force: true });
+    }
     const probe = join(homedir(), `.jig-sandbox-test-${process.pid}`);
     assert.match(await run(`echo bad > ${probe}`, sandbox), denied);
     assert.equal(existsSync(probe), false);
@@ -73,14 +85,1378 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("keeps the directories holding a hidden path in place, where commands can write", async () => {
+    // Hidden by its path: moved aside with a directory holding it, a file was out of the next command's mask.
+    const config = join(project, "config");
+    await mkdir(join(config, "keys"), { recursive: true });
+    await writeFile(join(config, "keys", ".env"), "TOKEN=moved-out-of-hiding\n");
+    const sandbox = createSandbox(project, { network: false, hidden: [join(config, "keys", ".env")] })!;
+    // Nor the project, which holds it, into a temp directory: on macOS the rule letting commands write in it
+    // matched it too. Renamed by node, as mv copies across file systems, which bubblewrap's mount points are.
+    const away = join(tmpdir(), `jig-sandbox-moved-${process.pid}`);
+    try {
+      for (const path of ["config/keys", "config"]) assert.match(await run(`mv ${path} ${path}-moved`, sandbox), /Exit code: [1-9]/, path);
+      const moveProject = `node -e 'require("fs").renameSync(process.argv[1], process.argv[2])' ${project} ${away}`;
+      assert.match(await run(moveProject, sandbox), /Exit code: [1-9]/, "the project");
+      assert.equal(existsSync(away), false);
+      assert.doesNotMatch(await run("cat config-moved/keys/.env config/keys-moved/.env config/keys/.env", sandbox), /moved-out-of-hiding/);
+      assert.match(await run("mkdir other && mv other other-moved && echo moved", sandbox), /^moved/);
+    } finally {
+      if (existsSync(away)) await rename(away, project);
+      sandbox.close?.();
+      for (const path of ["config", "config-moved", "other", "other-moved"]) await rm(join(project, path), { recursive: true, force: true });
+    }
+  });
+
+  it("hides jig's own directory from commands, but for its skills, whose scripts the model runs", async () => {
+    const home = process.env.JIG_HOME!;
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "s.jsonl"), "an earlier session\n");
+    const skill = join(home, "skills", "hello");
+    await mkdir(join(skill, "scripts"), { recursive: true });
+    await writeFile(join(skill, "scripts", "hello.sh"), "echo hello from the skill\n");
+    const sandbox = createSandbox(project, { network: false })!;
+    assert.doesNotMatch(await run(`cat ${join(home, "sessions", "s.jsonl")}`, sandbox), /an earlier session/);
+    assert.doesNotMatch(await run(`ls ${join(home, "sessions")}`, sandbox), /s\.jsonl/);
+    assert.match(await run(`bash ${join(skill, "scripts", "hello.sh")}`, sandbox), /^hello from the skill/);
+    assert.match(sandbox.limits, /jig's own directory \(its sessions, snapshots and settings\) is hidden from commands, but for its skills/);
+    // Here it is in a temp directory, which commands can write in, but not in it: settings there could add hooks.
+    await run(`echo '{}' > ${join(home, "settings.json")}`, sandbox);
+    assert.equal(existsSync(join(home, "settings.json")), false);
+    // A project in it, a skill being written say, stays as it was, its git config read-only too.
+    git(skill, "init", "-q");
+    const inSkill = createSandbox(skill, { network: false })!;
+    assert.match(await runCommand("echo 1 > b.txt && cat b.txt scripts/hello.sh", skill, 20, undefined, inSkill), /^1\necho hello/);
+    const config = await readFile(join(skill, ".git", "config"), "utf8");
+    assert.match(await runCommand(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> .git/config`, skill, 20, undefined, inSkill), denied);
+    assert.equal(await readFile(join(skill, ".git", "config"), "utf8"), config);
+  });
+
+  it("keeps jig's own directory, and those holding it where commands can write, in place", async () => {
+    // In a temp directory, as in skill evals: moved aside with a directory holding it, it was out of the place
+    // the next command's sandbox hid, which hid an empty directory a command made there instead, or nothing.
+    const home = join(dir, "h", "jig-home");
+    process.env.JIG_HOME = home;
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "s.jsonl"), "an earlier session\n");
+    const sandbox = createSandbox(project, { network: false })!;
+    const moved = [dir, join(dir, "h"), home];
+    try {
+      for (const path of moved) {
+        assert.match(await run(`mv ${path} ${path}-moved`, sandbox), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+      assert.doesNotMatch(await run(`cat ${join(home, "sessions", "s.jsonl")}`, sandbox), /an earlier session/);
+    } finally {
+      for (const path of moved) await rm(`${path}-moved`, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a hidden file out of the snapshots, and those an older jig took out of commands' reach", async () => {
+    const app = join(dir, "app");
+    await mkdir(app);
+    await writeFile(join(app, ".env"), "TOKEN=the-hidden-token\n");
+    await writeFile(join(app, "a.txt"), "1\n");
+    // jig before this change copied it into every snapshot, where a command could read it back.
+    new Snapshots(app).take("an older jig's");
+    const home = process.env.JIG_HOME!;
+    await writeFile(join(home, "settings.json"), JSON.stringify({ hiddenPaths: [join(app, ".env")] }));
+    const store = join(home, "snapshots", projectKey(app));
+    const command = `echo ran; cat .env; git --git-dir=${store} log --all -p; git --git-dir=${store} show HEAD:.env`;
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Look around."], { api, cwd: app, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests[1].messages), /ran\\n/);
+      assert.doesNotMatch(JSON.stringify(api.requests[1].messages), /the-hidden-token/);
+      // The snapshot taken before the task left it out.
+      assert.equal(git(app, `--git-dir=${store}`, "ls-tree", "-r", "--name-only", "HEAD"), "a.txt\n");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("lets commands read the whole of a long output, but not send jig's writes to it elsewhere", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const outputs = new OutputFiles();
+    const target = join(homedir(), `.jig-sandbox-target-${process.pid}`);
+    const fileOf = (out: string) => /The whole output is in (\S+):/.exec(out)?.[1];
+    try {
+      const path = fileOf(await runCommand("seq 1 20000", project, 20, undefined, sandbox, outputs));
+      // macOS's wc pads the count with spaces.
+      assert.match(await run(`wc -l < ${path}`, sandbox), /^ *20000\n\nExit code: 0$/);
+      // Midway, a command puts a symlink to a file it can't write in place of the file jig writes to, which
+      // it finds by what it printed (other tests' files may be there too, and other users' unreadable ones,
+      // which make grep fail though it found the file).
+      await writeFile(target, "untouched\n");
+      const mark = `jig-sandbox-swap-${process.pid}`;
+      const swap = `f=$(grep -l ${mark} ${tmpdir()}/jig-output-*.log 2>/dev/null); [ -n "$f" ] && rm "$f" && ln -s ${target} "$f" && swapped=$f`;
+      const out = await runCommand(`echo ${mark}; seq 1 20000; sleep 0.5; ${swap}; seq 1 20000; echo "swapped $swapped"`, project, 20, undefined, sandbox, outputs);
+      assert.match(out, new RegExp(`swapped ${fileOf(out)}\n`));
+      assert.equal(await readFile(target, "utf8"), "untouched\n");
+    } finally {
+      outputs.remove();
+      await rm(target, { force: true });
+    }
+  });
+
   it("can allow the network", () => {
     const flags = (network: boolean) => createSandbox(project, { network })!.wrap("x").args.join(" ");
     assert.match(flags(false), /deny network|--unshare-net/);
     assert.doesNotMatch(flags(true), /deny network|--unshare-net/);
   });
+
+  const linuxOnly = process.platform === "darwin" && "Seatbelt applies its rules whatever path a lookup takes, so there is nothing to reach";
+
+  it("can't reach outside the sandbox through /proc/<pid>/root of a process outside it", { skip: linuxOnly }, async () => {
+    const hidden = await mkdtemp(join(homedir(), ".jig-sandbox-escape-"));
+    const answer = join(hidden, "answer.txt");
+    await writeFile(answer, "the hidden answer");
+    const target = join(homedir(), `.jig-escape-target-${process.pid}`);
+    try {
+      const sandbox = createSandbox(project, { network: false, hidden: [hidden] })!;
+      // bubblewrap ran commands in the host's PID namespace, so /proc/<jig>/root (here the test process) and
+      // /proc/1/root led into the host's mount namespace, where the sandbox's binds don't apply: a review's
+      // probe read a hidden file and wrote outside the writable directories that way. Now a command sees only
+      // the session's processes, each with the hidden paths and jig's directory masked in its root.
+      //
+      // Both hops are probed. One hop is /proc/<p>/root of a visible process. Two hops is
+      // /proc/<p>/root/proc/<n>/root: the keeper (pid 1) has its own /proc too, so if it were the host's a
+      // command could reach a host process's root -- and the host mount namespace -- that way. The probe
+      // follows every visible pid, and through each its own /proc's pids, so an exposed host /proc anywhere
+      // is caught, not only at pid 1.
+      const roots =
+        "for p in /proc/$$/.. $(ls /proc | grep -E '^[0-9]+$'); do " +
+        "echo /proc/$p/root; for n in $(ls /proc/$p/root/proc 2>/dev/null | grep -E '^[0-9]+$'); do echo /proc/$p/root/proc/$n/root; done; " +
+        `done; echo /proc/${process.pid}/root`;
+      assert.doesNotMatch(await run(`for r in $(${roots}); do cat $r${answer} 2>/dev/null; done; echo end`, sandbox), /the hidden answer/);
+      assert.match(await run(`for r in $(${roots}); do echo bad > $r${target} 2>/dev/null; done; echo end`, sandbox), /\nend\n/);
+      assert.equal(existsSync(target), false);
+      // And directly: the keeper's own /proc (reached through its root) must be the session's, not the host's.
+      const keeperProc = (await run("ls /proc/1/root/proc 2>/dev/null | grep -cE '^[0-9]+$'", sandbox)).split("\n")[0];
+      assert.ok(Number(keeperProc) > 0 && Number(keeperProc) < 50, `the keeper's /proc shows only the session's processes: saw ${keeperProc}`);
+      sandbox.close?.();
+    } finally {
+      await rm(hidden, { recursive: true, force: true });
+      await rm(target, { force: true });
+    }
+  });
+
+  it("shows a command only the session's own processes in /proc", { skip: linuxOnly }, async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const lines = (await run(`ls /proc | grep -cE '^[0-9]+$'; [ -e /proc/${process.pid} ] && echo visible || echo hidden`, sandbox)).split("\n");
+    assert.equal(lines[1], "hidden", "the jig process, outside the session's namespace, isn't in the command's /proc");
+    assert.ok(Number(lines[0]) > 0 && Number(lines[0]) < 50, `only the session's processes, not the machine's hundreds: saw ${lines[0]}`);
+    sandbox.close?.();
+  });
+
+  it("starts the session's namespace again when a command ends it", { skip: linuxOnly }, async () => {
+    // kill -1 ends every process a command may signal, the keeper's among them, and the namespace with it:
+    // joining that one failed every later command ("Can't fork for --pidns: Cannot allocate memory"). And the
+    // namespace's init could still be running when the command had exited, so now and then the next command
+    // joined a namespace about to end, and failed: jig looks at the keeper's shell too (and see the next test).
+    const sandbox = createSandbox(project, { network: false })!;
+    try {
+      await run("kill -TERM -1", sandbox); // what it prints is a race: the namespace's end kills it too
+      assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+      // Given --die-with-parent, any command that joined, a restarted keeper's or not, was now and then killed as
+      // it started (see Keeper).
+      assert.ok(!sandbox.wrap("true").args.includes("--die-with-parent"), "a join ends with the keeper alone");
+      assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
+      assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");
+    } finally {
+      sandbox.close?.();
+      await rm(join(project, "job.pid"), { force: true });
+    }
+  });
+
+  it("runs a command once more when the session's namespace ends as it joins", { skip: linuxOnly }, async () => {
+    // A command, or a job it left, can end the keeper after jig found it running and before bubblewrap joins
+    // its namespace: the join fails ("Can't fork for --pidns: Cannot allocate memory") and nothing runs. That
+    // was a race, lost about once in 40 runs of the test above. A bwrap earlier on the PATH loses it every
+    // time, once: the first command to join after the mark is made ends the namespace first, and waits until
+    // it can't be joined, then joins as bubblewrap does.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const mark = join(dir, "end-the-namespace");
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    const fake = [
+      "#!/bin/sh",
+      "join= prev=",
+      'for a do case $prev in --userns|--pidns) join="$join $prev $a";; esac; prev=$a; done',
+      `if [ -n "$join" ] && rm "${mark}" 2>/dev/null; then`,
+      `  ${real} $join --ro-bind / / -- /bin/sh -c 'kill -KILL -1'`,
+      `  i=0; while [ $i -lt 500 ] && ${real} $join --ro-bind / / -- /bin/true 2>/dev/null; do i=$((i + 1)); sleep 0.01; done`,
+      "fi",
+      `exec ${real} "$@"`,
+    ];
+    await writeFile(join(fakeBin, "bwrap"), `${fake.join("\n")}\n`, { mode: 0o755 });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${savedPath}`;
+    const sandbox = createSandbox(project, { network: false })!; // it finds bwrap now
+    process.env.PATH = savedPath;
+    try {
+      assert.match(await run("echo first", sandbox), /^first\n\nExit code: 0$/);
+      await writeFile(mark, "");
+      assert.match(await run("echo ran >> runs.txt && echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+      assert.equal(existsSync(mark), false, "the namespace ended as the command joined it");
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\n", "the command ran once");
+      // And a run that waits for its command, as an eval's check and git in the sandbox do.
+      await writeFile(mark, "");
+      const waited = execInSandbox(sandbox, "echo ran >> runs.txt && echo still runs", [], { cwd: project, stdio: ["ignore", "pipe", "pipe"] });
+      assert.equal(waited.toString(), "still runs\n");
+      assert.equal(existsSync(mark), false, "the namespace ended as it joined it too");
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\nran\n", "that command ran once too");
+      assert.match(await run("sleep 30 > /dev/null 2>&1 & echo $! > job.pid", sandbox), /Exit code: 0$/);
+      assert.match(await run("[ -e /proc/$(cat job.pid) ] && echo reachable", sandbox), /^reachable/, "in one namespace again");
+    } finally {
+      sandbox.close?.();
+      for (const file of ["runs.txt", "job.pid"]) await rm(join(project, file), { force: true });
+    }
+  });
+
+  it("never runs a command twice, though it ends the session's namespace and says what bubblewrap would", { skip: linuxOnly }, async () => {
+    // Only a command bubblewrap never started runs once more: a command it started is never run again, even
+    // one that failed with the words of a failed join, its namespace ended under it.
+    const sandbox = createSandbox(project, { network: false })!;
+    try {
+      const failed = `echo ran >> runs.txt; echo "bwrap: Can't fork for --pidns: Cannot allocate memory" >&2; kill -KILL -1; sleep 10; exit 1`;
+      assert.doesNotMatch(await run(failed, sandbox), /Exit code: 0$/);
+      assert.equal(await readFile(join(project, "runs.txt"), "utf8"), "ran\n", "the command ran once");
+      assert.match(await run("echo still runs", sandbox), /^still runs\n\nExit code: 0$/);
+    } finally {
+      sandbox.close?.();
+      await rm(join(project, "runs.txt"), { force: true });
+    }
+  });
+
+  it("keeps jig's API keys out of every process a command can see", { skip: linuxOnly }, async () => {
+    // The keeper (pid 1 and 2 of the session's namespace) shares it with commands, which can read its
+    // environment in /proc: unprivileged too, as they join its user namespace.
+    const key = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = "sk-ant-not-a-real-key";
+    try {
+      const sandbox = createSandbox(project, { network: false })!;
+      const out = await run("cat /proc/[0-9]*/environ 2>/dev/null | tr '\\0' '\\n' | grep -c sk-ant-not-a-real-key", sandbox);
+      sandbox.close?.();
+      assert.match(out, /^0\n/);
+    } finally {
+      if (key === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = key;
+    }
+  });
+
+  it("runs --check-writes' syntax checks in it", async () => {
+    const sandbox = createSandbox(project, { network: false })!;
+    const ctx = { cwd: project, versions: new FileVersions(), sandbox, checkWrites: true, mayRun: () => true };
+    try {
+      assert.match(await writeTool.run({ path: "checked.py", content: "def f(:\n" }, ctx), /\(python3's ast\.parse\) failed:\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked.js", content: "function (\n" }, ctx), /\(node --check\) failed:\nchecked\.js:1\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked-esm.js", content: "export const x = ;\n" }, ctx), /\(node --check\) failed:\nchecked-esm\.js:1\n.*SyntaxError/s);
+      assert.match(await writeTool.run({ path: "checked.sh", content: "if true; then\n" }, ctx), /\(bash -n\) failed:\nchecked\.sh: line \d+: syntax error/);
+    } finally {
+      sandbox.close?.();
+    }
+  });
+
+  it("leaves the session's namespace descriptors, and bubblewrap's pipe, out of what a command runs", { skip: linuxOnly }, async () => {
+    // bubblewrap leaves the --userns and --pidns descriptors open; the command, and jobs it leaves running, mustn't inherit them.
+    const sandbox = createSandbox(project, { network: false })!;
+    const out = await run("ls -l /proc/self/fd; (ls -l /proc/self/fd &); sleep 0.2", sandbox);
+    sandbox.close?.();
+    assert.doesNotMatch(out, /(pid|user):\[/);
+    // Nor the pipe bubblewrap reports the command's process on (--info-fd): only stdin, stdout, stderr and ls's own.
+    assert.doesNotMatch(out, / (?:[4-9]|\d\d+) -> /);
+  });
+
+  it("starts a command with only stdin, stdout and stderr open, whatever jig itself was given", async () => {
+    // jig passes on what its own parent left open (a CI runner's pipes, say), and the sandbox passes on what it
+    // gets: one more descriptor, after those the sandbox asks for, stands for such a pipe.
+    const sandbox = createSandbox(project, { network: false })!;
+    const listing = async (extra: boolean) => {
+      const { program, args, stdio = [] } = sandbox.wrap("ls /dev/fd; (ls /dev/fd &); sleep 0.2");
+      const given: ("ignore" | "pipe" | number)[] = ["ignore", "pipe", "pipe", ...stdio];
+      // The extra one is descriptor 9, which neither the sandbox nor ls uses.
+      if (extra) given.push(...Array<"ignore">(9 - given.length).fill("ignore"), "pipe");
+      const child = spawn(program, args, { cwd: project, stdio: given });
+      let out = "";
+      child.stdout!.setEncoding("utf8").on("data", (chunk: string) => (out += chunk));
+      await new Promise((resolve) => child.on("close", resolve));
+      return out.trim().split(/\s+/);
+    };
+    try {
+      // What ls lists past stderr is its own (one on Linux, two on macOS): the extra one changes nothing, in the
+      // command or in a job it leaves.
+      const listed = await listing(true);
+      assert.ok(!listed.includes("9"), listed.join(" "));
+      assert.deepEqual(listed, await listing(false));
+    } finally {
+      sandbox.close?.();
+    }
+  });
+
+  it("kills a command's whole tree on timeout, inside the session's namespace", { skip: linuxOnly }, async () => {
+    // A command that leaves a job in the background and then hangs: its timeout must take the job down too,
+    // which the next command in the session confirms through the shared /proc.
+    const sandbox = createSandbox(project, { network: false })!;
+    const timedOut = await runCommand("sleep 60 & echo $! > child.pid; sleep 60", project, 1, undefined, sandbox);
+    assert.match(timedOut, /Killed: it timed out/);
+    const pid = (await readFile(join(project, "child.pid"), "utf8")).trim();
+    assert.match(await run(`[ -e /proc/${pid} ] && echo alive || echo gone`, sandbox), /^gone/);
+    sandbox.close?.();
+  });
+
+  it("stops a command run that waits when it times out or its output overflows", async () => {
+    // execFileSync kills only bubblewrap, which left a command that joined the session's namespace running: an
+    // eval's check that timed out went on changing the project as git read it for the grader. The command's
+    // process is killed too now (see execInSandbox), so neither command here gets as far as its touch.
+    const sandbox = createSandbox(project, { network: false })!;
+    const files = ["started", "after-timeout", "after-overflow"];
+    try {
+      const timedOut = "touch started; sleep 4; touch after-timeout";
+      assert.throws(() => execInSandbox(sandbox, timedOut, [], { cwd: project, stdio: ["ignore", "ignore", "ignore"], timeout: 2000 }), { code: "ETIMEDOUT" });
+      assert.ok(existsSync(join(project, "started")), "the command had started");
+      const overflows = "printf '%2000s' x; sleep 2; touch after-overflow";
+      assert.throws(() => execInSandbox(sandbox, overflows, [], { cwd: project, stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1000 }), { code: "ENOBUFS" });
+      await new Promise((resolve) => setTimeout(resolve, 3000)); // past both sleeps
+      assert.equal(existsSync(join(project, "after-timeout")), false, "the command that timed out went no further");
+      assert.equal(existsSync(join(project, "after-overflow")), false, "nor did the one whose output overflowed");
+    } finally {
+      sandbox.close?.();
+      for (const file of files) await rm(join(project, file), { force: true });
+    }
+  });
+
+  it("keeps the repository's git config and hooks read-only, and its git directory in place", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd: repo });
+      const config = await readFile(join(repo, ".git", "config"), "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // git runs the programs these name outside the sandbox: the user's git later, in a shell prompt say.
+      assert.match(await inRepo('git config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inRepo('echo "touch planted" > .git/hooks/pre-commit'), /Exit code: [1-9]/);
+      // Moved aside, it could be replaced by a git directory with a config of the command's own.
+      assert.match(await inRepo("mv .git .git-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      assert.equal(existsSync(join(repo, ".git", "hooks", "pre-commit")), false);
+      assert.match(sandbox.limits, /git config and hooks are read-only/);
+      // The rest of git works as before.
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s";
+      assert.equal(await inRepo(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the directories between a repository and a temp directory holding it in place", async () => {
+    // A clone in a directory in a temp directory: only the project and its git directory stayed in place, so a
+    // command could move work aside and put a copy with a config of its own where the repository was.
+    const [work, repo] = [join(dir, "work"), join(dir, "work", "repo")];
+    await mkdir(join(repo, "config", "keys"), { recursive: true });
+    git(repo, "init", "-q");
+    await writeFile(join(repo, "config", "keys", ".env"), "TOKEN=moved-out-of-hiding\n");
+    const config = await readFile(join(repo, ".git", "config"), "utf8");
+    const moved = [work, repo, join(repo, ".git"), join(repo, "config")];
+    // Hiding nothing first, as a hidden path in the project keeps work in place for itself.
+    const sandbox = createSandbox(repo, { network: false })!;
+    const hiding = createSandbox(repo, { network: false, hidden: [join(repo, "config", "keys", ".env")] })!;
+    try {
+      for (const path of moved.slice(0, 3)) {
+        assert.match(await runCommand(`mv ${path} ${path}-moved`, repo, 20, undefined, sandbox), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      assert.deepEqual(sandbox.gitChanges?.(), []);
+      // Ordinary work goes on in the project and beside it.
+      const ordinary = "mkdir src && mv src lib && echo 1 > lib/a.txt && rm -r lib && mkdir ../notes && mv ../notes ../n && rmdir ../n && echo done";
+      assert.match(await runCommand(ordinary, repo, 20, undefined, sandbox), /^done/);
+      // With config/keys/.env hidden, config stays in place too, though git's binds of those holding it come later.
+      for (const path of moved) {
+        assert.match(await runCommand(`mv ${path} ${path}-moved`, repo, 20, undefined, hiding), /Exit code: [1-9]/, path);
+        assert.ok(existsSync(path), path);
+      }
+    } finally {
+      sandbox.close?.();
+      hiding.close?.();
+      for (const path of moved) await rm(`${path}-moved`, { recursive: true, force: true });
+    }
+  });
+
+  it("makes a repository's missing hooks directory, so that it is read-only too", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q", "--template="); // no hooks directory, as an empty init.templateDir leaves it too
+      const sandbox = createSandbox(repo, { network: false })!;
+      assert.match(await runCommand("mkdir -p .git/hooks; echo 'touch planted' > .git/hooks/post-commit", repo, 20, undefined, sandbox), /Exit code: [1-9]/);
+      assert.equal(existsSync(join(repo, ".git", "hooks", "post-commit")), false);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a git directory made with --separate-git-dir read-only too, though it has no .git in its path", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const [work, gitDir] = [join(base, "work"), join(base, "gitdirs", "work")]; // as dotfile managers set up
+      for (const path of [work, dirname(gitDir)]) await mkdir(path);
+      git(work, "init", "-q", `--separate-git-dir=${gitDir}`);
+      const config = await readFile(join(gitDir, "config"), "utf8");
+      const sandbox = createSandbox(work, { network: false })!;
+      const inWork = (command: string) => runCommand(command, work, 20, undefined, sandbox);
+      assert.match(await inWork('git config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inWork(`echo "touch planted" > ${join(gitDir, "hooks", "pre-commit")}`), /Exit code: [1-9]/);
+      assert.match(await inWork(`echo "gitdir: ${tmpdir()}" > .git`), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(gitDir, "config"), "utf8"), config);
+      assert.equal(existsSync(join(gitDir, "hooks", "pre-commit")), false);
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s";
+      assert.equal(await inWork(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("stops looking for the repository where git does: at a bare one, and at GIT_CEILING_DIRECTORIES", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    const ceilings = process.env.GIT_CEILING_DIRECTORIES;
+    try {
+      // A home directory's dotfiles repository, with a server's bare repository and a project below it.
+      git(base, "init", "-q");
+      git(base, "init", "-q", "--bare", "srv/r.git");
+      for (const dir of ["srv/r.git/hooks", "proj"]) await mkdir(join(base, dir), { recursive: true });
+      const planted = join(base, ".git", "planted");
+      const plant = async (from: string) => {
+        const cwd = join(base, from);
+        return runCommand(`echo planted > ${planted}`, cwd, 20, undefined, createSandbox(cwd, { network: false })!);
+      };
+      // git takes the bare repository for the one it is in, not base's.
+      for (const from of ["srv/r.git", "srv/r.git/hooks"]) assert.match(await plant(from), denied, `from ${from}`);
+      // The server's own hooks stay writable, as setting them up can be the task, and nothing of base's is in it.
+      const server = join(base, "srv", "r.git");
+      const inServer = createSandbox(server, { network: false })!;
+      assert.equal(await runCommand("echo 'exit 0' > hooks/post-receive && echo set", server, 20, undefined, inServer), "set\n\nExit code: 0");
+      assert.equal(inServer.gitChanges, undefined);
+      // Told to stop at base, git finds no repository from proj.
+      process.env.GIT_CEILING_DIRECTORIES = base;
+      assert.match(await plant("proj"), denied, "from proj");
+      assert.equal(existsSync(planted), false);
+    } finally {
+      if (ceilings === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+      else process.env.GIT_CEILING_DIRECTORIES = ceilings;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps submodules' git config and hooks read-only, and their git directories in place", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const sub = join(repo, ".git", "modules", "libs", "s"); // a name with a slash is a directory in modules/
+      const config = await readFile(join(sub, "config"), "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // The user's git status in the repository runs git in the submodule, and so its fsmonitor.
+      assert.match(await inRepo('git -C libs/s config core.fsmonitor "touch planted"'), /Exit code: [1-9]/);
+      assert.match(await inRepo('echo "touch planted" > .git/modules/libs/s/hooks/post-commit'), /Exit code: [1-9]/);
+      assert.match(await inRepo("mv .git/modules .git/modules-moved"), /Exit code: [1-9]/);
+      assert.match(await inRepo("mv .git/modules/libs .git/modules/libs-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(sub, "config"), "utf8"), config);
+      assert.equal(existsSync(join(sub, "hooks", "post-commit")), false);
+      const commit = "cd libs/s && echo 2 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inRepo(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a submodule checkout's .git file read-only, and says when a command put another checkout in its place", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const dotGit = join(await realpath(repo), "libs", "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      // The user's git status in the repository runs git in the checkout, with the config its .git leads to.
+      assert.match(await inRepo(`echo "gitdir: ${tmpdir()}" > libs/s/.git`), /Exit code: [1-9]/);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      // Seatbelt refuses the new .git. bubblewrap can't keep the checkout in place, so the sandbox tells, once.
+      await inRepo("mv libs/s libs/s-moved && mkdir libs/s && git init -q libs/s");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a submodule checkout's .git read-only from the directory holding it, though a command made that look bare", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      // jig runs in libs, which holds the checkout libs/s: the user's git status in repo runs git in it.
+      const libs = join(repo, "libs");
+      const dotGit = join(await realpath(libs), "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      const session = () => {
+        const sandbox = createSandbox(libs, { network: false })!;
+        return { sandbox, inLibs: (command: string) => runCommand(command, libs, 20, undefined, sandbox) };
+      };
+      // A command in an earlier session wrote a config there that says it is bare. git takes that for no
+      // repository, and goes on to repo's: so does jig, which locks repo's files and lets git work as before.
+      await writeFile(join(libs, "config"), "[core]\n\tbare = true\n");
+      assert.equal(git(libs, "rev-parse", "--is-bare-repository").trim(), "false");
+      const first = session();
+      assert.match(await first.inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.match(await first.inLibs(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ../.git/config`), denied);
+      const commit = "cd s && echo 2 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await first.inLibs(commit), "t\n\nExit code: 0");
+      // With a HEAD, objects and refs too, git takes it for a bare repository, and so does jig. The checkout's
+      // .git, which is repo's, stays read-only all the same, and repo's git directory isn't made writable.
+      assert.equal(await first.inLibs("git init -q --bare . && echo made"), "made\n\nExit code: 0");
+      assert.equal(git(libs, "rev-parse", "--is-bare-repository").trim(), "true");
+      const { sandbox, inLibs } = session();
+      assert.match(await inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.match(await inLibs("echo planted > ../.git/planted"), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      assert.equal(existsSync(join(repo, ".git", "planted")), false);
+      // The model is told so, and not that the bare repository's own config and hooks are read-only.
+      assert.match(sandbox.limits, /Some git files of the repository around this one are read-only/);
+      assert.doesNotMatch(sandbox.limits, /The repository's git config and hooks are read-only/);
+      // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
+      const deep = join(libs, "deep");
+      await mkdir(deep);
+      const inDeep = createSandbox(deep, { network: false })!;
+      assert.match(await runCommand(`echo "gitdir: ${tmpdir()}" > ../s/.git`, deep, 20, undefined, inDeep), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      // Seatbelt refuses a new .git there. bubblewrap can't keep the checkout in place, so the sandbox tells.
+      await inLibs("mv s s-moved && mkdir s && git init -q s");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(dotGit) ? [dotGit] : []);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a submodule checkout's .git read-only from the directory holding it, though a command made a repository there", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const libs = join(repo, "libs");
+      const real = await realpath(libs);
+      const dotGit = join(real, "s", ".git");
+      const pointer = await readFile(dotGit, "utf8");
+      // Making a repository can be the task, so neither sandbox refuses it, but the sandbox tells.
+      const first = createSandbox(libs, { network: false })!;
+      assert.equal(await runCommand("git init -q && echo made", libs, 20, undefined, first), "made\n\nExit code: 0");
+      assert.deepEqual(first.gitChanges!(), [join(real, ".git")]);
+      // The next session there takes libs for the repository, as git does, and repo's .git for the checkout
+      // in it stays read-only: the user's git status in repo still runs git in the checkout.
+      const next = createSandbox(libs, { network: false })!;
+      const inLibs = (command: string) => runCommand(command, libs, 20, undefined, next);
+      assert.match(await inLibs(`echo "gitdir: ${tmpdir()}" > s/.git`), denied);
+      assert.equal(await readFile(dotGit, "utf8"), pointer);
+      // repo's git directory isn't made writable, and libs's own repository works as any other.
+      assert.match(await inLibs("echo planted > ../.git/planted"), denied);
+      const commit = "echo 1 > b.txt && git add b.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inLibs(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the files of a repository around one a command made read-only in a temp directory, and in an added one", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    const added = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      // In a temp directory, which commands can write, around a bare repository a command made in libs.
+      const repo = await repoWithSubmodule(base);
+      const libs = join(repo, "libs");
+      git(libs, "init", "-q", "--bare", ".");
+      const config = await readFile(join(repo, ".git", "config"), "utf8");
+      const inTemp = createSandbox(libs, { network: false })!;
+      const inLibs = (command: string) => runCommand(command, libs, 20, undefined, inTemp);
+      const fsmonitor = `printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ../.git/config`;
+      assert.match(await inLibs(fsmonitor), denied);
+      // Nor can its git directory be moved aside, to put another in its place.
+      assert.match(await inLibs("mv ../.git ../.git-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config"), "utf8"), config);
+      // In a directory added with --add-dir, around a repository made in libs.
+      const other = await repoWithSubmodule(added);
+      const otherLibs = join(other, "libs");
+      git(otherLibs, "init", "-q");
+      const otherConfig = await readFile(join(other, ".git", "config"), "utf8");
+      const inAdded = createSandbox(otherLibs, { network: false, dirs: [other] })!;
+      assert.match(await runCommand(fsmonitor, otherLibs, 20, undefined, inAdded), denied);
+      assert.match(await runCommand("mv ../.git ../.git-moved", otherLibs, 20, undefined, inAdded), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(other, ".git", "config"), "utf8"), otherConfig);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+      await rm(added, { recursive: true, force: true });
+    }
+  });
+
+  it("shows commands none of jig's own directory, though a repository around the project's leads there", async () => {
+    // jig's directory is in the temp directory here, which commands can write, as an added one can hold it.
+    const home = process.env.JIG_HOME!;
+    await mkdir(home, { recursive: true });
+    await writeFile(join(home, "secret"), "a session\n");
+    git(home, "init", "-q", "--bare", "store.git");
+    const project = join(dir, "project");
+    await mkdir(project);
+    git(project, "init", "-q");
+    const look = async (command: string) => runCommand(command, project, 20, undefined, createSandbox(project, { network: false })!);
+    // A .git above the project that leads to a git directory there, or to one holding jig's directory.
+    await writeFile(join(dir, ".git"), `gitdir: ${join(home, "store.git")}\n`);
+    assert.match(await look(`ls ${join(home, "store.git")}`), /No such file|Operation not permitted/);
+    await writeFile(join(dir, ".git"), "gitdir: .\n");
+    await writeFile(join(dir, "HEAD"), "ref: refs/heads/main\n");
+    assert.match(await look(`cat ${join(home, "secret")}`), /No such file|Operation not permitted/);
+  });
+
+  it("still locks the config of a repository and of a submodule whose HEAD a command moved aside, and says so", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      const gitDir = join(await realpath(repo), ".git");
+      const sub = join(gitDir, "modules", "libs", "s");
+      const configs = () => Promise.all([gitDir, sub].map((dir) => readFile(join(dir, "config"), "utf8")));
+      const before = await configs();
+      // git passes over a git directory without a HEAD. Asked where the repository is, the next session would
+      // lock nothing there, and a command could change the config and put the HEAD back.
+      const first = createSandbox(repo, { network: false })!;
+      const move = "mv .git/HEAD .git/HEAD.away && mv .git/modules/libs/s/HEAD .git/modules/libs/s/HEAD.away && echo moved";
+      assert.equal(await runCommand(move, repo, 20, undefined, first), "moved\n\nExit code: 0");
+      assert.deepEqual(first.gitChanges!(), [join(gitDir, "HEAD"), join(sub, "HEAD")]);
+      assert.deepEqual(first.gitChanges!(), []);
+      const next = createSandbox(repo, { network: false })!;
+      for (const config of [".git/config", ".git/modules/libs/s/config"]) {
+        assert.match(await runCommand(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> ${config}`, repo, 20, undefined, next), denied);
+      }
+      assert.deepEqual(await configs(), before);
+      // Put back, both are in order again: nothing to say. A HEAD that names nothing, or refs gone, are told too.
+      for (const dir of [gitDir, sub]) await rename(join(dir, "HEAD.away"), join(dir, "HEAD"));
+      assert.deepEqual(next.gitChanges!(), []);
+      await runCommand("echo nothing > .git/modules/libs/s/HEAD && mv .git/refs .git/refs-moved", repo, 20, undefined, next);
+      assert.deepEqual(next.gitChanges!(), [join(gitDir, "refs"), join(sub, "HEAD")]);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps every linked worktree's files read-only, from the main worktree and from another one", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const main = join(base, "main");
+      await mkdir(main);
+      git(main, "init", "-q");
+      git(main, "commit", "-q", "--allow-empty", "-m", "first");
+      for (const name of ["wt1", "wt2"]) git(main, "worktree", "add", "-q", "--detach", join(base, name));
+      const worktrees = join(await realpath(main), ".git", "worktrees");
+      // The user's git in wt1 or wt2 would read the config of a git directory a commondir there points to.
+      const sandbox = createSandbox(main, { network: false })!;
+      const inMain = (command: string) => runCommand(command, main, 20, undefined, sandbox);
+      assert.match(await inMain(`echo ${tmpdir()} > .git/worktrees/wt1/commondir`), /Exit code: [1-9]/);
+      assert.match(await inMain("mv .git/worktrees .git/worktrees-moved"), /Exit code: [1-9]/);
+      assert.match(await inMain("mv .git/worktrees/wt1 .git/worktrees/wt1-moved"), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(worktrees, "wt1", "commondir"), "utf8"), "../..\n");
+      // A worktree made in the session is the command's own, and can go again.
+      const made = join(tmpdir(), `jig-sandbox-worktree-${process.pid}`);
+      assert.equal(await inMain(`git worktree add -q --detach ${made} && git worktree remove ${made} && echo removed`), "removed\n\nExit code: 0");
+      const fromWt1 = createSandbox(join(base, "wt1"), { network: false })!;
+      const inWt1 = (command: string) => runCommand(command, join(base, "wt1"), 20, undefined, fromWt1);
+      assert.match(await inWt1(`echo ${tmpdir()} > ${join(worktrees, "wt2", "commondir")}`), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(worktrees, "wt2", "commondir"), "utf8"), "../..\n");
+      // Seatbelt refuses a config.worktree that isn't there; bubblewrap can't, so the sandbox tells.
+      const config = join(worktrees, "wt2", "config.worktree");
+      await inWt1(`printf "[core]\\n" > ${config}`);
+      assert.deepEqual(fromWt1.gitChanges!(), existsSync(config) ? [config] : []);
+      // The user removes a worktree during the session: commands still run, without binding what is gone.
+      git(main, "worktree", "remove", "--force", join(base, "wt2"));
+      assert.equal(await inMain("echo still"), "still\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a linked worktree's .git file and its files in the git directory read-only", async () => {
+    const base = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      const main = join(base, "main");
+      const worktree = join(base, "wt");
+      await mkdir(main);
+      git(main, "init", "-q");
+      git(main, "commit", "-q", "--allow-empty", "-m", "first");
+      git(main, "worktree", "add", "-q", "--detach", worktree);
+      const own = join(main, ".git", "worktrees", "wt");
+      const sandbox = createSandbox(worktree, { network: false })!;
+      const inWorktree = (command: string) => runCommand(command, worktree, 20, undefined, sandbox);
+      // Either would have the user's git in the worktree read the config of a git directory the command made.
+      assert.match(await inWorktree(`echo "gitdir: ${tmpdir()}" > .git`), /Exit code: [1-9]/);
+      assert.match(await inWorktree(`echo ${tmpdir()} > ${join(own, "commondir")}`), /Exit code: [1-9]/);
+      assert.match(await inWorktree(`mv ${join(main, ".git", "worktrees")} ${join(main, ".git", "worktrees-moved")}`), /Exit code: [1-9]/);
+      assert.match(await readFile(join(worktree, ".git"), "utf8"), /worktrees\/wt/);
+      assert.equal(await readFile(join(own, "commondir"), "utf8"), "../..\n");
+      const commit = "echo 1 > a.txt && git add a.txt && git -c user.name=t -c user.email=t@localhost commit -qm t && git log --format=%s -1";
+      assert.equal(await inWorktree(commit), "t\n\nExit code: 0");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a config.worktree read-only, and says when a command made a commondir where there was none", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      await writeFile(join(repo, ".git", "config.worktree"), "");
+      const sandbox = createSandbox(repo, { network: false })!;
+      const inRepo = (command: string) => runCommand(command, repo, 20, undefined, sandbox);
+      assert.match(await inRepo('printf "[core]\\n\\tfsmonitor = touch planted\\n" >> .git/config.worktree'), /Exit code: [1-9]/);
+      assert.equal(await readFile(join(repo, ".git", "config.worktree"), "utf8"), "");
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      // Seatbelt refuses it. bubblewrap can't: binding a path that isn't there creates it, and an empty
+      // commondir breaks git. So the sandbox tells, once, that the user's git would read another config.
+      await inRepo(`echo ${tmpdir()} > .git/commondir`);
+      const commondir = join(await realpath(repo), ".git", "commondir");
+      assert.deepEqual(sandbox.gitChanges!(), existsSync(commondir) ? [commondir] : []);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("says when a command made a .git in the subdirectory of a repository it runs in", async () => {
+    const repo = await mkdtemp(join(homedir(), ".jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      const sub = join(repo, "sub");
+      await mkdir(sub);
+      const sandbox = createSandbox(sub, { network: false })!;
+      const inSub = (command: string) => runCommand(command, sub, 20, undefined, sandbox);
+      // The user's git in the subdirectory would then use the config of the git directory it names. Making a
+      // repository can be the task (git init), so neither sandbox refuses it, but the sandbox tells, once.
+      assert.equal(await inSub(`echo "gitdir: ${tmpdir()}" > .git && echo planted`), "planted\n\nExit code: 0");
+      const dotGit = join(await realpath(sub), ".git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+      await inSub("rm .git && git init -q");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      // Only the start of a file is read, so a long one that changes past it is told by its size.
+      await inSub("rm -rf .git && printf '%070000d' 0 > .git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      await inSub("echo 1 >> .git");
+      assert.deepEqual(sandbox.gitChanges!(), [dotGit]);
+      // So is the subdirectory made a git directory, which git there takes for the repository.
+      await inSub("rm .git && git init -q --bare .");
+      assert.deepEqual(sandbox.gitChanges!(), [`${dirname(dotGit)}${sep}`]);
+      assert.deepEqual(sandbox.gitChanges!(), []);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("says when a command made a .git, or a git directory, above the project, up to the repository", async () => {
+    // In a temp directory, which commands can write.
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    try {
+      git(repo, "init", "-q");
+      const project = join(repo, "a", "b", "c");
+      await mkdir(project, { recursive: true });
+      const sandbox = createSandbox(project, { network: false })!;
+      const a = join(await realpath(repo), "a");
+      await runCommand("git init -q --bare ../..", project, 20, undefined, sandbox);
+      assert.deepEqual(sandbox.gitChanges!(), [`${a}${sep}`]);
+      await runCommand("git init -q ..", project, 20, undefined, sandbox);
+      assert.deepEqual(sandbox.gitChanges!(), [join(a, "b", ".git")]);
+    } finally {
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("says when a command made that .git a named pipe or a link to /dev/zero, without reading it", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const sub = join(repo, "sub");
+    await mkdir(sub);
+    // Reading a named pipe waits for a writer, and /dev/zero never ends: either hung jig after the task.
+    const commands: Record<string, string> = { "Make a pipe.": "mkfifo .git", "Make a link.": "rm .git && ln -s /dev/zero .git" };
+    const api = await fakeMessagesApi((request) => {
+      const task = (request.messages as { content: unknown }[]).at(-1)!.content;
+      return typeof task === "string" ? [{ tool: "bash", input: { command: commands[task] } }] : [{ text: "Done." }];
+    });
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5"], { api, cwd: sub, stdin: "Make a pipe.\nMake a link.\n", timeout: 20_000 });
+      assert.equal(code, 0, output);
+      const dotGit = join(await realpath(sub), ".git");
+      assert.equal(output.split(`A command created or changed ${dotGit}, `).length - 1, 2, output);
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("starts in a repository where a command left named pipes or links to themselves in a worktree's or a submodule's git directory", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    // None was there to be locked when that command ran, so neither sandbox stopped it.
+    const gitDir = join(repo, ".git");
+    for (const dir of ["worktrees/w", "modules/m", "modules/l"]) await mkdir(join(gitDir, dir), { recursive: true });
+    for (const name of ["m", "l"]) await writeFile(join(gitDir, "modules", name, "HEAD"), "ref: refs/heads/main\n");
+    execFileSync("mkfifo", [join(gitDir, "worktrees", "w", "gitdir"), join(gitDir, "modules", "m", "config")]);
+    // Looking at a config that links to itself throws ELOOP, which stopped jig starting.
+    await symlink("config", join(gitDir, "modules", "l", "config"));
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "echo ran" } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo, timeout: 20_000 });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests[1].messages), /ran\\n/);
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command made a commondir or a config.worktree", { skip: process.platform === "darwin" && "Seatbelt refuses to make them" }, async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const command = `echo ${tmpdir()} > .git/commondir && printf "[core]\\n" > .git/config.worktree`;
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo });
+      assert.equal(code, 0);
+      const gitDir = join(await realpath(repo), ".git");
+      assert.match(output, new RegExp(`A command created or changed ${join(gitDir, "commondir")}, .*: git would now read its config from elsewhere`));
+      // A config.worktree doesn't send git elsewhere: it adds to the config.
+      assert.match(output, new RegExp(`A command created or changed ${join(gitDir, "config.worktree")}, .*: git can read more config from it,`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command moved a git directory's HEAD aside", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const command = "mv .git/HEAD .git/HEAD.away";
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: repo });
+      assert.equal(code, 0, output);
+      const gitDir = join(await realpath(repo), ".git");
+      assert.match(output, new RegExp(`A command removed or broke ${join(gitDir, "HEAD")}, .*: git no longer takes ${gitDir} for a git directory, so it fails there or uses another above it`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns after a task in which a command made the project, in a subdirectory of a repository, a git directory", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const sub = join(repo, "sub");
+    await mkdir(sub);
+    const command = "git init -q --bare .";
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Make a repository."], { api, cwd: sub });
+      assert.equal(code, 0, output);
+      const made = await realpath(sub);
+      assert.match(output, new RegExp(`A command made ${made} a git directory, which the sandbox doesn't prevent: git there would now take it for its repository`));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("warns at the end of a session of a commondir made after the last task, as a job a command left running can", async () => {
+    const repo = await mkdtemp(join(tmpdir(), "jig-sandbox-repo-"));
+    git(repo, "init", "-q");
+    const commondir = join(await realpath(repo), ".git", "commondir");
+    const api = await fakeMessagesApi((request) => {
+      if ((request.messages as unknown[]).length === 1) return [{ text: "Done." }];
+      // The /compact after the task, when no task is running: here the test makes the file, as such a job would.
+      writeFileSync(commondir, `${tmpdir()}\n`);
+      return [{ text: "The user asked to tidy up, and nothing needed it." }];
+    });
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5"], { api, cwd: repo, stdin: "Tidy up.\n/compact\n" });
+      assert.equal(code, 0, output);
+      assert.match(output, new RegExp(`Compacted [^\\n]*\\n[\\s\\S]*A command created or changed ${commondir}, `));
+    } finally {
+      api.close();
+      await rm(repo, { recursive: true, force: true });
+    }
+  });
 });
 
+describe("a background job in the session's PID namespace", { skip: sandboxProblem() || (process.platform === "darwin" && "the session's PID namespace is a Linux feature") }, () => {
+  it("is reachable by the next command in the session, and dies when jig exits", async () => {
+    const proj = join(dir, "bg-normal");
+    await mkdir(proj);
+    const marker = join(proj, "survived");
+    // cmd1 leaves a job in the background and records its namespace PID; cmd2 finds it still there; then the
+    // task ends and jig exits, which ends the whole namespace, so the job's later write never lands.
+    const cmds = [`(sleep 3; touch ${marker}) & echo $! > ns.pid; sleep 0.2; echo one`, "n=$(cat ns.pid); [ -e /proc/$n ] && echo REACHABLE || echo gone"];
+    let i = 0;
+    const api = await fakeMessagesApi(() => (i < cmds.length ? [{ tool: "bash", input: { command: cmds[i++] } }] : [{ text: "Done." }]));
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj });
+      assert.equal(code, 0, output);
+      assert.match(JSON.stringify(api.requests), /REACHABLE/, "the next command saw the job in the shared /proc");
+      await new Promise((done) => setTimeout(done, 3500));
+      assert.equal(existsSync(marker), false, "the background job outlived jig's exit");
+    } finally {
+      api.close();
+    }
+  });
+
+  it("dies when jig is killed with SIGKILL", async () => {
+    const proj = join(dir, "bg-sigkill");
+    await mkdir(proj);
+    const marker = join(proj, "survived");
+    const started = join(proj, "started");
+    // A long command keeps jig busy; runJig's timeout SIGKILLs jig before the job's delay elapses. The keeper
+    // dies with jig (--die-with-parent), the kernel ends the namespace, and the job never writes its marker.
+    // The timeout counts from jig's start: on a runner too slow to reach the command by then, there is no job
+    // to outlive jig, and the test says so rather than passing.
+    const command = `(sleep 3; touch ${marker}) & touch ${started}; sleep 30`;
+    const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command } }]);
+    try {
+      const { code } = await runJig(["--model", "claude-haiku-4-5", "Start a job."], { api, cwd: proj, timeout: 2500 });
+      assert.equal(code, null, "jig was killed by the signal, running no handler");
+      assert.equal(existsSync(started), true, "the command, and its job, started before jig was killed");
+      await new Promise((done) => setTimeout(done, 3500));
+      assert.equal(existsSync(marker), false, "the background job outlived a killed jig");
+    } finally {
+      api.close();
+    }
+  });
+});
+
+describe("the sandbox's fallback without a session PID namespace", { skip: sandboxProblem() || (process.platform === "darwin" && "Linux only") }, () => {
+  it("builds each command its own PID namespace when bubblewrap has no --pidns", async () => {
+    // A bwrap earlier on the PATH whose --help lacks --pidns stands in for an old bubblewrap. jig must fall
+    // back to --unshare-pid per command (still secure, but a command's background jobs end with it) and say so.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    await writeFile(join(fakeBin, "bwrap"), `#!/bin/sh\nif [ "$1" = "--help" ]; then echo "    --unshare-pid    Create new pid namespace"; exit 0; fi\nexec ${real} "$@"\n`);
+    await chmod(join(fakeBin, "bwrap"), 0o755);
+    const savedPath = process.env.PATH;
+    let fellBack = false;
+    try {
+      process.env.PATH = `${fakeBin}${sep === "\\" ? ";" : ":"}${savedPath}`;
+      const sandbox = createSandbox(dir, { network: false, onFallback: () => (fellBack = true) })!;
+      const { args, stdio, note } = sandbox.wrap("echo hi");
+      assert.equal(fellBack, true, "jig told the user it fell back");
+      assert.ok(args.includes("--unshare-pid"), "each command gets its own PID namespace");
+      assert.ok(args.includes("--die-with-parent"), "which ends with jig, as there is no keeper to end it");
+      assert.ok(args.join(" ").includes("--proc /proc"), "with its own /proc");
+      assert.ok(!args.includes("--pidns") && !args.includes("--userns"), "it doesn't try to join a keeper");
+      assert.equal(stdio, undefined, "and passes no namespace descriptors");
+      // The bash tool tells the model to leave a server running in the background, which here ends with its command.
+      assert.match(note ?? "", /a job it leaves in the background ends with it/, "and tells the model, with the first command");
+      assert.equal(sandbox.wrap("echo hi").note, undefined, "once");
+      assert.match(await runCommand("echo hi", dir, 20, undefined, sandbox), /^hi\n\nExit code: 0$/, "a command's result has no note after the first");
+      sandbox.close?.();
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
+  it("says there is no sandbox where bubblewrap can't mount a /proc, as in a container that masks its own", async () => {
+    // Docker and Podman mask parts of a container's /proc unless told not to, and the kernel then refuses a user
+    // namespace a fresh one. Every command mounts one, so bubblewrap that could start but not mount it ran nothing.
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    const refuse = `echo "bwrap: Can't mount proc on /newroot/proc: Operation not permitted" >&2; exit 1`;
+    await writeFile(join(fakeBin, "bwrap"), `#!/bin/sh\nfor a do [ "$a" = --proc ] && { ${refuse}; }; done\nexec ${real} "$@"\n`, { mode: 0o755 });
+    const sandbox = join(import.meta.dirname, "..", "src", "sandbox.ts");
+    const script = `import(${JSON.stringify(sandbox)}).then((m) => console.log(m.sandboxProblem() ?? "a sandbox"))`;
+    const env = { ...process.env, PATH: `${fakeBin}:${process.env.PATH}` };
+    const problem = execFileSync(process.execPath, ["--input-type=module", "-e", script], { env, encoding: "utf8" }).trim();
+    assert.equal(problem, "bubblewrap can't create a sandbox here: Can't mount proc on /newroot/proc: Operation not permitted");
+  });
+});
+
+describe("the macOS sandbox's profile", () => {
+  it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
+    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"], gitDirectories: ["/p/.git"] };
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], git);
+    const locked = profile.indexOf('(deny file-write* (literal "/p/.git/config") (subpath "/p/.git/hooks"))');
+    assert.ok(locked > profile.indexOf('(allow file-write* (subpath "/p")'), "after the rule it overrides, since the last rule wins");
+    assert.match(profile, /^\(deny file-write-unlink \(literal "\/p\/\.git"\)\)$/m);
+    assert.doesNotMatch(seatbeltProfile(["/p"], false, []), /\.git/);
+  });
+
+  it("hides jig's own directory but its skills, and leaves a project in it as it was", () => {
+    // A skill being written in jig's directory, with a repository of its own and a file the user hides.
+    const project = "/u/.jig/skills/s";
+    const git = { locked: [`${project}/.git/config`], fixed: [`${project}/.git`], gitDirectories: [`${project}/.git`] };
+    const lines = seatbeltProfile([project, "/private/tmp"], false, [`${project}/key`], git, "/u/.jig").split("\n");
+    const at = (line: string) => {
+      assert.ok(lines.includes(line), `${line} is in the profile`);
+      return lines.indexOf(line);
+    };
+    // The last rule that matches wins.
+    const order = [
+      at('(deny file-read* file-write* (subpath "/u/.jig"))'),
+      at('(allow file-read* (subpath "/u/.jig/skills"))'),
+      at('(allow file-read* file-write* (subpath "/u/.jig/skills/s"))'),
+      at('(deny file-write* (literal "/u/.jig/skills/s/.git/config"))'),
+      at('(deny file-read* file-write* (subpath "/u/.jig/skills/s/key"))'),
+    ];
+    assert.deepEqual(order, [...order].sort((a, b) => a - b));
+    assert.ok(at('(allow file-read-metadata (literal "/u/.jig"))') > order[0], "paths through it can be resolved");
+    assert.doesNotMatch(seatbeltProfile(["/p"], false, [], undefined, "/u/.jig"), /\(allow file-read\* file-write\*/);
+  });
+
+  it("keeps the directories holding jig's own in place, where it lies in a writable directory", () => {
+    // In a temp directory, as in skill evals: moved aside with one, it would be out of the rules' reach.
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, [], undefined, "/private/tmp/e/h/.jig");
+    const fixed = '(deny file-write-unlink (literal "/private/tmp/e") (literal "/private/tmp/e/h"))';
+    assert.ok(profile.split("\n").includes(fixed), profile);
+    assert.ok(profile.indexOf(fixed) > profile.indexOf("(allow file-write* "), "after the rule it overrides, since the last rule wins");
+    // An added directory in a temp directory can be moved too; a writable directory in none can't.
+    const added = seatbeltProfile(["/p", "/private/tmp/e", "/private/tmp"], false, [], undefined, "/private/tmp/e/.jig");
+    assert.match(added, /^\(deny file-write-unlink \(literal "\/private\/tmp\/e"\)\)$/m);
+    // Nor are there any for ~/.jig in no writable directory, and in a home-directory project only the project itself.
+    assert.doesNotMatch(seatbeltProfile(["/p", "/private/tmp"], false, [], undefined, "/u/.jig"), /file-write-unlink/);
+    const home = seatbeltProfile(["/u", "/private/tmp"], false, [], undefined, "/u/.jig");
+    assert.deepEqual(home.split("\n").filter((line) => line.includes("file-write-unlink")), ['(deny file-write-unlink (literal "/u"))']);
+  });
+
+  it("keeps the directories holding a hidden path in place, where it lies in a writable directory", () => {
+    // Denied by its path: moved aside with a directory holding it, it would be out of the rule's reach.
+    const profile = seatbeltProfile(["/p", "/private/tmp"], false, ["/p/a/b/key", "/p/c", "/u/.ssh"]);
+    const fixed = '(deny file-write-unlink (literal "/p/a") (literal "/p/a/b"))';
+    assert.ok(profile.split("\n").includes(fixed), profile);
+    assert.ok(profile.indexOf(fixed) > profile.indexOf("(allow file-write* "), "after the rule it overrides, since the last rule wins");
+  });
+
+  it("keeps a writable directory in place where it holds a hidden path, jig's own directory or git's files", () => {
+    // (subpath "/p"), which lets commands write in the project, matches /p itself: a command moved the project
+    // to /private/tmp/p and made /p again, then read the hidden file at its new path, or changed git's config
+    // there and moved it back, as no rule names those paths. A rename unlinks what moves and creates where it goes.
+    const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"], gitDirectories: ["/p/.git"] };
+    const writable = ["/p", "/private/tmp"];
+    const profiles = {
+      "a hidden path": seatbeltProfile(writable, false, ["/p/a/key"]),
+      "jig's own directory": seatbeltProfile(writable, false, [], undefined, "/p/a/.jig"),
+      "git's config and hooks": seatbeltProfile(writable, false, [], git),
+    };
+    for (const [what, profile] of Object.entries(profiles)) {
+      const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
+      assert.equal(allows("file-write-unlink", "/p"), false, `the project, holding ${what}, moved aside`);
+      assert.ok(allows("file-write-create", "/private/tmp/p") && allows("file-write-create", "/p"), "the rest of the move, and making /p again");
+      assert.ok(profile.split("\n").includes('(deny file-write-unlink (literal "/p"))'), profile);
+      // Ordinary work goes on: files and folders are made, changed, removed and renamed in it, and in /p/a too.
+      for (const path of ["/p/b.txt", "/p/src", "/p/src/c.txt", "/p/a/d.txt", "/private/tmp/e.txt"]) {
+        for (const operation of ["file-write-create", "file-write-data", "file-write-unlink"]) assert.ok(allows(operation, path), `${operation} ${path}, with ${what}`);
+      }
+    }
+    // Each writable directory holding any of them once, the outermost first; none for one holding none.
+    const lockedIn = { locked: ["/private/tmp/w/.git/config"], fixed: ["/private/tmp/w/.git"], gitDirectories: ["/private/tmp/w/.git"] };
+    const nested = seatbeltProfile(["/private/tmp/w", "/q", "/private/tmp"], false, ["/private/tmp/w/key"], lockedIn, "/private/tmp/w/.jig");
+    assert.ok(nested.split("\n").includes('(deny file-write-unlink (literal "/private/tmp") (literal "/private/tmp/w"))'), nested);
+    assert.doesNotMatch(nested, /literal "\/q"/);
+  });
+
+  it("keeps the directories between git's files and a writable directory holding the project in place", async () => {
+    // A clone in a directory in a temp directory: only the project and its git directory stayed in place, so
+    // a command could move work aside and put a copy with a config of its own where the repository was.
+    const base = await realpath(await mkdtemp(join(tmpdir(), "jig-profile-")));
+    try {
+      const [work, repo] = [join(base, "work"), join(base, "work", "repo")];
+      await mkdir(repo, { recursive: true });
+      git(repo, "init", "-q");
+      const writable = [repo, base];
+      const control = gitControl(repo, undefined, writable)!;
+      assert.deepEqual(control.fixed, [work, repo, join(repo, ".git")], "outermost first");
+      const profile = seatbeltProfile(writable, false, [], control);
+      assert.ok(profile.split("\n").includes(`(deny file-write-unlink (literal "${work}") (literal "${repo}") (literal "${join(repo, ".git")}"))`), profile);
+      const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
+      for (const path of [work, repo, join(repo, ".git")]) assert.equal(allows("file-write-unlink", path), false, path);
+      // Ordinary work goes on: files and folders are made, removed and renamed in the project and beside it.
+      for (const path of [join(repo, "src"), join(repo, "src", "a.txt"), join(work, "notes.txt"), join(base, "other")]) {
+        for (const operation of ["file-write-create", "file-write-unlink"]) assert.ok(allows(operation, path), `${operation} ${path}`);
+      }
+      // With the project in no other writable directory, only its git directory, as before.
+      assert.deepEqual(gitControl(repo, undefined, [repo])!.fixed, [join(repo, ".git")]);
+      // A git directory made with --separate-git-dir in a folder of the project: that folder too.
+      const [separate, gitDir] = [join(base, "separate"), join(base, "separate", "meta", "gd")];
+      await mkdir(dirname(gitDir), { recursive: true });
+      git(separate, "init", "-q", `--separate-git-dir=${gitDir}`);
+      const separated = seatbeltProfile([separate, base], false, [], gitControl(separate, undefined, [separate, base])!);
+      assert.equal(seatbeltAllows(separated, "file-write-unlink", join(separate, "meta")), false);
+      // A folder holding a submodule's checkout is still renamed: a .git put in the checkout's place is reported.
+      const outer = await repoWithSubmodule(base);
+      const withSubmodule = seatbeltProfile([outer, base], false, [], gitControl(outer, undefined, [outer, base])!);
+      assert.ok(seatbeltAllows(withSubmodule, "file-write-unlink", join(outer, "libs")));
+      assert.equal(seatbeltAllows(withSubmodule, "file-write-unlink", outer), false, "the project, which holds its git directory");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("covers submodules, every linked worktree's files, and those that aren't there yet", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      for (const name of ["wt", "wt2"]) git(repo, "worktree", "add", "-q", "--detach", join(base, name));
+      const [real, wt, wt2] = [await realpath(repo), await realpath(join(base, "wt")), await realpath(join(base, "wt2"))];
+      const profile = seatbeltProfile([wt, join(real, ".git")], false, [], gitControl(wt)!);
+      const dotGit = join(real, ".git");
+      const rule = (kind: string, path: string) => `(${kind} "${path}")`;
+      const denied = profile.split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      const own = ["commondir", "gitdir", "config.worktree"].flatMap((name) => [`worktrees/wt/${name}`, `worktrees/wt2/${name}`]);
+      const files = ["config", "config.worktree", "commondir", ...own, "modules/libs/s/config", "modules/libs/s/commondir"];
+      for (const path of files) assert.ok(denied.includes(rule("literal", join(dotGit, path))), `${path} is read-only`);
+      for (const path of ["hooks", "modules/libs/s/hooks"]) assert.ok(denied.includes(rule("subpath", join(dotGit, path))), `${path} is read-only`);
+      for (const path of [join(wt, ".git"), join(wt2, ".git"), join(real, "libs", "s", ".git")]) {
+        assert.ok(denied.includes(rule("literal", path)), `${path}, a worktree's or a submodule checkout's .git file, is read-only`);
+      }
+      const fixed = profile.split("\n").find((line) => line.startsWith("(deny file-write-unlink "))!;
+      for (const dir of ["", "worktrees", "worktrees/wt", "worktrees/wt2", "modules", "modules/libs", "modules/libs/s"]) {
+        assert.ok(fixed.includes(rule("literal", join(dotGit, dir))), `${dir || ".git"} stays in place`);
+      }
+      assert.equal(gitControl(base), undefined, "outside a repository");
+      git(base, "init", "-q", "--bare", "server.git");
+      assert.equal(gitControl(join(base, "server.git")), undefined, "in a bare repository");
+      // A bare clone with its worktrees beside it is no server's: the user runs git in the worktrees. One
+      // named .git is locked before it has any, as the file tools refuse its config.
+      git(base, "clone", "-q", "--bare", repo, "x/.git");
+      git(base, "clone", "-q", "--bare", repo, "y/.bare");
+      await writeFile(join(base, "y", ".git"), "gitdir: ./.bare\n");
+      const [x, y] = [await realpath(join(base, "x")), await realpath(join(base, "y"))];
+      assert.ok(gitControl(x)?.locked.includes(join(x, ".git", "config")), "a bare x/.git");
+      assert.equal(gitControl(y), undefined, "a bare y/.bare with no worktree");
+      for (const folder of [x, y]) git(folder, "worktree", "add", "-q", "--detach", "main");
+      for (const [project, config] of [[x, join(x, ".git", "config")], [y, join(y, ".bare", "config")]]) {
+        for (const from of [project, join(project, "main")]) assert.ok(gitControl(from)?.locked.includes(config), `from ${from}`);
+      }
+      assert.ok(gitControl(y)?.locked.includes(join(y, ".git")), "y's .git file, which says where its git directory is");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("finds the repository's git directory with a git older than 2.31, which prints back a flag it doesn't know", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    const path = process.env.PATH;
+    try {
+      git(base, "init", "-q", "repo");
+      await mkdir(join(base, "repo", "sub"));
+      await mkdir(join(base, "bin"));
+      // As git rev-parse before 2.31 (2.30 is Debian 11's) takes --path-format=absolute: it prints it back.
+      const real = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+      const shim = `#!/bin/sh\nfor a do shift; case $a in --path-format=*) echo "$a" ;; *) set -- "$@" "$a" ;; esac; done\nexec '${real}' "$@"\n`;
+      await writeFile(join(base, "bin", "git"), shim, { mode: 0o755 });
+      process.env.PATH = `${join(base, "bin")}:${path}`;
+      const config = join(await realpath(join(base, "repo")), ".git", "config");
+      for (const project of ["repo", "repo/sub"]) assert.ok(gitControl(join(base, project))?.locked.includes(config), `from ${project}`);
+    } finally {
+      process.env.PATH = path;
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("takes a directory for a bare repository only as git does, and covers what the repository around one has in it", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      await mkdir(join(repo, "docs"));
+      const real = await realpath(repo);
+      // A config a command wrote in a subdirectory, saying it is bare, git takes for no repository.
+      for (const dir of ["docs", "libs"]) await writeFile(join(repo, dir, "config"), "[core]\n\tbare = true\n");
+      // Nor with a HEAD and a commondir that names nothing: git looks for the objects and refs where it leads.
+      await writeFile(join(repo, "docs", "HEAD"), "ref: refs/heads/main\n");
+      await writeFile(join(repo, "docs", "commondir"), "nowhere\n");
+      assert.equal(git(join(repo, "docs"), "rev-parse", "--absolute-git-dir").trim(), join(real, ".git"));
+      for (const dir of ["docs", "libs"]) assert.ok(gitControl(join(repo, dir))?.locked.includes(join(real, ".git", "config")), `from ${dir}`);
+      // With a HEAD, objects and refs too, git does: it is left alone, as a server's would be, but the .git of
+      // the checkout in it is denied, and nothing of repo's git directory, which isn't made writable, is fixed:
+      // only libs itself stays in place, as it holds that .git.
+      git(join(repo, "libs"), "init", "-q", "--bare", ".");
+      const control = gitControl(join(repo, "libs"))!;
+      const profile = seatbeltProfile([join(real, "libs"), "/private/tmp"], false, [], control);
+      const denied = profile.split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      assert.equal(denied, `(deny file-write* (literal "${join(real, "libs", "s", ".git")}"))`);
+      const fixed = profile.split("\n").filter((line) => line.includes("file-write-unlink"));
+      assert.deepEqual(fixed, [`(deny file-write-unlink (literal "${join(real, "libs")}"))`]);
+      assert.deepEqual(control.fixed, []);
+      // From a subdirectory of libs too, where the bare repository, writable as well, is above the project.
+      await mkdir(join(repo, "libs", "deep"));
+      assert.deepEqual(gitControl(join(repo, "libs", "deep"))?.locked, [join(real, "libs", "s", ".git")]);
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("covers what the repositories around a repository a command made have where commands can write", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base, "a/b/s");
+      const real = await realpath(repo);
+      const [b, dotGit] = [join(repo, "a", "b"), join(real, "a", "b", "s", ".git")];
+      // A repository made in a/b, which holds the checkout a/b/s: its own files and repo's .git for the checkout.
+      git(b, "init", "-q");
+      for (const path of [join(real, "a", "b", ".git", "config"), dotGit]) assert.ok(gitControl(b)?.locked.includes(path), path);
+      // One made in a as well, nearer than repo, leaves repo's covered all the same.
+      git(join(repo, "a"), "init", "-q");
+      assert.ok(gitControl(b)?.locked.includes(dotGit), "past a/.git");
+      // Given the sandbox's writable directories, repo's files in any of them, and the directories holding them
+      // there, which binding grants nothing; none of those outside one, which binding would make writable.
+      const control = gitControl(b, undefined, [join(real, "a", "b"), real])!;
+      assert.ok(control.locked.includes(join(real, ".git", "config")));
+      assert.ok(control.fixed.includes(join(real, ".git", "modules", "a")));
+      assert.deepEqual(control.fixed, [...control.fixed].sort((x, y) => x.length - y.length), "a directory before those in it");
+      assert.ok(gitControl(b)!.fixed.every((dir) => dir.startsWith(join(real, "a", "b", ".git"))), "only a/b's own");
+      const profile = seatbeltProfile([join(real, "a", "b"), real], false, [], control);
+      const fixed = profile.split("\n").find((line) => line.startsWith("(deny file-write-unlink "))!;
+      assert.ok(fixed.includes(`(literal "${join(real, ".git")}")`));
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("finds every submodule's checkout, though git can't read one's config, and never waits on a pipe one includes", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      const repo = await repoWithSubmodule(base);
+      git(repo, "submodule", "add", "-q", join(base, "sub"), "libs/t");
+      const real = await realpath(repo);
+      const [s, t] = ["s", "t"].map((name) => join(real, ".git", "modules", "libs", name, "config"));
+      const dotGits = ["s", "t"].map((name) => join(real, "libs", name, ".git"));
+      const config = await readFile(t, "utf8");
+      await appendFile(t, "[core\n");
+      assert.ok(gitControl(repo)?.locked.includes(dotGits[0]), "past the config git can't read");
+      await writeFile(t, config);
+      // git config --file follows no include a config makes, nor does jig: git would wait on a named pipe.
+      const pipe = join(base, "pipe");
+      execFileSync("mkfifo", [pipe]);
+      await appendFile(s, `[include]\n\tpath = ${pipe}\n`);
+      // Something writes to it, once, so that a git that opened it would go on, and leave a mark.
+      const writer = spawn("sh", ["-c", `echo '[core]' > '${pipe}' && touch '${pipe}-opened'`]);
+      try {
+        const locked = gitControl(repo)?.locked;
+        for (const path of dotGits) assert.ok(locked?.includes(path), path);
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        assert.equal(existsSync(`${pipe}-opened`), false, "git opened the pipe");
+      } finally {
+        writer.kill();
+      }
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("starts where a submodule's checkout is a file, a link to itself or a directory it can't search, and locks its .git", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    const checkout = join(base, "repo", "libs", "s");
+    try {
+      const repo = await repoWithSubmodule(base);
+      const dotGit = join(await realpath(repo), "libs", "s", ".git");
+      // Looking for its .git threw ENOTDIR, ELOOP or EACCES, which stopped jig starting, with the sandbox or without.
+      const locks = (what: string) => {
+        assert.ok(gitControl(repo)?.locked.includes(dotGit), what);
+        lockedGitPaths(repo);
+      };
+      // git keeps a submodule's git directory, and the core.worktree that names its checkout, once the checkout is gone.
+      await rm(checkout, { recursive: true });
+      await writeFile(checkout, "");
+      locks("a file");
+      await rm(checkout);
+      await symlink("s", checkout); // as a command can leave it
+      locks("a link to itself");
+      await rm(checkout);
+      await mkdir(checkout, { mode: 0 });
+      locks("a directory it can't search");
+    } finally {
+      await chmod(checkout, 0o755).catch(() => {});
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+
+  it("covers a git directory git passes over, and a submodule's that a planted HEAD would hide", async () => {
+    const base = await mkdtemp(join(tmpdir(), "jig-profile-"));
+    try {
+      // In a repository of its own, where git goes on to once it passes over the project's.
+      git(base, "init", "-q");
+      const repo = await repoWithSubmodule(base);
+      git(repo, "worktree", "add", "-q", "--detach", join(base, "wt"));
+      const dotGit = join(await realpath(repo), ".git");
+      const profileOf = (project: string) => seatbeltProfile([project], false, [], gitControl(project)!);
+      const denied = (project: string) => profileOf(project).split("\n").find((line) => line.startsWith("(deny file-write* "))!;
+      const configs = ["config", "modules/libs/s/config"].map((path) => `(literal "${join(dotGit, path)}")`);
+      // A command moves HEAD aside in one session, or the refs: git takes base's repository for the project's.
+      await rename(join(dotGit, "HEAD"), join(dotGit, "HEAD-moved"));
+      await rename(join(dotGit, "modules", "libs", "s", "refs"), join(dotGit, "modules", "libs", "s", "refs-moved"));
+      assert.equal(git(repo, "rev-parse", "--absolute-git-dir").trim(), join(await realpath(base), ".git"));
+      // Nor does a config beside the .git that says it is bare, as a command can write one.
+      await writeFile(join(repo, "config"), "[core]\n\tbare = true\n");
+      for (const config of configs) assert.ok(denied(repo).includes(config), `${config} is read-only`);
+      // From a linked worktree whose own HEAD is gone, which git takes for no repository at all.
+      await rename(join(dotGit, "worktrees", "wt", "HEAD"), join(dotGit, "worktrees", "wt", "HEAD-moved"));
+      assert.ok(denied(join(base, "wt")).includes(configs[0]), "from the worktree");
+      // A HEAD or a config in modules/libs, as if it were a submodule's git directory, doesn't hide libs/s in it.
+      await writeFile(join(dotGit, "modules", "libs", "HEAD"), "ref: refs/heads/main\n");
+      await writeFile(join(dotGit, "modules", "libs", "config"), "");
+      assert.ok(denied(repo).includes(configs[1]), "behind a planted HEAD");
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+});
+
+/** git with an identity, and allowed to clone a submodule from a local path. */
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@localhost", "-c", "protocol.file.allow=always", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/**
+ * Whether a Seatbelt profile lets a command do an operation on a path, as Seatbelt decides it: by the last
+ * rule that matches. As much of its language as seatbeltProfile writes, so a profile can be checked on Linux
+ * too: operations, one ending in * standing for those it starts and default for all; and literal, subpath and
+ * regex filters, a rule with none matching every path and one with others only (the network's) none.
+ */
+function seatbeltAllows(profile: string, operation: string, path: string): boolean {
+  let allowed = false;
+  for (const rule of profile.split(/\n(?=\()/)) {
+    const [, verdict, body] = /^\((allow|deny) (.*)\)$/s.exec(rule) ?? [];
+    if (!verdict) continue;
+    const operations = body.split(" (")[0].split(" ");
+    const does = operations.some((name) => name === "default" || name === operation || (name.endsWith("*") && operation.startsWith(name.slice(0, -1))));
+    const on = [...body.matchAll(/\((literal|subpath|regex) #?"((?:[^"\\]|\\.)*)"\)/g)].some(([, kind, quoted]) => {
+      const value = quoted.replace(/\\(.)/g, "$1");
+      if (kind === "literal") return path === value;
+      return kind === "subpath" ? path === value || path.startsWith(`${value}/`) : new RegExp(value).test(path);
+    });
+    if (does && (on || !body.includes("("))) allowed = verdict === "allow";
+  }
+  return allowed;
+}
+
+/** A repository in `base`/repo with one commit and a submodule at libs/s, or at `path`. */
+async function repoWithSubmodule(base: string, path = "libs/s"): Promise<string> {
+  const [repo, sub] = [join(base, "repo"), join(base, "sub")];
+  for (const dir of [repo, sub]) {
+    await mkdir(dir);
+    git(dir, "init", "-q");
+    await writeFile(join(dir, "a.txt"), "1\n");
+    git(dir, "add", "a.txt");
+    git(dir, "commit", "-qm", "first");
+  }
+  git(repo, "submodule", "add", "-q", sub, path);
+  git(repo, "commit", "-qm", "submodule");
+  return repo;
+}
+
 describe("snapshots", () => {
+  /** git on the snapshots of the project in dir. */
+  const snapshotGit = (...args: string[]) => git(dir, `--git-dir=${join(process.env.JIG_HOME!, "snapshots", projectKey(dir))}`, `--work-tree=${dir}`, ...args);
+
   it("undo puts back changed and deleted files and removes new ones, one task at a time", async () => {
     await writeFile(join(dir, "keep.txt"), "v1\n");
     await writeFile(join(dir, "doomed.txt"), "precious\n");
@@ -109,9 +1485,83 @@ describe("snapshots", () => {
     assert.equal(snapshots.undo(), undefined);
   });
 
+  it("lists the files changed since the last snapshot, for the Stop hooks, and undo still puts them back", async () => {
+    await writeFile(join(dir, "keep.txt"), "v1\n");
+    await writeFile(join(dir, "gone.txt"), "x\n");
+    const snapshots = new Snapshots(dir);
+    assert.equal(snapshots.changed(), undefined, "no snapshot yet");
+    snapshots.take("task");
+    assert.deepEqual(snapshots.changed(), []);
+    await writeFile(join(dir, "keep.txt"), "v2\n");
+    await rm(join(dir, "gone.txt"));
+    await writeFile(join(dir, "new.txt"), "n\n");
+    assert.deepEqual(snapshots.changed(), ["gone.txt", "keep.txt", "new.txt"]);
+    // Listing them stores nothing: a file the task made (a big one, say) isn't copied into the snapshots.
+    const gitDir = join(process.env.JIG_HOME!, "snapshots", projectKey(dir));
+    const blob = execFileSync("git", ["hash-object", join(dir, "new.txt")], { encoding: "utf8" }).trim();
+    assert.throws(() => execFileSync("git", [`--git-dir=${gitDir}`, "cat-file", "-e", blob], { stdio: "ignore" }));
+    assert.deepEqual(snapshots.undo(), { changed: ["gone.txt", "keep.txt"], removed: ["new.txt"] });
+    assert.equal(await readFile(join(dir, "gone.txt"), "utf8"), "x\n");
+  });
+
+  it("leaves out the hidden paths in the project, which undo neither puts back nor removes", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    await writeFile(join(dir, ".env"), "e1");
+    await mkdir(join(dir, "secrets"));
+    await writeFile(join(dir, "secrets", "key"), "k1");
+    // An older jig's snapshot holds them, and the index still has them.
+    new Snapshots(dir).take("older jig");
+    // By real path, as the sandbox hides them: here one is named through a link to the project.
+    const link = `${dir}-link`;
+    await symlink(dir, link);
+    try {
+      const snapshots = new Snapshots(dir, [join(link, ".env"), join(dir, "secrets"), join(dir, "not-there")]);
+      snapshots.take("t");
+      assert.equal(snapshotGit("ls-tree", "-r", "--name-only", "HEAD"), "a.txt\n");
+      await writeFile(join(dir, "a.txt"), "2");
+      await writeFile(join(dir, ".env"), "e2");
+      await writeFile(join(dir, "secrets", "new"), "n");
+      await writeFile(join(dir, "not-there"), "made by the task");
+      assert.deepEqual(snapshots.changed(), ["a.txt"]);
+      assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+      assert.equal(await readFile(join(dir, ".env"), "utf8"), "e2");
+      assert.equal(await readFile(join(dir, "secrets", "new"), "utf8"), "n");
+      assert.equal(await readFile(join(dir, "not-there"), "utf8"), "made by the task");
+      assert.throws(() => new Snapshots(join(dir, "secrets"), [link]).take("t"), /hiddenPaths hide the project/);
+    } finally {
+      await rm(link);
+    }
+  });
+
   it("refuses projects too big to copy", async () => {
     await writeFile(join(dir, "data.bin"), Buffer.alloc(201_000_000));
     assert.throws(() => new Snapshots(dir).take("t"), /201 MB of files that aren't ignored/);
+  });
+
+  it("stops a git that waits on a named pipe a command made, and leaves no lock behind", async () => {
+    // git opens a .gitignore or a .gitattributes and waits for as long as a named pipe is there: jig waited
+    // with it, in its own thread, past --time-limit, before the next task or for a Stop hook's changed_files.
+    await mkdir(join(dir, "sub"));
+    await writeFile(join(dir, "sub", "a.txt"), "1");
+    const snapshots = new Snapshots(dir, [], undefined, 1);
+    snapshots.take("t1");
+    execFileSync("mkfifo", [join(dir, "sub", ".gitignore")]);
+    assert.throws(() => snapshots.changed(), /git took over 1 seconds/);
+    assert.throws(() => snapshots.take("t2"), /git took over 1 seconds/);
+    await rm(join(dir, "sub", ".gitignore"));
+    // git add waits on a .gitattributes holding the index's lock: stopped with SIGTERM, git removes the lock,
+    // where SIGKILL left one that failed every later snapshot. It reads attributes only for a file it hashes,
+    // so one changes size here: git hashes an unchanged file only if it was written in the same second as
+    // t1's index, which made this test pass or fail by the clock.
+    await writeFile(join(dir, "sub", "a.txt"), "12");
+    execFileSync("mkfifo", [join(dir, ".gitattributes")]);
+    assert.throws(() => snapshots.take("t3"), /git took over 1 seconds/);
+    await rm(join(dir, ".gitattributes"));
+    await writeFile(join(dir, "sub", "a.txt"), "2");
+    snapshots.take("t4");
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: [] });
+    assert.deepEqual(snapshots.undo(), { changed: ["sub/a.txt"], removed: [] });
+    assert.equal(await readFile(join(dir, "sub", "a.txt"), "utf8"), "1");
   });
 
   it("works outside git and doesn't touch the project's own repository", async () => {
@@ -122,6 +1572,186 @@ describe("snapshots", () => {
     snapshots.undo();
     assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
     assert.equal(existsSync(join(dir, ".git")), false);
+  });
+
+  it("checks the size before every snapshot, counting the files already snapshotted", async () => {
+    await writeFile(join(dir, "a.bin"), Buffer.alloc(800_000));
+    const snapshots = new Snapshots(dir, [], 1_000_000);
+    snapshots.take("t1");
+    await writeFile(join(dir, "b.bin"), Buffer.alloc(800_000)); // a dataset the task downloaded, say
+    assert.throws(() => snapshots.take("t2"), /2 MB of files that aren't ignored, more than the 1 MB/);
+    assert.equal(snapshots.undo(), undefined, "undoing to t1 would undo the next task too");
+  });
+
+  it("undo stores nothing the task created, so a big file can't get past the size check", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir, [], 1_000_000);
+    snapshots.take("t");
+    await writeFile(join(dir, "data.bin"), Buffer.alloc(2_000_000, 1)); // a dataset the task downloaded, say
+    const blob = execFileSync("git", ["hash-object", join(dir, "data.bin")], { encoding: "utf8" }).trim();
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["data.bin"] });
+    assert.equal(existsSync(join(dir, "data.bin")), false);
+    const gitDir = join(process.env.JIG_HOME!, "snapshots", projectKey(dir));
+    assert.throws(() => execFileSync("git", [`--git-dir=${gitDir}`, "cat-file", "-e", blob], { stdio: "ignore" }));
+  });
+
+  it("undo goes another task back after you edit a file in between", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t1");
+    await writeFile(join(dir, "a.txt"), "2");
+    await writeFile(join(dir, "b.txt"), "b");
+    snapshots.take("t2");
+    snapshots.undo();
+    await writeFile(join(dir, "a.txt"), "edited by hand");
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: ["b.txt"] });
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
+    assert.equal(existsSync(join(dir, "b.txt")), false);
+  });
+
+  it("leaves nested repositories out, and never runs a program their git config names", async () => {
+    // A repository in the project, such as a sandboxed command can make, with a clean filter: git runs it
+    // outside the sandbox to see whether an edited file in it changed, if it looks there at all.
+    const nested = join(dir, "vendor", "x");
+    await mkdir(nested, { recursive: true });
+    await writeFile(join(dir, "a.txt"), "1");
+    await writeFile(join(nested, "f.txt"), "1");
+    git(nested, "init", "-q");
+    git(nested, "add", "f.txt");
+    git(nested, "commit", "-qm", "first");
+    // Older versions of jig stored it in their snapshots, as a gitlink, and the index still has it.
+    new Snapshots(dir).take("older jig");
+    snapshotGit("add", "--all", ".");
+    const ran = join(dir, "filter-ran");
+    git(nested, "config", "filter.x.clean", `touch ${ran}; cat`);
+    await writeFile(join(nested, ".git", "info", "attributes"), "* filter=x\n");
+    await writeFile(join(nested, "f.txt"), "2"); // the same size, so git would have to read it
+
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+    assert.doesNotMatch(snapshotGit("ls-files", "--stage"), /^160000/m, "the snapshot holds no gitlink");
+    await writeFile(join(dir, "a.txt"), "2");
+    snapshotGit("add", "vendor/x"); // as git add stores one a command makes while a snapshot is taken
+    assert.deepEqual(snapshots.changed(), ["a.txt"]);
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.equal(await readFile(join(nested, "f.txt"), "utf8"), "2", "files in a nested repository are left alone");
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+  });
+
+  it("keeps names that aren't UTF-8 as git wrote them, so such a repository is left out too", { skip: process.platform === "darwin" && "macOS takes only UTF-8 names" }, async () => {
+    // A command picks the names. Decoded as UTF-8, 0xff turns into U+FFFD and no longer names the file: git
+    // would store the repository and then run its filter, and /undo would leave such a file behind.
+    const named = (prefix: string) => Buffer.concat([Buffer.from(join(dir, prefix)), Buffer.from([0xff])]);
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t1");
+    const nested = join(dir, "vendor");
+    await mkdir(nested);
+    await writeFile(join(nested, "f.txt"), "1");
+    git(nested, "init", "-q");
+    git(nested, "add", "f.txt");
+    git(nested, "commit", "-qm", "first");
+    const ran = join(dir, "filter-ran");
+    git(nested, "config", "filter.x.clean", `touch ${ran}; cat`);
+    await writeFile(join(nested, ".git", "info", "attributes"), "* filter=x\n");
+    await writeFile(join(nested, "f.txt"), "2");
+    await rename(nested, named("vendor-"));
+    await writeFile(named("new-"), "n");
+    snapshotGit("add", "--all", "."); // as git add stores one a command makes while a snapshot is taken
+
+    assert.deepEqual(snapshots.changed(), ["new-�"]);
+    snapshots.take("t2");
+    assert.doesNotMatch(snapshotGit("ls-files", "--stage"), /^160000/m, "the snapshot holds no gitlink");
+    await writeFile(join(dir, "a.txt"), "2");
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["new-�"] });
+    assert.equal(existsSync(named("new-")), false);
+    assert.equal(existsSync(ran), false, "git ran the nested repository's filter");
+  });
+
+  it("doesn't say it put back a file in a submodule, which it leaves alone", async () => {
+    const repo = await repoWithSubmodule(dir);
+    const snapshots = new Snapshots(repo);
+    snapshots.take("t");
+    await writeFile(join(repo, "libs", "s", "a.txt"), "2\n");
+    assert.deepEqual(snapshots.changed(), []);
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: [] });
+    assert.equal(await readFile(join(repo, "libs", "s", "a.txt"), "utf8"), "2\n");
+  });
+
+  it("undo removes what a task created around a repository it made, and leaves the repository", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    const clone = join(dir, "b", "clone");
+    await mkdir(clone, { recursive: true });
+    git(clone, "init", "-q"); // with no commit yet, which git can't store as a gitlink
+    await writeFile(join(clone, "f.txt"), "f");
+    await writeFile(join(dir, "a-new.txt"), "n"); // listed before the repository
+    await writeFile(join(dir, "b", "z.txt"), "z"); // and after it
+    assert.deepEqual(snapshots.undo(), { changed: [], removed: ["a-new.txt", "b/z.txt"] });
+    assert.equal(existsSync(join(dir, "a-new.txt")), false);
+    assert.equal(existsSync(join(clone, "f.txt")), true);
+    snapshots.take("the next task");
+  });
+
+  it("sizes a symlink as git stores it, not what it points to", async () => {
+    const project = join(dir, "project");
+    await mkdir(join(project, "data"), { recursive: true });
+    await writeFile(join(project, "data", "a.txt"), "1");
+    await writeFile(join(dir, "big.bin"), Buffer.alloc(3_000_000)); // outside the project
+    const snapshots = new Snapshots(project, [], 1_000_000);
+    snapshots.take("t1");
+    // A task links in a big file from elsewhere, makes a link that loops, and puts a file where a directory was.
+    await symlink(join(dir, "big.bin"), join(project, "big.bin"));
+    await symlink("loop", join(project, "loop"));
+    await rm(join(project, "data"), { recursive: true });
+    await writeFile(join(project, "data"), "2");
+    snapshots.take("t2");
+    snapshots.take("t3");
+    snapshots.undo();
+    snapshots.undo();
+    assert.deepEqual(snapshots.undo(), { changed: ["data/a.txt"], removed: ["big.bin", "data", "loop"] });
+    assert.equal(await readFile(join(project, "data", "a.txt"), "utf8"), "1");
+    assert.equal(existsSync(join(dir, "big.bin")), true, "what a link points to is left alone");
+  });
+
+  it("doesn't sign its commits or run hooks, whatever the user's git config says", async () => {
+    const hooks = join(dir, "global-hooks");
+    await mkdir(hooks);
+    await writeFile(join(hooks, "post-commit"), `#!/bin/sh\ntouch ${join(dir, "hook-ran")}\n`);
+    await chmod(join(hooks, "post-commit"), 0o755);
+    // A signer that fails, like an SSH key in a locked password manager.
+    await writeFile(join(dir, "gitconfig"), `[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = false\n[core]\n\thooksPath = ${hooks}\n`);
+    process.env.GIT_CONFIG_GLOBAL = join(dir, "gitconfig");
+    try {
+      const project = join(dir, "project");
+      await mkdir(project);
+      await writeFile(join(project, "a.txt"), "1");
+      const snapshots = new Snapshots(project);
+      snapshots.take("t");
+      await writeFile(join(project, "a.txt"), "2");
+      snapshots.undo();
+      assert.equal(await readFile(join(project, "a.txt"), "utf8"), "1");
+      assert.equal(existsSync(join(dir, "hook-ran")), false);
+    } finally {
+      delete process.env.GIT_CONFIG_GLOBAL;
+    }
+  });
+
+  it("says what went wrong when git fails, and keeps the snapshot to undo again", async () => {
+    await writeFile(join(dir, "a.txt"), "1");
+    const snapshots = new Snapshots(dir);
+    snapshots.take("t");
+    await writeFile(join(dir, "a.txt"), "2");
+    // Left behind by a git that was killed, or held by another jig in the same project.
+    const lock = join(process.env.JIG_HOME!, "snapshots", projectKey(dir), "index.lock");
+    await writeFile(lock, "");
+    assert.throws(() => snapshots.undo(), { message: /^fatal: Unable to create '.*index\.lock': File exists/ });
+    await rm(lock);
+    assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
+    assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
   });
 });
 
@@ -186,9 +1816,41 @@ describe("settings", () => {
   it("explains a bad settings file", async () => {
     await writeSettings({}, { deny: "git push" });
     assert.throws(() => readSettings(dir), /"deny" must be a list of commands/);
-    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { BeforeEverything: [] } }));
-    assert.throws(() => readSettings(dir), /unknown hook event "BeforeEverything"/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "(", command: "true" }] } }));
+    assert.throws(() => readSettings(dir), /\.jig\/settings\.json: the hook matcher "\(" is not a valid regular expression \(Invalid regular expression: .*\)$/);
+    await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hooks: { PreToolUse: [{ matcher: "*", command: "true" }] } }));
+    assert.equal(readSettings(dir).project?.settings.hooks[0].matcher, "*", "* is every tool, as in Claude Code");
     await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ mcpServers: { db: { args: [] } } }));
     assert.throws(() => readSettings(dir), /MCP server "db" needs a "command"/);
+  });
+
+  it("refuses a project's settings file that isn't a regular file, rather than waiting on it", async () => {
+    // A command can leave a named pipe there, which jig would wait on for good, its deny rules unread.
+    await mkdir(join(dir, ".jig"));
+    execFileSync("mkfifo", [join(dir, ".jig", "settings.json")]);
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: dir, timeout: 20_000 });
+      assert.equal(code, 1, output);
+      assert.match(output, /\.jig\/settings\.json isn't a regular file \(a named pipe, say\), so jig doesn't read it/);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("takes Stop hooks, behind the project's trust, and leaves out events jig doesn't have, with a warning", async () => {
+    // As settings written for Claude Code can have: the file loads, without those hooks.
+    await writeSettings({ hooks: { UserPromptSubmit: [{ command: "./log.sh" }] } }, { hooks: { SessionStart: [{ command: "echo hi" }], Stop: [{ command: "npm test 1>&2 || exit 2" }] } });
+    const { user, project, warnings } = readSettings(dir);
+    assert.deepEqual(user.hooks, []);
+    assert.deepEqual(project!.settings.hooks, [{ event: "Stop", matcher: undefined, command: "npm test 1>&2 || exit 2" }]);
+    assert.deepEqual(warnings, [
+      `${join(dir, ".jig-home", "settings.json")}: jig has no hook event "UserPromptSubmit", so those hooks don't run (it has PreToolUse, PostToolUse, Stop).`,
+      `${join(dir, ".jig", "settings.json")}: jig has no hook event "SessionStart", so those hooks don't run (it has PreToolUse, PostToolUse, Stop).`,
+    ]);
+    assert.deepEqual(needsTrust(project!.settings), ["run a Stop hook: npm test 1>&2 || exit 2"]);
+    assert.deepEqual(mergeSettings(user, project!.settings, false).hooks, []);
+    assert.deepEqual(mergeSettings(user, project!.settings, true).hooks, project!.settings.hooks);
   });
 });

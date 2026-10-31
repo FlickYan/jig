@@ -7,19 +7,20 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { existsSync } from "node:fs";
-import { basename, join, relative, resolve } from "node:path";
+import { constants } from "node:os";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
-import { type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, type ToolHooks, type Usage } from "./agent.ts";
+import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
-import { runHooks } from "./hooks.ts";
-import { connectMcpServers } from "./mcp.ts";
+import { hooksFor, runHooks, runStopHooks } from "./hooks.ts";
+import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
-import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort } from "./model.ts";
+import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
+import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
-import { createSandbox, sandboxProblem } from "./sandbox.ts";
+import { createSandbox, lockedGitPaths, sandboxProblem } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { reviewCommand } from "./review-cli.ts";
 import { listSessions, sessionsCommand } from "./sessions-cli.ts";
@@ -31,9 +32,10 @@ import { terminalApprover } from "./proposals.ts";
 import { proposeSkillTool } from "./skill-proposals.ts";
 import { discoverSkills, loadSkill, skillCatalog, skillTool, type Skill } from "./skills.ts";
 import { skillsCommand } from "./skills-cli.ts";
-import { Snapshots } from "./snapshots.ts";
-import { type Share, Stats } from "./stats.ts";
+import { type Restored, Snapshots } from "./snapshots.ts";
+import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
+import { bashTool, killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -49,7 +51,8 @@ Options:
                           models, openai for others; DeepSeek serves both)
       --base-url <url>    the API's address, e.g. http://localhost:11434/v1 for Ollama (default: the
                           provider's own; OPENAI_BASE_URL works too)
-  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: the model's own; DeepSeek takes low | high | max)
+  -e, --effort <level>    ${EFFORTS.join(" | ")} (default: medium for Claude models, the model's own
+                          for others; DeepSeek takes low | high | max)
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto
@@ -60,25 +63,46 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
   -c, --continue          continue this project's most recent session
       --resume <file>     continue a saved session (--sessions lists them)
       --sessions          list this project's saved sessions
-      --compact-at <n>    summarize the conversation once it reaches n tokens (default: 200000; 0: never)
+      --compact-at <n>    summarize the conversation once it reaches n tokens, or 80% of the model's context
+                          window if that is less (default: 200000; 0: never)
   -C, --cwd <dir>         project directory (default: the current directory)
       --add-dir <dir>     let the file tools work in this directory too, and the sandbox write there
                           (repeatable; --add-dir / inside a container makes the whole system the project)
-      --max-steps <n>     most model calls per task (default: 50)
+      --max-steps <n>     most steps per task, each a model call that may call tools (default: 50)
+      --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
+                          included, and --check and --reviewer don't start in its last quarter (default: none)
+      --no-budget-notes   don't tell the model what is left of its budget: by default, once half the steps, or
+                          half of --time-limit, are used, a note after each step says how many steps it has
+                          used and how much time is left, and before its last step that it is the last
+      --finish-gate       the first time the model says it is done, with a step left, send it back once if it
+                          changed files after it last ran anything, or its last test run failed (not in
+                          --time-limit's last quarter)
+      --no-wrap-up        at --max-steps, stop without one more call (no tools) asking the model what it
+                          changed, what it verified and what is left
       --escalate <model>  once a test command the model runs fails, this model takes the steps left
       --no-subagents      leave out the subagent tool
       --tools <names>     give the model only some of jig's tools, comma-separated, e.g. --tools bash
                           (from ${TOOL_NAMES.join(", ")}; default: all)
-      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far
+      --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far, and how often
+                          each of jig's mechanisms fired (retries, compactions, the wrap-up, ...)
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
-                          use this system prompt instead of jig's own (the project's AGENTS.md and the
-                          skills are still added after it)
+                          use this system prompt instead of jig's own (--check's instructions, the skills,
+                          what jig remembers and the project's AGENTS.md are still added after it)
       --check             in a one-shot run, tell the model nobody can answer and ask it to check its
                           work against the task before it finishes (costs turns; see the README)
       --reviewer <model>  before the task ends, this model checks the work against the task (it can only
                           look) and sends the problems it finds back to the model
+      --check-writes      after write_file and edit_file, tell the model of a syntax error the change made
+                          (Python, JavaScript, shell and JSON files), and of lines write_file left that look
+                          like placeholders for code left out. python3, node and bash check a file only where
+                          the model could run them on it unasked: with --yes, --mode auto or /mode auto, in
+                          edits mode in the sandbox without the network, or by an allow rule or an [a]lways
+                          answer; and not where a deny rule matches the check, a PreToolUse hook covers bash,
+                          or --tools leaves it out
+      --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
+                          dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -91,11 +115,43 @@ jig sessions list | export lists sessions, or exports them as fine-tuning data (
 jig review reviews an agent's finished work by running it, in a copy (jig review --help).
 
 Settings go in ~/.jig/settings.json and the project's .jig/settings.json: allow and deny rules for
-commands, hooks around tool calls, and MCP servers. A project's settings can only run programs or
-loosen the sandbox once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
+commands, paths to hide from commands and the file tools (hiddenPaths), hooks around tool calls and
+before a task ends, and MCP servers. A project's settings can only run programs or loosen the sandbox
+once you trust them (JIG_TRUST_PROJECT=1 trusts them without asking, for scripts).
 Skills (folders with a SKILL.md) are found in .jig/skills, .agents/skills and .claude/skills, in the
 project and in your home directory.
-Ctrl+C stops the current task (press it again to force quit).`;
+Ctrl+C stops the current task (press it again to force quit). At the prompt it clears the line, and
+pressed twice on an empty one it quits. A paste of several lines is one message, sent with Enter, and a
+line ending in \\ goes on in the next. A session can also read its tasks and /commands from a pipe, one
+on each line: there a line ending in \\ doesn't go on.
+
+A task given on the command line exits with 0 when the model finished, 1 on an error, 2 when it ran out
+of steps (--max-steps), 3 when a reply hit the output limit or the context window, 4 when the model
+declined, 5 when tool calls needed approval and there was no terminal to ask (see --yes), 6 when the model
+made the same tool calls, with the same results, ${SAME_STEPS} steps in a row, 7 when it reached --time-limit,
+8 when the model gave a second reply with no text or tool call, and 130 when interrupted.`;
+
+/** How a task ended: as the loop stopped, or "error" if it failed. */
+type Ending = RunResult["stop"] | "error";
+
+/**
+ * A one-shot run's exit code, by how its task ended, so a script can tell work the model finished from a
+ * task that stopped short: `jig "fix the tests" && git commit` shouldn't commit after the step limit.
+ * Any other ending, a failure included, is 1.
+ */
+const EXIT_CODES: Partial<Record<Ending, number>> = { end_turn: 0, max_steps: 2, max_tokens: 3, model_context_window_exceeded: 3, refusal: 4, unapproved: 5, loop: 6, time_limit: 7, empty: 8, interrupted: 130 };
+
+// With no terminal, how many tool calls that need approval a task may make before it stops (see authorize),
+// and why it stopped, as the calls left in the reply and the user are told.
+const MAX_UNAPPROVED = 3;
+const NO_APPROVER = `${MAX_UNAPPROVED} tool calls needed approval, and with no terminal there is no one to give it (see --yes)`;
+
+// With --time-limit, the share of it, at the end, in which --check, the reviewer and --finish-gate no longer
+// start: what is left must hold the check and the fixes after it, and in milestone 9 --check ran 12 attempts
+// into their time limit, against 4 without it.
+const CHECK_SHARE = 0.25;
+// What a command, a hook or a tool call stopped at --time-limit is said to have been stopped by.
+const TIME_UP = "the time limit (--time-limit) was reached";
 
 const SUBAGENT_MAX_STEPS = 30;
 // A review reads what the task names and the work touched, not the whole project, and the task's clock runs.
@@ -186,6 +242,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       cwd: { type: "string", short: "C", default: "." },
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
+      "time-limit": { type: "string" },
+      "budget-notes": { type: "boolean", default: true },
+      "finish-gate": { type: "boolean", default: false },
+      "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
       subagents: { type: "boolean", default: true },
       tools: { type: "string" },
@@ -195,6 +255,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       memory: { type: "boolean", default: true },
       check: { type: "boolean", default: false },
       reviewer: { type: "string" },
+      "check-writes": { type: "boolean", default: false },
+      "tolerant-edits": { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -227,6 +289,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (!MODES.includes(mode)) throw new Error(`--mode must be one of: ${MODES.join(", ")}`);
   const maxSteps = Number(values["max-steps"]);
   if (!Number.isInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer");
+  const timeLimit = values["time-limit"] === undefined ? undefined : Number(values["time-limit"]);
+  if (timeLimit !== undefined && !(timeLimit > 0 && timeLimit * 1000 < 2 ** 31)) throw new Error("--time-limit must be a positive number of seconds, under 24 days");
   const compactAt = Number(values["compact-at"]);
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
   ui.setThinkingVisible(!values["hide-thinking"]);
@@ -234,32 +298,67 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
   const toolNames = values.tools === undefined ? undefined : parseToolList(values.tools);
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
+  // Every model and loop below counts its mechanisms in the stats file as they fire, subagents' included.
+  const count = stats && ((event: Mechanism) => stats.count(event));
 
   // Flags win over the settings files, which win over the defaults: sandbox on, network off.
   const settings = await loadSettings(cwd);
   const network = values["allow-network"] ?? settings.network ?? false;
   const wantSandbox = values.sandbox ?? settings.sandbox ?? true;
-  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths }) : undefined;
+  // On Linux jig holds one PID namespace for the session (see sandbox.ts's Keeper); if it can't, each command
+  // gets one of its own, which ends a command's background jobs with the command. Said once, at the first command.
+  const onFallback = () =>
+    ui.notice("jig couldn't set up one process namespace for the whole session (bubblewrap is too old, or the kernel refused it), so each command gets its own: a job left in the background then ends with the command that started it.");
+  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths, onFallback }) : undefined;
   if (values.sandbox && !sandbox) throw new Error(`No sandbox: ${sandboxProblem()}.`);
   // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
   if (!sandbox && settings.hiddenPaths.length) ui.notice("The settings' hiddenPaths need the sandbox: without it, commands can read them.");
+  // The file tools run outside the sandbox, so they refuse what it locks in git themselves, with it or without.
+  const gitLocked = lockedGitPaths(cwd, dirs);
   const contained = !!sandbox && !network;
-  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny: settings.deny, contained, dirs });
-  let snapshots: Snapshots | undefined = new Snapshots(cwd);
+  // The whole of a command's output too long to show, for the model to search: the main loop's policy lets
+  // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
+  // policy doesn't know them, so their results don't point to a file their commands couldn't read.
+  const outputs = new OutputFiles();
+  // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, a command still running is killed
+  // as Ctrl+C kills it, and the session's keeper (sandbox.ts) ends with the whole PID namespace, so a job a
+  // command left in the background dies too: only bubblewrap's sandbox would otherwise take them down with jig.
+  process.on("exit", () => {
+    killCommands();
+    sandbox?.close?.();
+    outputs.remove();
+  });
+  // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
+  // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
+  // shell would give.
+  for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
+  let snapshots: Snapshots | undefined = new Snapshots(cwd, settings.hiddenPaths);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
   const compactLimit = compactAt && Math.min(compactAt, Math.floor(contextWindow(model) * 0.8));
 
   // Extensions: skills, the MCP servers' tools, hooks, and subagents.
   // jig's own skills are for writing skills; a plain one-shot task (a benchmark's, say) sees only yours.
-  const skillOptions = { hidden: values["hide-skill"], ...(taskText && !skillsVerb && { builtin: null }) };
+  const skillOptions = { hidden: values["hide-skill"], hiddenPaths: settings.hiddenPaths, dirs, ...(taskText && !skillsVerb && { builtin: null }) };
   let { skills, warnings } = discoverSkills(cwd, undefined, skillOptions);
   for (const warning of warnings) ui.notice(warning);
   const mcp = await connectMcpServers(settings.mcpServers, cwd);
   cleanup.push(mcp.close);
   for (const error of mcp.errors) ui.notice(error);
-  const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd) : undefined;
+  // A deny rule or hook that names a tool still holds once a clash of names has added a hash to it.
+  const deny = [...settings.deny, ...[...mcp.renamed].filter(([, { was }]) => settings.deny.includes(was)).map(([name]) => name)];
+  const permissions = new Permissions(mode, cwd, { allow: settings.allow, deny, contained, dirs, outputs });
+  const hooks = settings.hooks.length ? hookRunner(settings.hooks, cwd, mcp.renamed) : undefined;
+  // The files the task changed, for the Stop hooks: by the snapshot taken before it, while /undo works.
+  const changedFiles = () => {
+    try {
+      return snapshots?.changed();
+    } catch {
+      return undefined;
+    }
+  };
+  const stopHooks = settings.hooks.some((hook) => hook.event === "Stop") ? stopHookRunner(settings.hooks, cwd, changedFiles) : undefined;
   let extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
   // Memory: notes from earlier sessions (--no-memory leaves them out, for a with-and-without comparison).
   let memories = values.memory ? loadMemories(cwd) : [];
@@ -273,24 +372,25 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   ];
 
   // The system prompt (with the project's instructions) is fixed for a conversation; /reset rebuilds it.
-  let instructions = loadInstructions(cwd);
+  let instructions = followedInstructions(cwd);
   // jig's own tools, unless --tools picks some. The prompts then name only the tools there are.
   const own = selectTools(toolNames);
   const named = (tools: Tool[]) => (toolNames ? tools.map((tool) => tool.definition.name) : undefined);
   // Subagents research: they get the tools that only look (and bash, under plan mode's rules), and never ask.
-  const research = new Permissions("plan", cwd, { deny: settings.deny, contained, dirs });
+  const research = new Permissions("plan", cwd, { deny, contained, dirs });
   const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
   let researchTools = researchFrom(extensions);
   const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
-    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools }), true);
+    return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true);
   };
   const subagents: SubagentSetup = {
     callModel: newSubagentModel(),
     tools: researchTools,
     cwd,
     dirs,
+    hidden: settings.hiddenPaths,
     maxSteps: SUBAGENT_MAX_STEPS,
     compactAt: compactLimit,
     async authorize(tool, input) {
@@ -299,6 +399,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     },
     sandbox,
     hooks,
+    count,
     ui: ui.subagentUI,
   };
   // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
@@ -307,7 +408,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (!reviewing) return undefined;
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     const api = (values.api ?? defaultApi(reviewing)) as Api;
-    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools }), true, { kind: "reviewed", model: reviewing });
+    const callModel = metered(createModel({ model: reviewing, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true, { kind: "reviewed", model: reviewing });
     return reviewer(reviewing, { ...subagents, tools: researchTools, callModel, maxSteps: REVIEW_MAX_STEPS });
   };
   const withSubagents = values.subagents && (toolNames?.includes("subagent") ?? true);
@@ -339,9 +440,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // The same for the model that takes over, so the conversation carries over whole.
     const stronger = values.escalate;
     escalation = stronger
-      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools }), false, { kind: "escalated", model: stronger }) }
+      ? { model: stronger, callModel: metered(createModel({ model: stronger, effort, api: (values.api ?? defaultApi(stronger)) as Api, baseURL, system, tools, count }), false, { kind: "escalated", model: stronger }) }
       : undefined;
-    return metered(createModel({ model, effort, api, baseURL, system, tools }));
+    return metered(createModel({ model, effort, api, baseURL, system, tools, count }));
   };
   // jig skills learn and jig memory reflect work on the last session, unless --resume names another.
   const fromLast = values.continue || skillsVerb === "learn" || !!memoryVerb;
@@ -352,6 +453,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     ? new Conversation(new SessionFile(resumeFrom), SessionFile.load(resumeFrom))
     : new Conversation(SessionFile.create(cwd, model));
   let task: AbortController | undefined; // the running task, so Ctrl+C can stop it
+  let unapproved = 0; // the running task's calls that needed approval, with no terminal to ask
   // Things the model should know before the next request, like an /undo. Plan mode is announced when it
   // starts and ends: the system prompt can't change mid-conversation, so this rides on the user's message.
   const notes: string[] = [];
@@ -361,12 +463,20 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const decision = permissions.decide(tool, input);
     if (decision === "allow") return null;
     if (decision !== "ask") return decision.refuse;
-    if (!process.stdin.isTTY) return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    if (!process.stdin.isTTY) {
+      // The model would try call after call that can't run until its steps ran out. It may manage without
+      // one or two (a check it can skip), so the task stops at the third.
+      count?.("call.unapproved");
+      if (++unapproved >= MAX_UNAPPROVED) task?.abort(NO_APPROVER);
+      return "Not run: there is no one to approve it (no terminal). The user can allow tool calls with --yes.";
+    }
     const always = permissions.alwaysLabel(tool, input);
-    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `);
+    // The task stopping (at --time-limit) closes the question unanswered, so it doesn't wait past the limit.
+    const signal = task?.signal;
+    const answer = await ui.ask(`  Allow? [y]es / [n]o${always ? ` / [a]lways allow ${always}` : ""}: `, signal);
     if (answer === null) {
       task?.abort(); // Ctrl+C at the prompt stops the whole task
-      return "Not run: the user stopped the task.";
+      return `Not run: ${whyStopped(signal, "the user stopped the task")}.`;
     }
     const choice = answer.trim().toLowerCase();
     if (always && choice.startsWith("a")) {
@@ -376,25 +486,61 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return choice.startsWith("y") ? null : "The user declined this tool call. Ask them how they want to proceed.";
   }
 
+  // --check-writes runs python3, node or bash on a file only where the model could run that program on it
+  // itself without asking (see write-check.ts): not without the bash tool, nor where a PreToolUse hook covers
+  // bash, as jig can't ask a hook about a command the model didn't make; otherwise where the policy, as it is
+  // now, would run `command` unasked and no deny rule matches `script`, what runs in its place. The user is
+  // told once why a check was left out; --stats counts each one.
+  const bash = bashTool.definition.name;
+  const programsOff = !own.some((tool) => tool.definition.name === bash)
+    ? "bash isn't among the model's tools"
+    : hooksFor(settings.hooks, "PreToolUse", [bash]).length
+      ? "a PreToolUse hook covers bash"
+      : undefined;
+  let toldChecksOff = false;
+  function mayRun(command: string, script: string): boolean {
+    const decision = permissions.decide(bashTool, { command });
+    const why = programsOff ?? (decision === "ask" ? "the model's commands ask first here" : decision !== "allow" || permissions.denies(script) ? "a deny rule refuses it" : undefined);
+    if (why && !toldChecksOff) {
+      toldChecksOff = true;
+      ui.notice(`--check-writes runs python3, node and bash only where the model could run them itself without asking, so it left out a check by ${command.split(" ")[0]}: ${why}.`);
+    }
+    return !why;
+  }
+
   const agent: AgentOptions = {
     callModel: newModel(),
     escalate: escalation,
     tools,
     cwd,
     dirs,
+    hidden: settings.hiddenPaths,
+    gitLocked,
+    // Not the subagents' or the reviewer's: they don't change files.
+    checkWrites: values["check-writes"],
+    // For the model --escalate hands over to too, as the two share these options.
+    mayRun,
+    tolerantEdits: values["tolerant-edits"],
     maxSteps,
     compactAt: compactLimit,
     authorize,
     sandbox,
+    outputs,
     hooks,
+    // Not the subagents' or the reviewer's: their answers don't end the task.
+    stopHooks,
     review: oneShot ? REVIEW : undefined,
     reviewer: newReviewer(),
+    // The files the task changed, by its snapshot, so that the gate sees what commands changed too.
+    finishGate: values["finish-gate"] ? { changed: changedFiles } : undefined,
+    wrapUp: values["wrap-up"],
+    count,
     ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
   };
   conversation.describe(context);
 
-  /** Runs `work` as the current task, so Ctrl+C stops it. */
-  async function asTask(work: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+  /** Runs `work` as the current task, so Ctrl+C stops it. Resolves to what `work` does, or to how it failed. */
+  async function asTask<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T | "interrupted" | "error"> {
     const controller = (task = new AbortController());
     const onSigint = () => {
       if (controller.signal.aborted) process.exit(130); // second Ctrl+C: give up waiting
@@ -403,19 +549,22 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     };
     process.on("SIGINT", onSigint);
     try {
-      await work(controller.signal);
-      return true;
+      return await work(controller.signal);
     } catch (err) {
       const message = controller.signal.aborted ? "Interrupted." : describeError(err);
       ui.error(message);
       stats?.failed(message);
-      return false;
+      return controller.signal.aborted ? "interrupted" : "error";
     } finally {
       process.off("SIGINT", onSigint);
     }
   }
 
-  function runTask(text: string, label = text): Promise<boolean> {
+  async function runTask(text: string, label = text): Promise<Ending> {
+    // --time-limit counts from here, the snapshot included.
+    const begun = Date.now();
+    const deadline = timeLimit === undefined ? undefined : begun + timeLimit * 1000;
+    const checkUntil = timeLimit === undefined ? undefined : begun + timeLimit * 1000 * (1 - CHECK_SHARE);
     if ((permissions.mode === "plan") !== modelKnowsPlanMode) {
       modelKnowsPlanMode = permissions.mode === "plan";
       notes.push(
@@ -425,36 +574,91 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       );
     }
     takeSnapshot(label);
+    // The loop's note after an empty reply, left last when the previous request ended without an answer:
+    // it asks the model to go on with that request, so the model is told it is over.
+    const last = conversation.messages.at(-1)?.content;
+    if (typeof last === "string" && AFTER_EMPTY.includes(last)) notes.push("Your previous request ended without an answer from you.");
     const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
     notes.length = 0;
     conversation.push({ role: "user", content: message });
+    unapproved = 0;
     const started = Date.now();
-    return asTask(async (signal) => {
-      const result = await runAgent(conversation, agent, signal);
+    const ending = await asTask(async (signal) => {
+      // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
+      // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
+      const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
+      const budgetNotes = values["budget-notes"] ? { begun, deadline } : undefined;
+      const result = await runAgent(conversation, { ...agent, checkUntil, budgetNotes }, signal).finally(() => clearTimeout(timer));
+      // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
+      // after a Ctrl+C the task can still be stopping when the deadline passes.
+      if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";
+      if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
       report(result, Date.now() - started, maxSteps);
+      return result.stop;
     });
+    // However the task ended: a command may have run before it failed or was stopped.
+    warnOfGitChanges();
+    return ending;
+  }
+
+  /**
+   * Says which files telling git where its config is commands changed, which git directories they made git
+   * pass over, and which directories they made git directories, where the sandbox doesn't stop them.
+   */
+  function warnOfGitChanges(): void {
+    for (const path of sandbox?.gitChanges?.() ?? []) {
+      // A commondir or a .git sends git to another git directory's config; a config.worktree adds to the config;
+      // without its HEAD, objects and refs in order, git passes over a git directory, to one above it if any;
+      // and a directory made a git directory (its path ends in a slash) is the repository git there finds.
+      const name = basename(path);
+      const [change, effect] = path.endsWith(sep)
+        ? [`made ${path.slice(0, -1)} a git directory`, "git there would now take it for its repository"]
+        : ["HEAD", "objects", "refs"].includes(name)
+          ? [`removed or broke ${path}`, `git no longer takes ${dirname(path)} for a git directory, so it fails there or uses another above it`]
+          : [`created or changed ${path}`, name === "config.worktree" ? "git can read more config from it" : "git would now read its config from elsewhere"];
+      ui.notice(`A command ${change}, which the sandbox doesn't prevent: ${effect}, and a config can name programs for git to run. Check it before you run git in this repository.`);
+    }
   }
 
   /** /<skill> [task]: the user picked the skill, so its instructions come with the request. */
-  function runSkill(skill: Skill, task: string): Promise<boolean> {
-    const content = loadSkill(skill);
+  async function runSkill(skill: Skill, task: string): Promise<Ending> {
+    const content = skillContent(skill);
+    if (content === undefined) return "error";
     conversation.pin(`skill:${skill.name}`, content);
     return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
   }
 
   /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
-  function runSkillWriting(task: string, label: string): Promise<boolean> {
+  function runSkillWriting(task: string, label: string): Promise<Ending> {
     const writer = skills.find((skill) => skill.name === "skill-writer");
-    if (!writer) return runTask(task, label);
-    const content = loadSkill(writer);
+    const content = writer && skillContent(writer);
+    if (!writer || content === undefined) return runTask(task, label);
     conversation.pin(`skill:${writer.name}`, content);
     return runTask(`${content}\n\n${task}`, label);
   }
 
-  /** Finds the skills and memories again (new ones may have been saved) and gives the model the new lists. */
+  /**
+   * A skill's instructions, or a notice and undefined if its SKILL.md is gone (or is a named pipe, or a link
+   * where the file tools don't read) since jig found it: a command or a checkout can do that mid-session,
+   * and it is no reason to end the session.
+   */
+  function skillContent(skill: Skill): string | undefined {
+    try {
+      return loadSkill(skill, settings.hiddenPaths, [cwd, ...dirs]);
+    } catch (err) {
+      ui.notice((err as Error).message);
+      return undefined;
+    }
+  }
+
+  /**
+   * Finds the skills and memories again (new ones may have been saved) and gives the model the new lists,
+   * saying why a skill is left out, as at the start: a command can have changed one since.
+   */
   function refreshSkills(): void {
-    ({ skills } = discoverSkills(cwd, undefined, skillOptions));
+    ({ skills, warnings } = discoverSkills(cwd, undefined, skillOptions));
+    for (const warning of warnings) ui.notice(warning);
     memories = values.memory ? loadMemories(cwd) : [];
     extensions = [...(skills.length ? [skillTool(skills)] : []), ...mcp.tools];
     researchTools = researchFrom(extensions);
@@ -474,7 +678,13 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   }
 
   function undo(): void {
-    const restored = snapshots?.undo();
+    let restored: Restored | undefined;
+    try {
+      restored = snapshots?.undo();
+    } catch (err) {
+      // A git failure (a lock another git left, say) is no reason to end the session.
+      return ui.notice(`Couldn't undo (the snapshot is kept for another /undo): ${(err as Error).message.split("\n")[0]}`);
+    }
     if (!restored) return ui.notice(snapshots ? "Nothing to undo." : "/undo is off: the project couldn't be snapshotted.");
     const { changed, removed } = restored;
     if (!changed.length && !removed.length) return ui.notice("The last task didn't change any files.");
@@ -494,7 +704,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/undo") {
       undo();
     } else if (name === "/reset") {
-      instructions = loadInstructions(cwd);
+      instructions = followedInstructions(cwd);
       refreshSkills();
       agent.callModel = newModel();
       agent.escalate = escalation;
@@ -536,7 +746,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/mcp") {
       if (!Object.keys(settings.mcpServers).length) ui.notice('No MCP servers. Add them under "mcpServers" in jig\'s settings.');
       for (const line of [...mcp.status, ...mcp.errors]) ui.println(`  ${line}`);
-      for (const tool of mcp.tools) ui.println(ui.dim(`    ${tool.definition.name}${tool.kind === "read" ? " (read-only)" : ""}`));
+      for (const tool of mcp.tools) {
+        const renamed = mcp.renamed.get(tool.definition.name);
+        const notes = [...(renamed ? [`from "${renamed.server}"`] : []), ...(tool.kind === "read" ? ["read-only"] : [])];
+        ui.println(ui.dim(`    ${tool.definition.name}${notes.length ? ` (${notes.join(", ")})` : ""}`));
+      }
     } else if (skills.some((skill) => name === `/${skill.name}`)) {
       await runSkill(skills.find((skill) => name === `/${skill.name}`)!, line.slice(name.length).trim());
     } else if (name === "/context") {
@@ -546,7 +760,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     } else if (name === "/compact") {
       await asTask(async (signal) => {
         ui.notice("Compacting the conversation…");
-        const done = await compact(conversation, agent.callModel, { signal });
+        const done = await compact(conversation, agent.callModel, { signal }).catch((err: unknown) => {
+          throw new Error(`Compaction failed: ${describeError(err)}`); // compact's "the model wrote no summary" doesn't say what failed
+        });
         ui.notice(done ? `Compacted ${formatTokens(done.before)} tokens into about ${formatTokens(done.after)}.` : "Nothing to compact yet.");
       });
     } else {
@@ -558,12 +774,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
     const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText, memoryVerb ? `jig memory reflect ${given}` : taskText);
-    if (!(await run)) process.exitCode = 1;
+    process.exitCode = EXIT_CODES[await run] ?? 1;
     return;
   }
 
   const through = api === defaultApi(model) && !baseURL ? "" : ` (${api} API${baseURL ? ` at ${baseURL}` : ""})`;
-  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model}${through} · effort ${effort ?? "default"} · mode ${mode} · ${cwd}`)}`);
+  ui.println(`${ui.bold("jig")} ${ui.dim(`· ${model}${through} · effort ${effortFor(model, api, effort) ?? "default"} · mode ${mode} · ${cwd}`)}`);
   if (noSandbox) ui.notice(`${noSandbox} Commands run directly on this machine.`);
   else ui.println(ui.dim(sandbox ? `Commands run in the ${sandbox.description}.` : "Commands run directly on this machine (sandbox off)."));
   if (instructions.length) ui.println(ui.dim(`Following ${describeInstructions(instructions)}.`));
@@ -577,7 +793,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   ui.println(ui.dim("Type a task and press Enter. /help shows the commands."));
   for (;;) {
     ui.println();
-    const line = await ui.ask(ui.bold("> "));
+    const line = await ui.askTask(ui.bold("> "));
     if (line === null) break;
     const input = line.trim();
     if (input.startsWith("/")) {
@@ -586,15 +802,19 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       await runTask(input);
     }
   }
+  // Once more: a job a command left running in the background may have changed one since the last task.
+  warnOfGitChanges();
 }
 
 /**
  * The settings in effect: the user's, plus the project's. A repository could run programs through its
  * settings (hooks, MCP servers) or loosen the sandbox, so those parts of a project's settings only apply
- * once the user trusts them, which is asked again whenever the file changes. Deny rules always apply.
+ * once the user trusts them, which is asked again whenever the file changes. Deny rules and hidden paths
+ * always apply.
  */
 async function loadSettings(cwd: string): Promise<Settings> {
-  const { user, project } = readSettings(cwd);
+  const { user, project, warnings } = readSettings(cwd);
+  for (const warning of warnings) ui.notice(warning);
   if (!project) return user;
   const asks = needsTrust(project.settings);
   const file = relative(cwd, project.path);
@@ -608,21 +828,31 @@ async function loadSettings(cwd: string): Promise<Settings> {
   }
   if (!trusted) {
     const how = process.stdin.isTTY ? "" : " Run jig in a terminal to review it, or set JIG_TRUST_PROJECT=1.";
-    ui.notice(`Not using ${file} (apart from its deny rules) until you trust it.${how}`);
+    ui.notice(`Not using ${file} (apart from its deny rules and hidden paths) until you trust it.${how}`);
   }
   return mergeSettings(user, project.settings, trusted);
 }
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */
-function hookRunner(hooks: Hook[], cwd: string): ToolHooks {
-  const run = async (event: HookEvent, call: Parameters<typeof runHooks>[2]) => {
-    const outcome = await runHooks(hooks, event, call, cwd);
+function hookRunner(hooks: Hook[], cwd: string, renamed: McpServers["renamed"]): ToolHooks {
+  const run = async (event: Exclude<HookEvent, "Stop">, call: Parameters<typeof runHooks>[2], signal?: AbortSignal) => {
+    const outcome = await runHooks(hooks, event, call, cwd, { signal, was: renamed.get(call.tool)?.was });
     for (const warning of outcome.warnings) ui.notice(warning);
     return outcome;
   };
   return {
-    before: async (tool, input) => (await run("PreToolUse", { tool, input })).block ?? null,
-    after: async (tool, input, output) => (await run("PostToolUse", { tool, input, output })).feedback ?? null,
+    before: async (tool, input, signal) => (await run("PreToolUse", { tool, input }, signal)).block ?? null,
+    after: async (tool, input, output, signal) => (await run("PostToolUse", { tool, input, output }, signal)).feedback ?? null,
+  };
+}
+
+/** The settings' Stop hooks, before a task ends. Likewise, a broken one is reported and otherwise ignored. */
+function stopHookRunner(hooks: Hook[], cwd: string, changedFiles: () => string[] | undefined): AgentOptions["stopHooks"] {
+  return async ({ task, answer, active, session }, signal) => {
+    const stop = { task, last_message: answer, stop_hook_active: active, session_path: session, changed_files: changedFiles() };
+    const outcome = await runStopHooks(hooks, stop, cwd, { signal });
+    for (const warning of outcome.warnings) ui.notice(warning);
+    return outcome.block ?? null;
   };
 }
 
@@ -646,6 +876,13 @@ function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
+/** The project's AGENTS.md files, and a notice of each one left out. */
+function followedInstructions(cwd: string): Instructions[] {
+  const { instructions, warnings } = loadInstructions(cwd);
+  for (const warning of warnings) ui.notice(warning);
+  return instructions;
+}
+
 function describeInstructions(instructions: { path: string }[]): string {
   return instructions.map((file) => file.path).join(", ");
 }
@@ -666,8 +903,14 @@ function report(result: RunResult, ms: number, maxSteps: number): void {
     model_context_window_exceeded: "The conversation no longer fits in the context window. Use /compact or /reset.",
     refusal: "The model declined this request.",
     interrupted: "Interrupted.",
+    loop: `Stopped: the model made the same tool calls, and got the same results, ${SAME_STEPS} steps in a row.`,
+    empty: "", // the loop has said so
+    time_limit: "Stopped at the time limit (--time-limit).",
+    unapproved: `Stopped: ${NO_APPROVER}. Rules in jig's settings can allow them too.`,
   };
   const note = notes[result.stop] ?? `Stopped (${result.stop}).`;
+  // The model's wrap-up at the step limit wasn't streamed (it is asked for like a summary), so it is printed here.
+  if (result.stop === "max_steps" && result.text.trim()) ui.println(result.text.trim());
   if (note) ui.notice(note);
   // The benchmark runner (bench/run.ts) reads these lines, so keep their format.
   const tokens = (usage: Usage) => `${formatTokens(usage.input + usage.cacheWrite + usage.cacheRead)} tokens in (${formatTokens(usage.cacheRead)} from cache) · ${formatTokens(usage.output)} out`;

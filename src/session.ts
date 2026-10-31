@@ -1,19 +1,32 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
+import { projectDir } from "./paths.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
-/** One line of a session file. */
+/**
+ * One line of a session file. A start begins with type and cwd, which paths.ts reads without the rest. Each
+ * line after the start also has `at`, the time it was written.
+ */
 type Entry =
   | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
-  | { type: "message"; message: MessageParam }
+  | ({ type: "message"; message: MessageParam } & Timing)
   | { type: "compaction"; messages: MessageParam[] };
 
-/** Where a project's sessions are kept: ~/.jig/sessions/<project path, with / replaced by ->. */
+/**
+ * How long the step behind a message took, in milliseconds, so a session shows where a task's time went:
+ * the model call that wrote a reply (`ms`, retries included), or each tool call whose result the message
+ * holds, by the call's id (`toolMs`; calls that only read run at the same time, so these can overlap).
+ */
+export interface Timing {
+  ms?: number;
+  toolMs?: Record<string, number>;
+}
+
+/** Where a project's sessions are kept: ~/.jig/sessions/<project key> (see projectKey). */
 export function sessionDir(cwd: string): string {
-  return join(jigHome(), "sessions", projectKey(cwd));
+  return projectDir("sessions", cwd);
 }
 
 /**
@@ -60,11 +73,12 @@ export class SessionFile {
       appendFileSync(this.path, `${JSON.stringify(this.start)}\n`);
       this.start = undefined;
     }
-    appendFileSync(this.path, `${JSON.stringify(entry)}\n`);
+    const { type, ...rest } = entry;
+    appendFileSync(this.path, `${JSON.stringify({ type, at: new Date().toISOString(), ...rest })}\n`);
   }
 
-  /** The messages a session file ended with. */
-  static load(path: string): MessageParam[] {
+  /** The messages a session file ended with; with `whole`, every message it holds, as if never compacted. */
+  static load(path: string, whole = false): MessageParam[] {
     let messages: MessageParam[] = [];
     for (const line of readFileSync(path, "utf8").split("\n")) {
       let entry: Entry;
@@ -74,7 +88,7 @@ export class SessionFile {
         continue; // blank, or cut off by a crash mid-write
       }
       if (entry.type === "message") messages.push(entry.message);
-      else if (entry.type === "compaction") messages = [...entry.messages];
+      else if (entry.type === "compaction" && !whole) messages = [...entry.messages];
     }
     return answerOpenToolCalls(messages);
   }
@@ -91,19 +105,24 @@ export class SessionFile {
 }
 
 /**
- * If the session ended while tools were running, the last assistant message has tool calls with no
- * results, and the API would reject the history. Answer them as interrupted.
+ * If the session ended while tools were running, an assistant message has tool calls with no results, and
+ * the API would reject the history. Answer them as interrupted, right after the calls. Not only at the end:
+ * the answers aren't written to the file, so once a continued session goes on, the open calls are mid-file.
  */
-function answerOpenToolCalls(messages: MessageParam[]): MessageParam[] {
-  const last = messages.at(-1);
-  if (last?.role !== "assistant" || typeof last.content === "string") return messages;
-  const calls = last.content.filter((block) => block.type === "tool_use");
-  if (calls.length === 0) return messages;
-  const results = calls.map((call) => ({
-    type: "tool_result" as const,
-    tool_use_id: call.id,
-    content: "Not run: the session ended before this call ran.",
-    is_error: true,
-  }));
-  return [...messages, { role: "user", content: results }];
+export function answerOpenToolCalls(messages: MessageParam[]): MessageParam[] {
+  return messages.flatMap((message, i) => {
+    if (message.role !== "assistant" || typeof message.content === "string") return [message];
+    const next = messages[i + 1]?.content;
+    const answered = new Set(Array.isArray(next) ? next.flatMap((block) => (block.type === "tool_result" ? [block.tool_use_id] : [])) : []);
+    const results = message.content
+      .filter((block) => block.type === "tool_use")
+      .filter((call) => !answered.has(call.id))
+      .map((call) => ({
+        type: "tool_result" as const,
+        tool_use_id: call.id,
+        content: "Not run: the session ended before this call ran.",
+        is_error: true,
+      }));
+    return results.length ? [message, { role: "user" as const, content: results }] : [message];
+  });
 }

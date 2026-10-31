@@ -1,6 +1,7 @@
 import { writeFileSync } from "node:fs";
 import { addUsage, type RunResult, type Usage } from "./agent.ts";
 import type { CallModel } from "./model.ts";
+import { writeAnew } from "./tools/util.ts";
 
 /** Calls made by another model than the session's: the one that took over (--escalate), or the reviewer. */
 export interface Share {
@@ -15,12 +16,83 @@ interface ShareTotals {
 }
 
 /**
+ * The mechanisms --stats counts, each time one fires: what jig did besides calling the model and running
+ * the tools. A change to one of them can then be seen to run at all; in milestone 28, two candidates'
+ * changes ran in none of their attempts, which only reading the sessions showed.
+ */
+export type Mechanism =
+  // The model's calls (model.ts): a request the SDK sent again (a rate limit, an overload, a server error,
+  // a timeout), and a reply jig asked for again because it broke off, went quiet, or its tool input wasn't JSON.
+  | "retry.api"
+  | "retry.brokeOff"
+  | "retry.quiet"
+  | "retry.malformed"
+  // The loop (agent.ts): a summary replaced the conversation; past --compact-at one failed, so the task went
+  // on as it was; the API said the conversation was too long, so it was compacted and the call made again.
+  | "compaction"
+  | "compaction.failed"
+  | "compaction.tooLong"
+  // A reply with no text or tool call, one cut off at the output limit (the model was asked to go on, or to
+  // continue), and one a safety classifier declined.
+  | "reply.empty"
+  | "reply.continued"
+  | "reply.refused"
+  // Tool calls that didn't run as asked: a repeat of an earlier call in the reply, a tool the request didn't
+  // offer, a call cut off at the output limit, invalid input, and one the permission check refused (plan
+  // mode, a deny rule, a subagent's call that would need asking, the user's no), which includes those the
+  // CLI counts as needing an approval nobody was there to give; a PreToolUse hook's block, a PostToolUse
+  // hook's report on a result, and output cut to its start and end to fit.
+  | "call.repeat"
+  | "call.notOffered"
+  | "call.cutOff"
+  | "call.invalid"
+  | "call.refused"
+  | "call.unapproved"
+  | "hook.blocked"
+  | "hook.feedback"
+  | "output.truncated"
+  // What --check-writes added to a write_file or edit_file result: a syntax error the change made, and lines
+  // that look like placeholders for code left out, in a file write_file made much shorter. And a change it
+  // didn't check with python3, node or bash, as the model couldn't have run that program unasked.
+  | "write.syntaxError"
+  | "write.placeholder"
+  | "write.checkSkipped"
+  // An edit_file call --tolerant-edits applied: its old_string matched one place only once typographic
+  // punctuation, or trailing whitespace too, didn't count.
+  | "edit.tolerant"
+  // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
+  // on the last step, so the task ended anyway.
+  | "hook.stopBlocked"
+  | "hook.stopCapped"
+  // --check's request, --reviewer's review and the problems it sent back (either skipped, too close to
+  // --time-limit), --escalate's handover, the stop for repeating the same calls, and the wrap-up at --max-steps.
+  | "check"
+  | "check.skipped"
+  | "review"
+  | "review.skipped"
+  | "review.problems"
+  | "escalated"
+  | "loop"
+  | "wrapUp"
+  // The budget notes' note after a step's tool results on the steps (and time) used, and the one before the
+  // last step instead.
+  | "budgetNote"
+  | "budgetNote.lastStep"
+  // --finish-gate sending the model back at its first stop: a file changed after it last ran anything, or its
+  // last test run failed; and not looking, too close to --time-limit.
+  | "finishGate"
+  | "finishGate.skipped";
+
+/**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,
- * tokens (subagents included) and tool calls. It is rewritten after every model call, so a run that
- * is killed, at a benchmark's time limit say, still leaves its numbers behind.
+ * tokens (subagents included), tool calls, and how often each Mechanism fired. It is rewritten after
+ * every model call and every mechanism that fires, so a run that is killed, at a benchmark's time limit
+ * say, still leaves its numbers behind.
  */
 export class Stats {
   private readonly path: string;
+  /** The path is in /dev or /proc, /dev/stdout say, so it is written to as it is. */
+  private readonly direct: boolean;
   private readonly started = Date.now();
   private readonly data: {
     model: string;
@@ -36,11 +108,16 @@ export class Stats {
     /** With --reviewer: the reviewer's calls and tokens, which the totals include. */
     reviewed?: ShareTotals;
     toolCalls: Record<string, number>;
+    /** How often each mechanism fired, by name, subagents' and the reviewer's included; those that didn't are left out. */
+    events: Partial<Record<Mechanism, number>>;
     seconds: number;
   };
 
   constructor(path: string, model: string) {
     this.path = path;
+    // By where the path is, not by what is there: a command, even one an earlier run left in the background,
+    // can put a link to a device or a named pipe anywhere it can write, but not in /dev or /proc.
+    this.direct = /^\/(dev|proc)\//.test(path);
     this.data = {
       model,
       stop: null,
@@ -49,6 +126,7 @@ export class Stats {
       subagentModelCalls: 0,
       usage: { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 },
       toolCalls: {},
+      events: {},
       seconds: 0,
     };
     this.write();
@@ -75,6 +153,12 @@ export class Stats {
     this.data.toolCalls[name] = (this.data.toolCalls[name] ?? 0) + 1;
   }
 
+  /** Written at once: a run killed while the API is asked again, say, still shows that it was. */
+  count(event: Mechanism): void {
+    this.data.events[event] = (this.data.events[event] ?? 0) + 1;
+    this.write();
+  }
+
   finish(result: RunResult): void {
     this.data.stop = result.stop;
     this.data.steps += result.steps;
@@ -87,8 +171,17 @@ export class Stats {
     this.write();
   }
 
+  /**
+   * Written anew and renamed into place (see writeAnew): jig writes it outside the sandbox, often in the
+   * project, where a command can put a symlink or a hard link in its place. A path in /dev or /proc,
+   * /dev/stdout or a process substitution's /dev/fd/63 say, is written to as it is: jig can't make a file
+   * there, or as root mustn't replace /dev/stdout with one. A named pipe anywhere else is replaced, as a
+   * link is.
+   */
   private write(): void {
     this.data.seconds = Math.round((Date.now() - this.started) / 100) / 10;
-    writeFileSync(this.path, `${JSON.stringify(this.data, null, 2)}\n`);
+    const json = `${JSON.stringify(this.data, null, 2)}\n`;
+    if (this.direct) writeFileSync(this.path, json);
+    else writeAnew(this.path, json);
   }
 }

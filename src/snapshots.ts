@@ -1,13 +1,22 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, rmdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
-import { isInside } from "./tools/util.ts";
+import { join, relative } from "node:path";
+import { jigHome, projectDir } from "./paths.ts";
+import { isInside, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 const MAX_PROJECT_BYTES = 200_000_000;
+// The most a git command here may take: a first snapshot at the size limit takes seconds. git waits for as
+// long as a named pipe is where it reads (a .gitignore, a .gitattributes), and a command can make one; jig,
+// waiting on git in its own thread, ran nothing else, not even --time-limit's stop. git is stopped with
+// SIGTERM, on which it removes its lock: killed, it would leave one that failed every later snapshot.
+const GIT_SECONDS = 60;
 // Never snapshot these, even in a project without a .gitignore.
 const EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", "dist/", "build/", "target/", ".next/", ".jig/"];
+// Paths go back to git as the bytes it listed, on its standard input: a name a command picks needn't be
+// valid UTF-8, and Node passes arguments as UTF-8, so a pathspec for such a name would match nothing.
+const PATHSPECS_ON_STDIN = ["--pathspec-from-file=-", "--pathspec-file-nul"];
+const SLASH = "/".charCodeAt(0);
 
 export interface Restored {
   changed: string[]; // modified or deleted since the snapshot, now put back
@@ -18,20 +27,28 @@ export interface Restored {
  * Snapshots of a project's files, taken before each task so /undo can put them back. They live in a
  * private git repository (~/.jig/snapshots/<project>) whose work tree is the project, so this works in
  * any directory, honors .gitignore, and never touches the project's own repository, index or stash.
+ * They leave out the `hidden` paths (the settings' hiddenPaths) in the project.
  */
 export class Snapshots {
   private readonly root: string;
+  private readonly hidden: string[];
   private readonly gitDir: string;
+  private readonly maxBytes: number;
+  private readonly gitSeconds: number;
   private readonly taken: string[] = []; // commits, oldest first
 
-  constructor(root: string) {
+  constructor(root: string, hidden: string[] = [], maxBytes = MAX_PROJECT_BYTES, gitSeconds = GIT_SECONDS) {
     this.root = root;
-    this.gitDir = join(jigHome(), "snapshots", projectKey(root));
+    this.hidden = hidden;
+    this.gitDir = projectDir("snapshots", root);
+    this.maxBytes = maxBytes;
+    this.gitSeconds = gitSeconds;
   }
 
-  /** Records the project's current files. Throws if the project is too big to snapshot. */
+  /** Records the project's current files. Throws if the project is too big to snapshot, or hidden, or git fails. */
   take(label: string): void {
     if (this.root === homedir() || this.root === "/") throw new Error("jig doesn't snapshot your home directory or /");
+    const hidden = this.hiddenPaths();
     if (!existsSync(this.gitDir)) {
       mkdirSync(this.gitDir, { recursive: true });
       // A repository with no work tree of its own: every command passes the project as its work tree.
@@ -41,9 +58,17 @@ export class Snapshots {
       const home = relative(this.root, jigHome());
       const excludes = isInside(this.root, jigHome()) && home ? [...EXCLUDES, `/${home}/`] : EXCLUDES;
       writeFileSync(join(this.gitDir, "info", "exclude"), `${excludes.join("\n")}\n`);
-      this.checkSize();
     }
-    this.git("add", "--all", ".");
+    // The index can hold nested repositories as gitlinks (older versions of jig stored them, and git add
+    // stores one a command makes during a snapshot): drop them, so they are listed and left out as new ones are.
+    // And the hidden paths, which older versions stored too, or the settings didn't hide when they were taken.
+    const { tracked, gitlinks } = this.index();
+    const dropped = [...gitlinks, ...tracked.filter((path) => within(hidden, path))];
+    if (dropped.length) this.run(["update-index", "-z", "--force-remove", "--stdin"], nul(dropped));
+    const { created, nested } = this.others(hidden);
+    // Before every snapshot, not just the first: a project can grow past the limit later (a dataset, say).
+    this.checkSize([...tracked.filter((path) => !within(hidden, path)), ...created]);
+    this.run(["add", "--all", ...PATHSPECS_ON_STDIN], allBut([...nested, ...hidden]));
     this.git("-c", "user.name=jig", "-c", "user.email=jig@localhost", "commit", "-q", "--allow-empty", "--no-verify", "-m", label);
     this.taken.push(this.git("rev-parse", "HEAD").trim());
   }
@@ -54,56 +79,181 @@ export class Snapshots {
 
   /**
    * Puts the project's files back the way they were in the latest snapshot and forgets it, so the next
-   * call goes one task further back. Returns undefined when there is no snapshot left.
+   * call goes one task further back. Returns undefined when there is no snapshot left. Throws if git fails
+   * (a lock another git left, say), and keeps the snapshot so that the next call can try again.
    */
   undo(): Restored | undefined {
-    const snapshot = this.taken.pop();
+    const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
-    this.git("add", "--all", "."); // the index now describes the files as they are
-    const restored: Restored = { changed: [], removed: [] };
-    const fields = this.git("diff", "--cached", "--name-status", "--no-renames", "-z", snapshot).split("\0");
-    for (let i = 0; i + 1 < fields.length; i += 2) {
-      const [status, path] = [fields[i], fields[i + 1]];
-      if (status === "A") {
-        removeFile(this.root, path);
-        restored.removed.push(path);
-      } else {
-        restored.changed.push(path);
-      }
+    // Compare with this snapshot's files: an earlier /undo left the index at the later one it went back to.
+    // --reset keeps what git knows of the files that match, so it needn't read them all again, and doesn't
+    // mind files edited since.
+    this.git("read-tree", "--reset", snapshot);
+    const { tracked, created } = this.changes(snapshot);
+    for (const path of created) removeFile(this.root, path);
+    if (tracked.length) this.run(["checkout", snapshot, ...PATHSPECS_ON_STDIN], allBut(this.index().gitlinks));
+    this.taken.pop();
+    return { changed: tracked, removed: created.map(String) };
+  }
+
+  /** The files changed, created or deleted since the latest snapshot, relative to the project; undefined without one. */
+  changed(): string[] | undefined {
+    const snapshot = this.taken.at(-1);
+    if (!snapshot) return undefined;
+    const { tracked, created } = this.changes(snapshot);
+    return [...new Set([...tracked, ...created.map(String)])].sort();
+  }
+
+  /**
+   * How the files differ from a snapshot the index holds: tracked files that differ or are gone, and the
+   * files that are new, outside nested repositories. It only looks: adding the files first would copy
+   * whatever the task created into the snapshots, however big, past the size check every snapshot makes.
+   */
+  private changes(snapshot: string): { tracked: string[]; created: Buffer[] } {
+    // A snapshot can still hold a nested repository a command made while it was taken (see take), and diff
+    // takes no pathspecs on its standard input: --ignore-submodules=all keeps git out of them all.
+    const diff = this.list("diff", "--name-only", "--no-renames", "--ignore-submodules=all", "-z", snapshot);
+    return { tracked: diff.map(String), created: this.others(this.hiddenPaths()).created };
+  }
+
+  /**
+   * The hidden paths in the project, relative to it, by where they really lead, as the sandbox hides them.
+   * A snapshot that held one would let commands read it back from the store. So snapshots leave them out,
+   * and /undo neither puts them back nor removes them, which costs little: commands can't change them, and
+   * the file tools refuse them. Worked out each time, since where a path leads can change; one that isn't
+   * there is left out where it would be made.
+   */
+  private hiddenPaths(): Buffer[] {
+    const root = realpathSync(this.root);
+    return this.hidden.flatMap((path) => {
+      const real = realTargetSync(path);
+      if (real === undefined) return [];
+      if (isInside(real, root)) throw new Error("the settings' hiddenPaths hide the project");
+      return isInside(root, real) ? [Buffer.from(relative(root, real))] : [];
+    });
+  }
+
+  /**
+   * The files in the index (the latest snapshot's, or the one undo went back to), and apart from them the
+   * nested repositories it holds as gitlinks. Snapshots leave nested repositories (submodules, clones, or
+   * one a command made) out: to see whether one it holds changed, git runs git status in it, and that runs
+   * the programs its config names, a clean filter say, outside the sandbox.
+   */
+  private index(): { tracked: Buffer[]; gitlinks: Buffer[] } {
+    const index = { tracked: [] as Buffer[], gitlinks: [] as Buffer[] };
+    for (const entry of this.list("ls-files", "--stage", "-z")) {
+      // "<mode> <object> <stage>\t<path>", and a gitlink's mode is 160000
+      const path = entry.subarray(entry.indexOf("\t") + 1);
+      (entry.toString("latin1", 0, 7) === "160000 " ? index.gitlinks : index.tracked).push(path);
     }
-    if (restored.changed.length) this.git("checkout", snapshot, "--", ".");
-    return restored;
+    return index;
+  }
+
+  /**
+   * The files that are new, and apart from them the new nested repositories, which git lists as "dir/"
+   * without running anything in them. Not those in the hidden paths.
+   */
+  private others(hidden: Buffer[]): { created: Buffer[]; nested: Buffer[] } {
+    const others = { created: [] as Buffer[], nested: [] as Buffer[] };
+    for (const path of this.list("ls-files", "--others", "--exclude-standard", "-z")) {
+      if (within(hidden, path)) continue;
+      if (path.at(-1) === SLASH) others.nested.push(path.subarray(0, -1));
+      else others.created.push(path);
+    }
+    return others;
   }
 
   /** Snapshots copy the project's files, so refuse projects that would make them huge (big data files, say). */
-  private checkSize(): void {
+  private checkSize(files: Buffer[]): void {
     let bytes = 0;
-    for (const path of this.git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter(Boolean)) {
-      bytes += statSync(join(this.root, path), { throwIfNoEntry: false })?.size ?? 0;
+    // lstat, since git stores a symlink as the path it points to: a link to a big file outside the project
+    // adds only that path, and a link that loops is no error.
+    for (const path of files) {
+      try {
+        bytes += lstatSync(inProject(this.root, path), { throwIfNoEntry: false })?.size ?? 0; // deleted since the last one
+      } catch {
+        // ENOTDIR: a file has replaced its directory, and lstat throws for that whatever throwIfNoEntry says
+      }
     }
-    if (bytes > MAX_PROJECT_BYTES) {
+    if (bytes > this.maxBytes) {
+      // Earlier snapshots go too: going back to one now would also undo the coming task, which has none.
       rmSync(this.gitDir, { recursive: true, force: true });
+      this.taken.length = 0;
       const mb = (n: number) => `${Math.round(n / 1e6)} MB`;
-      throw new Error(`the project has ${mb(bytes)} of files that aren't ignored, more than the ${mb(MAX_PROJECT_BYTES)} jig snapshots`);
+      throw new Error(`the project has ${mb(bytes)} of files that aren't ignored, more than the ${mb(this.maxBytes)} jig snapshots`);
     }
+  }
+
+  /**
+   * What a git command lists with -z, one entry each, as the bytes git wrote: a name needn't be valid
+   * UTF-8, and decoded as UTF-8 it would no longer name the file.
+   */
+  private list(...args: string[]): Buffer[] {
+    const output = this.run(args);
+    const entries: Buffer[] = [];
+    let start = 0;
+    for (let end = output.indexOf(0); end !== -1; end = output.indexOf(0, start)) {
+      if (end > start) entries.push(output.subarray(start, end));
+      start = end + 1;
+    }
+    return entries;
   }
 
   private git(...args: string[]): string {
-    return execFileSync("git", [`--git-dir=${this.gitDir}`, `--work-tree=${this.root}`, ...args], {
-      cwd: this.root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      maxBuffer: 64 * 1024 * 1024,
-    });
+    return this.run(args).toString();
+  }
+
+  /** Runs git, with input (if any) on its standard input, and returns what it printed. */
+  private run(args: string[], input?: Buffer): Buffer {
+    // The user's git config applies here too, but its signing and hooks are for their own commits: a
+    // signer that prompts or fails would stop every snapshot, and a global post-commit hook would run on it.
+    const options = [...SAFE_GIT, "-c", "commit.gpgsign=false", `--git-dir=${this.gitDir}`, `--work-tree=${this.root}`];
+    try {
+      return execFileSync("git", [...options, ...args], {
+        cwd: this.root,
+        env: withoutKeys(),
+        input,
+        stdio: [input ? "pipe" : "ignore", "pipe", "pipe"],
+        maxBuffer: 64 * 1024 * 1024,
+        timeout: this.gitSeconds * 1000,
+      });
+    } catch (err) {
+      if ((err as { code?: string }).code === "ETIMEDOUT") {
+        throw new Error(`git took over ${this.gitSeconds} seconds (a named pipe where it reads, a .gitignore say, has it wait forever)`);
+      }
+      // What git said, rather than execFileSync's "Command failed:" and the whole command line.
+      const said = (err as { stderr?: Buffer }).stderr?.toString().trim();
+      throw said ? new Error(said) : err;
+    }
   }
 }
 
+/** Pathspecs, for git's standard input, for the whole project but these paths and what is under them, matched literally. */
+function allBut(paths: Buffer[]): Buffer {
+  return nul([Buffer.from("."), ...paths.map((path) => Buffer.concat([Buffer.from(":(exclude,literal)"), path]))]);
+}
+
+/** Whether a path git listed is one of these paths or under one. */
+function within(paths: Buffer[], path: Buffer): boolean {
+  return paths.some((top) => path.subarray(0, top.length).equals(top) && (path.length === top.length || path[top.length] === SLASH));
+}
+
+/** Paths for git's standard input, a NUL after each. */
+function nul(paths: Buffer[]): Buffer {
+  return Buffer.concat(paths.flatMap((path) => [path, Buffer.alloc(1)]));
+}
+
+/** A path git listed, in the project, as bytes for the file system. */
+function inProject(root: string, path: Buffer): Buffer {
+  return Buffer.concat([Buffer.from(`${root}/`), path]);
+}
+
 /** Deletes a file, and then any directories that removing it left empty. */
-function removeFile(root: string, path: string): void {
-  rmSync(join(root, path), { force: true });
-  for (let dir = dirname(path); dir !== "."; dir = dirname(dir)) {
+function removeFile(root: string, path: Buffer): void {
+  rmSync(inProject(root, path), { force: true });
+  for (let end = path.lastIndexOf(SLASH); end > 0; end = path.lastIndexOf(SLASH, end - 1)) {
     try {
-      rmdirSync(join(root, dir));
+      rmdirSync(inProject(root, path.subarray(0, end)));
     } catch {
       return; // not empty
     }

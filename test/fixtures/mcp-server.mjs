@@ -35,7 +35,7 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (method === "tools/call") {
     const { name, arguments: args } = params;
     if (name === "add") return reply(text(args.a + args.b));
-    if (name === "fail") return reply({ ...text("the database is locked"), isError: true });
+    if (name === "fail") return reply({ ...text(`the ${process.env.DATABASE ?? "database"} is locked`), isError: true }); // which server answered
     if (name === "crash") process.exit(1);
     if (name === "pid") return reply(text(process.pid));
     if (name === "slow") return void setTimeout(() => reply(text("done")), 1000);
