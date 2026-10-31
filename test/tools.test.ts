@@ -969,6 +969,8 @@ describe("--test-notes", () => {
     const pytest = "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run.)";
     const collected = "=== test session starts ===\nplatform linux -- Python 3.13.0, pytest-8.3.3\ncollected 0 items\n\n=== no tests ran in 0.01s ===";
     assert.equal(await note("pytest && python check.py", `${collected}\n\nExit code: 5`), pytest);
+    // The last runner's && counts, not an earlier word's.
+    assert.equal(await note("pip install -q pytest && pytest -q && python check.py", "\nno tests ran in 0.01s\n\nExit code: 5"), pytest);
   });
 
   it("says only that no tests ran where what came after the runner ran", async () => {
@@ -980,6 +982,11 @@ describe("--test-notes", () => {
     assert.equal(await note("python -m unittest -v\npython - <<'PY'\nprint('checked')\nPY", `${NONE}checked\n\nExit code: 0`), none);
     assert.equal(await note("python -m unittest -v; python check.py", `${NONE}checked\n\nExit code: 0`), none);
     assert.equal(await note("pytest -q; python check.py", "no tests ran in 0.01s\nchecked\n\nExit code: 0"), "(Note from jig: no tests ran.)");
+    // A runner's name before an && that went on to the last runner, which printed the output and came last.
+    assert.equal(await note("which pytest && pytest -q tests", "/usr/bin/pytest\n\nno tests ran in 0.00s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
+    assert.equal(await note("pip install -q pytest && python -m pytest -q", "\nno tests ran in 0.01s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
+    assert.equal(await note("pytest --version && python -m unittest -v", `pytest 9.1.1\n${NONE}\nExit code: 5`), none);
+    assert.equal(await note("cd /app/pytest-demo && python -m unittest -v", `${NONE}\nExit code: 5`), none);
   });
 
   it("names only the folders unittest's discovery doesn't enter, and none the settings hide", async () => {
@@ -996,6 +1003,33 @@ describe("--test-notes", () => {
     );
     // pytest's discovery doesn't need packages.
     assert.equal(await note("pytest", "no tests ran in 0.01s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
+  });
+
+  it("names no folder the command's unittest already starts its discovery in, or names a file or module in", async () => {
+    // Python imports those without an __init__.py, so something else is why no tests ran: no TestCase, say.
+    for (const command of [
+      "python -m unittest discover -s tests",
+      "python3 -m unittest discover -v tests",
+      "python -m unittest discover --start-directory=./tests/ -p 'test*.py'",
+      `python -m unittest discover -s ${join(cwd, "tests")} -v`,
+      "python -m unittest tests/test_calc.py -v",
+      "python -m unittest tests.test_calc",
+      "python -m unittest -v; python -m unittest discover -s tests",
+    ]) {
+      assert.equal(await note(command, `${NONE}\nExit code: 5`), "(Note from jig: no tests ran.)", command);
+    }
+    // Another folder is still named.
+    await mkdir(join(cwd, "checks"));
+    await writeFile(join(cwd, "checks", "test_more.py"), "");
+    assert.equal(
+      await note("python -m unittest tests.test_calc", `${NONE}\nExit code: 5`),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks holds test*.py files but no __init__.py: `unittest discover -s checks` starts it there.)",
+    );
+    // A bare `unittest tests` loads the folder as a module, which holds no tests, so discovery there is news.
+    assert.equal(
+      await note("python -m unittest tests -v", `${NONE}\nExit code: 5`),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks and tests hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
+    );
   });
 
   it("says nothing where tests ran, or where what exited with 5 wasn't unittest or pytest", async () => {

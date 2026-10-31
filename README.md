@@ -181,10 +181,11 @@ first two finding and reading the files, the test file a step after those the ta
 write came at step 3 or 4. It is off until benchmarks show whether it helps; `--stats` counts it
 (`overview`, and `overview.file` for each file shown).
 `--test-notes` adds a line to a command's result when unittest or pytest ran no tests in it, by what they
-print or by their exit code 5 (unittest's from Python 3.12): that no tests ran; where the runner, which then
-exits with an error, was followed by `&&`, that the commands after it didn't run; and for unittest, which
-of the project's folders hold `test*.py` files but no `__init__.py`, which its discovery doesn't enter, and
-that `unittest discover -s <folder>` starts it there. In milestone 30's two evolve2 runs with budget notes,
+print or by their exit code 5 (unittest's from Python 3.12): that no tests ran; where the command's last
+runner, which then exits with an error, was followed by `&&`, that the commands after it didn't run; and
+for unittest, which of the project's folders hold `test*.py` files but no `__init__.py`, which its discovery
+doesn't enter (not one the command already starts it in, or names a file or module in), and that
+`unittest discover -s <folder>` starts it there. In milestone 30's two evolve2 runs with budget notes,
 29 of 210 attempts ran unittest from the project, whose `tests/` has no `__init__.py`, 27 of them on their
 last step; in 22 the model's own checks (`python - <<'PY'`) came after its `&&` and didn't run either,
 which the result didn't say. It is off until benchmarks show whether it helps; `--stats` counts each note (`bash.noTests`).
