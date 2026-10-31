@@ -60,6 +60,8 @@ export type Mechanism =
   // An edit_file call --tolerant-edits applied: its old_string matched one place only once typographic
   // punctuation, or trailing whitespace too, didn't count.
   | "edit.tolerant"
+  // A bash result --test-notes added a note to: its unittest or pytest run ran no tests.
+  | "bash.noTests"
   // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
   // on the last step, so the task ended anyway.
   | "hook.stopBlocked"

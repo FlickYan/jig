@@ -3,20 +3,20 @@
 // environment. The model gets the output and the exit code; a job left in the background keeps running, in
 // bubblewrap's session until jig exits (see sandbox.ts's Keeper), and under Seatbelt or with no sandbox as
 // in a terminal, outliving jig. A long output is cut from the middle, and the whole of it goes to a file the
-// model can search.
+// model can search. With --test-notes, the result of a test run that ran no tests says so (noTestsNote).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, closeSync, openSync, rmSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { Readable } from "node:stream";
-import { stat } from "node:fs/promises";
+import { readdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { Sandbox } from "../sandbox.ts";
 import type { Tool, ToolContext } from "./index.ts";
-import { parseCommand } from "./shell.ts";
-import { type FileVersions, isInside, withoutKeys } from "./util.ts";
+import { parseCommand, TEST_COMMAND, withoutHeredocs } from "./shell.ts";
+import { type FileVersions, hiddenTest, isInside, realTargetSync, withoutKeys } from "./util.ts";
 
 const DEFAULT_TIMEOUT = 120; // seconds
 const MAX_TIMEOUT = 600;
@@ -55,14 +55,72 @@ export const bashTool: Tool = {
   kind: "run",
   describe: ({ command }) => String(command),
 
-  async run(input, { cwd, signal, versions, sandbox, dirs = [], outputs, count }) {
+  async run(input, { cwd, signal, versions, sandbox, dirs = [], hidden, outputs, count, testNotes }) {
     const { command, timeout = DEFAULT_TIMEOUT } = input as { command: string; timeout?: number };
     const seconds = Math.min(Math.max(timeout, 1), MAX_TIMEOUT);
     const output = await runCommand(command, cwd, seconds, signal, sandbox, outputs, count);
     await recordViewedFiles(command, cwd, versions, dirs);
-    return output;
+    const note = testNotes ? await noTestsNote(command, output, { cwd, dirs, hidden }) : undefined;
+    if (!note) return output;
+    count?.("bash.noTests");
+    // On the line before the exit code, which stays last: failedTestRun reads it there.
+    const last = output.lastIndexOf("\n") + 1;
+    return `${output.slice(0, last)}${note}\n${output.slice(last)}`;
   },
 };
+
+/** What unittest and pytest print when a run ran no tests, and when one ran some. */
+const RAN_NONE = /^Ran 0 tests in |^NO TESTS RAN$|\bno tests ran in |^collected 0 items/m;
+const RAN_SOME = /^Ran [1-9]\d* tests? in |\b[1-9]\d* (passed|failed)\b/m;
+/** The runners that exit with 5 when they ran no tests (unittest from Python 3.12), and one followed by &&. */
+const RUNNER = /\b(unittest|pytest)\b/;
+const RUNNER_THEN = /\b(unittest|pytest)\b[^\n;|&]*&&/;
+
+/**
+ * --test-notes: what jig adds to the result of a test run in which unittest or pytest ran no tests, by what
+ * they print or their exit code, and no run ran any; or undefined. It says that no tests ran; where the runner,
+ * which then exits with an error, was followed by &&, that the commands after it didn't run; and for unittest,
+ * which of the project's folders its discovery doesn't enter. In milestone 30's evolve2 runs, 29 attempts ran
+ * unittest from a project whose tests/ had no __init__.py, and it found no tests; in 22 of them the model's
+ * own checks came after its && (`python - <<'PY'`) and didn't run either, which the result didn't say.
+ */
+export async function noTestsNote(command: string, output: string, { cwd, dirs = [], hidden }: Pick<ToolContext, "cwd" | "dirs" | "hidden">): Promise<string | undefined> {
+  if (!TEST_COMMAND.test(command) || RAN_SOME.test(output)) return undefined;
+  // The exit code is the last command's, so 5 says no tests ran only where such a runner is among the commands.
+  const commands = withoutHeredocs(command);
+  const byExitCode = /\nExit code: 5$/.test(output) && RUNNER.test(commands);
+  if (!byExitCode && !RAN_NONE.test(output)) return undefined;
+  const said = ["no tests ran."];
+  // Before Python 3.12, unittest said OK and exited with 0, so what followed ran. `2>&1` and `&>` are no lists.
+  if ((byExitCode || /no tests ran/i.test(output)) && RUNNER_THEN.test(commands.replace(/\d*[<>]&\d*|&>>?/g, " "))) {
+    said.push("The test runner exits with an error code then, so the commands after its && didn't run.");
+  }
+  const folders = /\bunittest\b/.test(commands) ? await unenteredFolders(cwd, [cwd, ...dirs], hidden) : [];
+  if (folders.length) {
+    const [named, holds, start] =
+      folders.length === 1
+        ? [folders[0], "holds", `\`unittest discover -s ${folders[0]}\` starts it there`]
+        : [`${folders.slice(0, -1).join(", ")} and ${folders.at(-1)}`, "hold", "`unittest discover -s <folder>` starts it in one"];
+    said.push(`unittest's discovery enters only packages, and ${named} ${holds} test*.py files but no __init__.py: ${start}.`);
+  }
+  return `(Note from jig: ${said.join(" ")})`;
+}
+
+/**
+ * The project's folders with test*.py files (unittest's pattern) but no __init__.py, which unittest's discovery
+ * from the project doesn't enter. Not a folder the settings hide: commands can't read it either.
+ */
+async function unenteredFolders(cwd: string, roots: string[], hidden: string[] = []): Promise<string[]> {
+  const hides = hiddenTest(hidden, roots);
+  const found: string[] = [];
+  for (const entry of await readdir(cwd, { withFileTypes: true }).catch(() => [])) {
+    const folder = join(cwd, entry.name);
+    if (!entry.isDirectory() || entry.name.startsWith(".") || hides(realTargetSync(folder) ?? folder)) continue;
+    const names = await readdir(folder).catch((): string[] => []);
+    if (names.some((name) => /^test.*\.py$/.test(name)) && !names.includes("__init__.py")) found.push(entry.name);
+  }
+  return found.sort();
+}
 
 // Programs that print a file's content. Models often look at files this way instead of with read_file.
 const VIEWERS = new Set(["cat", "head", "tail", "nl"]);

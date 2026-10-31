@@ -113,6 +113,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           which then count as read (16 KB each, 32 KB in all); each only where the model's own
                           glob or read_file would show it unasked, so not where --tools leaves that tool out, a
                           deny rule refuses it or a PreToolUse hook covers it
+      --test-notes        when a command's unittest or pytest run ran no tests, say so in its result: that the
+                          commands after the runner's && didn't run, and for unittest, which folders hold
+                          test*.py files but no __init__.py, which its discovery doesn't enter
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -269,6 +272,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "check-writes": { type: "boolean", default: false },
       "tolerant-edits": { type: "boolean", default: false },
       overview: { type: "boolean", default: false },
+      "test-notes": { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -554,6 +558,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // For the model --escalate hands over to too, as the two share these options.
     mayRun,
     tolerantEdits: values["tolerant-edits"],
+    // The model --escalate hands over to gets it too; not the subagents, whose plan-mode rules run no tests.
+    testNotes: values["test-notes"],
     maxSteps,
     compactAt: compactLimit,
     authorize,

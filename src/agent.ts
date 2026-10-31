@@ -13,6 +13,7 @@ import type { Sandbox } from "./sandbox.ts";
 import type { Mechanism } from "./stats.ts";
 import { type OutputFiles, whyStopped, withoutOutputFileNames } from "./tools/bash.ts";
 import { checkInput, truncate, type Tool, type ToolInput } from "./tools/index.ts";
+import { TEST_COMMAND, withoutHeredocs } from "./tools/shell.ts";
 import { isInside } from "./tools/util.ts";
 
 type Message = Anthropic.Beta.BetaMessage;
@@ -58,6 +59,8 @@ export interface AgentOptions {
   mayRun?(command: string, script: string): boolean;
   /** Let edit_file apply a unique match that differs in typographic punctuation or trailing whitespace (--tolerant-edits). */
   tolerantEdits?: boolean;
+  /** After a command whose unittest or pytest run ran no tests, have bash say so in its result (--test-notes). */
+  testNotes?: boolean;
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
@@ -693,7 +696,7 @@ async function handleToolCall(
     // child process's event handler), a counter that throws would leave the call unanswered.
     const counted: Mechanism[] = [];
     const count = (event: Mechanism) => void counted.push(event);
-    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, gitLocked: opts.gitLocked, checkWrites: opts.checkWrites, mayRun: opts.mayRun, tolerantEdits: opts.tolerantEdits, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
+    const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, gitLocked: opts.gitLocked, checkWrites: opts.checkWrites, mayRun: opts.mayRun, tolerantEdits: opts.tolerantEdits, testNotes: opts.testNotes, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
     const whole = await tool.run(input, context);
     for (const event of counted) opts.count?.(event);
     output = truncate(whole);
@@ -765,9 +768,6 @@ function jsonProblem(raw: string): string {
   return "input is not a JSON object";
 }
 
-/** Commands that run a project's tests, by the usual runners' names. */
-const TEST_COMMAND = /\b(pytest|unittest|tox|npm (run )?test|yarn test|pnpm test|node --test|jest|vitest|mocha|go test|cargo test|make (check|test)|rspec|phpunit|dotnet test|ctest)\b/;
-
 /** What the runners print when tests fail: unittest, pytest, node --test, jest and vitest, go test, cargo test. */
 const TESTS_FAILED = /^FAILED \(|\b[1-9]\d* (failed|errors?)\b|^(#|ℹ) fail [1-9]|^--- FAIL|^FAIL\b|test result: FAILED/m;
 
@@ -803,20 +803,9 @@ const BEFORE_PROGRAM = new Set(["if", "then", "else", "elif", "do", "while", "un
  * counts as running something, so --finish-gate stays quiet.
  */
 export function runsSomething(command: string): boolean {
-  // `cat > solve.py << 'EOF'` writes solve.py, whatever its lines say, up to the line with the delimiter.
-  const lines: string[] = [];
-  let heredoc: string | undefined;
-  for (const line of command.split("\n")) {
-    if (heredoc !== undefined) {
-      if (line.trim() === heredoc) heredoc = undefined;
-      continue;
-    }
-    lines.push(line);
-    heredoc = /(?<!<)<<(?!<)-?\s*["'\\]?(\w+)/.exec(line)?.[1];
-  }
   // Each command of a list, a pipe or a substitution (but not 2>&1's &), by its first word that is no variable
   // assignment, redirection or keyword.
-  return withoutQuotedText(lines.join("\n")).split(/&&|\|\||[;|\n()`]|(?<![<>])&(?!>)/).some((part) => {
+  return withoutQuotedText(withoutHeredocs(command)).split(/&&|\|\||[;|\n()`]|(?<![<>])&(?!>)/).some((part) => {
     const words = part.trim().split(/\s+/);
     for (let i = 0; i < words.length; i++) {
       const word = words[i];

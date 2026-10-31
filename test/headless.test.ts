@@ -1196,6 +1196,37 @@ describe("--overview", () => {
   });
 });
 
+describe("--test-notes", () => {
+  it("says in a command's result that its test run ran no tests, and why, and counts it in --stats; without it, nothing is said", async () => {
+    // As milestone 30's evolve2 attempts ran unittest, with a shell function in place of Python 3.12's.
+    const command = "python() { printf 'Ran 0 tests in 0.000s\\n\\nNO TESTS RAN\\n'; return 5; }; python -m unittest -v && echo checked";
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    try {
+      await mkdir(join(project, "tests"));
+      await writeFile(join(project, "tests", "test_app.py"), "import unittest\n");
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      const result = (request: number) => ((api.requests[request].messages as Anthropic.Beta.BetaMessageParam[])[2].content as Anthropic.Beta.BetaToolResultBlockParam[])[0].content;
+      const off = await runJig([...args, "Run the tests."], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(result(1), "Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\nExit code: 5");
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+
+      const on = await runJig([...args, "--test-notes", "Run the tests."], { api, cwd: project });
+      assert.equal(on.code, 0, on.output);
+      const note =
+        "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run. " +
+        "unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)";
+      assert.equal(result(3), `Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\n${note}\nExit code: 5`);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "bash.noTests": 1 });
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--test-notes {8}when a command's unittest or pytest run ran no tests/);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

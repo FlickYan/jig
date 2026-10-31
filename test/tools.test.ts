@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
 import { lockedGitPaths, type Sandbox } from "../src/sandbox.ts";
 import type { Mechanism } from "../src/stats.ts";
-import { bashTool, OutputFiles, runCommand } from "../src/tools/bash.ts";
+import { bashTool, noTestsNote, OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
 import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
@@ -938,6 +938,85 @@ describe("bash", () => {
     } finally {
       outputs.remove();
     }
+  });
+});
+
+describe("--test-notes", () => {
+  // What unittest prints from Python 3.12 when it ran no tests, and then exits with 5; before 3.12 it said OK
+  // instead, and exited with 0. And what it prints when it ran some.
+  const NONE = `\n${"-".repeat(70)}\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n`;
+  const SOME = `\n${"-".repeat(70)}\nRan 4 tests in 0.002s\n\nOK\n`;
+  // The note for milestone 30's evolve2 runs, whose tests/ had no __init__.py.
+  const EVOLVE2 =
+    "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run. " +
+    "unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)";
+  let events: Mechanism[];
+  beforeEach(async () => {
+    events = [];
+    ctx = { ...ctx, testNotes: true, count: (event) => void events.push(event) };
+    await mkdir(join(cwd, "tests"));
+    await writeFile(join(cwd, "tests", "test_calc.py"), "import unittest\n");
+  });
+  const note = (command: string, output: string, more: Partial<ToolContext> = {}) => noTestsNote(command, output, { ...ctx, ...more });
+
+  it("says no tests ran, that the commands after the runner's && didn't run, and which folder unittest's discovery doesn't enter", async () => {
+    // As milestone 30's evolve2 attempts ran it: a heredoc's lines are a file's, not commands.
+    const command = "cd /tmp/project && python -m unittest -v && python - <<'PY'\nprint('checked: no pytest here')\nPY";
+    assert.equal(await note(command, `${NONE}\nExit code: 5`), EVOLVE2);
+    assert.equal(await note("python3 -m unittest discover -v 2>&1 && python3 check.py", `${NONE}\nExit code: 5`), EVOLVE2, "2>&1 is no list");
+    // Its exit code alone says so, where the command runs unittest or pytest.
+    assert.equal(await note("python -m unittest > log.txt 2>&1 && python check.py", "(no output)\n\nExit code: 5"), EVOLVE2);
+    const pytest = "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run.)";
+    const collected = "=== test session starts ===\nplatform linux -- Python 3.13.0, pytest-8.3.3\ncollected 0 items\n\n=== no tests ran in 0.01s ===";
+    assert.equal(await note("pytest && python check.py", `${collected}\n\nExit code: 5`), pytest);
+  });
+
+  it("says only that no tests ran where what came after the runner ran", async () => {
+    const none = "(Note from jig: no tests ran. unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)";
+    // Before Python 3.12, unittest exited with 0.
+    assert.equal(await note("python -m unittest -v && python check.py", "Ran 0 tests in 0.000s\n\nOK\nchecked\n\nExit code: 0"), none);
+    // A pipe's exit code is its last command's, and a runner on a line of its own, or before a ;, ends no list.
+    assert.equal(await note("python -m unittest -v 2>&1 | tail -20 && python check.py", `${NONE}checked\n\nExit code: 0`), none);
+    assert.equal(await note("python -m unittest -v\npython - <<'PY'\nprint('checked')\nPY", `${NONE}checked\n\nExit code: 0`), none);
+    assert.equal(await note("python -m unittest -v; python check.py", `${NONE}checked\n\nExit code: 0`), none);
+    assert.equal(await note("pytest -q; python check.py", "no tests ran in 0.01s\nchecked\n\nExit code: 0"), "(Note from jig: no tests ran.)");
+  });
+
+  it("names only the folders unittest's discovery doesn't enter, and none the settings hide", async () => {
+    for (const folder of ["checks", "pkg", ".cache", "private", "docs"]) await mkdir(join(cwd, folder));
+    await writeFile(join(cwd, "checks", "test_more.py"), "");
+    await writeFile(join(cwd, "pkg", "test_pkg.py"), "");
+    await writeFile(join(cwd, "pkg", "__init__.py"), "");
+    await writeFile(join(cwd, ".cache", "test_cached.py"), "");
+    await writeFile(join(cwd, "private", "test_secret.py"), "");
+    await writeFile(join(cwd, "docs", "conf.py"), "");
+    assert.equal(
+      await note("python -m unittest", `${NONE}\nExit code: 5`, { hidden: [join(cwd, "private")] }),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks and tests hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
+    );
+    // pytest's discovery doesn't need packages.
+    assert.equal(await note("pytest", "no tests ran in 0.01s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
+  });
+
+  it("says nothing where tests ran, or where what exited with 5 wasn't unittest or pytest", async () => {
+    assert.equal(await note("python -m unittest -v && python check.py", `${SOME}checked\n\nExit code: 0`), undefined);
+    assert.equal(await note("pytest -q", "7 passed in 0.31s\n\nExit code: 0"), undefined);
+    // One run of two ran some, so the other's NO TESTS RAN isn't all there is to say.
+    assert.equal(await note("python -m unittest -v; python -m unittest discover -s tests -v", `${NONE}${SOME}\nExit code: 0`), undefined);
+    // The exit code is the last command's: here not a runner's, nor one in a heredoc's lines.
+    assert.equal(await note("go test ./... && ./check.sh", "ok  \texample\t0.01s\n\nExit code: 5"), undefined);
+    assert.equal(await note("cat > t.py <<'PY'\nimport unittest\nPY\n./check.sh", "(no output)\n\nExit code: 5"), undefined);
+    assert.equal(await note("./check.sh", `${NONE}\nExit code: 5`), undefined, "not a test run");
+  });
+
+  it("goes in bash's result on the line before the exit code, which stays last, and is counted; without it, nothing is said", async () => {
+    // A shell function stands in for Python 3.12's unittest, whatever Python there is.
+    const command = `python() { printf '%s' '${NONE}'; return 5; }; python -m unittest -v && echo checked`;
+    assert.equal(await bashTool.run({ command }, ctx), `${NONE.trimEnd()}\n\n${EVOLVE2}\nExit code: 5`);
+    assert.deepEqual(events, ["bash.noTests"]);
+    assert.equal(await bashTool.run({ command }, { ...ctx, testNotes: false }), `${NONE.trimEnd()}\n\nExit code: 5`);
+    assert.equal(await bashTool.run({ command: "pytest() { echo '3 passed in 0.01s'; }; pytest" }, ctx), "3 passed in 0.01s\n\nExit code: 0");
+    assert.deepEqual(events, ["bash.noTests"]);
   });
 });
 

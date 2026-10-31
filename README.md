@@ -112,6 +112,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         and no-break spaces count as ASCII, or then trailing whitespace doesn't (see below)
       --overview        before a task, give the model the project's files with their sizes, and the files the
                         task names as read_file shows them, which then count as read (see below)
+      --test-notes      when a command's unittest or pytest run ran no tests, say so in its result, with what
+                        didn't run after it and where unittest didn't look (see below)
   -v, --version         print jig's version
   -h, --help            show this help
 ```
@@ -178,6 +180,14 @@ left one out of as `overview.skipped`. In milestone 30's runs on evolve2's 4 ste
 first two finding and reading the files, the test file a step after those the task named, so its first
 write came at step 3 or 4. It is off until benchmarks show whether it helps; `--stats` counts it
 (`overview`, and `overview.file` for each file shown).
+`--test-notes` adds a line to a command's result when unittest or pytest ran no tests in it, by what they
+print or by their exit code 5 (unittest's from Python 3.12): that no tests ran; where the runner, which then
+exits with an error, was followed by `&&`, that the commands after it didn't run; and for unittest, which
+of the project's folders hold `test*.py` files but no `__init__.py`, which its discovery doesn't enter, and
+that `unittest discover -s <folder>` starts it there. In milestone 30's two evolve2 runs with budget notes,
+29 of 210 attempts ran unittest from the project, whose `tests/` has no `__init__.py`, 27 of them on their
+last step; in 22 the model's own checks (`python - <<'PY'`) came after its `&&` and didn't run either,
+which the result didn't say. It is off until benchmarks show whether it helps; `--stats` counts each note (`bash.noTests`).
 
 ## What it does
 

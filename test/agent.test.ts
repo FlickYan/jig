@@ -691,6 +691,17 @@ describe("escalating to a stronger model", () => {
     assert.deepEqual(strong.seen, []);
   });
 
+  it("takes over after a test run that ran no tests, with --test-notes' note before its exit code, and gets the notes too", async () => {
+    // A shell function stands in for Python 3.12's unittest, which exits with 5 when it ran no tests.
+    const none = "python() { printf 'Ran 0 tests in 0.000s\\n\\nNO TESTS RAN\\n'; return 5; }; python -m unittest";
+    const strong = stronger([reply([toolUse("t2", "bash", { command: none })]), reply([text("Done.")])]);
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "bash", { command: none })])], { maxSteps: 4, escalate: strong.escalate, testNotes: true });
+    const result = await runAgent(conversation, options);
+    assert.equal(result.escalated?.step, 2);
+    const results = [messages[2], messages[4]].map((message) => resultsIn(message)[0].content);
+    assert.deepEqual(results, Array(2).fill("Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\n(Note from jig: no tests ran.)\nExit code: 5"));
+  });
+
   it("reads a failure from the runner's report when a pipe hides the exit code", () => {
     const run = (command: string, content: string) =>
       failedTestRun({ type: "tool_use", id: "t1", name: "bash", input: { command } }, { type: "tool_result", tool_use_id: "t1", content });

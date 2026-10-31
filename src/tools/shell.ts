@@ -13,3 +13,24 @@ export function parseCommand(command: string): string[][] | null {
 function unquote(word: string): string {
   return word.replace(/^["']+|["']+$/g, "");
 }
+
+/** Commands that run a project's tests, by the usual runners' names. */
+export const TEST_COMMAND = /\b(pytest|unittest|tox|npm (run )?test|yarn test|pnpm test|node --test|jest|vitest|mocha|go test|cargo test|make (check|test)|rspec|phpunit|dotnet test|ctest)\b/;
+
+/**
+ * A command without its heredocs' lines, which are a file's content, not commands: `cat > solve.py << 'EOF'`
+ * writes solve.py, whatever its lines say, up to the line with the delimiter.
+ */
+export function withoutHeredocs(command: string): string {
+  const lines: string[] = [];
+  let heredoc: string | undefined;
+  for (const line of command.split("\n")) {
+    if (heredoc !== undefined) {
+      if (line.trim() === heredoc) heredoc = undefined;
+      continue;
+    }
+    lines.push(line);
+    heredoc = /(?<!<)<<(?!<)-?\s*["'\\]?(\w+)/.exec(line)?.[1];
+  }
+  return lines.join("\n");
+}
