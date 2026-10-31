@@ -35,7 +35,7 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
 - [x] **28. The loop and the tools again:** a new baseline (33 of 63) for the analysis, and three loop-only candidates against milestone 21's comparison runs, all rejected (+2, +5 and +5 points, ahead in 57 to 65% of resamples, at 19 to 34% more cost): the sessions show two of the changes never ran (a test re-run in 0 of 30 attempts, a multi-file `edit_file` used in 0), so their +5 is what a change that does nothing scores; and a request's narrowed tools are no limit, since the model called undeclared tools in 22 of 30 attempts and jig ran them; after the round, two fixes: an invalid call goes back as the parse error, its first 2,000 characters and the 400 before the error (milestone 27's echoes held up to 155k), and the loop runs only the tools the request declared
 - [x] **29. A reviewer that runs the work:** `jig review`: once the agent is done, a model checks the work by running it in a copy of the machine (on Terminal-Bench, a sibling container from `docker commit`, with no network), each problem's command runs again in a fresh copy before it goes back, and `eval/review_before.py` runs the hidden tests on the work as the review saw it; two smoke tests found three bugs and the first failure a review turned into a pass (mteb-retrieve); on the 20 tasks, 10 of 20, no result changed (one trial got problems back and failed before and after), no false alarm in 9 passes, and the causes of two failures found and lost, one to an empty `<shows>` the re-check dropped, one to a verdict written as a tool call; replays showed a cut-off review's verdict to be a coin toss, and the verdict at the time-out is now asked at low effort, in the asked form, by the time limit, and once more when it doesn't come
-- [x] **30. Four ideas from other agents, measured:** budget notes, a finish gate, checks after writes and tolerant edits, each behind a flag and reviewed; on evolve2 at 4 steps, side by side with two baselines (66 and 66 of 105), budget notes passed 92 of 105 (+25 points, +11 to +40), twice, at the same cost, did no harm at 40 steps or on the main benchmark (60 of 60), and are on by default; the gate and the checks never fired, and tolerant edits would fix none of flash's stored failed edits, so they stay opt-in; Terminal-Bench, which design.md asks for first, couldn't run on this machine
+- [x] **30. Four ideas from other agents, measured:** budget notes, a finish gate, checks after writes and tolerant edits, each behind a flag and reviewed; on evolve2 at 4 steps, side by side with two baselines (66 and 66 of 105), budget notes passed 92 of 105 (+25 points, +11 to +40), twice, at the same cost, did no harm at 40 steps or on the main benchmark (60 of 60), and are on by default; the gate and the checks never fired, and tolerant edits would fix none of flash's stored failed edits, so they stay opt-in; and on Terminal-Bench they were no worse (30 of 38 against 29, at 8% less cost, none stopped at the time limit against 3)
 
 ## Milestone 9: checking before finishing
 
@@ -1432,19 +1432,28 @@ Run again, the gain held exactly, 92 of 105, with 89 attempts testing after thei
 changing the code. With 40 steps the notes did no harm, on the suite or on the main benchmark, where few
 attempts get to 20 steps and they rarely fire.
 
-**Not checked on Terminal-Bench.** [design.md](design.md) asks for it before a change that won on evolve2
-is merged (milestone 16's lost 15 points there), and it is where the notes may matter most: its limit is
-the task's time, and the notes say how much of it is left. The machine this round ran on has Docker, but
-its containers can't reach the network, which the tasks' setup and hidden tests need. The check, on a
-machine with Docker (about $4.20 and 9 hours, by milestone 19's):
+**Checked on Terminal-Bench**, as [design.md](design.md) asks before a change that won on evolve2 is merged
+(milestone 16's lost 15 points there), and where the notes may matter most: its limit is the task's time,
+and the notes say how much of it is left. The same build (`3547aac`) with the notes and with
+`--no-budget-notes`, 2 rounds each on the 20 tasks; a task's four trials ran at once, so both sides met
+the same hour of DeepSeek's service and the same load. The machine was a Linux container whose Docker has
+no route out, so three things were set up there and not committed: a forward proxy on the host for the
+task containers, with the egress proxy's CA mounted into them; the key proxy listening on the Docker
+bridge, not 127.0.0.1 (Linux's `host.docker.internal` reaches the bridge, not the host's loopback, unlike
+OrbStack's and Docker Desktop's); and the images pulled one task at a time and removed after, as all
+twenty don't fit its disk. mteb-retrieve, whose image has an 8.6 GB layer, didn't fit at all and was left
+out on both sides; one trial whose `apt-get` failed in setup, before jig started, was run again.
 
-```bash
-for round in 1 2; do
-  eval/run.sh tb-notes-off-r$round jig --ak ref=HEAD --ak no_budget_notes=true
-  eval/run.sh tb-notes-on-r$round jig --ak ref=HEAD
-done
-python3 eval/report.py eval/jobs/tb-notes-off-r1+eval/jobs/tb-notes-off-r2 eval/jobs/tb-notes-on-r1+eval/jobs/tb-notes-on-r2
-```
+| | passed | stopped at the time limit | cost a trial |
+|---|---|---|---|
+| with the notes | 30 of 38 (79%) | 0 | $0.061 |
+| `--no-budget-notes` | 29 of 38 (76%) | 3 (two of them passed) | $0.066 |
+
++3 points (−13 to +18), behind in 32% of resamples, where tbcheck rejects at 80%: no worse on
+Terminal-Bench, at 8% less cost. The notes stay on. Without them, three trials ran into `--time-limit`;
+with them none did, which is what the time in the notes is for, though three is too few to call. One
+trial with the notes (db-wal-recovery) fetched the benchmark's own solution from GitHub, and counts as
+failed, as every look-up does (milestone 10). Results: `eval/results/tb-m30-notes-on.json` and `-off.json`.
 
 **Found by the reviews.** `--check-writes`' first version ran python3, node and bash on every write without
 the permission policy. With `--no-sandbox` in edits mode, a `.pth` file the model wrote into the
@@ -1461,4 +1470,5 @@ and Node 22 passing a `.js` module's syntax errors; all fixed, each with a test.
 writes and tolerant edits stay opt-in, for runs where they can fire.
 
 **Cost.** By jig's token counts, at list prices: the round $7.18, the rerun $1.54, the 40 steps $2.49 and
-the main benchmark $0.27. The DeepSeek balance fell 38.55 CNY over the day.
+the main benchmark $0.27; Terminal-Bench $4.81. The DeepSeek balance fell 38.55 CNY over the
+evolve2 runs and 16.5 CNY over Terminal-Bench's.
