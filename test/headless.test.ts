@@ -838,11 +838,13 @@ describe("--check-writes", () => {
   });
 
   // A python3 first on the PATH that notes the file it is given (its last argument), then runs the real one; and
-  // runs of jig with --check-writes whose model, told "Write x.py.", writes x.py with a syntax error. A run
-  // resolves to the write_file calls' results, and the files python3 was given.
+  // runs of jig with --check-writes whose model, told "Write x.py.", writes x.py with a syntax error, given the
+  // user's `settings` if any. A run resolves to the write_file calls' results, the files python3 was given,
+  // what jig printed, what the model was sent, and how many checks --stats counted as left out.
   const checkingWrites = async () => {
     const bin = join(outside, "bin");
     const ran = join(outside, "ran.txt");
+    const stats = join(outside, "stats.json");
     const python = execFileSync("bash", ["-c", "command -v python3"], { encoding: "utf8" }).trim();
     await mkdir(bin);
     await writeFile(join(bin, "python3"), `#!/bin/sh\nfor arg; do file=$arg; done\nbasename "$file" >> '${ran}'\nexec '${python}' "$@"\n`, { mode: 0o755 });
@@ -850,19 +852,27 @@ describe("--check-writes", () => {
       const task = /Write (\w+\.py)\./.exec(JSON.stringify((request.messages as { content: unknown }[]).at(-1)!.content));
       return task ? [{ tool: "write_file", input: { path: task[1], content: "def f(:\n" } }] : [{ text: "Done." }];
     });
-    const run = async (args: string[], stdin = "") => {
+    const run = async (args: string[], stdin = "", settings?: object) => {
       await rm(ran, { force: true });
       for (const file of ["app.py", "a.py", "b.py"]) await rm(join(project, file), { force: true });
-      const env = { PATH: `${bin}:${process.env.PATH}` };
-      const { code, output } = await runJig(["--check-writes", "--model", "claude-haiku-4-5", ...args], { api, cwd: project, env, stdin });
+      const home = settings && (await tempDir("jig-home-"));
+      if (home) await writeFile(join(home, "settings.json"), JSON.stringify(settings));
+      const env = { PATH: `${bin}:${process.env.PATH}`, ...(home && { JIG_HOME: home }) };
+      const { code, output } = await runJig(["--check-writes", "--model", "claude-haiku-4-5", "--stats", stats, ...args], { api, cwd: project, env, stdin });
       assert.equal(code, 0, output);
       const messages = api.requests.at(-1)!.messages as { content: string | { type: string; content: string }[] }[];
       const results = messages.flatMap(({ content }) => (Array.isArray(content) ? content.filter((block) => block.type === "tool_result").map((block) => block.content) : []));
-      return { results, ran: existsSync(ran) ? (await readFile(ran, "utf8")).split("\n").filter(Boolean) : [] };
+      const skipped: number = JSON.parse(await readFile(stats, "utf8")).events["write.checkSkipped"] ?? 0;
+      return { results, ran: existsSync(ran) ? (await readFile(ran, "utf8")).split("\n").filter(Boolean) : [], output, sent: JSON.stringify(messages), skipped };
     };
     return { run, close: () => api.close() };
   };
-  const unchecked = { results: ["Created app.py (1 line)."], ran: [] };
+  // A run that wrote app.py and didn't check it with python3, as the user is told once, with `why`; --stats counts it.
+  const unchecked = ({ results, ran, output, skipped }: { results: string[]; ran: string[]; output: string; skipped: number }, why: string) => {
+    assert.deepEqual({ results, ran, skipped }, { results: ["Created app.py (1 line)."], ran: [], skipped: 1 });
+    assert.equal(output.match(/left out a check/g)?.length, 1, output);
+    assert.match(output, new RegExp(`--check-writes runs python3, node and bash only where the model could run them itself without asking, so it left out a check by python3: ${why}\\.`));
+  };
   // The result of a write of name.py that python3 checked.
   const checked = (name: string) => new RegExp(`^Created ${name}\\.py \\(1 line\\)\\.\\n\\nA syntax check of ${name}\\.py \\(python3's ast\\.parse\\) failed:\\n.*\\nSyntaxError: `, "s");
 
@@ -870,7 +880,7 @@ describe("--check-writes", () => {
     const { run, close } = await checkingWrites();
     try {
       // Without the sandbox, edits mode asks before python3 runs (with no terminal, it doesn't run).
-      assert.deepEqual(await run(["--no-sandbox", "--mode", "edits", "Write app.py."]), unchecked);
+      unchecked(await run(["--no-sandbox", "--mode", "edits", "Write app.py."]), "the model's commands ask first here");
       const yes = await run(["--no-sandbox", "--yes", "Write app.py."]);
       assert.deepEqual(yes.ran, ["app.py"]);
       assert.equal(yes.results.length, 1);
@@ -889,11 +899,76 @@ describe("--check-writes", () => {
   it("runs python3 on the file in edits mode where the sandbox contains commands, not where they have the network", { skip: sandboxProblem() }, async () => {
     const { run, close } = await checkingWrites();
     try {
-      assert.deepEqual(await run(["--mode", "edits", "--allow-network", "Write app.py."]), unchecked);
+      unchecked(await run(["--mode", "edits", "--allow-network", "Write app.py."]), "the model's commands ask first here");
       const contained = await run(["--mode", "edits", "Write app.py."]);
       assert.deepEqual(contained.ran, ["app.py"]);
       assert.equal(contained.results.length, 1);
       assert.match(contained.results[0], checked("app"));
+    } finally {
+      close();
+    }
+  });
+
+  it("tells the user once why it left a check out, not the model, and counts each one in --stats", async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      const session = await run(["--no-sandbox", "--mode", "edits"], "Write a.py.\nWrite b.py.\n");
+      assert.deepEqual(session.results, ["Created a.py (1 line).", "Created b.py (1 line)."]);
+      assert.deepEqual(session.ran, []);
+      assert.equal(session.skipped, 2);
+      assert.equal(session.output.match(/left out a check/g)?.length, 1, session.output);
+      assert.match(session.output, /so it left out a check by python3: the model's commands ask first here\./);
+      assert.doesNotMatch(session.sent, /left out a check/);
+      // Where python3 checks every write, nothing is said or counted.
+      const yes = await run(["--no-sandbox", "--yes", "Write app.py."]);
+      assert.deepEqual(yes.ran, ["app.py"]);
+      assert.equal(yes.skipped, 0);
+      assert.doesNotMatch(yes.output, /left out a check/);
+    } finally {
+      close();
+    }
+  });
+
+  it("runs no program where a PreToolUse hook covers bash, as it can't ask the hook about a check", async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      // A hook that blocks every command, named by a matcher each way one can name bash; the model's commands
+      // would otherwise run unasked (--yes), on the host (--no-sandbox).
+      const blocking = (matcher?: string) => ({ hooks: { PreToolUse: [{ matcher, command: '[ "$JIG_TOOL" != bash ] || exit 2' }] } });
+      for (const matcher of ["bash", "*", undefined, "read_file|ba.*"]) {
+        unchecked(await run(["--no-sandbox", "--yes", "Write app.py."], "", blocking(matcher)), "a PreToolUse hook covers bash");
+      }
+      // Hooks on other tools, or after a command, don't count.
+      const others = { hooks: { PreToolUse: [{ matcher: "write_file|edit_file", command: "true" }], PostToolUse: [{ matcher: "bash", command: "true" }] } };
+      const yes = await run(["--no-sandbox", "--yes", "Write app.py."], "", others);
+      assert.deepEqual(yes.ran, ["app.py"]);
+      assert.match(yes.results[0], checked("app"));
+    } finally {
+      close();
+    }
+  });
+
+  it("runs no program where --tools leaves bash out", async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      unchecked(await run(["--no-sandbox", "--yes", "--tools", "write_file,read_file", "Write app.py."]), "bash isn't among the model's tools");
+      const yes = await run(["--no-sandbox", "--yes", "--tools", "write_file,bash", "Write app.py."]);
+      assert.deepEqual(yes.ran, ["app.py"]);
+      assert.match(yes.results[0], checked("app"));
+    } finally {
+      close();
+    }
+  });
+
+  it("runs no program where a deny rule matches the script the check runs, though not the program on the file", async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      // The policy is asked about `python3 '<file>'`, which "python3 -c" doesn't match; what runs is
+      // `python3 -I -S -c '<code>' '<file>'`, which it does.
+      unchecked(await run(["--no-sandbox", "--yes", "Write app.py."], "", { deny: ["python3 -c"] }), "a deny rule refuses it");
+      const yes = await run(["--no-sandbox", "--yes", "Write app.py."], "", { deny: ["python3 -m"] });
+      assert.deepEqual(yes.ran, ["app.py"]);
+      assert.match(yes.results[0], checked("app"));
     } finally {
       close();
     }

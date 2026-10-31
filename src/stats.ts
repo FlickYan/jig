@@ -52,9 +52,11 @@ export type Mechanism =
   | "hook.feedback"
   | "output.truncated"
   // What --check-writes added to a write_file or edit_file result: a syntax error the change made, and lines
-  // that look like placeholders for code left out, in a file write_file made much shorter.
+  // that look like placeholders for code left out, in a file write_file made much shorter. And a change it
+  // didn't check with python3, node or bash, as the model couldn't have run that program unasked.
   | "write.syntaxError"
   | "write.placeholder"
+  | "write.checkSkipped"
   // An edit_file call --tolerant-edits applied: its old_string matched one place only once typographic
   // punctuation, or trailing whitespace too, didn't count.
   | "edit.tolerant"

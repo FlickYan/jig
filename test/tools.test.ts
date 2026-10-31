@@ -421,6 +421,8 @@ describe("--check-writes", () => {
       asked.push(command);
       return false;
     };
+    // Each change whose program check is left out is counted.
+    const skipped: Mechanism[] = Array(3).fill("write.checkSkipped");
     // Without mayRun, or where it says no, the file is written and only JSON.parse, in jig, checks it.
     for (const [dir, mayRun] of [["absent", undefined], ["refused", refuse]] as const) {
       ctx.mayRun = mayRun;
@@ -431,15 +433,21 @@ describe("--check-writes", () => {
     assert.equal(await edit("= 1;", "= (1;"), "Edited code.js: replaced 1 line at line 1 with 1 line.");
     assert.deepEqual(commands, []);
     assert.equal(existsSync(ran), false);
-    assert.deepEqual(events, ["write.syntaxError", "write.syntaxError"]);
+    assert.deepEqual(events, [...skipped, "write.syntaxError", ...skipped, "write.syntaxError", "write.checkSkipped"]);
     // The policy is asked about the program on the file, once a change.
     const on = (program: string, path: string) => `${program} '${join(cwd, path)}'`;
     assert.deepEqual(asked, [on("python3", "refused/app.py"), on("node", "refused/app.js"), on("bash", "refused/app.sh"), on("node", "code.js")]);
 
-    // Where it would run them, they run.
-    ctx.mayRun = () => true;
+    // Where it would run them, they run; and the script it is given, for the deny rules, is the one that runs.
+    const scripts: string[] = [];
+    ctx.mayRun = (_command, script) => {
+      scripts.push(script);
+      return true;
+    };
     for (const [path, content] of broken("allowed")) assert.match(await write(path, content), /^Created .*\n\nA syntax check of .* failed:\n/);
     assert.equal(commands.length, 3);
+    assert.deepEqual(scripts, commands);
+    assert.match(scripts[0], /^command -v python3 >\/dev\/null \|\| exit 0; python3 -I -S -c '.*' '.*\/allowed\/app\.py'$/s);
     assert.deepEqual(new Set(readFileSync(ran, "utf8").split("\n").filter(Boolean)), new Set(["bash", "python3", "node"]));
   });
 

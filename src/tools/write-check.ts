@@ -4,10 +4,10 @@
 //
 // - The syntax, by the file's extension: python3's ast.parse for .py, node --check for .js, .mjs and .cjs,
 //   bash -n for .sh, run as commands run (in the sandbox, without jig's keys), for 5 seconds at most and only
-//   where commands find the program; and JSON.parse for .json, in jig. A program runs only where the
-//   permission policy would run it on the file without asking (see ToolContext.mayRun), or that check is left
-//   out: the model can pick the program (a virtualenv's python3 first on the PATH, whose files it can write)
-//   and what it runs as it starts, so the check is a command of the model's like any other. Only an error the
+//   where commands find the program; and JSON.parse for .json, in jig. A program runs only where the model
+//   could run it on the file itself without asking (see ToolContext.mayRun), or that check is left out: the
+//   model can pick the program (a virtualenv's python3 first on the PATH, whose files it can write) and what
+//   it runs as it starts, so the check is a command of the model's like any other. Only an error the
 //   change made is reported: the old content is checked too, and an error it had already (the same, line
 //   numbers aside) is left alone, as these checks name only the first error, and a file one can't read at all
 //   (JSX in a .js file, comments in a .json one) would otherwise be reported at every change. The old content
@@ -24,7 +24,7 @@ import { extname } from "node:path";
 import { runCommand } from "./bash.ts";
 import type { ToolContext } from "./index.ts";
 import { shownLine } from "./read.ts";
-import { countLines } from "./util.ts";
+import { countLines, realTarget } from "./util.ts";
 
 /** How long a syntax check may take, in seconds. An object, so that tests can lower it. */
 export const checkLimits = { seconds: 5 };
@@ -32,8 +32,8 @@ export const checkLimits = { seconds: 5 };
 /** A syntax check: its name for the model, and how it finds an error. */
 interface Check {
   name: string;
-  /** The program it runs on the file, if it runs one. */
-  program?: string;
+  /** The program it runs on the file, if it runs one, and the script that does, given the file's real path. */
+  runs?: { program: string; script(real: string): string };
   /** The line of an error it finds that names the error (see sameError). */
   names: RegExp;
   /**
@@ -77,7 +77,7 @@ const CHECKS: Record<string, Check> = {
 export async function checkChange(file: string, path: string, old: string | undefined, ctx: ToolContext, whole = false): Promise<(text: string) => Promise<string>> {
   // Asked once, so the old content and the new are both checked, or neither: an error the file had already
   // isn't then taken for the change's.
-  const check = checkFor(file, ctx);
+  const check = await checkFor(file, ctx);
   const notes: string[] = [];
   const before = old !== undefined && check ? await check.run(file, path, old, ctx, notes) : undefined;
   return async (text) => {
@@ -104,13 +104,18 @@ export async function checkChange(file: string, path: string, old: string | unde
 
 /**
  * The syntax check for `file`, by its extension, if it has one. One that runs a program on it is left out
- * unless the permission policy would run that program on the file without asking (ToolContext.mayRun), as it
- * would the model's own command: the program, and what it runs as it starts, can be the model's.
+ * (and counted) unless the model could run that program on the file itself without asking
+ * (ToolContext.mayRun), as the program, and what it runs as it starts, can be the model's. The policy is
+ * asked about `<program> <file>`, as allow rules and "always" answers name the program, and deny rules are
+ * matched against the script that runs too, with the path the file really has once written (realTarget).
  */
-function checkFor(file: string, ctx: ToolContext): Check | undefined {
+async function checkFor(file: string, ctx: ToolContext): Promise<Check | undefined> {
   const check: Check | undefined = CHECKS[extname(file).toLowerCase()];
-  if (check?.program && !ctx.mayRun?.(`${check.program} ${quoted(file)}`)) return undefined;
-  return check;
+  if (!check?.runs) return check;
+  const real = (await realTarget(file)) ?? file;
+  if (ctx.mayRun?.(`${check.runs.program} ${quoted(file)}`, check.runs.script(real))) return check;
+  ctx.count?.("write.checkSkipped");
+  return undefined;
 }
 
 /**
@@ -121,9 +126,10 @@ function checkFor(file: string, ctx: ToolContext): Check | undefined {
  * would print anyway, shown as the model's.
  */
 function command(name: string, program: string, call: (file: string) => string, error: RegExp): Check {
+  const script = (real: string) => `command -v ${program} >/dev/null || exit 0; ${call(quoted(real))}`;
   return {
     name,
-    program,
+    runs: { program, script },
     names: error,
     async run(file, path, _text, { cwd, signal, sandbox }, notes) {
       const real = await realpath(file).catch(() => undefined);
@@ -138,9 +144,8 @@ function command(name: string, program: string, call: (file: string) => string, 
           return wrapped;
         },
       };
-      const script = `command -v ${program} >/dev/null || exit 0; ${call(quoted(real))}`;
       // A check that can't be started finds nothing: the change is written, or about to be, either way.
-      const result = await runCommand(script, cwd, checkLimits.seconds, signal, noting).catch(() => "");
+      const result = await runCommand(script(real), cwd, checkLimits.seconds, signal, noting).catch(() => "");
       // The output, then a blank line and how the command ended: a timeout or Ctrl+C finds nothing.
       const end = result.lastIndexOf("\n\n");
       const output = result.slice(0, end);

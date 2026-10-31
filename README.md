@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 551 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 555 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -104,7 +104,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
       --check-writes    after write_file and edit_file, tell the model of a syntax error the change made, or of
-                        lines write_file left that look like placeholders for code left out (see below)
+                        lines write_file left that look like placeholders for code left out; python3, node and
+                        bash check a file only where the model could run them on it unasked (see below)
       --tolerant-edits  let edit_file apply an old_string that matches one place only once curly quotes, dashes
                         and no-break spaces count as ASCII, or then trailing whitespace doesn't (see below)
   -v, --version         print jig's version
@@ -137,13 +138,20 @@ syntax error the change made in a Python, JavaScript, shell or JSON file (python
 `node --check` and `bash -n`, run as commands are, for 5 seconds at most and only where they are installed;
 `JSON.parse` in jig), but not one the file had before; and lines like `// ... existing code ...` that
 `write_file` left in a file it made at least a quarter shorter, which stand for code a whole-file rewrite
-dropped. python3, node and bash check a file only where the model's command running them on it would need
-no approval: with `--yes`, in `edits` mode where the sandbox contains commands (so not without it, nor with
-`--allow-network`), or where an allow rule or an `[a]lways` answer allows the program, and never where a
-deny rule refuses it. Elsewhere those checks are left out, since the model can choose what they would run:
-a virtualenv's `python3` first on the PATH, and the `.pth` files it runs as it starts, can be files the
-model wrote (python3 runs with `-I -S`, which leaves out `.pth` files and `sitecustomize`, but the program
-itself can be replaced). It is off until benchmarks show whether it helps; `--stats` counts what it finds.
+dropped. python3, node and bash check a file only where the model could run them on it itself without
+asking: in `auto` mode (`--yes`, `--mode auto` or `/mode auto`), in `edits` mode where the sandbox contains
+commands (so not without it, nor with the network, by `--allow-network` or the settings' `"network": true`),
+or where an allow rule or an `[a]lways` answer allows the program. Never where a deny rule matches the
+program on the file or the script the check runs (`python3 -I -S -c '...' <file>`, so a rule `python3 -c`
+holds), where a `PreToolUse` hook covers `bash` (jig can't ask a hook about a command the model didn't
+make), or where `--tools` leaves `bash` out. Elsewhere those checks are left out, since the model can
+choose what they run: a virtualenv's `python3` first on the PATH, and what it runs as it starts, can be
+files the model wrote. jig tells you once why it left one out, and `--stats` counts each as
+`write.checkSkipped`. python3 runs with `-I -S`, which leaves out the project's modules, `.pth` files and
+`sitecustomize`, but not everything an interpreter the project holds does as it starts (a virtualenv's
+`pyvenv.cfg` can point it at a standard library the model wrote): what keeps such a program to where the
+model could run it anyway is the rule above, not `-S`. It is off until benchmarks show whether it helps;
+`--stats` counts what it finds.
 
 `--tolerant-edits` lets `edit_file` apply an `old_string` that isn't in the file but matches one place once
 curly quotes, en and em dashes and no-break spaces count as their ASCII look-alikes, or failing that, once

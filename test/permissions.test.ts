@@ -118,6 +118,9 @@ describe("M4 rules", () => {
     }
     assert.equal(permissions.decide(tool("bash"), { command: "git status" }), "allow");
     assert.ok(matchesDenyRule("git log --grep push", "git push"), "a false alarm, but a safe one");
+    // Asked of what runs in place of a command decide was asked about (--check-writes' script, say).
+    assert.equal(permissions.denies("command -v git >/dev/null || exit 0; git -C repo push"), "git push");
+    assert.equal(permissions.denies("git status"), undefined);
   });
 
   it("runs allowed commands without asking, but not with something else chained on", () => {

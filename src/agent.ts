@@ -54,8 +54,8 @@ export interface AgentOptions {
   gitLocked?: string[];
   /** After write_file and edit_file, check what they wrote and tell the model what is wrong (--check-writes). */
   checkWrites?: boolean;
-  /** Whether the permission policy would run a bash command without asking: where --check-writes may run its programs. */
-  mayRun?(command: string): boolean;
+  /** Whether the model could run a bash command itself without asking: where --check-writes may run its programs (see ToolContext). */
+  mayRun?(command: string, script: string): boolean;
   /** Let edit_file apply a unique match that differs in typographic punctuation or trailing whitespace (--tolerant-edits). */
   tolerantEdits?: boolean;
   /** The user's hooks around tool calls (see hooks.ts). */

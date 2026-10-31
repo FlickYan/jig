@@ -35,11 +35,13 @@ export interface ToolContext {
   /** --check-writes: write_file and edit_file check what they wrote, and say what is wrong (see write-check.ts). */
   checkWrites?: boolean;
   /**
-   * Whether the permission policy as it is now (after a /mode, say) would run a bash command without asking
-   * (see Permissions.decide). --check-writes runs a program on a file (`python3 <file>`, say) only where it
-   * would; without this, it runs none.
+   * Whether the model could run a bash command itself without asking: it has the bash tool, no PreToolUse
+   * hook covers it, the permission policy as it is now (after a /mode, say) would run `command` so (see
+   * Permissions.decide), and no deny rule matches `script`, what runs in its place. --check-writes runs a
+   * program on a file only where it could (`command` is `python3 <file>`, say, and `script` the check that
+   * runs it); without this, it runs none.
    */
-  mayRun?(command: string): boolean;
+  mayRun?(command: string, script: string): boolean;
   /** --tolerant-edits: edit_file applies a unique match that differs in typographic punctuation or trailing whitespace. */
   tolerantEdits?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */

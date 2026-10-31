@@ -86,7 +86,7 @@ export class Permissions {
     const name = tool.definition.name;
     if (this.denyRules.includes(name)) return { refuse: `Refused: the ${name} tool is denied in jig's settings.` };
     const command = tool.kind === "run" ? String(input.command) : "";
-    const rule = command && this.denyRules.find((r) => matchesDenyRule(command, r));
+    const rule = command && this.denies(command);
     if (rule) return { refuse: `Refused: the command matches the deny rule "${rule}" in jig's settings. Don't try to get around it.` };
     // A proposal asks the user itself, and changes nothing until they agree.
     if (tool.kind === "read" || tool.kind === "propose") return "allow";
@@ -100,6 +100,15 @@ export class Permissions {
     if (tool.kind === "edit") return this.mode === "edits" || this.editsAllowed ? "allow" : "ask";
     if (commands?.every((argv) => this.readsOnly(argv) || this.isApproved(argv) || this.allowedByRule(argv))) return "allow";
     return this.mode === "edits" && this.contained ? "allow" : "ask";
+  }
+
+  /**
+   * The deny rule a command matches, if any. decide asks it of the command it is given; jig asks it too of
+   * what runs in place of a command it asked decide about (--check-writes asks about `python3 <file>`, and
+   * runs a longer script), so a rule that matches only what runs refuses it all the same.
+   */
+  denies(command: string): string | undefined {
+    return this.denyRules.find((rule) => matchesDenyRule(command, rule));
   }
 
   /**

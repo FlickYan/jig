@@ -13,7 +13,7 @@ import { parseArgs } from "node:util";
 import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
-import { runHooks, runStopHooks } from "./hooks.ts";
+import { hooksFor, runHooks, runStopHooks } from "./hooks.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
@@ -96,8 +96,10 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           look) and sends the problems it finds back to the model
       --check-writes      after write_file and edit_file, tell the model of a syntax error the change made
                           (Python, JavaScript, shell and JSON files), and of lines write_file left that look
-                          like placeholders for code left out; python3, node and bash check a file only
-                          where the model's command running them on it would need no approval
+                          like placeholders for code left out. python3, node and bash check a file only where
+                          the model could run them on it unasked: with --yes, --mode auto or /mode auto, in
+                          edits mode in the sandbox without the network, or by an allow rule; and not where a
+                          deny rule matches the check, a PreToolUse hook covers bash, or --tools leaves it out
       --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
   -v, --version           print jig's version
@@ -483,6 +485,28 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return choice.startsWith("y") ? null : "The user declined this tool call. Ask them how they want to proceed.";
   }
 
+  // --check-writes runs python3, node or bash on a file only where the model could run that program on it
+  // itself without asking (see write-check.ts): not without the bash tool, nor where a PreToolUse hook covers
+  // bash, as jig can't ask a hook about a command the model didn't make; otherwise where the policy, as it is
+  // now, would run `command` unasked and no deny rule matches `script`, what runs in its place. The user is
+  // told once why a check was left out; --stats counts each one.
+  const bash = bashTool.definition.name;
+  const programsOff = !own.some((tool) => tool.definition.name === bash)
+    ? "bash isn't among the model's tools"
+    : hooksFor(settings.hooks, "PreToolUse", [bash]).length
+      ? "a PreToolUse hook covers bash"
+      : undefined;
+  let toldChecksOff = false;
+  function mayRun(command: string, script: string): boolean {
+    const decision = permissions.decide(bashTool, { command });
+    const why = programsOff ?? (decision === "ask" ? "the model's commands ask first here" : decision !== "allow" || permissions.denies(script) ? "a deny rule refuses it" : undefined);
+    if (why && !toldChecksOff) {
+      toldChecksOff = true;
+      ui.notice(`--check-writes runs python3, node and bash only where the model could run them itself without asking, so it left out a check by ${command.split(" ")[0]}: ${why}.`);
+    }
+    return !why;
+  }
+
   const agent: AgentOptions = {
     callModel: newModel(),
     escalate: escalation,
@@ -493,9 +517,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     gitLocked,
     // Not the subagents' or the reviewer's: they don't change files.
     checkWrites: values["check-writes"],
-    // Its programs run where the policy would run them as the model's own commands, without asking: by the
-    // mode as it is now, and for the model --escalate hands over to too, as the two share these options.
-    mayRun: (command) => permissions.decide(bashTool, { command }) === "allow",
+    // For the model --escalate hands over to too, as the two share these options.
+    mayRun,
     tolerantEdits: values["tolerant-edits"],
     maxSteps,
     compactAt: compactLimit,

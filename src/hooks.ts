@@ -39,9 +39,7 @@ export async function runHooks(
   { signal, timeout = TIMEOUT, was }: { signal?: AbortSignal; timeout?: number; was?: string } = {},
 ): Promise<HookOutcome> {
   const outcome: HookOutcome = { warnings: [] };
-  const names = was ? [call.tool, was] : [call.tool];
-  const matching = hooks.filter((hook) => hook.event === event && names.some((name) => hookMatcher(hook.matcher).test(name)));
-  for (const hook of matching) {
+  for (const hook of hooksFor(hooks, event, was ? [call.tool, was] : [call.tool])) {
     if (signal?.aborted) break;
     const file = typeof call.input.path === "string" ? resolve(cwd, call.input.path) : "";
     const env = { ...withoutKeys(), JIG_EVENT: event, JIG_TOOL: call.tool, JIG_FILE: file, JIG_PROJECT_DIR: cwd };
@@ -57,6 +55,15 @@ export async function runHooks(
     }
   }
   return outcome;
+}
+
+/**
+ * The hooks for `event` that apply to a tool called by any of `names` (its name, and the one it was given as,
+ * see runHooks), by their matchers. jig asks it of the bash tool too: --check-writes runs no program where a
+ * PreToolUse hook covers bash, as it can't ask the hook about a command the model didn't make.
+ */
+export function hooksFor(hooks: Hook[], event: Exclude<HookEvent, "Stop">, names: string[]): Hook[] {
+  return hooks.filter((hook) => hook.event === event && names.some((name) => hookMatcher(hook.matcher).test(name)));
 }
 
 /** What a Stop hook gets on stdin, besides the event and the project directory. */
