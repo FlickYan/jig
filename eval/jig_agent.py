@@ -94,6 +94,9 @@ class JigOptions(InstalledAgentOptions):
     finish_gate: Annotated[bool | None, Cli("--finish-gate")] = Field(
         default=None, description="jig's --finish-gate: send the model back once if its trace shows unchecked work"
     )
+    overview: Annotated[bool | None, Cli("--overview")] = Field(
+        default=None, description="jig's --overview: the project's files, and the files the task names, before the task"
+    )
     tools: Annotated[str | None, Cli("--tools")] = Field(
         default=None, description="jig's --tools: only these of its tools, e.g. bash"
     )

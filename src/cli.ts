@@ -18,6 +18,7 @@ import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
+import { overview } from "./overview.ts";
 import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
 import { createSandbox, lockedGitPaths, sandboxProblem } from "./sandbox.ts";
@@ -103,6 +104,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           or --tools leaves it out
       --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
+      --overview          before a task, give the model the project's files with their sizes (in a
+                          conversation's first message), and the files the task names as read_file shows them,
+                          which then count as read (16 KB each, 32 KB in all)
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -257,6 +261,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       reviewer: { type: "string" },
       "check-writes": { type: "boolean", default: false },
       "tolerant-edits": { type: "boolean", default: false },
+      overview: { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -560,8 +565,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     }
   }
 
-  async function runTask(text: string, label = text): Promise<Ending> {
-    // --time-limit counts from here, the snapshot included.
+  /**
+   * Runs a task. `words` are the user's own words in it, for --overview to find the files they name; jig's
+   * own requests (/reflect, /remember, writing a skill) have none, and get no overview.
+   */
+  async function runTask(text: string, label = text, words?: string): Promise<Ending> {
+    // --time-limit counts from here, the snapshot and the overview included.
     const begun = Date.now();
     const deadline = timeLimit === undefined ? undefined : begun + timeLimit * 1000;
     const checkUntil = timeLimit === undefined ? undefined : begun + timeLimit * 1000 * (1 - CHECK_SHARE);
@@ -578,7 +587,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // it asks the model to go on with that request, so the model is told it is over.
     const last = conversation.messages.at(-1)?.content;
     if (typeof last === "string" && AFTER_EMPTY.includes(last)) notes.push("Your previous request ended without an answer from you.");
-    const message = notes.length ? `${notes.map((note) => `(Note from jig: ${note})`).join("\n")}\n\n${text}` : text;
+    const shown = values.overview && words !== undefined ? await overviewFor(words) : undefined;
+    const message = [...(notes.length ? [notes.map((note) => `(Note from jig: ${note})`).join("\n")] : []), ...(shown ? [shown] : []), text].join("\n\n");
     notes.length = 0;
     conversation.push({ role: "user", content: message });
     unapproved = 0;
@@ -600,6 +610,25 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // However the task ended: a command may have run before it failed or was stopped.
     warnOfGitChanges();
     return ending;
+  }
+
+  /**
+   * --overview's text before a task in the user's `words` (see overview.ts): the project's files in a
+   * conversation's first message, where the model has none of it yet, and the files the words name, which
+   * it records as read. Each time it adds something is counted, and each named file it shows. A project it
+   * can't list (one the settings hide, say) gets none, and the user is told why.
+   */
+  async function overviewFor(words: string): Promise<string | undefined> {
+    try {
+      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list: conversation.messages.length === 0 });
+      if (!found) return undefined;
+      count?.("overview");
+      for (let i = 0; i < found.shown; i++) count?.("overview.file");
+      return found.text;
+    } catch (err) {
+      ui.notice(`--overview left the project's files out: ${(err as Error).message}`);
+      return undefined;
+    }
   }
 
   /**
@@ -626,7 +655,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     const content = skillContent(skill);
     if (content === undefined) return "error";
     conversation.pin(`skill:${skill.name}`, content);
-    return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`);
+    return runTask(`${content}\n\n${task || `Use the ${skill.name} skill.`}`, `/${skill.name} ${task}`, task);
   }
 
   /** Writing a skill (/skills new, /learn, jig skills new|learn): with skill-writer's instructions, if it is there. */
@@ -773,7 +802,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   if (taskText) {
     if (noSandbox) ui.notice(noSandbox);
-    const run = skillsVerb ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`) : runTask(taskText, memoryVerb ? `jig memory reflect ${given}` : taskText);
+    const run = skillsVerb
+      ? runSkillWriting(taskText, `jig skills ${skillsVerb} ${given}`)
+      : memoryVerb
+        ? runTask(taskText, `jig memory reflect ${given}`)
+        : runTask(taskText, taskText, taskText);
     process.exitCode = EXIT_CODES[await run] ?? 1;
     return;
   }
@@ -799,7 +832,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     if (input.startsWith("/")) {
       if (!(await command(input))) break;
     } else if (input) {
-      await runTask(input);
+      await runTask(input, input, input);
     }
   }
   // Once more: a job a command left running in the background may have changed one since the last task.

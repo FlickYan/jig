@@ -1002,6 +1002,68 @@ describe("--tolerant-edits", () => {
   });
 });
 
+describe("--overview", () => {
+  // The first message of each request, and the result of the model's first call in it.
+  const firstMessage = (request: Record<string, unknown>) => (request.messages as Anthropic.Beta.BetaMessageParam[])[0].content;
+  const firstResult = (request: Record<string, unknown>) => JSON.stringify((request.messages as unknown[])[2]);
+  const listed =
+    "(Note from jig: the project's files, shallowest first, with their sizes; what git ignores, and folders like node_modules that git doesn't track, aren't listed.)\n" +
+    "NOTES.md (9 bytes)\napp.py (9 bytes)\ntests/test_app.py (11 bytes)";
+  const named = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
+
+  beforeEach(async () => {
+    await mkdir(join(project, "tests"));
+    await writeFile(join(project, "app.py"), "print(1)\n");
+    await writeFile(join(project, "NOTES.md"), "Print 2.\n");
+    await writeFile(join(project, "tests", "test_app.py"), "import app\n");
+  });
+
+  it("puts the project's files, and the files the task names as read_file shows them, before the task, so the model can replace one at once; and counts them", async () => {
+    // The model replaces app.py on its first step, without reading it.
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "write_file", input: { path: "app.py", content: "print(2)\n" } }] : [{ text: "Done." }],
+    );
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      const task = "Make app.py do what NOTES.md says.";
+      const off = await runJig([...args, task], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(firstMessage(api.requests[0]), task, "off by default");
+      assert.match(firstResult(api.requests[1]), /You haven't read app\.py yet/);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+
+      const on = await runJig([...args, "--overview", task], { api, cwd: project });
+      assert.equal(on.code, 0, on.output);
+      assert.equal(firstMessage(api.requests[2]), `${listed}\n\n${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.\n\n${task}`);
+      assert.match(firstResult(api.requests[3]), /Overwrote app\.py \(1 line\)\./);
+      assert.equal(await readFile(join(project, "app.py"), "utf8"), "print(2)\n");
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "overview.file": 2 });
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--overview/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("lists the files in a conversation's first message only, and shows the files each task names", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const env = { JIG_HOME: await tempDir("jig-home-") };
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--overview"];
+      const first = await runJig([...args, "--", "-"], { api, cwd: project, env, stdin: "Read the notes." });
+      const second = await runJig([...args, "--continue", "--", "-"], { api, cwd: project, env, stdin: "Now check tests/test_app.py." });
+      assert.deepEqual([first.code, second.code], [0, 0], second.output);
+      assert.equal(firstMessage(api.requests[0]), `${listed}\n\nRead the notes.`, "no file named: the list alone");
+      const messages = api.requests[1].messages as Anthropic.Beta.BetaMessageParam[];
+      assert.deepEqual(messages.map((message) => message.role), ["user", "assistant", "user"]);
+      assert.equal(messages[2].content, `${named}\ntests/test_app.py:\n     1\timport app\n\nNow check tests/test_app.py.`);
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("a one-shot run's exit code", () => {
   const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up"];
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");

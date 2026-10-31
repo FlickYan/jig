@@ -108,6 +108,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         bash check a file only where the model could run them on it unasked (see below)
       --tolerant-edits  let edit_file apply an old_string that matches one place only once curly quotes, dashes
                         and no-break spaces count as ASCII, or then trailing whitespace doesn't (see below)
+      --overview        before a task, give the model the project's files with their sizes, and the files the
+                        task names as read_file shows them, which then count as read (see below)
   -v, --version         print jig's version
   -h, --help            show this help
 ```
@@ -160,6 +162,17 @@ first, and a looser one applies only where it is the only one; the result says w
 `--stats` counts it as `edit.tolerant`. It is off until benchmarks show whether it helps: deepseek-flash's
 edits rarely fail at all (2 of 1,709 in the stored benchmark runs of milestone 4 and later), unlike
 milestone 27's 7B models' (527 of 623).
+
+`--overview` puts two things before a task, with no model call: in a conversation's first message, the
+project's files, shallowest first, with their sizes (200 at most, leaving out what `glob` leaves out); and
+with each task, the files it names (a word with a dot or a slash that is a file's path, or the name of only
+one file) as `read_file` shows them, up to 16 KB each and 32 KB in all (a larger file, or one that isn't
+UTF-8 text, is named but not shown). Those shown count as read, so `write_file` can replace them without a
+read first. Not in the home directory or at the root, nor in the requests jig writes itself (`/reflect`,
+say). In milestone 30's runs on evolve2's 4 steps, the model spent its first two finding and reading the
+files, the test file a step after those the task named, so its first write came at step 3 or 4. It is off
+until benchmarks show whether it helps; `--stats` counts it (`overview`, and `overview.file` for each file
+shown).
 
 ## What it does
 
@@ -548,6 +561,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments and the keeper that holds the session's PID namespace on Linux; what it keeps read-only in git, and the git changes jig warns of |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
+| [`src/overview.ts`](src/overview.ts) | `--overview`: the project's files, and those the task names, put before the task |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |

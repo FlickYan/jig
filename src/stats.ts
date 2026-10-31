@@ -81,7 +81,11 @@ export type Mechanism =
   // --finish-gate sending the model back at its first stop: a file changed after it last ran anything, or its
   // last test run failed; and not looking, too close to --time-limit.
   | "finishGate"
-  | "finishGate.skipped";
+  | "finishGate.skipped"
+  // --overview putting the project's files, or the files a task names, before the task; and each named file
+  // it showed.
+  | "overview"
+  | "overview.file";
 
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,

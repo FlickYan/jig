@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
@@ -11,11 +12,16 @@ import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
 import { loadMemories } from "../src/memory.ts";
 import { type CallModel, type ModelTurn, tooLong } from "../src/model.ts";
+import { overview, overviewLimits } from "../src/overview.ts";
 import { projectKey } from "../src/paths.ts";
 import { loadInstructions, systemPrompt } from "../src/prompt.ts";
 import { SessionFile } from "../src/session.ts";
 import { Snapshots } from "../src/snapshots.ts";
+import { searchLimits } from "../src/tools/files.ts";
 import { TOOLS } from "../src/tools/index.ts";
+import { readTool } from "../src/tools/read.ts";
+import { FileVersions } from "../src/tools/util.ts";
+import { writeTool } from "../src/tools/write.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
@@ -509,5 +515,121 @@ describe("AGENTS.md", () => {
       instructions: [{ path: "../CLAUDE.md", text: "claude" }],
       warnings: ["../AGENTS.md", "AGENTS.md"].map((path) => `${path} isn't a regular file (a named pipe, say), so jig doesn't read it.`),
     });
+  });
+});
+
+describe("--overview", () => {
+  const LISTED = "(Note from jig: the project's files, shallowest first, with their sizes; what git ignores, and folders like node_modules that git doesn't track, aren't listed.)";
+  const NAMED = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
+  let project: string;
+
+  /** A git repository with these files, none of them committed, as `project`. */
+  async function repository(files: Record<string, string | Buffer>): Promise<void> {
+    project = join(dir, "app");
+    for (const [path, content] of Object.entries(files)) {
+      await mkdir(dirname(join(project, path)), { recursive: true });
+      await writeFile(join(project, path), content);
+    }
+    execFileSync("git", ["init", "-q"], { cwd: project });
+  }
+
+  async function withLimits(limits: Partial<typeof overviewLimits>, run: () => Promise<void>): Promise<void> {
+    const was = { ...overviewLimits };
+    Object.assign(overviewLimits, limits);
+    try {
+      await run();
+    } finally {
+      Object.assign(overviewLimits, was);
+    }
+  }
+
+  it("lists the project's files shallowest first, with their sizes, leaving out what grep and glob leave out, up to its limit", async () => {
+    await repository({
+      "app.py": "print(1)\n",
+      "lib/util.py": "x = 1\n",
+      "lib/deep/x.py": "",
+      ".gitignore": "logs/\n",
+      "logs/debug.log": "ignored\n",
+      "node_modules/m/index.js": "untracked\n",
+    });
+    // A file the settings hide, and one in jig's own directory (JIG_HOME, which holds other projects' files),
+    // each reached through a link.
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key.txt"), "secret\n");
+    await symlink(join(secrets, "key.txt"), join(project, "key.txt"));
+    await mkdir(join(dir, "home", "sessions"), { recursive: true });
+    await writeFile(join(dir, "home", "sessions", "s.jsonl"), "another project's session\n");
+    await symlink(join(dir, "home", "sessions", "s.jsonl"), join(project, "s.jsonl"));
+    const look = () => overview("Look around.", { cwd: project, hidden: [secrets], versions: new FileVersions(), list: true });
+    const files = [".gitignore (6 bytes)", "app.py (9 bytes)", "lib/util.py (6 bytes)", "lib/deep/x.py (0 bytes)"];
+    assert.deepEqual(await look(), { text: `${LISTED}\n${files.join("\n")}`, shown: 0 });
+    // The hidden files it passes over don't count among those not listed.
+    await withLimits({ files: 3 }, async () => {
+      assert.deepEqual(await look(), { text: `${LISTED}\n${files.slice(0, 3).join("\n")}\n(1 more not listed)`, shown: 0 });
+    });
+    // Outside git, a walk that stopped at its limit leaves more files than it counted.
+    const walked = join(dir, "walked");
+    await mkdir(walked);
+    for (const name of ["a", "b", "c", "d"]) await writeFile(join(walked, `${name}.txt`), "");
+    const was = searchLimits.files;
+    searchLimits.files = 3;
+    try {
+      await withLimits({ files: 2 }, async () => {
+        // Which three files the walk found first is the directory's order, not their names'.
+        const lines = (await overview("Look around.", { cwd: walked, versions: new FileVersions(), list: true }))?.text.split("\n");
+        assert.equal(lines?.length, 4);
+        assert.deepEqual([lines?.[0], lines?.[3]], [LISTED, "(at least 1 more not listed)"]);
+      });
+    } finally {
+      searchLimits.files = was;
+    }
+    await mkdir(join(dir, "empty"));
+    assert.equal((await overview("Start.", { cwd: join(dir, "empty"), versions: new FileVersions(), list: true }))?.text, `${LISTED}\n(none)`);
+    // Nothing to say without the list and a file named; nothing at all in the home directory or the root.
+    assert.equal(await overview("Look around.", { cwd: project, versions: new FileVersions(), list: false }), undefined);
+    for (const cwd of [homedir(), "/"]) assert.equal(await overview("Read /etc/hosts.", { cwd, versions: new FileVersions(), list: true }), undefined);
+  });
+
+  it("shows the files the task names, by path or by a name only one file has, as read_file shows them, and records them as read", async () => {
+    await repository({ "app.py": "print(1)\r\nprint(2)", "docs/guide.md": "# Guide\n", "lib/util.py": "x = 1\n", "tests/util.py": "y = 2\n", "notes": "plain\n" });
+    const versions = new FileVersions();
+    // util.py names two files, so it names neither; the absolute path names one; notes has no dot or slash.
+    const words = `Fix \`app.py\` as docs/guide.md says, and util.py (see ${project}/lib/util.py); read the notes.`;
+    const found = await overview(words, { cwd: project, versions, list: false });
+    const shown = (path: string) => readTool.run({ path }, { cwd: project, versions: new FileVersions() }).then((text) => `${path}:\n${text.trimEnd()}`);
+    const files = await Promise.all(["app.py", "docs/guide.md", "lib/util.py"].map(shown));
+    assert.deepEqual(found, { text: `${NAMED}\n${files.join("\n\n")}`, shown: 3 });
+    assert.match(files[0], /^app\.py:\n {5}1\tprint\(1\)\n {5}2\tprint\(2\)$/);
+    // So write_file replaces a file shown without a read, but not one changed since, nor one not shown.
+    const write = (path: string) => writeTool.run({ path, content: "new\n" }, { cwd: project, versions });
+    assert.equal(await write("app.py"), "Overwrote app.py (1 line, kept its CRLF line endings).");
+    await writeFile(join(project, "docs", "guide.md"), "# Guide, longer\n");
+    await assert.rejects(write("docs/guide.md"), /docs\/guide\.md has changed since you last read it/);
+    await assert.rejects(write("tests/util.py"), /You haven't read tests\/util\.py yet/);
+  });
+
+  it("names a file over its limits, or not UTF-8 text, or not a regular file, without showing or opening it, and leaves out a hidden one", async () => {
+    await repository({ "a.txt": "first\n", "b.txt": "second\n", "big.txt": "x".repeat(20), "latin.txt": Buffer.from("caf\xe9\n", "latin1"), "bin.dat": Buffer.from([1, 0, 2]) });
+    // A named pipe would block a read until something wrote to it, and /dev/zero never ends.
+    execFileSync("mkfifo", [join(dir, "fifo")]);
+    await symlink(join(dir, "fifo"), join(project, "pipe.txt"));
+    await symlink("/dev/zero", join(project, "zero.txt"));
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key.txt"), "secret\n");
+    await symlink(join(secrets, "key.txt"), join(project, "key.txt"));
+    const versions = new FileVersions();
+    await withLimits({ fileBytes: 10, totalBytes: 12 }, async () => {
+      const found = await overview("Use a.txt, b.txt, big.txt, latin.txt, bin.dat, pipe.txt, zero.txt and key.txt.", { cwd: project, hidden: [secrets], versions, list: false });
+      const not = [
+        "b.txt isn't shown: with it, the files shown would be over 12 bytes.",
+        "big.txt isn't shown: at 20 bytes, it is over 10 bytes.",
+        "latin.txt isn't shown: it isn't UTF-8 text.",
+        "bin.dat isn't shown: it isn't UTF-8 text.",
+        "pipe.txt isn't shown: it isn't a regular file.",
+        "zero.txt isn't shown: it isn't a regular file.",
+      ];
+      assert.deepEqual(found, { text: `${NAMED}\na.txt:\n     1\tfirst\n\n${not.join("\n\n")}`, shown: 1 });
+    });
+    await assert.rejects(writeTool.run({ path: "b.txt", content: "" }, { cwd: project, versions }), /You haven't read b\.txt yet/);
   });
 });
