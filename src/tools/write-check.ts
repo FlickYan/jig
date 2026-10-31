@@ -4,12 +4,15 @@
 //
 // - The syntax, by the file's extension: python3's ast.parse for .py, node --check for .js, .mjs and .cjs,
 //   bash -n for .sh, run as commands run (in the sandbox, without jig's keys), for 5 seconds at most and only
-//   where commands find the program; and JSON.parse for .json, in jig. Only an error the change made is
-//   reported: the old content is checked too, and an error it had already (the same, line numbers aside) is
-//   left alone, as these checks name only the first error, and a file one can't read at all (JSX in a .js
-//   file, comments in a .json one) would otherwise be reported at every change. The old content is checked in
-//   its place, before it is replaced: where a file lies can decide how it parses (a package.json's "type", for
-//   node).
+//   where commands find the program; and JSON.parse for .json, in jig. A program runs only where the
+//   permission policy would run it on the file without asking (see ToolContext.mayRun), or that check is left
+//   out: the model can pick the program (a virtualenv's python3 first on the PATH, whose files it can write)
+//   and what it runs as it starts, so the check is a command of the model's like any other. Only an error the
+//   change made is reported: the old content is checked too, and an error it had already (the same, line
+//   numbers aside) is left alone, as these checks name only the first error, and a file one can't read at all
+//   (JSX in a .js file, comments in a .json one) would otherwise be reported at every change. The old content
+//   is checked in its place, before it is replaced: where a file lies can decide how it parses (a
+//   package.json's "type", for node).
 // - For write_file, which replaces a file whole: lines like "// ... existing code ..." that the old content
 //   didn't have, in a file it made much shorter. Models write them for the code they didn't repeat, and that
 //   code is then gone from the file.
@@ -29,6 +32,8 @@ export const checkLimits = { seconds: 5 };
 /** A syntax check: its name for the model, and how it finds an error. */
 interface Check {
   name: string;
+  /** The program it runs on the file, if it runs one. */
+  program?: string;
   /** The line of an error it finds that names the error (see sameError). */
   names: RegExp;
   /**
@@ -38,8 +43,10 @@ interface Check {
   run(file: string, path: string, text: string, ctx: ToolContext, notes: string[]): Promise<string | undefined>;
 }
 
-// ast.parse compiles nothing, so it writes no .pyc; -I keeps the project's own modules (an ast.py) out of it.
-// format_exception_only is given the error's type too, which Pythons before 3.10 (macOS's own is 3.9) require.
+// ast.parse compiles nothing, so it writes no .pyc; -I keeps the project's own modules (an ast.py) out of it,
+// and -S the site module, which runs the code of site-packages' .pth files and sitecustomize (ast, sys and
+// traceback need no site-packages). format_exception_only is given the error's type too, which Pythons
+// before 3.10 (macOS's own is 3.9) require.
 const PARSE_PYTHON = `import ast,sys,traceback
 s=open(sys.argv[1],"rb").read()
 try: ast.parse(s,sys.argv[1])
@@ -53,7 +60,7 @@ const CHECK_JS = (file: string) =>
 
 const NODE = command("node --check", "node", (file) => `node --check ${file}`, /^SyntaxError: /m);
 const CHECKS: Record<string, Check> = {
-  ".py": command("python3's ast.parse", "python3", (file) => `python3 -I -c '${PARSE_PYTHON}' ${file}`, /^\w*Error: /m),
+  ".py": command("python3's ast.parse", "python3", (file) => `python3 -I -S -c '${PARSE_PYTHON}' ${file}`, /^\w*Error: /m),
   ".js": command("node --check", "node", CHECK_JS, /^SyntaxError: /m),
   ".mjs": NODE,
   ".cjs": NODE,
@@ -68,13 +75,15 @@ const CHECKS: Record<string, Check> = {
  * tool's result, or "" when nothing is wrong. `whole` says the change replaced the whole file (write_file).
  */
 export async function checkChange(file: string, path: string, old: string | undefined, ctx: ToolContext, whole = false): Promise<(text: string) => Promise<string>> {
-  const check = CHECKS[extname(file).toLowerCase()];
+  // Asked once, so the old content and the new are both checked, or neither: an error the file had already
+  // isn't then taken for the change's.
+  const check = checkFor(file, ctx);
   const notes: string[] = [];
   const before = old !== undefined && check ? await check.run(file, path, old, ctx, notes) : undefined;
   return async (text) => {
     const found: string[] = [];
     const error = check ? await check.run(file, path, text, ctx, notes) : undefined;
-    if (error && !(before && sameError(check, before, error))) {
+    if (check && error && !(before && sameError(check, before, error))) {
       ctx.count?.("write.syntaxError");
       const since = old === undefined ? "" : before ? " after this change, with another error than before" : " after this change, though it passed before";
       found.push(`A syntax check of ${path} (${check.name}) failed${since}:\n${error}`);
@@ -94,6 +103,17 @@ export async function checkChange(file: string, path: string, old: string | unde
 }
 
 /**
+ * The syntax check for `file`, by its extension, if it has one. One that runs a program on it is left out
+ * unless the permission policy would run that program on the file without asking (ToolContext.mayRun), as it
+ * would the model's own command: the program, and what it runs as it starts, can be the model's.
+ */
+function checkFor(file: string, ctx: ToolContext): Check | undefined {
+  const check: Check | undefined = CHECKS[extname(file).toLowerCase()];
+  if (check?.program && !ctx.mayRun?.(`${check.program} ${quoted(file)}`)) return undefined;
+  return check;
+}
+
+/**
  * A check that runs `program` on the file, by the command `call` makes of its path, as the bash tool runs a
  * command, but for checkLimits.seconds at most, and only where commands find the program. It finds an error
  * when the command fails and its output shows `error`, which tells a syntax error from the program failing
@@ -103,6 +123,7 @@ export async function checkChange(file: string, path: string, old: string | unde
 function command(name: string, program: string, call: (file: string) => string, error: RegExp): Check {
   return {
     name,
+    program,
     names: error,
     async run(file, path, _text, { cwd, signal, sandbox }, notes) {
       const real = await realpath(file).catch(() => undefined);
@@ -117,8 +138,7 @@ function command(name: string, program: string, call: (file: string) => string, 
           return wrapped;
         },
       };
-      const quoted = `'${real.replaceAll("'", `'\\''`)}'`;
-      const script = `command -v ${program} >/dev/null || exit 0; ${call(quoted)}`;
+      const script = `command -v ${program} >/dev/null || exit 0; ${call(quoted(real))}`;
       // A check that can't be started finds nothing: the change is written, or about to be, either way.
       const result = await runCommand(script, cwd, checkLimits.seconds, signal, noting).catch(() => "");
       // The output, then a blank line and how the command ended: a timeout or Ctrl+C finds nothing.
@@ -132,6 +152,11 @@ function command(name: string, program: string, call: (file: string) => string, 
       return shown.replace(/^\[stdin\]:/, () => `${path}:`);
     },
   };
+}
+
+/** A path as one word of a shell command. */
+function quoted(path: string): string {
+  return `'${path.replaceAll("'", `'\\''`)}'`;
 }
 
 /**

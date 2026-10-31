@@ -35,7 +35,7 @@ import { skillsCommand } from "./skills-cli.ts";
 import { type Restored, Snapshots } from "./snapshots.ts";
 import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
-import { killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
+import { bashTool, killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
 import { parseToolList, selectTools, TOOL_NAMES, type Tool, type ToolInput } from "./tools/index.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
@@ -96,7 +96,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           look) and sends the problems it finds back to the model
       --check-writes      after write_file and edit_file, tell the model of a syntax error the change made
                           (Python, JavaScript, shell and JSON files), and of lines write_file left that look
-                          like placeholders for code left out
+                          like placeholders for code left out; python3, node and bash check a file only
+                          where the model's command running them on it would need no approval
       --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
   -v, --version           print jig's version
@@ -492,6 +493,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     gitLocked,
     // Not the subagents' or the reviewer's: they don't change files.
     checkWrites: values["check-writes"],
+    // Its programs run where the policy would run them as the model's own commands, without asking: by the
+    // mode as it is now, and for the model --escalate hands over to too, as the two share these options.
+    mayRun: (command) => permissions.decide(bashTool, { command }) === "allow",
     tolerantEdits: values["tolerant-edits"],
     maxSteps,
     compactAt: compactLimit,

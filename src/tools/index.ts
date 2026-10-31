@@ -34,6 +34,12 @@ export interface ToolContext {
   gitLocked?: string[];
   /** --check-writes: write_file and edit_file check what they wrote, and say what is wrong (see write-check.ts). */
   checkWrites?: boolean;
+  /**
+   * Whether the permission policy as it is now (after a /mode, say) would run a bash command without asking
+   * (see Permissions.decide). --check-writes runs a program on a file (`python3 <file>`, say) only where it
+   * would; without this, it runs none.
+   */
+  mayRun?(command: string): boolean;
   /** --tolerant-edits: edit_file applies a unique match that differs in typographic punctuation or trailing whitespace. */
   tolerantEdits?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */

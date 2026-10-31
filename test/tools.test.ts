@@ -335,7 +335,8 @@ describe("--check-writes", () => {
   let events: Mechanism[];
   beforeEach(() => {
     events = [];
-    ctx = { ...ctx, checkWrites: true, count: (event) => void events.push(event) };
+    // Where the permission policy would run the checks' programs without asking: see the test of mayRun below.
+    ctx = { ...ctx, checkWrites: true, mayRun: () => true, count: (event) => void events.push(event) };
   });
   const through = (wrap: Sandbox["wrap"]): Sandbox => ({ description: "a test sandbox", limits: "", wrap });
 
@@ -374,7 +375,7 @@ describe("--check-writes", () => {
       "import sys, traceback",
       "given = traceback.format_exception_only",
       "traceback.format_exception_only = lambda etype, value: given(etype, value)",
-      'code, sys.argv = sys.argv[3], ["-c", *sys.argv[4:]]', // python3 -I -c <code> <file>
+      'code, sys.argv = sys.argv[4], ["-c", *sys.argv[5:]]', // python3 -I -S -c <code> <file>
       "exec(code)",
     ];
     await writeFile(join(bin, "python3"), `${shim.join("\n")}\n`, { mode: 0o755 });
@@ -400,6 +401,69 @@ describe("--check-writes", () => {
     assert.equal(await write("app.py", "def f(:\n"), "Created app.py (1 line).");
   });
 
+  it("runs python3, node and bash on a file only where the permission policy would run them on it without asking", async () => {
+    // Each first on the PATH, saying it ran before it runs the real one; and the sandbox, which wraps every
+    // command, says what it was given. A check the policy wouldn't run starts nothing, not even a shell.
+    const bin = await tempDir("jig-bin-");
+    const ran = join(bin, "ran.txt");
+    for (const program of ["python3", "node", "bash"]) {
+      const real = execFileSync("bash", ["-c", `command -v ${program}`], { encoding: "utf8" }).trim();
+      await writeFile(join(bin, program), `#!/bin/sh\necho ${program} >> '${ran}'\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    }
+    const commands: string[] = [];
+    ctx.sandbox = through((command) => {
+      commands.push(command);
+      return { program: "/usr/bin/env", args: [`PATH=${bin}:${process.env.PATH}`, "bash", "-c", command] };
+    });
+    const broken = (dir: string) => [[`${dir}/app.py`, "def f(:\n"], [`${dir}/app.js`, "function (\n"], [`${dir}/app.sh`, "if true; then\n"]];
+    const asked: string[] = [];
+    const refuse = (command: string) => {
+      asked.push(command);
+      return false;
+    };
+    // Without mayRun, or where it says no, the file is written and only JSON.parse, in jig, checks it.
+    for (const [dir, mayRun] of [["absent", undefined], ["refused", refuse]] as const) {
+      ctx.mayRun = mayRun;
+      for (const [path, content] of broken(dir)) assert.equal(await write(path, content), `Created ${path} (1 line).`);
+      assert.match(await write(`${dir}/data.json`, "{,}\n"), /^Created .*\n\nA syntax check of .*data\.json \(JSON\.parse\) failed:\n/);
+    }
+    await givenFile("code.js", "const a = 1;\n");
+    assert.equal(await edit("= 1;", "= (1;"), "Edited code.js: replaced 1 line at line 1 with 1 line.");
+    assert.deepEqual(commands, []);
+    assert.equal(existsSync(ran), false);
+    assert.deepEqual(events, ["write.syntaxError", "write.syntaxError"]);
+    // The policy is asked about the program on the file, once a change.
+    const on = (program: string, path: string) => `${program} '${join(cwd, path)}'`;
+    assert.deepEqual(asked, [on("python3", "refused/app.py"), on("node", "refused/app.js"), on("bash", "refused/app.sh"), on("node", "code.js")]);
+
+    // Where it would run them, they run.
+    ctx.mayRun = () => true;
+    for (const [path, content] of broken("allowed")) assert.match(await write(path, content), /^Created .*\n\nA syntax check of .* failed:\n/);
+    assert.equal(commands.length, 3);
+    assert.deepEqual(new Set(readFileSync(ran, "utf8").split("\n").filter(Boolean)), new Set(["bash", "python3", "node"]));
+  });
+
+  it("runs python3 without its site module, so a virtualenv's .pth files don't run", async (t) => {
+    // A virtualenv's python3 first on the PATH, as when it is activated: the model can write in its
+    // site-packages, and what it writes there would otherwise run with each check.
+    const venv = join(await tempDir("jig-venv-"), "venv");
+    try {
+      execFileSync("python3", ["-m", "venv", "--without-pip", venv], { stdio: "ignore" });
+    } catch {
+      return t.skip("python3 can't make a virtualenv here");
+    }
+    const python = join(venv, "bin", "python3");
+    const site = execFileSync(python, ["-c", "import site; print(site.getsitepackages()[0])"], { encoding: "utf8" }).trim();
+    const ran = join(venv, "ran.txt");
+    await writeFile(join(site, "planted.pth"), `import os; open(${JSON.stringify(ran)}, "a").write("ran\\n")\n`);
+    ctx.sandbox = through((command) => ({ program: "/usr/bin/env", args: [`PATH=${join(venv, "bin")}:${process.env.PATH}`, "bash", "-c", command] }));
+    assert.match(await write("app.py", "def f(:\n"), /^Created app\.py \(1 line\)\.\n\nA syntax check of app\.py \(python3's ast\.parse\) failed:\n.*\nSyntaxError: /s);
+    assert.equal(existsSync(ran), false);
+    // As python3 would have run it without -S, -I or not.
+    execFileSync(python, ["-I", "-c", "pass"]);
+    assert.match(readFileSync(ran, "utf8"), /^(ran\n)+$/);
+  });
+
   it("runs the check in the sandbox, only where the program is, and stops it at the time limit", async () => {
     const commands: string[] = [];
     ctx.sandbox = through((command) => {
@@ -407,7 +471,7 @@ describe("--check-writes", () => {
       return { program: "bash", args: ["-c", command] };
     });
     assert.match(await write("a.py", "def f(:\n"), /python3's ast\.parse/);
-    assert.match(commands.join("\n"), /python3 -I -c /);
+    assert.match(commands.join("\n"), /python3 -I -S -c /);
     // The sandbox tells the model some things once, with a command's result: if a check took the note, it comes here.
     ctx.sandbox = through((command) => ({ program: "bash", args: ["-c", command], note: "(A note from the sandbox.)" }));
     assert.equal(await write("noted.py", "x = 1\n"), "Created noted.py (1 line).\n\n(A note from the sandbox.)");

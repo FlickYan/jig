@@ -13,6 +13,7 @@ import { Conversation } from "../src/conversation.ts";
 import { type CallModel, createModel, type ModelTurn } from "../src/model.ts";
 import { Permissions } from "../src/permissions.ts";
 import { systemPrompt } from "../src/prompt.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { Stats } from "../src/stats.ts";
 import { globTool } from "../src/tools/glob.ts";
 import { grepTool } from "../src/tools/grep.ts";
@@ -833,6 +834,68 @@ describe("--check-writes", () => {
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "write.syntaxError": 1 });
     } finally {
       api.close();
+    }
+  });
+
+  // A python3 first on the PATH that notes the file it is given (its last argument), then runs the real one; and
+  // runs of jig with --check-writes whose model, told "Write x.py.", writes x.py with a syntax error. A run
+  // resolves to the write_file calls' results, and the files python3 was given.
+  const checkingWrites = async () => {
+    const bin = join(outside, "bin");
+    const ran = join(outside, "ran.txt");
+    const python = execFileSync("bash", ["-c", "command -v python3"], { encoding: "utf8" }).trim();
+    await mkdir(bin);
+    await writeFile(join(bin, "python3"), `#!/bin/sh\nfor arg; do file=$arg; done\nbasename "$file" >> '${ran}'\nexec '${python}' "$@"\n`, { mode: 0o755 });
+    const api = await fakeMessagesApi((request) => {
+      const task = /Write (\w+\.py)\./.exec(JSON.stringify((request.messages as { content: unknown }[]).at(-1)!.content));
+      return task ? [{ tool: "write_file", input: { path: task[1], content: "def f(:\n" } }] : [{ text: "Done." }];
+    });
+    const run = async (args: string[], stdin = "") => {
+      await rm(ran, { force: true });
+      for (const file of ["app.py", "a.py", "b.py"]) await rm(join(project, file), { force: true });
+      const env = { PATH: `${bin}:${process.env.PATH}` };
+      const { code, output } = await runJig(["--check-writes", "--model", "claude-haiku-4-5", ...args], { api, cwd: project, env, stdin });
+      assert.equal(code, 0, output);
+      const messages = api.requests.at(-1)!.messages as { content: string | { type: string; content: string }[] }[];
+      const results = messages.flatMap(({ content }) => (Array.isArray(content) ? content.filter((block) => block.type === "tool_result").map((block) => block.content) : []));
+      return { results, ran: existsSync(ran) ? (await readFile(ran, "utf8")).split("\n").filter(Boolean) : [] };
+    };
+    return { run, close: () => api.close() };
+  };
+  const unchecked = { results: ["Created app.py (1 line)."], ran: [] };
+  // The result of a write of name.py that python3 checked.
+  const checked = (name: string) => new RegExp(`^Created ${name}\\.py \\(1 line\\)\\.\\n\\nA syntax check of ${name}\\.py \\(python3's ast\\.parse\\) failed:\\n.*\\nSyntaxError: `, "s");
+
+  it("runs python3 on the file only where the permission policy would run it without asking, as /mode leaves it", async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      // Without the sandbox, edits mode asks before python3 runs (with no terminal, it doesn't run).
+      assert.deepEqual(await run(["--no-sandbox", "--mode", "edits", "Write app.py."]), unchecked);
+      const yes = await run(["--no-sandbox", "--yes", "Write app.py."]);
+      assert.deepEqual(yes.ran, ["app.py"]);
+      assert.equal(yes.results.length, 1);
+      assert.match(yes.results[0], checked("app"));
+      // In a session, by the mode as it is when the file is written.
+      const session = await run(["--no-sandbox", "--mode", "edits"], "Write a.py.\n/mode auto\nWrite b.py.\n");
+      assert.deepEqual(session.ran, ["b.py"]);
+      assert.equal(session.results.length, 2);
+      assert.equal(session.results[0], "Created a.py (1 line).");
+      assert.match(session.results[1], checked("b"));
+    } finally {
+      close();
+    }
+  });
+
+  it("runs python3 on the file in edits mode where the sandbox contains commands, not where they have the network", { skip: sandboxProblem() }, async () => {
+    const { run, close } = await checkingWrites();
+    try {
+      assert.deepEqual(await run(["--mode", "edits", "--allow-network", "Write app.py."]), unchecked);
+      const contained = await run(["--mode", "edits", "Write app.py."]);
+      assert.deepEqual(contained.ran, ["app.py"]);
+      assert.equal(contained.results.length, 1);
+      assert.match(contained.results[0], checked("app"));
+    } finally {
+      close();
     }
   });
 });

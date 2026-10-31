@@ -348,7 +348,7 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
 
   it("runs --check-writes' syntax checks in it", async () => {
     const sandbox = createSandbox(project, { network: false })!;
-    const ctx = { cwd: project, versions: new FileVersions(), sandbox, checkWrites: true };
+    const ctx = { cwd: project, versions: new FileVersions(), sandbox, checkWrites: true, mayRun: () => true };
     try {
       assert.match(await writeTool.run({ path: "checked.py", content: "def f(:\n" }, ctx), /\(python3's ast\.parse\) failed:\n.*SyntaxError/s);
       assert.match(await writeTool.run({ path: "checked.js", content: "function (\n" }, ctx), /\(node --check\) failed:\nchecked\.js:1\n.*SyntaxError/s);

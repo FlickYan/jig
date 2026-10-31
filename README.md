@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 547 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 551 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -137,7 +137,13 @@ syntax error the change made in a Python, JavaScript, shell or JSON file (python
 `node --check` and `bash -n`, run as commands are, for 5 seconds at most and only where they are installed;
 `JSON.parse` in jig), but not one the file had before; and lines like `// ... existing code ...` that
 `write_file` left in a file it made at least a quarter shorter, which stand for code a whole-file rewrite
-dropped. It is off until benchmarks show whether it helps; `--stats` counts what it finds.
+dropped. python3, node and bash check a file only where the model's command running them on it would need
+no approval: with `--yes`, in `edits` mode where the sandbox contains commands (so not without it, nor with
+`--allow-network`), or where an allow rule or an `[a]lways` answer allows the program, and never where a
+deny rule refuses it. Elsewhere those checks are left out, since the model can choose what they would run:
+a virtualenv's `python3` first on the PATH, and the `.pth` files it runs as it starts, can be files the
+model wrote (python3 runs with `-I -S`, which leaves out `.pth` files and `sitecustomize`, but the program
+itself can be replaced). It is off until benchmarks show whether it helps; `--stats` counts what it finds.
 
 `--tolerant-edits` lets `edit_file` apply an `old_string` that isn't in the file but matches one place once
 curly quotes, en and em dashes and no-break spaces count as their ASCII look-alikes, or failing that, once
