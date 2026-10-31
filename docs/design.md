@@ -373,6 +373,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   not evidence, and not a finished answer to train on. The runs in `bench/` leave it out (`--no-wrap-up`):
   at evolve2's four steps every attempt would make the extra call, and costs would no longer compare with
   earlier runs.
+- **The model is told its budget.** A step limit or a deadline the model can't see is one it can't plan
+  for: on evolve2's 4 steps flash read until the calls ran out. Once half the steps, or half of
+  `--time-limit`, are used, a note after each step's results says what is used, and before the last step
+  that it is the last: 92 of 105 against 66 and 66 (milestone 30). Unlike `--check` it adds no model call,
+  and it goes in the results' own message, so the cached prefix stays the same.
 - **Checking before finishing is opt-in.** With nobody to look at the result, a model that declares a
   task done after a quick look has the last word; on Terminal-Bench, 15 of jig's 18 failures were tasks it
   finished on its own and got wrong. `--check` makes one-shot runs tell the model nobody can answer and

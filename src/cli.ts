@@ -98,8 +98,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           (Python, JavaScript, shell and JSON files), and of lines write_file left that look
                           like placeholders for code left out. python3, node and bash check a file only where
                           the model could run them on it unasked: with --yes, --mode auto or /mode auto, in
-                          edits mode in the sandbox without the network, or by an allow rule; and not where a
-                          deny rule matches the check, a PreToolUse hook covers bash, or --tools leaves it out
+                          edits mode in the sandbox without the network, or by an allow rule or an [a]lways
+                          answer; and not where a deny rule matches the check, a PreToolUse hook covers bash,
+                          or --tools leaves it out
       --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
   -v, --version           print jig's version

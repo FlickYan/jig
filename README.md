@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 555 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 568 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -614,6 +614,7 @@ What each question came to; the write-ups, with every number's run and caveat, a
 | Do skills and memory work? (12, 13) | each with and without, 9 runs each | a skill learned from one session: 9 of 9 against 0 of 9; a convention remembered from an earlier session: 9 of 9 against 0 of 9 |
 | Can jig improve its own code? (14–22, 28) | the evolve loop and its referee, on two suites | 19 candidates; one accepted (+15 and +17 points on the suite), then 15 points worse on Terminal-Bench, so not merged; neither advice in the prompt nor changes to the loop moved the suite, and two of the loop's changes never ran at all |
 | A stronger model when the tests fail? (23) | the trigger replayed on 676 saved attempts; deepseek-v4-pro alone | the trigger would have reached 1 of 220 failures; v4-pro was 7 points ahead for 5 times the cost, while 2 more steps put flash 24 ahead |
+| Does it help to tell the model its budget? (30) | evolve2 at 4 steps, 21 tasks × 5, against two baselines on the same build; run again, at 40 steps, and on the main benchmark | 92 of 105 against 66 and 66, at the same cost, and 92 again; no harm at 40 steps (41 of 42 both ways) or on the main benchmark (60 of 60): on by default. Terminal-Bench not yet run. A finish gate and checks after writes never fired: opt-in |
 | A second model reviewing the work? (24) | Terminal-Bench, 20 tasks, alternating at each task | 5 points ahead (−20 to +30) for 2.4 times the cost; no result changed because of a review |
 | A review that runs the work? (29) | Terminal-Bench, 20 tasks, the hidden tests on each trial's work before the review's fix and after it | in a smoke test, the first failure a review turned into a pass; in the round, no result changed, no false alarm in 9 passes, and the causes of two failures found and lost before they went back |
 | Training on its own successes? (26) | a LoRA of Qwen2.5-0.5B on 225 passed sessions, loss on held-out tasks | −57% overall, but −20% on the model's own tokens: the rest is the prompt and the tools learnt by heart |
@@ -677,6 +678,7 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 | 27 | A 7B model trained on jig's successes | a LoRA on Modal, served next to the base model: the loss fell, the agent got worse |
 | 28 | The loop and the tools again | three candidates, all rejected; two never ran, and a step's narrowed tools were no limit (now they are, and an invalid call goes back in part) |
 | 29 | A reviewer that runs the work | `jig review`, in a copy of the machine; one failure turned into a pass, in a smoke test; in the round, no result changed |
+| 30 | Four ideas from other agents, measured | budget notes on by default (+25 points at 4 steps, twice); a finish gate, checks after writes and tolerant edits stay opt-in |
 
 ## Tests
 
