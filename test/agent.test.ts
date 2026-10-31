@@ -927,6 +927,30 @@ describe("telling the model its budget (budget notes)", () => {
     assert.deepEqual(notesIn(off.messages), ["", "", "", ""]);
   });
 
+  it("with --early-budget-notes, starts once 3 steps or fewer are left, if that comes before half, and says in each what a step is", async () => {
+    const events: string[] = [];
+    const { options, conversation, messages } = setup(steps(4), { maxSteps: 4, budgetNotes: { begun: Date.now(), early: true }, count: (event) => events.push(event) });
+    assert.equal((await runAgent(conversation, options)).stop, "max_steps");
+    const step = "A step is one reply: all its tool calls run before your next reply, in the order you give them, or at the same time if none of them runs a command or changes anything.";
+    assert.deepEqual(notesIn(messages), [
+      `(Note from jig: you have used 1 of your 4 steps. ${step})`,
+      `(Note from jig: you have used 2 of your 4 steps. ${step})`,
+      `(Note from jig: your next reply is the last step whose tool calls run. ${step} Make sure your changes are saved and checked; don't start new exploration.)`,
+      "",
+    ]);
+    // Only the note that wouldn't have come without it counts as early.
+    assert.deepEqual(events, ["budgetNote.early", "budgetNote", "budgetNote.lastStep"]);
+    // The step after which the first note comes, by the steps there are: from 6 on, half comes first.
+    const first = async (maxSteps: number, early: boolean) => {
+      const run = setup(steps(maxSteps), { maxSteps, budgetNotes: { begun: Date.now(), early } });
+      await runAgent(run.conversation, run.options);
+      return notesIn(run.messages).findIndex(Boolean) + 1;
+    };
+    const budgets = [3, 4, 5, 6, 7, 8, 12];
+    assert.deepEqual(await Promise.all(budgets.map((n) => first(n, true))), [1, 1, 2, 3, 4, 4, 6]);
+    assert.deepEqual(await Promise.all(budgets.map((n) => first(n, false))), [2, 2, 3, 3, 4, 4, 6]);
+  });
+
   it("with --time-limit, says how much time is left too, from half of it on, whatever the steps", async () => {
     const minute = 60_000;
     const told = async (budgetNotes: AgentOptions["budgetNotes"]) => {

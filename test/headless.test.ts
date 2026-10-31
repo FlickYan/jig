@@ -750,14 +750,15 @@ describe("a run that reaches --max-steps", () => {
 });
 
 describe("budget notes", () => {
+  // What followed the tool results in each request's last message.
+  const notes = (requests: Record<string, unknown>[]) =>
+    requests.map((request) => {
+      const last = (request.messages as Anthropic.Beta.BetaMessageParam[]).at(-1)!.content;
+      return typeof last === "string" ? "" : last.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+    });
+
   it("tell the model, after its results, what is used of its steps and its time from half of them on, unless --no-budget-notes, and count each note", async () => {
     const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
-    // What followed the tool results in each request's last message.
-    const notes = (requests: Record<string, unknown>[]) =>
-      requests.map((request) => {
-        const last = (request.messages as Anthropic.Beta.BetaMessageParam[]).at(-1)!.content;
-        return typeof last === "string" ? "" : last.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
-      });
     try {
       const file = join(outside, "stats.json");
       const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file];
@@ -777,6 +778,33 @@ describe("budget notes", () => {
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
       assert.match(help, /--no-budget-notes/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("start once 3 steps or fewer are left with --early-budget-notes, say in each what a step is, and count the notes it adds", async () => {
+    const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
+    try {
+      const file = join(outside, "stats.json");
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file, "--early-budget-notes"];
+      const { code, output } = await runJig([...args, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 2, output);
+      const step = "A step is one reply: all its tool calls run before your next reply, in the order you give them, or at the same time if none of them runs a command or changes anything.";
+      assert.deepEqual(notes(api.requests), [
+        "",
+        `(Note from jig: you have used 1 of your 4 steps. ${step})`,
+        `(Note from jig: you have used 2 of your 4 steps. ${step})`,
+        `(Note from jig: your next reply is the last step whose tool calls run. ${step} Make sure your changes are saved and checked; don't start new exploration.)`,
+      ]);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "budgetNote.early": 1, budgetNote: 1, "budgetNote.lastStep": 1 });
+      // Without the notes it would change nothing, so asking for both is a mistake.
+      const off = await runJig([...args, "--no-budget-notes", "Fix the parser."], { api, cwd: project });
+      assert.equal(off.code, 1);
+      assert.match(off.output, /--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one\./);
+      assert.equal(api.requests.length, 4);
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--early-budget-notes\n +start the notes once 3 or fewer steps are left/);
     } finally {
       api.close();
     }

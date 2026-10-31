@@ -75,6 +75,10 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --no-budget-notes   don't tell the model what is left of its budget: by default, once half the steps, or
                           half of --time-limit, are used, a note after each step says how many steps it has
                           used and how much time is left, and before its last step that it is the last
+      --early-budget-notes
+                          start the notes once 3 or fewer steps are left, if that comes before half, and have
+                          each say what a step is: one reply, whose tool calls all run before the next, in the
+                          order given (at the same time if none of them runs a command or changes anything)
       --finish-gate       the first time the model says it is done, with a step left, send it back once if it
                           changed files after it last ran anything, or its last test run failed (not in
                           --time-limit's last quarter)
@@ -250,6 +254,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "max-steps": { type: "string", default: "50" },
       "time-limit": { type: "string" },
       "budget-notes": { type: "boolean", default: true },
+      "early-budget-notes": { type: "boolean", default: false },
       "finish-gate": { type: "boolean", default: false },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
@@ -286,6 +291,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
   if (values.check && values.reviewer) throw new Error("--check and --reviewer both check the work before the task ends: use one.");
+  if (values["early-budget-notes"] && !values["budget-notes"]) throw new Error("--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one.");
   const model = values.model;
   const effort = values.effort as Effort | undefined;
   if (effort && !EFFORTS.includes(effort)) throw new Error(`--effort must be one of: ${EFFORTS.join(", ")}`);
@@ -619,7 +625,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
       // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
       const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
-      const budgetNotes = values["budget-notes"] ? { begun, deadline } : undefined;
+      // The model --escalate hands over to gets them too: it runs in the same loop.
+      const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] } : undefined;
       const result = await runAgent(conversation, { ...agent, checkUntil, budgetNotes }, signal).finally(() => clearTimeout(timer));
       // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
       // after a Ctrl+C the task can still be stopping when the deadline passes.

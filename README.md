@@ -91,6 +91,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
       --no-budget-notes don't tell the model, once half the steps or the time is used, what is left (see below)
+      --early-budget-notes  start those notes once 3 or fewer steps are left, if that is before half, and say
+                        in each what a step is (see below)
       --finish-gate     at its first stop, send the model back once if it changed files after it last ran
                         anything, or its last test run failed
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
@@ -599,6 +601,15 @@ its last step, that its next reply is the last whose tool calls run. The note go
 so the cached prefix stays the same; subagents and the reviewer get none. On evolve2, where each task has 4
 steps, it took deepseek-flash from 66 of 105 attempts (twice) to 92 of 105 at the same cost (milestone 30).
 `--no-budget-notes` leaves the notes out, and `--stats` counts them (`budgetNote`, `budgetNote.lastStep`).
+
+`--early-budget-notes` starts the notes once 3 or fewer steps are left, if that comes before half: at
+evolve2's 4 steps, after the first step instead of the second (from 6 steps on, half comes first). Each
+note then also says what a step is: one reply, whose tool calls all run before the next, in the order
+given, or at the same time if none of them runs a command or changes anything. In milestone 30's runs the
+model heard its budget only after step 2, and its thinking often guessed that each call was a step, or
+that a reply's calls might run out of order, which led some attempts to put a change and its test in
+different steps. It is off until benchmarks show whether it helps; `--stats` counts the notes it adds
+(`budgetNote.early`).
 
 With `--finish-gate`, the first time the model says it is done with a step left, and not in `--time-limit`'s
 last quarter, jig looks at what the task's calls did, with no model call, and sends the model back once,

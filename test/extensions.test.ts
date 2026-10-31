@@ -595,11 +595,10 @@ describe("subagents", () => {
 });
 
 describe("parallel tool calls", () => {
-  /** A tool that takes a while, and records how many of its calls ran at the same time. */
-  function slowTool(kind: Tool["kind"]) {
-    const stats = { running: 0, most: 0 };
+  /** A tool that takes a while, and records how many of its calls (those of the tools sharing `stats`) ran at the same time. */
+  function slowTool(kind: Tool["kind"], name = "slow", stats = { running: 0, most: 0 }) {
     const tool: Tool = {
-      definition: { name: "slow", description: "", input_schema: { type: "object", properties: {} } },
+      definition: { name, description: "", input_schema: { type: "object", properties: {} } },
       kind,
       describe: () => "",
       async run() {
@@ -623,5 +622,14 @@ describe("parallel tool calls", () => {
       const results = conversation.messages[2].content as ToolResult[];
       assert.deepEqual(results.map((result) => result.tool_use_id), ["a", "b", "c"], "results keep the calls' order");
     }
+  });
+
+  it("runs the reads in order too when another call in the reply runs a command, as --early-budget-notes tells the model", async () => {
+    const stats = { running: 0, most: 0 };
+    const tools = [slowTool("read", "look", stats).tool, slowTool("run", "act", stats).tool];
+    const calls = [toolUse("a", "look", { n: 1 }), toolUse("b", "act", {}), toolUse("c", "look", { n: 2 })];
+    const conversation = new Conversation(undefined, [{ role: "user", content: "go" }]);
+    await runAgent(conversation, agentOptions(fakeModel([reply(calls), reply([text("Done.")])]), { tools }));
+    assert.equal(stats.most, 1);
   });
 });

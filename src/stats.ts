@@ -74,10 +74,11 @@ export type Mechanism =
   | "escalated"
   | "loop"
   | "wrapUp"
-  // The budget notes' note after a step's tool results on the steps (and time) used, and the one before the
-  // last step instead.
+  // The budget notes' note after a step's tool results on the steps (and time) used, the one before the last
+  // step instead, and one only --early-budget-notes gave, with less than half of the steps (and time) used.
   | "budgetNote"
   | "budgetNote.lastStep"
+  | "budgetNote.early"
   // --finish-gate sending the model back at its first stop: a file changed after it last ran anything, or its
   // last test run failed; and not looking, too close to --time-limit.
   | "finishGate"

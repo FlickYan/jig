@@ -79,9 +79,10 @@ export interface AgentOptions {
    * Budget notes (on unless --no-budget-notes): once half the steps are used, or half the time when there is a `deadline` (--time-limit;
    * with `begun`, when the task began, as Date.now() gives them), a note after each step's tool results says
    * how much is used, and before the last step that it is the last (see budgetNote). Only a task's own loop
-   * has them: a subagent's or the reviewer's steps are their own.
+   * has them: a subagent's or the reviewer's steps are their own. `early` (--early-budget-notes) starts them
+   * once EARLY_NOTES steps or fewer are left too, and has each say what a step is (ONE_REPLY).
    */
-  budgetNotes?: { begun: number; deadline?: number };
+  budgetNotes?: { begun: number; deadline?: number; early?: boolean };
   /**
    * --finish-gate: the first time the model stops with a step left, before checkUntil, what the task's own
    * calls did, with no model call, may send it back once (see finishGap): a file changed after the last
@@ -442,8 +443,8 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     // With budget notes, what is left of the budget goes in the results' message, after them: an earlier
     // message would change the cached prefix. Not once the task is stopped: the model won't see it.
     const note = opts.budgetNotes && !signal?.aborted ? budgetNote(step, opts.maxSteps, opts.budgetNotes) : undefined;
-    if (note) opts.count?.(note === LAST_STEP ? "budgetNote.lastStep" : "budgetNote");
-    const content: MessageParam["content"] = note ? [...results, { type: "text", text: note }] : results;
+    if (note) opts.count?.(note.event);
+    const content: MessageParam["content"] = note ? [...results, { type: "text", text: note.text }] : results;
     conversation.push({ role: "user", content }, { toolMs }); // all results for one reply go in one message
     // What each call did, in the order they ran, for --finish-gate to look at when the model stops.
     if (opts.finishGate) for (const [i, call] of calls.entries()) follow(trail, call, results[i], ended[call.id]);
@@ -521,17 +522,34 @@ export const AFTER_EMPTY = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER];
 export const WRAP_UP = "You have run out of steps. Don't call any tools: say what you changed, what you verified and how, and what is left undone.";
 
 /** The budget notes' note before the last step whose tool calls run (a wrap-up may follow it, without tools). */
-const LAST_STEP = "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)";
+const LAST_STEP = ["your next reply is the last step whose tool calls run.", "Make sure your changes are saved and checked; don't start new exploration."];
 
 /**
- * The budget notes' note after a step's tool results: the steps used, and with a deadline the time left, once
- * half of either is used; before the last step, LAST_STEP instead; nothing after it, where no step follows.
+ * With --early-budget-notes, the notes start once this many steps or fewer are left, if that comes before half
+ * of them: at evolve2's 4 steps, after the first step instead of the second. From 6 steps on, half comes first.
  */
-function budgetNote(step: number, maxSteps: number, { begun, deadline }: { begun: number; deadline?: number }): string | undefined {
+const EARLY_NOTES = 3;
+
+/**
+ * What --early-budget-notes adds to each note: what a step is, and how its calls run (as runAgent runs them).
+ * In milestone 30's runs at 4 steps, the model often guessed that each call was a step, or that a reply's
+ * calls could run out of order, and some attempts split a change and its test over two steps for it.
+ */
+const ONE_REPLY = "A step is one reply: all its tool calls run before your next reply, in the order you give them, or at the same time if none of them runs a command or changes anything.";
+
+/**
+ * The budget notes' note after a step's tool results, and what --stats counts it as: the steps used, and with
+ * a deadline the time left, once half of either is used, or with `early` once EARLY_NOTES steps or fewer are
+ * left; before the last step, LAST_STEP instead; nothing after it, where no step follows.
+ */
+function budgetNote(step: number, maxSteps: number, { begun, deadline, early }: NonNullable<AgentOptions["budgetNotes"]>): { text: string; event: Mechanism } | undefined {
   if (step >= maxSteps) return undefined;
-  if (step === maxSteps - 1) return LAST_STEP;
+  // ONE_REPLY follows the note's first sentence.
+  const note = ([first, ...rest]: string[]) => `(Note from jig: ${[first, ...(early ? [ONE_REPLY] : []), ...rest].join(" ")})`;
+  if (step === maxSteps - 1) return { text: note(LAST_STEP), event: "budgetNote.lastStep" };
   const now = Date.now();
-  if (2 * step < maxSteps && (deadline === undefined || 2 * (now - begun) < deadline - begun)) return undefined;
+  const half = 2 * step >= maxSteps || (deadline !== undefined && 2 * (now - begun) >= deadline - begun);
+  if (!half && !(early && maxSteps - step <= EARLY_NOTES)) return undefined;
   let time = "";
   if (deadline !== undefined) {
     // "9 of 30 minutes", or "45 seconds of 30 minutes".
@@ -539,7 +557,7 @@ function budgetNote(step: number, maxSteps: number, { begun, deadline }: { begun
     const [all, allUnit] = inUnits(deadline - begun);
     time = `, with ${left}${unit === allUnit ? "" : ` ${unit}`} of ${all} ${allUnit} left`;
   }
-  return `(Note from jig: you have used ${step} of your ${maxSteps} steps${time}.)`;
+  return { text: note([`you have used ${step} of your ${maxSteps} steps${time}.`]), event: half ? "budgetNote" : "budgetNote.early" };
 }
 
 /** A time as the model is told it, rounded down: in minutes from 2 minutes up, else in seconds. */
