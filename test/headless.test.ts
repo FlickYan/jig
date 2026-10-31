@@ -1062,6 +1062,110 @@ describe("--overview", () => {
       api.close();
     }
   });
+
+  // Runs of jig with --overview whose model is done at once, given the user's `settings` if any, on a task in
+  // `args` or on stdin. A run resolves to its first request's first message, what jig printed, what the model
+  // was sent in all, and what --stats counted.
+  const overviewing = async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    const stats = join(outside, "stats.json");
+    const run = async (args: string[], settings?: object, stdin = "") => {
+      const from = api.requests.length;
+      const home = await tempDir("jig-home-");
+      if (settings) await writeFile(join(home, "settings.json"), JSON.stringify(settings));
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--overview", "--stats", stats, ...args], { api, cwd: project, env: { JIG_HOME: home }, stdin });
+      assert.equal(code, 0, output);
+      const sent = JSON.stringify(api.requests.slice(from).map((request) => request.messages));
+      return { first: firstMessage(api.requests[from]), output, sent, events: JSON.parse(await readFile(stats, "utf8")).events };
+    };
+    return { run, close: () => api.close() };
+  };
+  const task = "Make app.py do what NOTES.md says.";
+  const files = `${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.`;
+  // What jig tells the user, once, when it leaves parts out.
+  const leftOut = (parts: string) => `--overview gives the model only what its own tools would show it unasked, so it left out ${parts}.`;
+  const once = (output: string, parts: string) => {
+    assert.equal(output.match(/--overview gives the model only/g)?.length, 1, output);
+    assert.ok(output.includes(leftOut(parts)), output);
+  };
+
+  it("gives no part the model's own tools wouldn't, under a deny rule that names one, and tells the user why", async () => {
+    const { run, close } = await overviewing();
+    try {
+      const reading = await run([task], { deny: ["read_file"] });
+      assert.equal(reading.first, `${listed}\n\n${task}`);
+      once(reading.output, "the files the task names (a deny rule refuses read_file)");
+      assert.deepEqual(reading.events, { overview: 1, "overview.skipped": 1 });
+      const listing = await run([task], { deny: ["glob"] });
+      assert.equal(listing.first, `${files}\n\n${task}`);
+      once(listing.output, "the project's files (a deny rule refuses glob)");
+      assert.deepEqual(listing.events, { overview: 1, "overview.file": 2, "overview.skipped": 1 });
+      // Rules on commands don't name either tool.
+      const commands = await run([task], { deny: ["cat", "git ls-files"] });
+      assert.equal(commands.first, `${listed}\n\n${files}\n\n${task}`);
+      assert.doesNotMatch(commands.output, /--overview gives/);
+      assert.deepEqual(commands.events, { overview: 1, "overview.file": 2 });
+    } finally {
+      close();
+    }
+  });
+
+  it("gives no part whose tool --tools leaves out", async () => {
+    const { run, close } = await overviewing();
+    try {
+      const bash = await run(["--tools", "bash", task]);
+      assert.equal(bash.first, task);
+      once(bash.output, "the project's files (glob isn't among the model's tools) and the files the task names (read_file isn't among the model's tools)");
+      assert.deepEqual(bash.events, { "overview.skipped": 1 });
+      const reading = await run(["--tools", "read_file,bash", task]);
+      assert.equal(reading.first, `${files}\n\n${task}`);
+      once(reading.output, "the project's files (glob isn't among the model's tools)");
+      const all = await run(["--tools", "read_file,glob,bash", task]);
+      assert.equal(all.first, `${listed}\n\n${files}\n\n${task}`);
+      assert.doesNotMatch(all.output, /--overview gives/);
+    } finally {
+      close();
+    }
+  });
+
+  it("gives no part whose tool a PreToolUse hook covers, as it can't ask the hook", async () => {
+    const { run, close } = await overviewing();
+    try {
+      const blocking = (matcher?: string) => ({ hooks: { PreToolUse: [{ matcher, command: "exit 2" }] } });
+      for (const matcher of ["read_file", "read_.*|edit_file"]) {
+        const reading = await run([task], blocking(matcher));
+        assert.equal(reading.first, `${listed}\n\n${task}`, matcher);
+        once(reading.output, "the files the task names (a PreToolUse hook covers read_file)");
+      }
+      for (const matcher of ["*", undefined]) {
+        const every = await run([task], blocking(matcher));
+        assert.equal(every.first, task, String(matcher));
+        once(every.output, "the project's files (a PreToolUse hook covers glob) and the files the task names (a PreToolUse hook covers read_file)");
+        assert.deepEqual(every.events, { "overview.skipped": 1 });
+      }
+      // Hooks on other tools, or after a read, don't count.
+      const others = { hooks: { PreToolUse: [{ matcher: "write_file|bash", command: "exit 2" }], PostToolUse: [{ matcher: "read_file|glob", command: "exit 2" }] } };
+      const all = await run([task], others);
+      assert.equal(all.first, `${listed}\n\n${files}\n\n${task}`);
+      assert.doesNotMatch(all.output, /--overview gives/);
+    } finally {
+      close();
+    }
+  });
+
+  it("tells the user once a session why it left a part out, not the model, and counts each task it left one out of", async () => {
+    const { run, close } = await overviewing();
+    try {
+      const session = await run([], { deny: ["read_file"] }, "Fix app.py.\nLook around.\nNow NOTES.md.\n");
+      assert.equal(session.first, `${listed}\n\nFix app.py.`);
+      assert.doesNotMatch(session.sent, /print\(1\)|Print 2|--overview gives/);
+      once(session.output, "the files the task names (a deny rule refuses read_file)");
+      // The second task names no file, so nothing was left out of it.
+      assert.deepEqual(session.events, { overview: 1, "overview.skipped": 2 });
+    } finally {
+      close();
+    }
+  });
 });
 
 describe("a one-shot run's exit code", () => {

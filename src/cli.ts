@@ -18,7 +18,7 @@ import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
-import { overview } from "./overview.ts";
+import { overview, type Part } from "./overview.ts";
 import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
 import { createSandbox, lockedGitPaths, sandboxProblem } from "./sandbox.ts";
@@ -106,7 +106,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
       --overview          before a task, give the model the project's files with their sizes (in a
                           conversation's first message), and the files the task names as read_file shows them,
-                          which then count as read (16 KB each, 32 KB in all)
+                          which then count as read (16 KB each, 32 KB in all); each only where the model's own
+                          glob or read_file would show it unasked, so not where --tools leaves that tool out, a
+                          deny rule refuses it or a PreToolUse hook covers it
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -513,6 +515,26 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     return !why;
   }
 
+  // --overview gives the model only what its own tools would show it unasked: the list as glob gives it, the
+  // named files as read_file shows them. A part is left out where --tools leaves its tool out, a deny rule
+  // refuses it, or a PreToolUse hook covers it, as jig can't ask a hook about a call the model didn't make
+  // (a PostToolUse hook can't refuse one). The user is told once why a part was left out; --stats counts each
+  // task it left one out of.
+  const overviewOff = new Map<Part, string>();
+  for (const [part, name, what] of [["list", "glob", "the project's files"], ["files", "read_file", "the files the task names"]] as const) {
+    const tool = own.find((t) => t.definition.name === name);
+    // A tool that only looks is refused only by a deny rule that names it.
+    const why = !tool
+      ? `${name} isn't among the model's tools`
+      : permissions.decide(tool, {}) !== "allow"
+        ? `a deny rule refuses ${name}`
+        : hooksFor(settings.hooks, "PreToolUse", [name]).length
+          ? `a PreToolUse hook covers ${name}`
+          : undefined;
+    if (why) overviewOff.set(part, `${what} (${why})`);
+  }
+  const toldOverviewOff = new Set<Part>();
+
   const agent: AgentOptions = {
     callModel: newModel(),
     escalate: escalation,
@@ -615,16 +637,22 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   /**
    * --overview's text before a task in the user's `words` (see overview.ts): the project's files in a
    * conversation's first message, where the model has none of it yet, and the files the words name, which
-   * it records as read. Each time it adds something is counted, and each named file it shows. A project it
+   * it records as read; each only where the model's own tools would show it (see overviewOff). Each time it
+   * adds something is counted, each named file it shows, and each time it leaves a part out. A project it
    * can't list (one the settings hide, say) gets none, and the user is told why.
    */
   async function overviewFor(words: string): Promise<string | undefined> {
     try {
-      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list: conversation.messages.length === 0 });
+      const list = conversation.messages.length === 0;
+      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list, withheld: [...overviewOff.keys()] });
       if (!found) return undefined;
-      count?.("overview");
+      if (found.text) count?.("overview");
       for (let i = 0; i < found.shown; i++) count?.("overview.file");
-      return found.text;
+      if (found.left.length) count?.("overview.skipped");
+      const untold = found.left.filter((part) => !toldOverviewOff.has(part));
+      for (const part of untold) toldOverviewOff.add(part);
+      if (untold.length) ui.notice(`--overview gives the model only what its own tools would show it unasked, so it left out ${untold.map((part) => overviewOff.get(part)).join(" and ")}.`);
+      return found.text || undefined;
     } catch (err) {
       ui.notice(`--overview left the project's files out: ${(err as Error).message}`);
       return undefined;

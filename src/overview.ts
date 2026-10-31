@@ -3,7 +3,8 @@
 // words name, as read_file shows them, recorded as read so that write_file can replace them at once. In the
 // evolve2 runs with budget notes (milestone 30), the model read the named files at its first step and the
 // test file, whose path it learned from a listing, at its second or third, so the first write came at step
-// 3 or 4, with no step left after the first test result. Facts only: the model can still look anywhere.
+// 3 or 4, with no step left after the first test result. Facts only, and only those the model's own glob and
+// read_file would give it unasked (cli.ts says when they wouldn't): the model can still look anywhere.
 
 import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -18,6 +19,9 @@ import { assertVisible, decodeUTF8, type FileVersions, isInside, isUTF16, number
  */
 export const overviewLimits = { files: 200, fileBytes: 16 * 1024, totalBytes: 32 * 1024 };
 
+/** An overview's two parts: the list of the project's files, and the files a task names. */
+export type Part = "list" | "files";
+
 export interface OverviewOptions {
   cwd: string;
   dirs?: string[];
@@ -26,18 +30,27 @@ export interface OverviewOptions {
   versions: FileVersions;
   /** Whether to list the project's files: in a conversation's first message only, as later ones have it. */
   list: boolean;
+  /**
+   * The parts to leave out, as the model's own tools wouldn't show them to it unasked: the list where glob
+   * wouldn't, the named files where read_file wouldn't. Nothing is read for them.
+   */
+  withheld?: Part[];
 }
 
 /**
- * The text to put before a task in the user's `words`, and how many named files it shows, or undefined when
- * there is nothing to say, or the directory is the root or the home directory, which aren't a project.
+ * The text to put before a task in the user's `words`, how many named files it shows, and which of the
+ * withheld parts had something to show (the text is empty if that was all); or undefined when there is
+ * nothing to say, or the directory is the root or the home directory, which aren't a project.
  */
-export async function overview(words: string, { cwd, dirs = [], hidden = [], versions, list }: OverviewOptions): Promise<{ text: string; shown: number } | undefined> {
+export async function overview(words: string, { cwd, dirs = [], hidden = [], versions, list, withheld = [] }: OverviewOptions): Promise<{ text: string; shown: number; left: Part[] } | undefined> {
   const real = realTargetSync(cwd);
   if (!real || real === dirname(real) || real === realTargetSync(homedir())) return undefined;
   const { files, capped, gitTimedOut } = await listFiles(cwd, ".", dirs, hidden);
   const sections: string[] = [];
-  if (list) {
+  const left: Part[] = [];
+  if (list && withheld.includes("list")) {
+    left.push("list");
+  } else if (list) {
     // Shallowest first, then by name as listed, so a cut keeps the project's layout. The list leaves out what
     // the file tools hide, as glob does; the named files are checked one by one below.
     const byDepth = files.map((file) => ({ file, depth: file.split("/").length })).sort((a, b) => a.depth - b.depth).map(({ file }) => file);
@@ -56,7 +69,10 @@ export async function overview(words: string, { cwd, dirs = [], hidden = [], ver
   let shown = 0;
   let bytes = 0;
   const texts: string[] = [];
-  for (const file of namedFiles(words, files, cwd)) {
+  const named = namedFiles(words, files, cwd);
+  const withholding = withheld.includes("files");
+  if (withholding && named.length) left.push("files");
+  for (const file of withholding ? [] : named) {
     const abs = resolveInRoot(cwd, file, dirs);
     // Nothing the settings hide, nor jig's own directory, wherever a link leads: read_file refuses them, and
     // the list leaves them out.
@@ -83,7 +99,7 @@ export async function overview(words: string, { cwd, dirs = [], hidden = [], ver
     const header = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
     sections.push(`${header}\n${texts.join("\n\n")}`);
   }
-  return sections.length ? { text: sections.join("\n\n"), shown } : undefined;
+  return sections.length || left.length ? { text: sections.join("\n\n"), shown, left } : undefined;
 }
 
 /**

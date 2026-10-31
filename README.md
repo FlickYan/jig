@@ -169,10 +169,13 @@ with each task, the files it names (a word with a dot or a slash that is a file'
 one file) as `read_file` shows them, up to 16 KB each and 32 KB in all (a larger file, or one that isn't
 UTF-8 text, is named but not shown). Those shown count as read, so `write_file` can replace them without a
 read first. Not in the home directory or at the root, nor in the requests jig writes itself (`/reflect`,
-say). In milestone 30's runs on evolve2's 4 steps, the model spent its first two finding and reading the
-files, the test file a step after those the task named, so its first write came at step 3 or 4. It is off
-until benchmarks show whether it helps; `--stats` counts it (`overview`, and `overview.file` for each file
-shown).
+say). Each part only where the model's own `glob` or `read_file` would show it unasked: not where `--tools`
+leaves that tool out, a deny rule names it, or a `PreToolUse` hook covers it (jig can't ask a hook about a
+call the model didn't make). jig tells you once why it left a part out, and `--stats` counts each task it
+left one out of as `overview.skipped`. In milestone 30's runs on evolve2's 4 steps, the model spent its
+first two finding and reading the files, the test file a step after those the task named, so its first
+write came at step 3 or 4. It is off until benchmarks show whether it helps; `--stats` counts it
+(`overview`, and `overview.file` for each file shown).
 
 ## What it does
 

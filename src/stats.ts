@@ -82,10 +82,11 @@ export type Mechanism =
   // last test run failed; and not looking, too close to --time-limit.
   | "finishGate"
   | "finishGate.skipped"
-  // --overview putting the project's files, or the files a task names, before the task; and each named file
-  // it showed.
+  // --overview putting the project's files, or the files a task names, before the task; each named file it
+  // showed; and a task it left one of those out of, as the model's own glob or read_file wouldn't show it.
   | "overview"
-  | "overview.file";
+  | "overview.file"
+  | "overview.skipped";
 
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,

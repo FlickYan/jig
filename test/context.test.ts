@@ -12,7 +12,7 @@ import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
 import { loadMemories } from "../src/memory.ts";
 import { type CallModel, type ModelTurn, tooLong } from "../src/model.ts";
-import { overview, overviewLimits } from "../src/overview.ts";
+import { overview, overviewLimits, type Part } from "../src/overview.ts";
 import { projectKey } from "../src/paths.ts";
 import { loadInstructions, systemPrompt } from "../src/prompt.ts";
 import { SessionFile } from "../src/session.ts";
@@ -562,10 +562,10 @@ describe("--overview", () => {
     await symlink(join(dir, "home", "sessions", "s.jsonl"), join(project, "s.jsonl"));
     const look = () => overview("Look around.", { cwd: project, hidden: [secrets], versions: new FileVersions(), list: true });
     const files = [".gitignore (6 bytes)", "app.py (9 bytes)", "lib/util.py (6 bytes)", "lib/deep/x.py (0 bytes)"];
-    assert.deepEqual(await look(), { text: `${LISTED}\n${files.join("\n")}`, shown: 0 });
+    assert.deepEqual(await look(), { text: `${LISTED}\n${files.join("\n")}`, shown: 0, left: [] });
     // The hidden files it passes over don't count among those not listed.
     await withLimits({ files: 3 }, async () => {
-      assert.deepEqual(await look(), { text: `${LISTED}\n${files.slice(0, 3).join("\n")}\n(1 more not listed)`, shown: 0 });
+      assert.deepEqual(await look(), { text: `${LISTED}\n${files.slice(0, 3).join("\n")}\n(1 more not listed)`, shown: 0, left: [] });
     });
     // Outside git, a walk that stopped at its limit leaves more files than it counted.
     const walked = join(dir, "walked");
@@ -598,7 +598,7 @@ describe("--overview", () => {
     const found = await overview(words, { cwd: project, versions, list: false });
     const shown = (path: string) => readTool.run({ path }, { cwd: project, versions: new FileVersions() }).then((text) => `${path}:\n${text.trimEnd()}`);
     const files = await Promise.all(["app.py", "docs/guide.md", "lib/util.py"].map(shown));
-    assert.deepEqual(found, { text: `${NAMED}\n${files.join("\n\n")}`, shown: 3 });
+    assert.deepEqual(found, { text: `${NAMED}\n${files.join("\n\n")}`, shown: 3, left: [] });
     assert.match(files[0], /^app\.py:\n {5}1\tprint\(1\)\n {5}2\tprint\(2\)$/);
     // So write_file replaces a file shown without a read, but not one changed since, nor one not shown.
     const write = (path: string) => writeTool.run({ path, content: "new\n" }, { cwd: project, versions });
@@ -628,8 +628,24 @@ describe("--overview", () => {
         "pipe.txt isn't shown: it isn't a regular file.",
         "zero.txt isn't shown: it isn't a regular file.",
       ];
-      assert.deepEqual(found, { text: `${NAMED}\na.txt:\n     1\tfirst\n\n${not.join("\n\n")}`, shown: 1 });
+      assert.deepEqual(found, { text: `${NAMED}\na.txt:\n     1\tfirst\n\n${not.join("\n\n")}`, shown: 1, left: [] });
     });
     await assert.rejects(writeTool.run({ path: "b.txt", content: "" }, { cwd: project, versions }), /You haven't read b\.txt yet/);
+  });
+
+  it("leaves out a withheld part without reading for it, and says it did where the part had something to show", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    const listed = `${LISTED}\napp.py (9 bytes)`;
+    const shown = `${NAMED}\napp.py:\n     1\tprint(1)`;
+    const versions = new FileVersions();
+    const look = (words: string, list: boolean, withheld: Part[]) => overview(words, { cwd: project, versions, list, withheld });
+    // The named files withheld: app.py isn't recorded as read, so write_file still wants a read first.
+    assert.deepEqual(await look("Fix app.py.", true, ["files"]), { text: listed, shown: 0, left: ["files"] });
+    await assert.rejects(writeTool.run({ path: "app.py", content: "" }, { cwd: project, versions }), /You haven't read app\.py yet/);
+    assert.deepEqual(await look("Fix app.py.", true, ["list"]), { text: shown, shown: 1, left: ["list"] });
+    assert.deepEqual(await look("Fix app.py.", true, ["list", "files"]), { text: "", shown: 0, left: ["list", "files"] });
+    // A part with nothing to show isn't left out: a task that names no file, or a later message, without the list.
+    assert.deepEqual(await look("Look around.", true, ["files"]), { text: listed, shown: 0, left: [] });
+    assert.equal(await look("Look around.", false, ["list", "files"]), undefined);
   });
 });
