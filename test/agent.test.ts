@@ -897,7 +897,7 @@ describe("Stop hooks before finishing", () => {
   });
 });
 
-describe("telling the model its budget (--budget-notes)", () => {
+describe("telling the model its budget (budget notes)", () => {
   const LAST_STEP = "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)";
   /** What follows the tool results in each message of them: the note, if there was one. */
   const notesIn = (messages: MessageParam[]) =>

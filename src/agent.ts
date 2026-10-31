@@ -70,7 +70,7 @@ export interface AgentOptions {
    */
   checkUntil?: number;
   /**
-   * --budget-notes: once half the steps are used, or half the time when there is a `deadline` (--time-limit;
+   * Budget notes (on unless --no-budget-notes): once half the steps are used, or half the time when there is a `deadline` (--time-limit;
    * with `begun`, when the task began, as Date.now() gives them), a note after each step's tool results says
    * how much is used, and before the last step that it is the last (see budgetNote). Only a task's own loop
    * has them: a subagent's or the reviewer's steps are their own.
@@ -433,7 +433,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
       conversation.push({ role: "user", content: [...results, ...open] }, { toolMs });
       throw err;
     }
-    // With --budget-notes, what is left of the budget goes in the results' message, after them: an earlier
+    // With budget notes, what is left of the budget goes in the results' message, after them: an earlier
     // message would change the cached prefix. Not once the task is stopped: the model won't see it.
     const note = opts.budgetNotes && !signal?.aborted ? budgetNote(step, opts.maxSteps, opts.budgetNotes) : undefined;
     if (note) opts.count?.(note === LAST_STEP ? "budgetNote.lastStep" : "budgetNote");
@@ -514,11 +514,11 @@ export const AFTER_EMPTY = [EMPTY_REPLY, CUT_OFF_BEFORE_ANSWER];
  */
 export const WRAP_UP = "You have run out of steps. Don't call any tools: say what you changed, what you verified and how, and what is left undone.";
 
-/** --budget-notes' note before the last step whose tool calls run (a wrap-up may follow it, without tools). */
+/** The budget notes' note before the last step whose tool calls run (a wrap-up may follow it, without tools). */
 const LAST_STEP = "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)";
 
 /**
- * --budget-notes' note after a step's tool results: the steps used, and with a deadline the time left, once
+ * The budget notes' note after a step's tool results: the steps used, and with a deadline the time left, once
  * half of either is used; before the last step, LAST_STEP instead; nothing after it, where no step follows.
  */
 function budgetNote(step: number, maxSteps: number, { begun, deadline }: { begun: number; deadline?: number }): string | undefined {

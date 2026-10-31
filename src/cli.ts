@@ -71,9 +71,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --max-steps <n>     most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>    most seconds per task: at the limit jig stops, a model call or command still running
                           included, and --check and --reviewer don't start in its last quarter (default: none)
-      --budget-notes      once half the steps, or half of --time-limit, are used, tell the model after each
-                          step how many steps it has used and how much time is left, and before its last step
-                          that it is the last
+      --no-budget-notes   don't tell the model what is left of its budget: by default, once half the steps, or
+                          half of --time-limit, are used, a note after each step says how many steps it has
+                          used and how much time is left, and before its last step that it is the last
       --finish-gate       the first time the model says it is done, with a step left, send it back once if it
                           changed files after it last ran anything, or its last test run failed (not in
                           --time-limit's last quarter)
@@ -234,7 +234,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "add-dir": { type: "string", multiple: true, default: [] },
       "max-steps": { type: "string", default: "50" },
       "time-limit": { type: "string" },
-      "budget-notes": { type: "boolean", default: false },
+      "budget-notes": { type: "boolean", default: true },
       "finish-gate": { type: "boolean", default: false },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },

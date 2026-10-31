@@ -90,7 +90,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         (repeatable; --add-dir / inside a container makes the whole system the project)
       --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
-      --budget-notes    once half the steps or the time is used, tell the model after each step what is left
+      --no-budget-notes don't tell the model, once half the steps or the time is used, what is left (see below)
       --finish-gate     at its first stop, send the model back once if it changed files after it last ran
                         anything, or its last test run failed
       --no-wrap-up      at --max-steps, stop without one more call (no tools) asking where the work stands
@@ -543,12 +543,12 @@ and in `--stats`. `--no-wrap-up` leaves it out, as the runners in `bench/` and `
 that their steps and costs compare with earlier runs. A `Stop` hook can send the model back to work from
 its final answer, after `--check` and the reviewer (see Hooks).
 
-The model isn't told these limits unless you ask: with `--budget-notes`, once half its steps, or half of
-`--time-limit`, are used, a note after each step's tool results says how many steps it has used and how
-much time is left, and, before its last step, that its next reply is the last whose tool calls run. The
-note goes in the results' message, so the cached prefix stays the same; subagents and the reviewer get
-none. It is off by default, so a benchmark can measure the same build with it and without, and `--stats`
-counts the notes (`budgetNote`, `budgetNote.lastStep`).
+The model is told these limits as they near: once half its steps, or half of `--time-limit`, are used, a
+note after each step's tool results says how many steps it has used and how much time is left, and, before
+its last step, that its next reply is the last whose tool calls run. The note goes in the results' message,
+so the cached prefix stays the same; subagents and the reviewer get none. On evolve2, where each task has 4
+steps, it took deepseek-flash from 66 of 105 attempts (twice) to 92 of 105 at the same cost (milestone 30).
+`--no-budget-notes` leaves the notes out, and `--stats` counts them (`budgetNote`, `budgetNote.lastStep`).
 
 With `--finish-gate`, the first time the model says it is done with a step left, and not in `--time-limit`'s
 last quarter, jig looks at what the task's calls did, with no model call, and sends the model back once,

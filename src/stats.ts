@@ -65,7 +65,7 @@ export type Mechanism =
   | "escalated"
   | "loop"
   | "wrapUp"
-  // --budget-notes' note after a step's tool results on the steps (and time) used, and the one before the
+  // The budget notes' note after a step's tool results on the steps (and time) used, and the one before the
   // last step instead.
   | "budgetNote"
   | "budgetNote.lastStep"

@@ -735,7 +735,8 @@ describe("a run that reaches --max-steps", () => {
       assert.match(output, /Out of steps: asking the model where the work stands\.\nListed the files; nothing verified; the fix is left\.\nStopped after 2 steps \(raise the limit with --max-steps\)\.\n2 steps · /);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.steps, stats.modelCalls, stats.usage.input], ["max_steps", 2, 3, 30]);
-      assert.deepEqual(stats.events, { wrapUp: 1 });
+      // Budget notes are on: before the second and last step, the model was told it is the last.
+      assert.deepEqual(stats.events, { "budgetNote.lastStep": 1, wrapUp: 1 });
 
       const off = await runJig([...args, "--no-wrap-up", "Fix the parser."], { api, cwd: project });
       assert.equal(api.requests.length, 5);
@@ -747,8 +748,8 @@ describe("a run that reaches --max-steps", () => {
   });
 });
 
-describe("--budget-notes", () => {
-  it("tells the model, after its results, what is used of its steps and its time from half of them on, and counts each note", async () => {
+describe("budget notes", () => {
+  it("tell the model, after its results, what is used of its steps and its time from half of them on, unless --no-budget-notes, and count each note", async () => {
     const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
     // What followed the tool results in each request's last message.
     const notes = (requests: Record<string, unknown>[]) =>
@@ -759,7 +760,7 @@ describe("--budget-notes", () => {
     try {
       const file = join(outside, "stats.json");
       const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file];
-      const { code, output } = await runJig([...args, "--budget-notes", "--time-limit", "600", "Fix the parser."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--time-limit", "600", "Fix the parser."], { api, cwd: project });
       assert.equal(code, 2, output);
       assert.deepEqual(notes(api.requests), [
         "",
@@ -768,13 +769,13 @@ describe("--budget-notes", () => {
         "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)",
       ]);
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { budgetNote: 1, "budgetNote.lastStep": 1 });
-      // Off by default.
-      const off = await runJig([...args, "Fix the parser."], { api, cwd: project });
+      // On by default; --no-budget-notes turns them off.
+      const off = await runJig([...args, "--no-budget-notes", "Fix the parser."], { api, cwd: project });
       assert.equal(off.code, 2, off.output);
       assert.deepEqual(notes(api.requests.slice(4)), ["", "", "", ""]);
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
-      assert.match(help, /--budget-notes/);
+      assert.match(help, /--no-budget-notes/);
     } finally {
       api.close();
     }
@@ -1014,7 +1015,8 @@ describe("a one-shot run with --time-limit", () => {
     assert.equal(code, 0, output);
     assert.equal(requests, 2);
     assert.match(output, /Too little time is left to check the work \(--time-limit\), so it stands as it is\./);
-    assert.deepEqual(events, { "check.skipped": 1 });
+    // Past half the time, the model was told what is left of it too (budget notes are on).
+    assert.deepEqual(events, { budgetNote: 1, "check.skipped": 1 });
   });
 
   it("is still a Ctrl+C when the deadline passes while the task stops", async () => {
