@@ -36,11 +36,14 @@ export class Conversation {
     if (context) this.session?.describe(context);
   }
 
-  /** `timing` is how long the step that made the message took; it goes only to the session file. */
-  push(message: MessageParam, timing?: Timing): void {
+  /**
+   * `timing` is how long the step that made the message took; `request`, in a task's message that holds
+   * more (jig's notes, --overview's files), the request alone. Both go only to the session file.
+   */
+  push(message: MessageParam, timing?: Timing, request?: string): void {
     this.messages.push(message);
     this.tokens += estimateTokens(message.content);
-    this.session?.write({ type: "message", ...timing, message });
+    this.session?.write({ type: "message", ...timing, ...(request !== undefined && { request }), message });
   }
 
   /** Starts over from `messages`, after compaction. The session file still has the full history. */

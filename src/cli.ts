@@ -110,9 +110,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
       --overview          before a task, give the model the project's files with their sizes (in a
                           conversation's first message), and the files the task names as read_file shows them,
-                          which then count as read (16 KB each, 32 KB in all); each only where the model's own
-                          glob or read_file would show it unasked, so not where --tools leaves that tool out, a
-                          deny rule refuses it or a PreToolUse hook covers it
+                          which then count as read (16 KB each, 32 KB in all, line numbers included); each only
+                          where the model's own glob or read_file would show it unasked, so not where --tools
+                          leaves that tool out, a deny rule refuses it or a PreToolUse hook covers it
       --test-notes        when a command's unittest or pytest run ran no tests, say so in its result: that the
                           commands after the runner's && didn't run, and for unittest, which folders hold
                           test*.py files but no __init__.py, which its discovery doesn't enter
@@ -601,7 +601,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
 
   /**
    * Runs a task. `words` are the user's own words in it, for --overview to find the files they name; jig's
-   * own requests (/reflect, /remember, writing a skill) have none, and get no overview.
+   * own requests (/reflect, /remember, writing a skill) have none, and get no overview. The loop takes the
+   * message without the overview for the task (see AgentOptions.task).
    */
   async function runTask(text: string, label = text, words?: string): Promise<Ending> {
     // --time-limit counts from here, the snapshot and the overview included.
@@ -621,19 +622,31 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     // it asks the model to go on with that request, so the model is told it is over.
     const last = conversation.messages.at(-1)?.content;
     if (typeof last === "string" && AFTER_EMPTY.includes(last)) notes.push("Your previous request ended without an answer from you.");
-    const shown = values.overview && words !== undefined ? await overviewFor(words) : undefined;
-    const message = [...(notes.length ? [notes.map((note) => `(Note from jig: ${note})`).join("\n")] : []), ...(shown ? [shown] : []), text].join("\n\n");
+    const told = notes.length ? [notes.map((note) => `(Note from jig: ${note})`).join("\n")] : [];
     notes.length = 0;
-    conversation.push({ role: "user", content: message });
     unapproved = 0;
-    const started = Date.now();
     const ending = await asTask(async (signal) => {
       // At the deadline the task stops as Ctrl+C stops it, a model call or a command still running included,
       // so nothing it does runs on into what comes after it (on Terminal-Bench, the hidden tests).
       const timer = deadline === undefined ? undefined : setTimeout(() => task?.abort(TIME_UP), deadline - Date.now());
-      // The model --escalate hands over to gets them too: it runs in the same loop.
-      const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] } : undefined;
-      const result = await runAgent(conversation, { ...agent, checkUntil, budgetNotes }, signal).finally(() => clearTimeout(timer));
+      let result: RunResult;
+      let started: number;
+      try {
+        // In the task, so that Ctrl+C and the deadline stop it too: the git that lists the files can wait on a
+        // named pipe (a .gitignore, say), for 30 seconds a call.
+        const shown = values.overview && words !== undefined ? await overviewFor(words, signal) : undefined;
+        const message = [...told, ...(shown ? [shown] : []), text].join("\n\n");
+        // The session keeps the request alone too, where the message holds more, for listing sessions.
+        conversation.push({ role: "user", content: message }, undefined, message === text ? undefined : text);
+        started = Date.now();
+        // The model --escalate hands over to gets them too: it runs in the same loop.
+        const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] } : undefined;
+        // The task is the message without the overview. A compaction before the first step keeps it in place
+        // of the message, so jig's notes, which the model hasn't seen yet, stay in it.
+        result = await runAgent(conversation, { ...agent, task: [...told, text].join("\n\n"), checkUntil, budgetNotes }, signal);
+      } finally {
+        clearTimeout(timer);
+      }
       // Stopped by authorize, or by the clock, not by the user. The signal's reason says what stopped it first:
       // after a Ctrl+C the task can still be stopping when the deadline passes.
       if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";
@@ -652,12 +665,18 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
    * conversation's first message, where the model has none of it yet, and the files the words name, which
    * it records as read; each only where the model's own tools would show it (see overviewOff). Each time it
    * adds something is counted, each named file it shows, and each time it leaves a part out. A project it
-   * can't list (one the settings hide, say) gets none, and the user is told why.
+   * can't list (one the settings hide, say) gets none, and the user is told why; a task stopped meanwhile
+   * (`signal`) gets none either.
    */
-  async function overviewFor(words: string): Promise<string | undefined> {
+  async function overviewFor(words: string, signal: AbortSignal): Promise<string | undefined> {
     try {
       const list = conversation.messages.length === 0;
-      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list, withheld: [...overviewOff.keys()] });
+      // The note says that the files shown count as read only where write_file can replace them: where it is
+      // among the model's tools, and neither the mode (plan) nor a deny rule refuses it.
+      const write = own.find((tool) => tool.definition.name === "write_file");
+      const decision = write && permissions.decide(write, {});
+      const writable = decision === "allow" || decision === "ask";
+      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list, withheld: [...overviewOff.keys()], writable, signal });
       if (!found) return undefined;
       if (found.text) count?.("overview");
       for (let i = 0; i < found.shown; i++) count?.("overview.file");
@@ -667,6 +686,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       if (untold.length) ui.notice(`--overview gives the model only what its own tools would show it unasked, so it left out ${untold.map((part) => overviewOff.get(part)).join(" and ")}.`);
       return found.text || undefined;
     } catch (err) {
+      if (signal.aborted) return undefined;
       ui.notice(`--overview left the project's files out: ${(err as Error).message}`);
       return undefined;
     }

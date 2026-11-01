@@ -1110,6 +1110,8 @@ describe("--overview", () => {
   };
   const task = "Make app.py do what NOTES.md says.";
   const files = `${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.`;
+  // Where write_file can't replace them, the note doesn't say they can be.
+  const unwritable = files.replace(" Those shown count as read, so write_file can replace them.", "");
   // What jig tells the user, once, when it leaves parts out.
   const leftOut = (parts: string) => `--overview gives the model only what its own tools would show it unasked, so it left out ${parts}.`;
   const once = (output: string, parts: string) => {
@@ -1146,10 +1148,10 @@ describe("--overview", () => {
       once(bash.output, "the project's files (glob isn't among the model's tools) and the files the task names (read_file isn't among the model's tools)");
       assert.deepEqual(bash.events, { "overview.skipped": 1 });
       const reading = await run(["--tools", "read_file,bash", task]);
-      assert.equal(reading.first, `${files}\n\n${task}`);
+      assert.equal(reading.first, `${unwritable}\n\n${task}`);
       once(reading.output, "the project's files (glob isn't among the model's tools)");
       const all = await run(["--tools", "read_file,glob,bash", task]);
-      assert.equal(all.first, `${listed}\n\n${files}\n\n${task}`);
+      assert.equal(all.first, `${listed}\n\n${unwritable}\n\n${task}`);
       assert.doesNotMatch(all.output, /--overview gives/);
     } finally {
       close();
@@ -1192,6 +1194,80 @@ describe("--overview", () => {
       assert.deepEqual(session.events, { overview: 1, "overview.skipped": 2 });
     } finally {
       close();
+    }
+  });
+
+  it("says the files shown count as read only where write_file can replace them: not in plan mode, nor under a deny rule", async () => {
+    // Nor where --tools leaves it out, above.
+    const { run, close } = await overviewing();
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      assert.notEqual(unwritable, files);
+      const plan = await runJig(["--no-sandbox", "--mode", "plan", "--model", "claude-haiku-4-5", "--overview", task], { api, cwd: project });
+      assert.equal(plan.code, 0, plan.output);
+      assert.equal(firstMessage(api.requests[0]), `(Note from jig: Plan mode is on: you can read, search and run read-only commands, but every change is refused. Investigate, then propose a plan.)\n\n${listed}\n\n${unwritable}\n\n${task}`);
+      assert.equal((await run([task], { deny: ["write_file"] })).first, `${listed}\n\n${unwritable}\n\n${task}`);
+    } finally {
+      close();
+      api.close();
+    }
+  });
+
+  it("gives the Stop hooks the task without the overview, and lists the session by it", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const env = { JIG_HOME: await tempDir("jig-home-") };
+      const stop = join(outside, "stop.json");
+      await writeFile(join(env.JIG_HOME, "settings.json"), JSON.stringify({ hooks: { Stop: [{ command: `cat > '${stop}'` }] } }));
+      const ran = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--overview", task], { api, cwd: project, env });
+      assert.equal(ran.code, 0, ran.output);
+      assert.equal(firstMessage(api.requests[0]), `${listed}\n\n${files}\n\n${task}`);
+      assert.equal(JSON.parse(await readFile(stop, "utf8")).task, task);
+      const listing = await runJig(["--sessions"], { api, cwd: project, env });
+      assert.match(listing.output, /^\S+ {2}Make app\.py do what NOTES\.md says\.$/m);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("isn't given to the requests jig writes itself: /remember, /reflect, writing a skill, jig memory reflect", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      // Each request but the last starts a conversation, which would get the list, and /remember's and
+      // /reflect's name AGENTS.md, which would be shown.
+      await writeFile(join(project, "AGENTS.md"), "Indent with tabs.\n");
+      const env = { JIG_HOME: await tempDir("jig-home-") };
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--overview"];
+      const runs = [
+        await runJig(args, { api, cwd: project, env, stdin: "/remember app.py is the entry point\n/reset\n/reflect\n/reset\n/skills new formatting\n/reset\n/learn\n" }),
+        await runJig(["skills", "new", "formatting", ...args], { api, cwd: project, env }),
+        await runJig(["skills", "learn", ...args], { api, cwd: project, env }),
+        await runJig(["memory", "reflect", ...args], { api, cwd: project, env }),
+      ];
+      for (const { code, output } of runs) assert.equal(code, 0, output);
+      const sent = api.requests.map((request) => JSON.stringify(request.messages));
+      const asked = ["Remember this for later sessions", "Look back over this conversation for what later sessions", "Write a new skill: formatting", "Look back over this conversation for a procedure"];
+      for (const request of asked) assert.ok(sent.some((messages) => messages.includes(request)), request);
+      assert.deepEqual(sent.filter((messages) => /Note from jig: the (project's files|files the task below names)/.test(messages)), []);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("runs as part of the task, so --time-limit stops it, git waiting on a named pipe included", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      // The project's own exclude file, which the git that lists its files reads, and the snapshot's doesn't.
+      execFileSync("git", ["init", "-q"], { cwd: project });
+      await rm(join(project, ".git", "info", "exclude"), { force: true });
+      execFileSync("mkfifo", [join(project, ".git", "info", "exclude")]);
+      const started = Date.now();
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--overview", "--time-limit", "1", task], { api, cwd: project });
+      assert.equal(code, 7, output);
+      assert.ok(Date.now() - started < 15_000, "git's own timeout is 30 seconds");
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
     }
   });
 });

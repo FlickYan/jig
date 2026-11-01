@@ -18,11 +18,11 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   cuts them, so one line of minified code can't fill the conversation. When it occurs more than once, the
   error says on which lines. The next attempt usually succeeds.
 - **Read before overwrite.** jig remembers each file's modification time and size as of the model's last
-  read (`read_file`, or printing it with `cat`, `head` or `tail`). `write_file` refuses to replace a file the
-  model hasn't read, or one that changed since (a formatter, a command or the user edited it), so it never
-  overwrites work it hasn't seen. `edit_file` doesn't need the check: its exact, unique match already proves
-  the model knows the text it replaces. In M2 and M3 the check covered edits too, and in the benchmark it
-  refused 22 edits, all false alarms, so M4 narrowed it.
+  read (`read_file`, printing it with `cat`, `head` or `tail`, or `--overview` showing it before the task).
+  `write_file` refuses to replace a file the model hasn't read, or one that changed since (a formatter, a
+  command or the user edited it), so it never overwrites work it hasn't seen. `edit_file` doesn't need the
+  check: its exact, unique match already proves the model knows the text it replaces. In M2 and M3 the check
+  covered edits too, and in the benchmark it refused 22 edits, all false alarms, so M4 narrowed it.
 - **Line endings are the file's business.** The model writes `\n`; in a file that uses `\r\n`, edits are
   matched and written with `\r\n` (including lines an edit adds), and `write_file` keeps an existing file's
   CRLF endings. Encodings are not converted: `edit_file` and `write_file` change only UTF-8 files.
@@ -63,9 +63,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   summary is sent: keeping the last few turns verbatim would replay thinking blocks whose earlier history
   is gone, which the API can reject, and a fresh start is valid for every provider. A request the user just
   typed is kept word for word after the summary, and the model must read a file again before `write_file`
-  replaces it. Mid-task, the task is restated after the summary, word for word up to 20,000 characters (a
-  longer one by its start and its end, since what it asks for is often last), with the log of file changes
-  and commands a reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
+  replaces it, so the files `--overview` put before the request go: their note says they count as read.
+  Mid-task, the task is restated after the summary, word for word up to 20,000 characters (a longer one by
+  its start and its end, since what it asks for is often last), with the log of file changes and commands a
+  reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
 - **The API says when the conversation is too long.** jig doesn't know every server's window, so it
   doesn't compact before a request that won't fit (milestone 28); when the API rejects one as too long,
   by one of a few specific wordings, it compacts and makes the call again, once. The summary request is

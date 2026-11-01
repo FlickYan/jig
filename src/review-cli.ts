@@ -89,12 +89,13 @@ export async function reviewCommand(args: string[]): Promise<void> {
   const fresh = values["verify-exec"] ? through(prefixOf(values["verify-exec"], "--verify-exec")) : undefined;
 
   // The whole history: after a compaction, the conversation starts from the agent's own summary, which
-  // isn't the task, and leaves out what it did before.
+  // isn't the task, and leaves out what it did before. The task is the request alone, without the notes and
+  // the files jig put before it (--overview's, whose text the work may have changed since).
   const messages = SessionFile.load(resolve(values.session), true);
   const start = messages.findIndex((message) => message.role === "user" && typeof message.content === "string");
   if (start === -1) throw new Error(`${values.session} holds no task.`);
   const changes = values.changes ? clipped(readFileSync(values.changes, "utf8").trim(), MAX_CHANGES) : undefined;
-  const work = { task: messages[start].content as string, answer: lastAnswer(messages), log: workLog(messages.slice(start)), changes };
+  const work = { task: SessionFile.firstRequest(resolve(values.session)), answer: lastAnswer(messages), log: workLog(messages.slice(start)), changes };
 
   // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy. It goes
   // when jig exits, whether the review ended well or failed. A command still running is killed first, as a

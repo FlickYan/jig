@@ -35,6 +35,14 @@ export interface AgentOptions {
   tools: Tool[];
   cwd: string;
   /**
+   * The task, where the message the run starts from holds more: the CLI's message without --overview's
+   * files. A compaction keeps it after the summary in place of that message, or restates it mid-task; the
+   * reviewer checks the work against it, and the Stop hooks get it. The files' text would be out of date
+   * once the model changed them, and after a compaction, which forgets what the model read, their note that
+   * they count as read would be false. Without it, the task is the message's text.
+   */
+  task?: string;
+  /**
    * Hard stop: the most steps one task may take, each a model call that may call tools. With wrapUp, one
    * more call, in which no tool runs, follows the last.
    */
@@ -188,10 +196,10 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   let askedAgain = false;
   let continued = 0;
   let unfinished = "";
-  // The task is the message the run starts from; a reviewer sees it and what the run did after it (all
-  // there is, if a compaction has replaced it with a summary).
-  const taskMessage = conversation.messages.at(-1);
-  const task = textOf(taskMessage);
+  // The task is the message the run starts from (or opts.task); a reviewer sees it and what the run did
+  // after it (all there is, if a compaction has replaced it with a summary).
+  let taskMessage = conversation.messages.at(-1);
+  const task = opts.task ?? textOf(taskMessage);
   const sinceTask = () => conversation.messages.slice(Math.max(0, conversation.messages.indexOf(taskMessage!)));
   // The first step compaction may run at (it waits a few steps after one that failed), and what the run did
   // before the last one, for the log that follows a summary.
@@ -205,14 +213,18 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
   const trail: Trail = { changed: [] };
 
   /**
-   * Compacts; resolves to whether there was anything to compact. Unless the task is the request kept after
-   * the summary, the task and a log of what was done for it follow the summary word for word.
+   * Compacts; resolves to whether there was anything to compact. Before the first step the task's message
+   * is the request kept after the summary, as the task; later, the task and a log of what was done for it
+   * follow the summary word for word.
    */
   const compactNow = async (rejected: boolean): Promise<boolean> => {
     const work = [...compactedWork, ...sinceTask()];
-    const restate = conversation.messages.at(-1) !== taskMessage ? { text: task, log: workLog(work) } : undefined;
-    const compacted = await compactConversation(conversation, opts, { task: restate, tooLong: rejected, signal });
+    const starting = conversation.messages.at(-1) === taskMessage;
+    const restate = starting ? undefined : { text: task, log: workLog(work) };
+    const compacted = await compactConversation(conversation, opts, { task: restate, tooLong: rejected, signal }, starting ? task : undefined);
     if (!compacted) return false;
+    // The request kept is a message of its own, which the run now starts from.
+    if (starting) taskMessage = conversation.messages.at(-1);
     opts.count?.("compaction");
     addUsage(usage, compacted.usage);
     compactedWork = work;
@@ -597,15 +609,17 @@ export const SAME_STEPS = 5;
 
 /**
  * Compacts between steps. A new request from the user is kept out of the summary and stays after it,
- * so the model still gets the user's exact words; otherwise the task is mid-way and the model carries on.
- * The loop's note after a reply that wasn't an answer is no request: kept, it would point at a reply the
- * model can no longer see, so it goes into the summary too.
+ * so the model still gets the user's exact words (as `request`, if given: the task, without --overview's
+ * files); otherwise the task is mid-way and the model carries on. The loop's note after a reply that wasn't
+ * an answer is no request: kept, it would point at a reply the model can no longer see, so it goes into the
+ * summary too.
  */
-async function compactConversation(conversation: Conversation, opts: AgentOptions, options: Pick<CompactOptions, "task" | "tooLong" | "signal">) {
+async function compactConversation(conversation: Conversation, opts: AgentOptions, options: Pick<CompactOptions, "task" | "tooLong" | "signal">, request?: string) {
   const last = conversation.messages.at(-1);
   const isRequest = last?.role === "user" && typeof last.content === "string" && !NOT_AN_ANSWER.includes(last.content);
+  const kept: MessageParam[] = isRequest ? [request === undefined ? last : { role: "user", content: request }] : [];
   opts.ui.notice(`Compacting the conversation (${formatTokens(conversation.tokens)} tokens)…`);
-  const compacted = await compact(conversation, opts.callModel, { ...options, keep: isRequest ? [last] : [], continueTask: !isRequest });
+  const compacted = await compact(conversation, opts.callModel, { ...options, keep: kept, continueTask: !isRequest });
   if (!compacted) return undefined;
   const cut = compacted.cut ? ` (summarized with ${compacted.cut} tool result${compacted.cut === 1 ? "" : "s"} cut short, to fit)` : "";
   opts.ui.notice(`Compacted ${formatTokens(compacted.before)} tokens into about ${formatTokens(compacted.after)}${cut}.`);

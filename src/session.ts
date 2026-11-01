@@ -7,11 +7,12 @@ type MessageParam = Anthropic.Beta.BetaMessageParam;
 
 /**
  * One line of a session file. A start begins with type and cwd, which paths.ts reads without the rest. Each
- * line after the start also has `at`, the time it was written.
+ * line after the start also has `at`, the time it was written. A task's message that holds more than the
+ * request (jig's notes, --overview's files) has the request alone too (`request`), for listing sessions.
  */
 type Entry =
   | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
-  | ({ type: "message"; message: MessageParam } & Timing)
+  | ({ type: "message"; message: MessageParam; request?: string } & Timing)
   | { type: "compaction"; messages: MessageParam[] };
 
 /**
@@ -93,12 +94,15 @@ export class SessionFile {
     return answerOpenToolCalls(messages);
   }
 
-  /** The first thing the user asked in a session, for listing sessions. */
+  /**
+   * The first thing the user asked in a session, for listing sessions: without the notes and the files jig
+   * put before it, where the session says what the request was (see Entry).
+   */
   static firstRequest(path: string): string {
     for (const line of readFileSync(path, "utf8").split("\n")) {
       if (!line.includes('"role":"user"')) continue;
-      const { message } = JSON.parse(line) as { message: MessageParam };
-      if (typeof message.content === "string") return message.content;
+      const { message, request } = JSON.parse(line) as { message: MessageParam; request?: string };
+      if (typeof message.content === "string") return request ?? message.content;
     }
     return "";
   }

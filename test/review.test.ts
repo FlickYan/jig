@@ -202,13 +202,17 @@ describe("a review that runs the work", () => {
 });
 
 describe("jig review", () => {
-  /** A session in which the agent wrote out.txt and said it was done; `compacted` before saying so. */
-  async function session(dir: string, compacted = false): Promise<string> {
+  /**
+   * A session in which the agent wrote out.txt and said it was done; `compacted` before saying so. `before`
+   * is what jig put before the request in its message, as --overview does.
+   */
+  async function session(dir: string, compacted = false, before = ""): Promise<string> {
     const path = join(dir, "agent.jsonl");
     const summary = { role: "user", content: "The conversation so far was compacted to save context. This is its summary:\n\nI wrote out.txt and checked it." };
+    const request = "Write out.txt with the total, 42.";
     const entries = [
       { type: "start", cwd: "/app", model: "deepseek-flash", date: "2026-10-14T00:00:00Z" },
-      { type: "message", message: { role: "user", content: "Write out.txt with the total, 42." } },
+      { type: "message", ...(before && { request }), message: { role: "user", content: before ? `${before}\n\n${request}` : request } },
       { type: "message", message: call("w", "write_file", { path: "out.txt", content: "41" }) },
       { type: "message", message: result("w", "Wrote out.txt") },
       ...(compacted ? [{ type: "compaction", messages: [summary] }] : []),
@@ -225,11 +229,11 @@ describe("jig review", () => {
       (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "printf 'total: 41\\n'" } }] : [{ text: queue.length > 1 ? queue.shift()! : queue[0] }];
   };
 
-  async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = [], compacted = false) {
+  async function review(verdict: string | string[] | ((request: Record<string, unknown>) => Reply), extra: string[] = [], compacted = false, before = "") {
     const dir = await tempDir("jig-review-cli-");
     const api = await fakeMessagesApi(typeof verdict === "function" ? verdict : replies(verdict));
     try {
-      const args = ["review", "--session", await session(dir, compacted), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
+      const args = ["review", "--session", await session(dir, compacted, before), "--exec", "bash -c", "--verify-exec", "bash -c", "--model", "claude-haiku-4-5", "--time-limit", "150", "--out", join(dir, "verdict.json"), ...extra];
       const { code, output } = await runJig(args, { api, cwd: dir });
       assert.equal(code, 0, output);
       return { verdict: JSON.parse(await readFile(join(dir, "verdict.json"), "utf8")), requests: api.requests };
@@ -256,6 +260,14 @@ describe("jig review", () => {
     const prompt = JSON.stringify(requests[0].messages);
     assert.match(prompt, /<task>\\nWrite out\.txt with the total, 42\.\\n<\/task>.*write_file out\.txt/);
     assert.doesNotMatch(prompt, /This is its summary/);
+  });
+
+  it("takes the request alone for the task, without the files --overview put before it as they were before the work", async () => {
+    const files = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)\nout.txt:\n     1\t0";
+    const { requests } = await review("APPROVED", [], false, files);
+    const prompt = JSON.stringify(requests[0].messages);
+    assert.match(prompt, /<task>\\nWrite out\.txt with the total, 42\.\\n<\/task>/);
+    assert.doesNotMatch(prompt, /count as read/);
   });
 
   it("drops a problem whose command doesn't show it again, and then sends nothing back", async () => {

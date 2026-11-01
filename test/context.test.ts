@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -161,6 +161,27 @@ describe("compaction", () => {
     assert.ok(summary.length < 21_000, "and no more than 20,000 characters of it");
   });
 
+  it("keeps or restates the task as the loop was given it, not its message, which --overview's files lengthen", async () => {
+    // As the CLI sends a task with --overview: the files' text before it, which says they count as read.
+    const files = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)\napp.py:\n     1\tx = 1";
+    const atStart = new Conversation(undefined, [
+      { role: "user", content: "fix the parser" },
+      { role: "assistant", content: [text("Done.")] },
+      { role: "user", content: `${files}\n\nnow change app.py` },
+    ]);
+    atStart.tokens = 9000;
+    await runAgent(atStart, { ...options(fakeModel([reply([text("Changed.")])]), 5000), task: "now change app.py" });
+    // The compaction forgot what was read, so the model is no longer told that the files count as read.
+    assert.deepEqual(atStart.messages[1], { role: "user", content: "now change app.py" });
+
+    const midTask = new Conversation(undefined, [{ role: "user", content: `${files}\n\nchange app.py` }]);
+    const model = fakeModel([reply([toolUse("t1", "bash", { command: "echo hi" })], 4000), reply([text("Done.")])]);
+    await runAgent(midTask, { ...options(model, 1000), task: "change app.py" });
+    const summary = String(midTask.messages[0].content);
+    assert.match(summary, /word for word:\n\nchange app\.py\n\n/);
+    assert.doesNotMatch(summary, /count as read|x = 1/);
+  });
+
   it("forgets which files were read, so they are read again before editing", async () => {
     const conversation = new Conversation(undefined, [{ role: "user", content: "hi" }]);
     await writeFile(join(dir, "a.txt"), "x");
@@ -315,6 +336,15 @@ describe("sessions", () => {
     assert.deepEqual(loaded[1], { role: "user", content: "second task" });
     assert.deepEqual(SessionFile.list(dir), [session.path]);
     assert.equal(SessionFile.firstRequest(session.path), "first task");
+  });
+
+  it("lists a session by the request alone, where its message holds jig's notes or --overview's files before it", async () => {
+    const session = SessionFile.create(dir, "fake-model");
+    const conversation = new Conversation(session);
+    const message = "(Note from jig: Plan mode is on.)\n\n(Note from jig: the project's files, ...)\napp.py (9 bytes)\n\nFix app.py.";
+    conversation.push({ role: "user", content: message }, undefined, "Fix app.py.");
+    assert.equal(SessionFile.firstRequest(session.path), "Fix app.py.");
+    assert.deepEqual(SessionFile.load(session.path), [{ role: "user", content: message }], "the model's message is kept whole");
   });
 
   it("records when each message was written, and how long its model call or its tool calls took", async () => {
@@ -520,7 +550,9 @@ describe("AGENTS.md", () => {
 
 describe("--overview", () => {
   const LISTED = "(Note from jig: the project's files, shallowest first, with their sizes; what git ignores, and folders like node_modules that git doesn't track, aren't listed.)";
-  const NAMED = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
+  const NAMED = "(Note from jig: the files the task below names, as read_file shows them.)";
+  // Where write_file can replace them.
+  const WRITABLE = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
   let project: string;
 
   /** A git repository with these files, none of them committed, as `project`. */
@@ -588,28 +620,56 @@ describe("--overview", () => {
     // Nothing to say without the list and a file named; nothing at all in the home directory or the root.
     assert.equal(await overview("Look around.", { cwd: project, versions: new FileVersions(), list: false }), undefined);
     for (const cwd of [homedir(), "/"]) assert.equal(await overview("Read /etc/hosts.", { cwd, versions: new FileVersions(), list: true }), undefined);
+    // Nor are the files listed then, which takes a while in a large tree: a project the settings hide, which
+    // can't be listed, gives no error unless a word could name a file.
+    assert.equal(await overview("Look around.", { cwd: project, hidden: [project], versions: new FileVersions(), list: false }), undefined);
+    await assert.rejects(overview("Fix app.py.", { cwd: project, hidden: [project], versions: new FileVersions(), list: false }));
+  });
+
+  it("stops listing the files when its signal says so, where git waits on a named pipe", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    await rm(join(project, ".git", "info", "exclude"), { force: true });
+    execFileSync("mkfifo", [join(project, ".git", "info", "exclude")]);
+    const started = Date.now();
+    await assert.rejects(overview("Fix app.py.", { cwd: project, versions: new FileVersions(), list: true, signal: AbortSignal.timeout(300) }), { name: "TimeoutError" });
+    assert.ok(Date.now() - started < 10_000, "git's own timeout is 30 seconds");
   });
 
   it("shows the files the task names, by path or by a name only one file has, as read_file shows them, and records them as read", async () => {
     await repository({ "app.py": "print(1)\r\nprint(2)", "docs/guide.md": "# Guide\n", "lib/util.py": "x = 1\n", "tests/util.py": "y = 2\n", "notes": "plain\n" });
     const versions = new FileVersions();
-    // util.py names two files, so it names neither; the absolute path names one; notes has no dot or slash.
-    const words = `Fix \`app.py\` as docs/guide.md says, and util.py (see ${project}/lib/util.py); read the notes.`;
-    const found = await overview(words, { cwd: project, versions, list: false });
+    // util.py names two files, so it names neither; the absolute path names the second; notes has no dot or slash.
+    const words = `Fix \`app.py\` as docs/guide.md says, and util.py (see ${project}/tests/util.py); read the notes.`;
+    const found = await overview(words, { cwd: project, versions, list: false, writable: true });
     const shown = (path: string) => readTool.run({ path }, { cwd: project, versions: new FileVersions() }).then((text) => `${path}:\n${text.trimEnd()}`);
-    const files = await Promise.all(["app.py", "docs/guide.md", "lib/util.py"].map(shown));
-    assert.deepEqual(found, { text: `${NAMED}\n${files.join("\n\n")}`, shown: 3, left: [] });
+    const files = await Promise.all(["app.py", "docs/guide.md", "tests/util.py"].map(shown));
+    assert.deepEqual(found, { text: `${WRITABLE}\n${files.join("\n\n")}`, shown: 3, left: [] });
     assert.match(files[0], /^app\.py:\n {5}1\tprint\(1\)\n {5}2\tprint\(2\)$/);
+    // Where write_file can't replace them, the note doesn't say they can be.
+    assert.equal((await overview(words, { cwd: project, versions: new FileVersions(), list: false }))?.text, `${NAMED}\n${files.join("\n\n")}`);
     // So write_file replaces a file shown without a read, but not one changed since, nor one not shown.
     const write = (path: string) => writeTool.run({ path, content: "new\n" }, { cwd: project, versions });
     assert.equal(await write("app.py"), "Overwrote app.py (1 line, kept its CRLF line endings).");
     await writeFile(join(project, "docs", "guide.md"), "# Guide, longer\n");
     await assert.rejects(write("docs/guide.md"), /docs\/guide\.md has changed since you last read it/);
-    await assert.rejects(write("tests/util.py"), /You haven't read tests\/util\.py yet/);
+    await assert.rejects(write("lib/util.py"), /You haven't read lib\/util\.py yet/);
+  });
+
+  it("records a file shown by its stats from before it was read, as read_file does, so a change made meanwhile isn't taken for read", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    // As if a command changed the file once it was read, before it was recorded.
+    const versions = new FileVersions();
+    const record = versions.record.bind(versions);
+    versions.record = async (abs, info) => {
+      await writeFile(abs, "print(1)\nprint(2)\n");
+      await record(abs, info);
+    };
+    assert.equal((await overview("Fix app.py.", { cwd: project, versions, list: false }))?.shown, 1);
+    await assert.rejects(writeTool.run({ path: "app.py", content: "" }, { cwd: project, versions }), /app\.py has changed since you last read it/);
   });
 
   it("names a file over its limits, or not UTF-8 text, or not a regular file, without showing or opening it, and leaves out a hidden one", async () => {
-    await repository({ "a.txt": "first\n", "b.txt": "second\n", "big.txt": "x".repeat(20), "latin.txt": Buffer.from("caf\xe9\n", "latin1"), "bin.dat": Buffer.from([1, 0, 2]) });
+    await repository({ "a.txt": "first\n", "b.txt": "second\n", "big.txt": "x".repeat(20), "lines.txt": "a\nb\nc\n", "latin.txt": Buffer.from("caf\xe9\n", "latin1"), "bin.dat": Buffer.from([1, 0, 2]) });
     // A named pipe would block a read until something wrote to it, and /dev/zero never ends.
     execFileSync("mkfifo", [join(dir, "fifo")]);
     await symlink(join(dir, "fifo"), join(project, "pipe.txt"));
@@ -618,11 +678,14 @@ describe("--overview", () => {
     await writeFile(join(secrets, "key.txt"), "secret\n");
     await symlink(join(secrets, "key.txt"), join(project, "key.txt"));
     const versions = new FileVersions();
-    await withLimits({ fileBytes: 10, totalBytes: 12 }, async () => {
-      const found = await overview("Use a.txt, b.txt, big.txt, latin.txt, bin.dat, pipe.txt, zero.txt and key.txt.", { cwd: project, hidden: [secrets], versions, list: false });
+    // The limits count the text as read_file shows it, line numbers included: a.txt's 6 bytes are 12 shown,
+    // b.txt's 13, and lines.txt's 6 bytes are 26.
+    await withLimits({ fileBytes: 16, totalBytes: 24 }, async () => {
+      const found = await overview("Use a.txt, b.txt, big.txt, lines.txt, latin.txt, bin.dat, pipe.txt, zero.txt and key.txt.", { cwd: project, hidden: [secrets], versions, list: false });
       const not = [
-        "b.txt isn't shown: with it, the files shown would be over 12 bytes.",
-        "big.txt isn't shown: at 20 bytes, it is over 10 bytes.",
+        "b.txt isn't shown: with it, the files shown would be over 24 bytes.",
+        "big.txt isn't shown: at 20 bytes, it is over 16 bytes.",
+        "lines.txt isn't shown: with its line numbers, it is 26 bytes, over 16 bytes.",
         "latin.txt isn't shown: it isn't UTF-8 text.",
         "bin.dat isn't shown: it isn't UTF-8 text.",
         "pipe.txt isn't shown: it isn't a regular file.",
@@ -631,6 +694,10 @@ describe("--overview", () => {
       assert.deepEqual(found, { text: `${NAMED}\na.txt:\n     1\tfirst\n\n${not.join("\n\n")}`, shown: 1, left: [] });
     });
     await assert.rejects(writeTool.run({ path: "b.txt", content: "" }, { cwd: project, versions }), /You haven't read b\.txt yet/);
+    // 16 KB of empty lines is about 128 KB numbered, which the file's size didn't show.
+    await writeFile(join(project, "blank.txt"), "\n".repeat(16 * 1024));
+    const blank = await overview("Fill blank.txt.", { cwd: project, versions, list: false });
+    assert.match(blank?.text ?? "", /^\(Note from jig: [^\n]*\)\nblank\.txt isn't shown: with its line numbers, it is 128 KB, over 16 KB\.$/);
   });
 
   it("leaves out a withheld part without reading for it, and says it did where the part had something to show", async () => {
