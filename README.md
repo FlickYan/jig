@@ -114,6 +114,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         the task names as read_file shows them, which then count as read (see below)
       --no-test-notes   don't say in a command's result when its unittest or pytest run ran no tests, with what
                         didn't run after it and where unittest didn't look (see below)
+      --keep-inputs     say in a command's result when a file that was there before the task is gone or empty
+                        after it, with its bytes in no other file, and where a copy of it as it was then is (see below)
   -v, --version         print jig's version
   -h, --help            show this help
 ```
@@ -203,6 +205,24 @@ budget notes, 29 of 210 attempts ran unittest from the project, whose `tests/` h
 them on their last step; in 22 the model's own checks (`python - <<'PY'`) came after its `&&` and didn't
 run either, which the result didn't say. They are on by default since milestone 31 (see the overview,
 above); `--stats` counts each note (`bash.noTests`).
+
+`--keep-inputs` watches the files that were there before the task (5,000 at most, the shallowest first) and
+adds a line to a command's result when one that wasn't empty is gone or empty after it, if it was as it was
+before the task until that command (not after `write_file`, `edit_file` or an earlier command changed it)
+and no other file in the project holds its bytes (a backup the model made, say). The line says where a copy
+of it as it was before the task is: a file in the temp directory with a random name, made as the long
+outputs' files are and deleted with them when jig exits. jig never puts the file back itself, and says it
+is gone after the command, not that the command removed it: a job left in the background can do that too.
+The copy comes from the task's snapshot or, where there is none (no git, as in most of milestone 30's
+Terminal-Bench trials), from a store jig makes at the task's start in `~/.jig/inputs/` (in the task, so
+Ctrl+C and `--time-limit` stop it): each file gzipped and named by its SHA-256, leaving out what snapshots
+leave out and what the project's `.gitignore` files ignore (as far as jig reads them without git), 20 MB a
+file and 100 MB in all, and removed when jig exits. A file past those is named without a copy. In milestone
+30's db-wal-recovery, the model's first look at the database with `sqlite3` deleted the task's only copy of
+its data, a write-ahead log with an invalid header; replayed with the task's files, the line gives that log
+back byte for byte. It is off until benchmarks show whether it helps; `--stats` counts each file named
+(`inputs.lost`), each without a copy (`inputs.copySkipped`), and each one gone or empty it kept quiet about
+(`inputs.suppressed`).
 
 ## What it does
 
@@ -590,6 +610,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/permissions.ts`](src/permissions.ts), [`src/settings.ts`](src/settings.ts) | Which tool calls run, need approval, or are refused; allow and deny rules; settings files and project trust |
 | [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments and the keeper that holds the session's PID namespace on Linux; what it keeps read-only in git, and the git changes jig warns of |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
+| [`src/inputs.ts`](src/inputs.ts) | `--keep-inputs`: the files there before a task, watched around its commands, and a copy of one a command lost |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/overview.ts`](src/overview.ts) | The overview: the project's files, and those the task names, put before the task |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |

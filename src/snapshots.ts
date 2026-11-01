@@ -12,7 +12,7 @@ const MAX_PROJECT_BYTES = 200_000_000;
 // SIGTERM, on which it removes its lock: killed, it would leave one that failed every later snapshot.
 const GIT_SECONDS = 60;
 // Never snapshot these, even in a project without a .gitignore.
-const EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", "dist/", "build/", "target/", ".next/", ".jig/"];
+export const EXCLUDES = [".git/", "node_modules/", ".venv/", "venv/", "__pycache__/", "dist/", "build/", "target/", ".next/", ".jig/"];
 // Paths go back to git as the bytes it listed, on its standard input: a name a command picks needn't be
 // valid UTF-8, and Node passes arguments as UTF-8, so a pathspec for such a name would match nothing.
 const PATHSPECS_ON_STDIN = ["--pathspec-from-file=-", "--pathspec-file-nul"];
@@ -102,6 +102,27 @@ export class Snapshots {
     if (!snapshot) return undefined;
     const { tracked, created } = this.changes(snapshot);
     return [...new Set([...tracked, ...created.map(String)])].sort();
+  }
+
+  /**
+   * The regular files the latest snapshot holds, relative to the project, each with the object that holds
+   * its bytes, for --keep-inputs (see inputs.ts): not its symlinks, nor the nested repositories it can hold as
+   * gitlinks. Undefined without one.
+   */
+  files(): { path: Buffer; object: string }[] | undefined {
+    const snapshot = this.taken.at(-1);
+    if (!snapshot) return undefined;
+    return this.list("ls-tree", "-r", "-z", "--full-tree", snapshot).flatMap((entry) => {
+      // "<mode> <type> <object>\t<path>"
+      const tab = entry.indexOf("\t");
+      const [mode, type, object] = entry.toString("latin1", 0, tab).split(" ");
+      return type === "blob" && (mode === "100644" || mode === "100755") ? [{ path: entry.subarray(tab + 1), object }] : [];
+    });
+  }
+
+  /** A file's bytes as a snapshot holds them, by the object files() gave. */
+  blob(object: string): Buffer {
+    return this.run(["cat-file", "blob", object]);
   }
 
   /**

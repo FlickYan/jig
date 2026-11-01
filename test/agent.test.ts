@@ -1201,3 +1201,23 @@ describe("counting the loop's mechanisms (--stats)", () => {
     assert.match(JSON.stringify(results[0]), /the stats file can't be written/);
   });
 });
+
+describe("--keep-inputs in the loop", () => {
+  it("looks at the files around each command only, and puts its line after the cut, before the exit code", async () => {
+    const seen: string[] = [];
+    const inputs = {
+      before: () => void seen.push("before"),
+      after: async () => {
+        seen.push("after");
+        return "(Note from jig: data.bin, which was there before the task (3 bytes), is gone after this command.)";
+      },
+    };
+    const calls = [toolUse("t1", "bash", { command: "seq 100000; exit 3" }), toolUse("t2", "write_file", { path: "n.txt", content: "n\n" })];
+    const { options, conversation, messages } = setup([reply(calls), reply([text("Done.")])], { inputs });
+    await runAgent(conversation, options);
+    assert.deepEqual(seen, ["before", "after"]);
+    const [bash, write] = resultsIn(messages[2]).map((result) => String(result.content));
+    assert.match(bash, /characters truncated[\s\S]*\n99999\n100000\n\n\(Note from jig: data\.bin, which was there before the task \(3 bytes\), is gone after this command\.\)\nExit code: 3$/);
+    assert.doesNotMatch(write, /Note from jig/);
+  });
+});

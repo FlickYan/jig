@@ -1,15 +1,20 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
-import { appendFile, chmod, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { gunzipSync } from "node:zlib";
+import { inputLimits, Inputs } from "../src/inputs.ts";
 import { projectKey } from "../src/paths.ts";
 import { createSandbox, execInSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
+import { editTool } from "../src/tools/edit.ts";
+import { readTool } from "../src/tools/read.ts";
 import { FileVersions } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { fakeMessagesApi, runJig } from "./fake-api.ts";
@@ -1753,6 +1758,189 @@ describe("snapshots", () => {
     await rm(lock);
     assert.deepEqual(snapshots.undo(), { changed: ["a.txt"], removed: [] });
     assert.equal(await readFile(join(dir, "a.txt"), "utf8"), "1");
+  });
+});
+
+describe("--keep-inputs", () => {
+  // The project is dir, with jig's own directory in it (see beforeEach), which neither source may keep.
+  let outputs: OutputFiles;
+  let events: string[];
+  let notices: string[];
+  beforeEach(() => {
+    outputs = new OutputFiles();
+    events = [];
+    notices = [];
+  });
+  afterEach(() => outputs.remove());
+
+  /** Watches dir's files from a snapshot taken now, or without one, from the store. */
+  async function watching(source: "snapshot" | "store", hidden: string[] = []): Promise<Inputs> {
+    const inputs = new Inputs(dir, { hidden, outputs, count: (event) => void events.push(event), notice: (text) => void notices.push(text) });
+    const snapshots = source === "snapshot" ? new Snapshots(dir, hidden) : undefined;
+    snapshots?.take("task");
+    await inputs.start(snapshots);
+    return inputs;
+  }
+  /** Runs a command as the loop does, between before() and after(), and resolves to the line for its result. */
+  async function command(inputs: Inputs, line: string): Promise<string | undefined> {
+    inputs.before();
+    assert.match(await runCommand(line, dir, 10), /Exit code: 0$/);
+    return inputs.after();
+  }
+  /** The copy a note names. */
+  const copyIn = (note?: string) => /is at (\S+)\.(?: |$)/.exec(note ?? "")?.[1] ?? assert.fail(`no copy in ${note}`);
+  /** What the store keeps for dir, by each blob's name. */
+  const store = () => join(process.env.JIG_HOME!, "inputs", projectKey(dir), String(process.pid));
+  async function kept(): Promise<Record<string, string>> {
+    const names = await readdir(store());
+    return Object.fromEntries(names.map((name) => [name, gunzipSync(readFileSync(join(store(), name))).toString()]));
+  }
+
+  for (const source of ["store", "snapshot"] as const) {
+    it(`notes a file from before the task that a command removes or empties, once, with a copy of its bytes then (from the ${source})`, async () => {
+      const wal = randomBytes(5000);
+      await writeFile(join(dir, "main.db-wal"), wal);
+      await mkdir(join(dir, "logs"));
+      await writeFile(join(dir, "logs", "app.log"), "started\nstopped\n");
+      // A file of the same size with other bytes doesn't hold them.
+      await writeFile(join(dir, "other.bin"), randomBytes(5000));
+      const inputs = await watching(source);
+      const gone = await command(inputs, "rm main.db-wal");
+      assert.match(
+        gone!,
+        /^\(Note from jig: main\.db-wal, which was there before the task \(5,000 bytes\), is gone after this command, and no file in the project holds its bytes\. A copy of it as it was before the task is at \S+\/jig-before-[0-9a-f]{12}-main\.db-wal\. If you removed it on purpose, ignore this; restore it only if the task needs those bytes\.\)$/,
+      );
+      assert.deepEqual(await readFile(copyIn(gone)), wal);
+      assert.equal(await command(inputs, "ls"), undefined, "once a task");
+      const emptied = await command(inputs, ": > logs/app.log");
+      assert.match(emptied!, /^\(Note from jig: logs\/app\.log, which was there before the task \(16 bytes\), is empty after this command, and no file/);
+      assert.equal(await readFile(copyIn(emptied), "utf8"), "started\nstopped\n");
+      assert.deepEqual(events, ["inputs.lost", "inputs.lost"]);
+      assert.deepEqual(outputs.paths(), [copyIn(gone), copyIn(emptied)], "deleted with the long outputs when jig exits");
+    });
+  }
+
+  it("says nothing of a file write_file or edit_file changed, nor of one the task made", async () => {
+    await writeFile(join(dir, "a.txt"), "alpha\n");
+    await writeFile(join(dir, "b.txt"), "beta\n");
+    const inputs = await watching("store");
+    const context = { cwd: dir, versions: new FileVersions() };
+    await readTool.run({ path: "a.txt" }, context);
+    await writeTool.run({ path: "a.txt", content: "alpha, rewritten\n" }, context);
+    await editTool.run({ path: "b.txt", old_string: "beta", new_string: "beta, edited" }, context);
+    assert.equal(await command(inputs, "rm a.txt && : > b.txt"), undefined);
+    assert.equal(await command(inputs, "echo new > c.txt"), undefined);
+    assert.equal(await command(inputs, "rm c.txt"), undefined);
+    assert.deepEqual(events, ["inputs.suppressed", "inputs.suppressed"]);
+  });
+
+  it("says nothing once a backup in the project holds a file's bytes, nor after a command rewrote it", async () => {
+    await writeFile(join(dir, "main.db-wal"), "wal bytes");
+    await writeFile(join(dir, "data.bin"), "data bytes");
+    const inputs = await watching("store");
+    assert.equal(await command(inputs, "cp main.db-wal main.db-wal.orig"), undefined);
+    assert.equal(await command(inputs, "rm main.db-wal"), undefined);
+    // Decoded in place, then deleted by another command, as sqlite3 did in milestone 30's other runs.
+    assert.equal(await command(inputs, "printf 'decoded data' > data.bin"), undefined);
+    assert.equal(await command(inputs, "rm data.bin"), undefined);
+    assert.deepEqual(events, ["inputs.suppressed", "inputs.suppressed"]);
+  });
+
+  for (const source of ["store", "snapshot"] as const) {
+    it(`never keeps or gives back what a hidden path holds, nor a file whose folder became a link into one (from the ${source})`, async () => {
+      await mkdir(join(dir, "secret"));
+      await writeFile(join(dir, "secret", "key.txt"), "hunter2");
+      await mkdir(join(dir, "data"));
+      await writeFile(join(dir, "data", "f.txt"), "visible");
+      const elsewhere = await tempDir("jig-hidden-");
+      const inputs = await watching(source, [join(dir, "secret"), elsewhere]);
+      if (source === "store") assert.deepEqual(Object.values(await kept()), ["visible"], "nor jig's own directory");
+      assert.equal(await command(inputs, "rm -r secret"), undefined);
+      // data/f.txt now leads into the hidden folder, where there is none.
+      assert.equal(await command(inputs, `rm -r data && ln -s ${elsewhere} data`), undefined);
+      assert.deepEqual(events, []);
+      assert.deepEqual(outputs.paths(), []);
+    });
+
+    it(`names a file over the cap without a copy (from the ${source})`, async () => {
+      const { fileBytes, totalBytes } = inputLimits;
+      Object.assign(inputLimits, { fileBytes: 10, totalBytes: 20 });
+      try {
+        await writeFile(join(dir, "big.bin"), "more than ten bytes");
+        for (const name of ["x.txt", "y.txt", "z.txt"]) await writeFile(join(dir, name), `seven ${name[0]}`);
+        const inputs = await watching(source);
+        const note =
+          "(Note from jig: big.bin, which was there before the task (19 bytes), is gone after this command, and no file in the project holds its bytes. " +
+          "jig kept no copy of it. If you removed it on purpose, ignore this; restore it only if the task needs those bytes.)";
+        assert.equal(await command(inputs, "rm big.bin"), note);
+        assert.deepEqual(events, ["inputs.lost", "inputs.copySkipped"]);
+        // The store keeps 20 bytes in all, so two of the three 7-byte files, and says once that it left some out.
+        if (source === "store") {
+          assert.deepEqual(Object.values(await kept()).sort(), ["seven x", "seven y"]);
+          assert.equal(notices.length, 1);
+          assert.match(notices[0], /^--keep-inputs keeps no copy of a file over \d+ MB, nor past \d+ MB in all, so it left out 2 of the project's files: if a command removes one, the model hears so without a copy\.$/);
+          await inputs.start(undefined);
+          assert.equal(notices.length, 1);
+        }
+      } finally {
+        Object.assign(inputLimits, { fileBytes, totalBytes });
+      }
+    });
+  }
+
+  it("keeps the files itself only without a snapshot: gzipped under their hashes, as a snapshot would take them, and gone when jig exits", async () => {
+    await writeFile(join(dir, "a.txt"), "kept");
+    await writeFile(join(dir, ".gitignore"), "*.log\ncache/\n");
+    await writeFile(join(dir, "run.log"), "ignored");
+    await mkdir(join(dir, "src", "cache"), { recursive: true });
+    await writeFile(join(dir, "src", "cache", "x"), "ignored too");
+    await mkdir(join(dir, "node_modules", "pkg"), { recursive: true });
+    await writeFile(join(dir, "node_modules", "pkg", "index.js"), "never snapshotted");
+    await mkdir(join(dir, "vendor", "lib"), { recursive: true });
+    git(join(dir, "vendor", "lib"), "init", "-q");
+    await writeFile(join(dir, "vendor", "lib", "lib.c"), "a nested repository's");
+    (await watching("snapshot")).remove();
+    assert.equal(existsSync(join(process.env.JIG_HOME!, "inputs")), false, "with a snapshot, no store");
+
+    // A store a session left behind when it was killed: no process has its number.
+    const stale = join(dirname(store()), "999999999");
+    await mkdir(stale, { recursive: true });
+    const inputs = await watching("store");
+    const blobs = await kept();
+    assert.deepEqual(Object.values(blobs).sort(), ["*.log\ncache/\n", "kept"]);
+    for (const [name, text] of Object.entries(blobs)) assert.equal(name, `${createHash("sha256").update(text).digest("hex")}.gz`);
+    // A file it left out isn't watched, so losing it isn't noted.
+    assert.equal(await command(inputs, "rm run.log src/cache/x node_modules/pkg/index.js vendor/lib/lib.c"), undefined);
+    // The same bytes in the next task are kept once.
+    await inputs.start(undefined);
+    assert.equal((await readdir(store())).length, 2);
+    inputs.remove();
+    assert.equal(existsSync(store()), false);
+    assert.equal(existsSync(stale), false);
+    assert.deepEqual(events, []);
+  });
+
+  it("makes each copy anew under a random name, so a link planted in the temp directory can't lead the write elsewhere", async () => {
+    const target = join(dir, "target.txt");
+    await writeFile(target, "the user's file\n");
+    // The copy's name with its random part guessed: opened with O_EXCL, a link there fails it.
+    const planted = join(tmpdir(), "jig-before-000000000000-main.db-wal");
+    await symlink(target, planted);
+    try {
+      assert.equal(outputs.copy("main.db-wal", Buffer.from("wal"), "000000000000"), undefined);
+      assert.equal(await readFile(target, "utf8"), "the user's file\n");
+    } finally {
+      await rm(planted);
+    }
+    const copy = outputs.copy("main db-wal", Buffer.from("wal"))!;
+    assert.match(copy, /^.+\/jig-before-[0-9a-f]{12}-main_db-wal$/);
+    assert.equal(dirname(copy), tmpdir(), "right in the temp directory, in no folder a command could swap");
+    const info = await lstat(copy);
+    assert.equal(info.isFile(), true);
+    assert.equal(info.mode & 0o777, 0o600);
+    assert.equal(await readFile(copy, "utf8"), "wal");
+    outputs.remove();
+    assert.equal(existsSync(copy), false);
   });
 });
 

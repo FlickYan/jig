@@ -281,6 +281,20 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   itself, where it holds jig's directory, a hidden path or git's config: on macOS the rule that lets
   commands write in a directory matches the directory too, so a command could move the whole project aside
   and read, or change, what the other rules deny at its new path (on Linux it is a mount point).
+- **A lost input is named, not put back.** With `--keep-inputs`, a command that leaves a file from before
+  the task gone or empty gets a line saying where a copy of it as it was then is. Only where the file was
+  still as it was before the task until that command, and no other file in the project holds its bytes: in
+  milestone 30, sqlite3 deleted a write-ahead log in three of four db-wal-recovery trials, two of them after
+  the model had backed it up or decoded it in place, and only the third was a loss. The line says the file
+  is gone after the command, not that the command deleted it, as a background job or an editor can do that
+  between two commands; and jig restores nothing, since a stale log put back beside a database written
+  since can corrupt it. The copy comes from the task's snapshot, read by object and only for regular files;
+  without git, from a store kept for this alone, each file gzipped and named by its hash, so that where
+  commands can read jig's directory (with `--no-sandbox` on Terminal-Bench, a model's `grep -r` found jig's
+  session files) neither names nor contents match a search for the project's. It never feeds `/undo`, which
+  would take a file a capped store left out for one the task created, and delete it. The copy goes right in
+  the temp directory under a random name, opened with `O_EXCL`, as long outputs do: in a folder of jig's
+  there, or under a name one could guess, a command could plant a link and have jig write elsewhere.
 - **Skills load through a tool, not `read_file`.** The model could read `SKILL.md` itself, but `read_file`
   stays inside the project and user skills live in the home directory. The `skill` tool also lists the
   skill's other files, and pins the instructions so compaction keeps them word for word rather than

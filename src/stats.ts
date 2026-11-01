@@ -89,7 +89,13 @@ export type Mechanism =
   // showed; and a task it left one of those out of, as the model's own glob or read_file wouldn't show it.
   | "overview"
   | "overview.file"
-  | "overview.skipped";
+  | "overview.skipped"
+  // --keep-inputs: a file from before the task that a command's result said was gone or empty after it, with
+  // its bytes in no other file; one it said so of without a copy; and one gone or empty that it kept quiet
+  // about, as it had changed before that command, or another file held its bytes.
+  | "inputs.lost"
+  | "inputs.copySkipped"
+  | "inputs.suppressed";
 
 /**
  * Totals for a session in a JSON file (--stats), for scripts and evaluation harnesses: model calls,

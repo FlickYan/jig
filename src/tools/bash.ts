@@ -7,7 +7,7 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, closeSync, openSync, rmSync } from "node:fs";
+import { appendFileSync, closeSync, openSync, rmSync, writeFileSync } from "node:fs";
 import type { Socket } from "node:net";
 import type { Readable } from "node:stream";
 import { readdir, stat } from "node:fs/promises";
@@ -436,6 +436,9 @@ export class OutputFiles {
   private files: OutputFile[] = []; // oldest first
   private size = 0;
   private readonly limit: number;
+  // --keep-inputs' copies (see copy), and their bytes in all.
+  private copies: string[] = [];
+  private copied = 0;
 
   constructor(limit = MAX_SAVED) {
     this.limit = limit;
@@ -479,7 +482,32 @@ export class OutputFiles {
    * the note tells the model to; not other files with names like theirs, which a command can make.
    */
   paths(): string[] {
-    return this.files.map((file) => file.path);
+    return [...this.files.map((file) => file.path), ...this.copies];
+  }
+
+  /**
+   * A new file holding `bytes`, made and written as the outputs' files are, named after `name`: --keep-inputs'
+   * copy of a file as it was before the task (see inputs.ts). Its path, or undefined if it can't be made, or
+   * the copies would hold more than `limit` bytes in all; they aren't deleted to make room, as outputs are,
+   * since the model was told where each one is. `random` is for tests.
+   */
+  copy(name: string, bytes: Buffer, random = randomBytes(6).toString("hex")): string | undefined {
+    if (this.copied + bytes.length > this.limit) return undefined;
+    // Only letters, digits, dots, dashes and underscores, so that the model can name it in a command as it is.
+    const path = join(tmpdir(), `jig-before-${random}-${name.replace(/[^\w.-]/g, "_").slice(0, 100)}`);
+    try {
+      const fd = openSync(path, "ax", 0o600);
+      this.copies.push(path);
+      try {
+        writeFileSync(fd, bytes);
+      } finally {
+        closeSync(fd);
+      }
+      this.copied += bytes.length;
+      return path;
+    } catch {
+      return undefined;
+    }
   }
 
   /** Done with a file: its command has ended. */
@@ -491,11 +519,13 @@ export class OutputFiles {
     }
   }
 
-  /** Deletes the files. */
+  /** Deletes the files, and the copies. */
   remove(): void {
-    for (const file of this.files) deleteFile(file.path);
+    for (const path of [...this.files.map((file) => file.path), ...this.copies]) deleteFile(path);
     this.files = [];
     this.size = 0;
+    this.copies = [];
+    this.copied = 0;
   }
 }
 

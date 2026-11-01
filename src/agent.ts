@@ -69,6 +69,13 @@ export interface AgentOptions {
   tolerantEdits?: boolean;
   /** After a command whose unittest or pytest run ran no tests, have bash say so in its result (on unless --no-test-notes). */
   testNotes?: boolean;
+  /**
+   * --keep-inputs: watches the files that were there before the task (see inputs.ts), told before and after
+   * each bash command; after one, it resolves to a line for the command's result if the command left such a
+   * file gone or empty, with its bytes in no other file. Only a task's own loop has it: a subagent's
+   * commands only look.
+   */
+  inputs?: { before(): void; after(): Promise<string | undefined> };
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
@@ -705,6 +712,7 @@ async function handleToolCall(
     return fail(`Not run: ${checking} failed: ${errorMessage(err)}`);
   }
   let output: string;
+  const inputs = tool.definition.name === "bash" ? opts.inputs : undefined;
   try {
     const pin = (key: string, text: string) => conversation.pin(key, text);
     // What the tool counts is counted once it has returned, here: from inside a tool (bash counts in a
@@ -712,12 +720,24 @@ async function handleToolCall(
     const counted: Mechanism[] = [];
     const count = (event: Mechanism) => void counted.push(event);
     const context = { cwd: opts.cwd, dirs: opts.dirs, hidden: opts.hidden, gitLocked: opts.gitLocked, checkWrites: opts.checkWrites, mayRun: opts.mayRun, tolerantEdits: opts.tolerantEdits, testNotes: opts.testNotes, versions: conversation.versions, signal, sandbox: opts.sandbox, outputs: opts.outputs, pin, usage, count };
+    inputs?.before();
     const whole = await tool.run(input, context);
     for (const event of counted) opts.count?.(event);
     output = truncate(whole);
     if (output !== whole) opts.count?.("output.truncated");
   } catch (err) {
     return fail(errorMessage(err));
+  }
+  // --keep-inputs' line goes in after the cut, so that it isn't cut away, before the exit code, which stays last
+  // (failedTestRun reads it there). Not once the task is stopped: the model won't see it.
+  if (inputs && !signal?.aborted) {
+    try {
+      const note = await inputs.after();
+      const last = output.lastIndexOf("\n") + 1;
+      if (note) output = `${output.slice(0, last)}${note}\n${output.slice(last)}`;
+    } catch (err) {
+      opts.ui.notice(`--keep-inputs couldn't look at the project's files after this command: ${errorMessage(err)}`);
+    }
   }
   try {
     const feedback = await opts.hooks?.after(call.name, input, output, signal);

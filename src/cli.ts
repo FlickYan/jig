@@ -14,6 +14,7 @@ import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Review
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
 import { hooksFor, runHooks, runStopHooks } from "./hooks.ts";
+import { Inputs } from "./inputs.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
@@ -121,6 +122,11 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           where the command exited with 0 and that && list came last), and for unittest, which
                           folders hold test*.py files but no __init__.py, which its discovery doesn't enter.
                           No note where the command runs another kind of runner too (go test, npm test)
+      --keep-inputs       after a command, say in its result when a file that was there before the task is gone
+                          or empty, if it was as it was then until the command and no other file in the project
+                          holds its bytes, and where a copy of it as it was before the task is: from the task's
+                          snapshot, or without git from a store jig keeps at the task's start (20 MB a file,
+                          100 MB in all); jig never puts it back itself
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -278,6 +284,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "tolerant-edits": { type: "boolean", default: false },
       overview: { type: "boolean", default: true },
       "test-notes": { type: "boolean", default: true },
+      "keep-inputs": { type: "boolean", default: false },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -345,6 +352,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // commands that only read look at these files, in plan mode too. Only the main loop's: the subagents'
   // policy doesn't know them, so their results don't point to a file their commands couldn't read.
   const outputs = new OutputFiles();
+  // --keep-inputs: the files that were there before each task, watched around its commands; its copies go
+  // where the long outputs go. Off until benchmarks show whether it helps.
+  const inputs = values["keep-inputs"] ? new Inputs(cwd, { hidden: settings.hiddenPaths, outputs, count, notice: ui.notice }) : undefined;
   // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, a command still running is killed
   // as Ctrl+C kills it, and the session's keeper (sandbox.ts) ends with the whole PID namespace, so a job a
   // command left in the background dies too: only bubblewrap's sandbox would otherwise take them down with jig.
@@ -352,6 +362,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     killCommands();
     sandbox?.close?.();
     outputs.remove();
+    inputs?.remove();
   });
   // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
   // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
@@ -566,6 +577,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     tolerantEdits: values["tolerant-edits"],
     // The model --escalate hands over to gets it too; not the subagents, whose plan-mode rules run no tests.
     testNotes: values["test-notes"],
+    // Not the subagents', whose commands only look.
+    inputs,
     maxSteps,
     compactAt: compactLimit,
     authorize,
@@ -638,6 +651,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       let result: RunResult;
       let started: number;
       try {
+        await watchInputs(signal);
         // In the task, so that Ctrl+C and the deadline stop it too: the git that lists the files can wait on a
         // named pipe (a .gitignore, say), for 30 seconds a call.
         const shown = values.overview && words !== undefined ? await overviewFor(words, signal) : undefined;
@@ -696,6 +710,19 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       if (signal.aborted) return undefined;
       ui.notice(`The overview left the project's files out (--no-overview turns it off): ${(err as Error).message}`);
       return undefined;
+    }
+  }
+
+  /**
+   * --keep-inputs lists the files there before the task, from the snapshot just taken, or without one by
+   * keeping them now: in the task, so that Ctrl+C and the deadline stop it. If that fails, the task goes on
+   * unwatched, and the user is told why.
+   */
+  async function watchInputs(signal: AbortSignal): Promise<void> {
+    try {
+      await inputs?.start(snapshots, signal);
+    } catch (err) {
+      if (!signal.aborted) ui.notice(`--keep-inputs isn't watching this task's files: ${(err as Error).message.split("\n")[0]}`);
     }
   }
 

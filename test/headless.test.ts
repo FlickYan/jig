@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { link, lstat, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -1333,6 +1334,98 @@ describe("--test-notes", () => {
       const flat = help.replace(/\s+/g, " ");
       assert.ok(flat.includes("that the commands after the last runner's && didn't run (not where the command exited with 0 and that && list came last)"), help);
       assert.ok(flat.includes("No note where the command runs another kind of runner too (go test, npm test)"), help);
+    } finally {
+      api.close();
+    }
+  });
+});
+
+describe("--keep-inputs", () => {
+  /**
+   * A fake API whose model runs `command`, then reads the copy the note in its result names, while jig still
+   * keeps it, and says it is done; with what it found, and the store's blobs as they were then.
+   */
+  async function removing(command: string, home: string) {
+    const found = { result: "", copy: undefined as Buffer | undefined, blobs: [] as string[] };
+    const api = await fakeMessagesApi((request) => {
+      const messages = request.messages as Anthropic.Beta.BetaMessageParam[];
+      if (messages.length === 1) return [{ tool: "bash", input: { command } }];
+      found.result = String((messages[2].content as Anthropic.Beta.BetaToolResultBlockParam[])[0].content);
+      const copy = /is at (\S+)\.(?: |$)/.exec(found.result)?.[1];
+      found.copy = copy ? readFileSync(copy) : undefined;
+      const store = join(home, "inputs");
+      found.blobs = existsSync(store) ? (readdirSync(store, { recursive: true }) as string[]).filter((name) => name.endsWith(".gz")) : [];
+      return [{ text: "Done." }];
+    });
+    return { api, found };
+  }
+
+  it("notes a file from before the task that a command removed, with a copy of its bytes then: from the snapshot, or without git from its store; off by default", async () => {
+    const wal = randomBytes(3000);
+    const home = await tempDir("jig-home-");
+    const stats = join(outside, "stats.json");
+    const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-overview", "--stats", stats, "Recover the data."];
+    const { api, found } = await removing("rm main.db-wal", home);
+    try {
+      await writeFile(join(project, "main.db-wal"), wal);
+      const withGit = await runJig(["--keep-inputs", ...args], { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(withGit.code, 0, withGit.output);
+      const note =
+        /^\(no output\)\n\n\(Note from jig: main\.db-wal, which was there before the task \(3,000 bytes\), is gone after this command, and no file in the project holds its bytes\. A copy of it as it was before the task is at \S+\/jig-before-[0-9a-f]{12}-main\.db-wal\. If you removed it on purpose, ignore this; restore it only if the task needs those bytes\.\)\nExit code: 0$/;
+      assert.match(found.result, note);
+      assert.deepEqual(found.copy, wal);
+      assert.deepEqual(found.blobs, [], "the snapshot held it");
+      assert.deepEqual(JSON.parse(await readFile(stats, "utf8")).events, { "inputs.lost": 1 });
+
+      // Without git on the PATH, as in 68 of milestone 30's 76 Terminal-Bench trials.
+      const bin = join(outside, "bin");
+      await mkdir(bin);
+      for (const program of ["bash", "rm"]) await symlink(execFileSync("bash", ["-c", `command -v ${program}`], { encoding: "utf8" }).trim(), join(bin, program));
+      await writeFile(join(project, "main.db-wal"), wal);
+      const withoutGit = await runJig(["--keep-inputs", ...args], { api, cwd: project, env: { JIG_HOME: home, PATH: bin } });
+      assert.equal(withoutGit.code, 0, withoutGit.output);
+      assert.match(withoutGit.output, /Couldn't snapshot the project, so \/undo is off: spawnSync git ENOENT/);
+      assert.match(found.result, note);
+      assert.deepEqual(found.copy, wal);
+      assert.equal(found.blobs.length, 1, "kept gzipped under its hash");
+      assert.deepEqual((readdirSync(join(home, "inputs"), { recursive: true }) as string[]).filter((name) => name.endsWith(".gz")), [], "removed when jig exits");
+      assert.equal(existsSync(/is at (\S+)\.(?: |$)/.exec(found.result)![1]), false, "the copy too");
+
+      await writeFile(join(project, "main.db-wal"), wal);
+      const off = await runJig(args, { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(found.result, "(no output)\n\nExit code: 0");
+      assert.deepEqual(JSON.parse(await readFile(stats, "utf8")).events, {});
+      const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
+      assert.match(help, /--keep-inputs {7}after a command, say in its result when a file that was there before the task is gone/);
+    } finally {
+      api.close();
+    }
+  });
+
+  // sqlite3, or else Python's sqlite3 module, the same library.
+  const sqlite = ["sqlite3", "python3"].find((program) => spawnSync("bash", ["-c", `command -v ${program}`]).status === 0);
+  it("gives back the write-ahead log SQLite deleted for its invalid header, as in milestone 30's db-wal-recovery", { skip: !sqlite && "neither sqlite3 nor python3 is installed" }, async (t) => {
+    const db = join(project, "main.db");
+    const schema = "pragma journal_mode=wal; create table items(id integer primary key, name text); insert into items(name) values ('a'), ('b');";
+    if (sqlite === "sqlite3") execFileSync("sqlite3", [db, schema]);
+    else execFileSync("python3", ["-I", "-c", "import sqlite3, sys; c = sqlite3.connect(sys.argv[1]); c.executescript(sys.argv[2]); c.close()", db, schema]);
+    // A log whose header SQLite can't read: that task's was XORed with 0x42.
+    const wal = Buffer.from(randomBytes(4096).map((byte) => byte ^ 0x42));
+    wal.fill(0x42, 0, 32);
+    await writeFile(`${db}-wal`, wal);
+    const look =
+      sqlite === "sqlite3"
+        ? 'sqlite3 main.db "select * from items;"'
+        : `python3 -c "import sqlite3; print(sqlite3.connect('main.db').execute('select * from items').fetchall())"`;
+    const home = await tempDir("jig-home-");
+    const { api, found } = await removing(look, home);
+    try {
+      const { code, output } = await runJig(["--keep-inputs", "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "Recover the data."], { api, cwd: project, env: { JIG_HOME: home } });
+      assert.equal(code, 0, output);
+      if (existsSync(`${db}-wal`)) return t.skip("this SQLite kept the log");
+      assert.match(found.result, /\(Note from jig: main\.db-wal, which was there before the task \(4,096 bytes\), is gone after this command, and no file in the project holds its bytes\. A copy of it as it was before the task is at \S+\/jig-before-[0-9a-f]{12}-main\.db-wal\./);
+      assert.deepEqual(found.copy, wal);
     } finally {
       api.close();
     }
