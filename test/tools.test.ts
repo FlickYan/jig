@@ -973,6 +973,15 @@ describe("--test-notes", () => {
     assert.equal(await note("pip install -q pytest && pytest -q && python check.py", "\nno tests ran in 0.01s\n\nExit code: 5"), pytest);
     // A later line's exit code says nothing of the &&: in one of milestone 30's evolve2 attempts, the check didn't run.
     assert.equal(await note("python -m unittest -v && python - <<'PY'\nprint('checked')\nPY\necho ALL_OK", `${NONE}ALL_OK\n\nExit code: 0`), EVOLVE2);
+    // Nor does a later list's after a ;, a || or a single &, which puts the runner's whole list in the background
+    // (each output as bash and Python 3.13 gave it).
+    for (const [command, output] of [
+      ['python -m unittest -v && python check.py; echo "exit=$?"', `${NONE}exit=5\n\nExit code: 0`],
+      ["python -m unittest -v && python check.py || echo FAILED_RUN", `${NONE}FAILED_RUN\n\nExit code: 0`],
+      ["python -m unittest -v && python check.py & wait", `${NONE}\nExit code: 0`],
+    ]) {
+      assert.equal(await note(command, output), EVOLVE2, command);
+    }
   });
 
   it("says the same where pytest couldn't collect the tests, and so ran none", async () => {

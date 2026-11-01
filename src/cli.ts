@@ -117,9 +117,10 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           so not where --tools leaves that tool out, a deny rule refuses it or a PreToolUse
                           hook covers it
       --no-test-notes     don't say in a command's result when its unittest or pytest run ran no tests: by
-                          default a note says so, that the commands after the runner's && didn't run, and for
-                          unittest, which folders hold test*.py files but no __init__.py, which its discovery
-                          doesn't enter
+                          default a note says so, that the commands after the last runner's && didn't run (not
+                          where the command exited with 0 and that && list came last), and for unittest, which
+                          folders hold test*.py files but no __init__.py, which its discovery doesn't enter.
+                          No note where the command runs another kind of runner too (go test, npm test)
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -688,11 +689,12 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       if (found.left.length) count?.("overview.skipped");
       const untold = found.left.filter((part) => !toldOverviewOff.has(part));
       for (const part of untold) toldOverviewOff.add(part);
-      if (untold.length) ui.notice(`--overview gives the model only what its own tools would show it unasked, so it left out ${untold.map((part) => overviewOff.get(part)).join(" and ")}.`);
+      // On by default, so these name the overview, not a flag the user may never have given.
+      if (untold.length) ui.notice(`The overview gives the model only what its own tools would show it unasked, so it left out ${untold.map((part) => overviewOff.get(part)).join(" and ")}. --no-overview turns it off.`);
       return found.text || undefined;
     } catch (err) {
       if (signal.aborted) return undefined;
-      ui.notice(`--overview left the project's files out: ${(err as Error).message}`);
+      ui.notice(`The overview left the project's files out (--no-overview turns it off): ${(err as Error).message}`);
       return undefined;
     }
   }

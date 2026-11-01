@@ -1124,10 +1124,11 @@ describe("--overview", () => {
   const files = `${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.`;
   // Where write_file can't replace them, the note doesn't say they can be.
   const unwritable = files.replace(" Those shown count as read, so write_file can replace them.", "");
-  // What jig tells the user, once, when it leaves parts out.
-  const leftOut = (parts: string) => `--overview gives the model only what its own tools would show it unasked, so it left out ${parts}.`;
+  // What jig tells the user, once, when it leaves parts out: the overview is on by default, so the user may
+  // never have given --overview.
+  const leftOut = (parts: string) => `The overview gives the model only what its own tools would show it unasked, so it left out ${parts}. --no-overview turns it off.`;
   const once = (output: string, parts: string) => {
-    assert.equal(output.match(/--overview gives the model only/g)?.length, 1, output);
+    assert.equal(output.match(/The overview gives the model only/g)?.length, 1, output);
     assert.ok(output.includes(leftOut(parts)), output);
   };
 
@@ -1145,7 +1146,7 @@ describe("--overview", () => {
       // Rules on commands don't name either tool.
       const commands = await run([task], { deny: ["cat", "git ls-files"] });
       assert.equal(commands.first, `${listed}\n\n${files}\n\n${task}`);
-      assert.doesNotMatch(commands.output, /--overview gives/);
+      assert.doesNotMatch(commands.output, /The overview gives/);
       assert.deepEqual(commands.events, { overview: 1, "overview.file": 2 });
     } finally {
       close();
@@ -1164,7 +1165,7 @@ describe("--overview", () => {
       once(reading.output, "the project's files (glob isn't among the model's tools)");
       const all = await run(["--tools", "read_file,glob,bash", task]);
       assert.equal(all.first, `${listed}\n\n${unwritable}\n\n${task}`);
-      assert.doesNotMatch(all.output, /--overview gives/);
+      assert.doesNotMatch(all.output, /The overview gives/);
     } finally {
       close();
     }
@@ -1189,7 +1190,7 @@ describe("--overview", () => {
       const others = { hooks: { PreToolUse: [{ matcher: "write_file|bash", command: "exit 2" }], PostToolUse: [{ matcher: "read_file|glob", command: "exit 2" }] } };
       const all = await run([task], others);
       assert.equal(all.first, `${listed}\n\n${files}\n\n${task}`);
-      assert.doesNotMatch(all.output, /--overview gives/);
+      assert.doesNotMatch(all.output, /The overview gives/);
     } finally {
       close();
     }
@@ -1200,10 +1201,22 @@ describe("--overview", () => {
     try {
       const session = await run([], { deny: ["read_file"] }, "Fix app.py.\nLook around.\nNow NOTES.md.\n");
       assert.equal(session.first, `${listed}\n\nFix app.py.`);
-      assert.doesNotMatch(session.sent, /print\(1\)|Print 2|--overview gives/);
+      assert.doesNotMatch(session.sent, /print\(1\)|Print 2|The overview gives/);
       once(session.output, "the files the task names (a deny rule refuses read_file)");
       // The second task names no file, so nothing was left out of it.
       assert.deepEqual(session.events, { overview: 1, "overview.skipped": 2 });
+    } finally {
+      close();
+    }
+  });
+
+  it("gives nothing in a project it can't list, one the settings hide, and tells the user why", async () => {
+    const { run, close } = await overviewing();
+    try {
+      const hidden = await run([task], { hiddenPaths: [project] });
+      assert.equal(hidden.first, task);
+      assert.ok(hidden.output.includes("The overview left the project's files out (--no-overview turns it off): . is hidden by the user's settings."), hidden.output);
+      assert.deepEqual(hidden.events, {});
     } finally {
       close();
     }
@@ -1283,7 +1296,7 @@ describe("--overview", () => {
       assert.ok(Date.now() - started < 15_000, "git's own timeout is 30 seconds");
       assert.equal(api.requests.length, 0);
       // Stopped, it failed for that, which is no news to the user.
-      assert.doesNotMatch(output, /--overview left/);
+      assert.doesNotMatch(output, /The overview left/);
     } finally {
       api.close();
     }
@@ -1316,6 +1329,10 @@ describe("--test-notes", () => {
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
       assert.match(help, /--no-test-notes {5}don't say in a command's result when its unittest or pytest run ran no tests/);
+      // With the README's exceptions to the && sentence and to the note itself.
+      const flat = help.replace(/\s+/g, " ");
+      assert.ok(flat.includes("that the commands after the last runner's && didn't run (not where the command exited with 0 and that && list came last)"), help);
+      assert.ok(flat.includes("No note where the command runs another kind of runner too (go test, npm test)"), help);
     } finally {
       api.close();
     }
