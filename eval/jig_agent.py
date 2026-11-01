@@ -279,9 +279,13 @@ class Jig(BaseInstalledAgent):
         """jig in the container, the task on stdin. The container is the sandbox (--no-sandbox: jig's own would
         need bubblewrap and user namespaces in the container), so the whole file system is the project
         (--add-dir /), and nobody is there to approve tool calls (--yes). jig's home goes in the logs, so the
-        session file (every message and tool input) comes back with the trial."""
+        session file (every message and tool input) comes back with the trial.
+
+        jig runs on nvm's node by its path, found in a subshell, so that nvm stays off the PATH jig and the
+        model's commands inherit. The hidden tests run with the image's own node, if it has one
+        (make-mips-interpreter's is Debian's), and in milestone 30 the model tested its work with nvm's 24."""
         return (
-            f"{LOAD_NODE} && node {INSTALL_DIR}/src/cli.ts --yes --no-sandbox --add-dir / --model {shlex.quote(model)} "
+            f'node=$({LOAD_NODE} && command -v node) && "$node" {INSTALL_DIR}/src/cli.ts --yes --no-sandbox --add-dir / --model {shlex.quote(model)} '
             f"--stats /logs/agent/{stats} {flags} -- - < {task_file} 2>&1 | tee -a /logs/agent/jig.txt"
         )
 

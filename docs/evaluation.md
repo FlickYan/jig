@@ -213,8 +213,11 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
 - [`eval/jig_agent.py`](../eval/jig_agent.py) is jig's Harbor adapter. It installs Node and jig from this
   checkout in each task's container, runs `jig --yes --add-dir / --stats …` on the instruction (the
   container is the sandbox, so the whole file system is the project), and reads the turns and tokens back
-  from the stats file. The API key stays on the host: jig in the container gets a token of the run, and
-  its requests go through [`eval/key_proxy.py`](../eval/key_proxy.py), which puts the key in (milestone 25).
+  from the stats file. jig runs on nvm's Node by its path, and nvm stays off the PATH of the model's
+  commands: they find the image's own node, if it has one, as the hidden tests do (in milestone 30 the model
+  tested make-mips-interpreter's work with nvm's Node 24, and the tests ran it with Debian's). The API key
+  stays on the host: jig in the container gets a token of the run, and its requests go through
+  [`eval/key_proxy.py`](../eval/key_proxy.py), which puts the key in (milestone 25).
   With `run_reviewer` (milestone 29), once jig is done the adapter commits the task's container, starts a
   copy of it with no network and none of Harbor's mounts, and runs `jig review` on the host, its commands
   going into the copy; the problems a fresh copy shows again go back to jig (`--continue`) in the time
@@ -236,6 +239,11 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   sometimes fetched them, so [`eval/report.py`](../eval/report.py) checks every command of every trial, and an
   attempt that fetched anything from the benchmark's repositories counts as failed, whatever the verifier
   said. The numbers here are all counted that way; before milestone 10, this section counted those passes.
+- **A trial the verifier couldn't grade doesn't count either way.** One whose verifier wrote no result
+  (`ctrf.json`) or ran out of disk, or of a task listed with `--skip-tasks` because its verifier can't run on
+  the machine (a task a line, why after a `#`: `eval/skip-tasks.txt` is the machine's own, kept out of git,
+  and tbcheck uses it), is unscorable: marked apart and left out of the pass rates, their intervals and the
+  differences. Milestone 30 counted six such trials as failures.
 
 ### Results
 

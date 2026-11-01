@@ -287,6 +287,18 @@ describe("the Terminal-Bench check", () => {
     );
   });
 
+  it("leaves out a trial the verifier couldn't grade, as eval/report.py marks it", () => {
+    // Milestone 30's pytorch-model-recovery: the baseline's verifier ran out of disk, the candidate's passed.
+    const baseline = attemptsOf([
+      { task: "a", passed: true, unscorable: null },
+      { task: "torch", passed: false, unscorable: "its verifier ran out of disk" },
+      { task: "corpus", passed: false, unscorable: "skipped (its download of its tests is refused here)" },
+    ]);
+    const candidate = attemptsOf([{ task: "a", passed: true }, { task: "torch", passed: true }]);
+    assert.deepEqual(baseline, [{ task: "a", passed: true, cost: null }]);
+    assert.equal(terminalBenchVerdict(candidate, baseline).comparison.tasks, 1, "paired on the task both could be graded on");
+  });
+
   it("prices a reviewer's calls at the reviewer's prices, as eval/report.py saves them", () => {
     // 1M tokens in (half cached) and 100k out, of which the reviewer, deepseek-v4-pro, made 200k in (100k cached) and 20k out
     const trial = { model: "deepseek-flash", input: 1_000_000, cached: 500_000, output: 100_000, shares: [{ model: "deepseek-v4-pro", modelCalls: 3, usage: { input: 100_000, cacheWrite: 0, cacheRead: 100_000, output: 20_000 } }] };

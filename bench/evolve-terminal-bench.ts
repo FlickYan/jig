@@ -17,14 +17,20 @@ export interface Trial {
   output?: number;
   /** What eval/report.py priced the trial at (saved from milestone 24 on: a reviewer's calls are at its prices). */
   cost?: number | null;
+  /** Why the verifier couldn't grade the trial, if it couldn't (eval/report.py): it is neither passed nor failed. */
+  unscorable?: string | null;
 }
 
 /** Prices of deepseek-flash per token, as eval/report.py has them: uncached input, cached input, output. */
 const PRICE = { input: 0.3e-6, cached: 0.006e-6, output: 1.2e-6 };
 
-/** Trials as the referee compares attempts: a look-up is a failure, and the cost comes from the tokens. */
+/**
+ * Trials as the referee compares attempts: a look-up is a failure, a trial the verifier couldn't grade isn't
+ * an attempt at all (in milestone 30, six such failures turned a 3-point loss into a 3-point gain), and the
+ * cost comes from the tokens.
+ */
 export function attemptsOf(trials: Trial[]): Attempt[] {
-  return trials.map((trial) => {
+  return trials.filter((trial) => !trial.unscorable).map((trial) => {
     const cached = trial.cached ?? 0;
     const cost = trial.cost !== undefined ? trial.cost : trial.input === undefined ? null : (trial.input - cached) * PRICE.input + cached * PRICE.cached + (trial.output ?? 0) * PRICE.output;
     return { task: trial.task, passed: trial.passed && !trial.looked_up, cost };
