@@ -182,6 +182,29 @@ describe("compaction", () => {
     assert.doesNotMatch(summary, /count as read|x = 1/);
   });
 
+  it("keeps the task once when the API rejects the request after a compaction before the first step", async () => {
+    // Compacted again, the request kept the first time is the task's message: it stays after the summary, and
+    // isn't restated in it too.
+    const files = "(Note from jig: the files the task below names, as read_file shows them.)\napp.py:\n     1\tx = 1";
+    const conversation = new Conversation(undefined, [
+      { role: "user", content: "fix the parser" },
+      { role: "assistant", content: [text("Done.")] },
+      { role: "user", content: `${files}\n\nnow change app.py` },
+    ]);
+    conversation.tokens = 9000;
+    let calls = 0;
+    const callModel: CallModel = async (messages, signal, options) => {
+      if (!options?.summarize && ++calls === 1) throw TOO_LONG;
+      return fakeModel([reply([text("Changed.")])])(messages, signal, options);
+    };
+    const result = await runAgent(conversation, { ...options(callModel, 5000), task: "now change app.py" });
+    assert.equal(result.text, "Changed.");
+    const [summary, request, answer] = conversation.messages;
+    assert.doesNotMatch(String(summary.content), /now change app\.py/);
+    assert.deepEqual(request, { role: "user", content: "now change app.py" });
+    assert.equal(answer.role, "assistant");
+  });
+
   it("forgets which files were read, so they are read again before editing", async () => {
     const conversation = new Conversation(undefined, [{ role: "user", content: "hi" }]);
     await writeFile(join(dir, "a.txt"), "x");
@@ -345,6 +368,17 @@ describe("sessions", () => {
     conversation.push({ role: "user", content: message }, undefined, "Fix app.py.");
     assert.equal(SessionFile.firstRequest(session.path), "Fix app.py.");
     assert.deepEqual(SessionFile.load(session.path), [{ role: "user", content: message }], "the model's message is kept whole");
+  });
+
+  it("finds the first request past a tool whose schema says \"role\":\"user\", and none in a line a crash cut off", async () => {
+    // An MCP server's tool is recorded with the session's start, its schema as the server gave it.
+    const tool = { name: "mcp__chat__send", input_schema: { type: "object" as const, properties: {}, examples: [{ role: "user", content: "hi" }] } };
+    const path = join(dir, "crashed.jsonl");
+    const start = JSON.stringify({ type: "start", cwd: dir, model: "m", date: "", tools: [tool] });
+    await writeFile(path, `${start}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Fix app.py." } })}\n`);
+    assert.equal(SessionFile.firstRequest(path), "Fix app.py.");
+    await writeFile(path, `${start}\n{"type":"message","at":"2026-11-01T10:00:00.000Z","message":{"role":"user","content":"Fix ap`);
+    assert.equal(SessionFile.firstRequest(path), "");
   });
 
   it("records when each message was written, and how long its model call or its tool calls took", async () => {

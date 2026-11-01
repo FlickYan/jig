@@ -67,7 +67,7 @@ export interface AgentOptions {
   mayRun?(command: string, script: string): boolean;
   /** Let edit_file apply a unique match that differs in typographic punctuation or trailing whitespace (--tolerant-edits). */
   tolerantEdits?: boolean;
-  /** After a command whose unittest or pytest run ran no tests, have bash say so in its result (--test-notes). */
+  /** After a command whose unittest or pytest run ran no tests, have bash say so in its result (on unless --no-test-notes). */
   testNotes?: boolean;
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
@@ -90,8 +90,8 @@ export interface AgentOptions {
    * Budget notes (on unless --no-budget-notes): once half the steps are used, or half the time when there is a `deadline` (--time-limit;
    * with `begun`, when the task began, as Date.now() gives them), a note after each step's tool results says
    * how much is used, and before the last step that it is the last (see budgetNote). Only a task's own loop
-   * has them: a subagent's or the reviewer's steps are their own. `early` (--early-budget-notes) starts them
-   * once EARLY_NOTES steps or fewer are left too, and has each say what a step is (ONE_REPLY).
+   * has them: a subagent's or the reviewer's steps are their own. `early` (on unless --no-early-budget-notes)
+   * starts them once EARLY_NOTES steps or fewer are left too, and has each say what a step is (ONE_REPLY).
    */
   budgetNotes?: { begun: number; deadline?: number; early?: boolean };
   /**
@@ -540,13 +540,14 @@ export const WRAP_UP = "You have run out of steps. Don't call any tools: say wha
 const LAST_STEP = ["your next reply is the last step whose tool calls run.", "Make sure your changes are saved and checked; don't start new exploration."];
 
 /**
- * With --early-budget-notes, the notes start once this many steps or fewer are left, if that comes before half
- * of them: at evolve2's 4 steps, after the first step instead of the second. From 6 steps on, half comes first.
+ * With the early notes (on unless --no-early-budget-notes), the notes start once this many steps or fewer are
+ * left, if that comes before half of them: at evolve2's 4 steps, after the first step instead of the second.
+ * From 6 steps on, half comes first.
  */
 const EARLY_NOTES = 3;
 
 /**
- * What --early-budget-notes adds to each note: what a step is, and how its calls run (as runAgent runs them).
+ * What the early notes add to each note: what a step is, and how its calls run (as runAgent runs them).
  * In milestone 30's runs at 4 steps, the model often guessed that each call was a step, or that a reply's
  * calls could run out of order, and some attempts split a change and its test over two steps for it.
  */

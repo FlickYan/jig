@@ -18,7 +18,7 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   cuts them, so one line of minified code can't fill the conversation. When it occurs more than once, the
   error says on which lines. The next attempt usually succeeds.
 - **Read before overwrite.** jig remembers each file's modification time and size as of the model's last
-  read (`read_file`, printing it with `cat`, `head` or `tail`, or `--overview` showing it before the task).
+  read (`read_file`, printing it with `cat`, `head` or `tail`, or the overview showing it before the task).
   `write_file` refuses to replace a file the model hasn't read, or one that changed since (a formatter, a
   command or the user edited it), so it never overwrites work it hasn't seen. `edit_file` doesn't need the
   check: its exact, unique match already proves the model knows the text it replaces. In M2 and M3 the check
@@ -63,7 +63,7 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   summary is sent: keeping the last few turns verbatim would replay thinking blocks whose earlier history
   is gone, which the API can reject, and a fresh start is valid for every provider. A request the user just
   typed is kept word for word after the summary, and the model must read a file again before `write_file`
-  replaces it, so the files `--overview` put before the request go: their note says they count as read.
+  replaces it, so the files the overview put before the request go: their note says they count as read.
   Mid-task, the task is restated after the summary, word for word up to 20,000 characters (a longer one by
   its start and its end, since what it asks for is often last), with the log of file changes and commands a
   reviewer gets, since a summary keeps the conclusions, not the working state (milestone 6).
@@ -379,7 +379,17 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   `--time-limit`, are used, a note after each step's results says what is used, and before the last step
   that it is the last: 92 of 105 against 66 and 66 on evolve2, and no worse on Terminal-Bench (milestone
   30). Unlike `--check` it adds no model call, and it goes in the results' own message, so the cached
-  prefix stays the same.
+  prefix stays the same. Since milestone 31 the notes start once 3 steps are left, if that is sooner, and
+  say what a step is: the model had guessed that each call was one.
+- **The model starts with what it would look up first.** Before a task, the overview lists the project's
+  files and shows those the task names, as `glob` and `read_file` would, with no model call and only where
+  the model's own calls would run unasked. At evolve2's 4 steps the model spent its first two steps finding
+  and reading them. It is on by default since milestone 31, with the early budget notes and the test notes:
+  alone, none of the three beat the noise; together, 290 of 315 attempts passed against 268.
+- **A test run that ran nothing says so.** unittest's discovery skips a folder without `__init__.py`, and
+  finding no tests it exits with an error (from Python 3.12), so what followed its `&&` doesn't run either;
+  in milestone 30's runs the results didn't say so. Now a result in which unittest or pytest ran no tests
+  says that, what didn't run after it, and where unittest didn't look; on by default since milestone 31.
 - **Checking before finishing is opt-in.** With nobody to look at the result, a model that declares a
   task done after a quick look has the last word; on Terminal-Bench, 15 of jig's 18 failures were tasks it
   finished on its own and got wrong. `--check` makes one-shot runs tell the model nobody can answer and

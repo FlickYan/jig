@@ -91,7 +91,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --max-steps <n>   most steps per task, each a model call that may call tools (default: 50)
       --time-limit <s>  most seconds per task: at the limit jig stops, whatever is running (see below)
       --no-budget-notes don't tell the model, once half the steps or the time is used, what is left (see below)
-      --early-budget-notes  start those notes once 3 or fewer steps are left, if that is before half, and say
+      --no-early-budget-notes  start those notes only at half, not once 3 or fewer steps are left, and don't say
                         in each what a step is (see below)
       --finish-gate     at its first stop, send the model back once if it changed files after it last ran
                         anything, or its last test run failed
@@ -110,9 +110,9 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                         bash check a file only where the model could run them on it unasked (see below)
       --tolerant-edits  let edit_file apply an old_string that matches one place only once curly quotes, dashes
                         and no-break spaces count as ASCII, or then trailing whitespace doesn't (see below)
-      --overview        before a task, give the model the project's files with their sizes, and the files the
-                        task names as read_file shows them, which then count as read (see below)
-      --test-notes      when a command's unittest or pytest run ran no tests, say so in its result, with what
+      --no-overview     don't give the model, before a task, the project's files with their sizes, and the files
+                        the task names as read_file shows them, which then count as read (see below)
+      --no-test-notes   don't say in a command's result when its unittest or pytest run ran no tests, with what
                         didn't run after it and where unittest didn't look (see below)
   -v, --version         print jig's version
   -h, --help            show this help
@@ -167,34 +167,41 @@ first, and a looser one applies only where it is the only one; the result says w
 edits rarely fail at all (2 of 1,709 in the stored benchmark runs of milestone 4 and later), unlike
 milestone 27's 7B models' (527 of 623).
 
-`--overview` puts two things before a task, with no model call: in a conversation's first message, the
-project's files, shallowest first, with their sizes (200 at most, leaving out what `glob` leaves out); and
-with each task, the files it names (a word with a dot or a slash that is a file's path, or the name of only
-one file) as `read_file` shows them, up to 16 KB each and 32 KB in all, line numbers included (a larger
-file, or one that isn't UTF-8 text, is named but not shown). Those shown count as read, so `write_file` can
-replace them without a read first; the note says so only where `write_file` is among the model's tools and
-neither plan mode nor a deny rule refuses it. Not in the home directory or at the root, nor in the requests
-jig writes itself (`/reflect`, say). Each part only where the model's own `glob` or `read_file` would show
-it unasked: not where `--tools` leaves that tool out, a deny rule names it, or a `PreToolUse` hook covers it
-(jig can't ask a hook about a call the model didn't make). jig tells you once why it left a part out, and
-`--stats` counts each task it left one out of as `overview.skipped`. It runs in the task, so Ctrl+C and
-`--time-limit` stop it. The task is the request without it: the reviewer, the Stop hooks and `jig review`
-get the request alone, `jig sessions list` shows it, and a compaction keeps or restates it without the
-files, since it forgets what the model read. In milestone 30's runs on evolve2's 4 steps, the model spent its
-first two finding and reading the files, the test file a step after those the task named, so its first
-write came at step 3 or 4. It is off until benchmarks show whether it helps; `--stats` counts it
+The overview puts two things before a task, with no model call (`--no-overview` leaves them out): in a
+conversation's first message, the project's files, shallowest first, with their sizes (200 at most, leaving
+out what `glob` leaves out); and with each task, the files it names (a word with a dot or a slash that is a
+file's path, or the name of only one file) as `read_file` shows them, up to 16 KB each and 32 KB in all,
+line numbers included (a larger file, or one that isn't UTF-8 text, is named but not shown). Those shown
+count as read, so `write_file` can replace them without a read first; the note says so only where
+`write_file` is among the model's tools and neither plan mode nor a deny rule refuses it. Not in the home
+directory or at the root, nor in the requests jig writes itself (`/reflect`, say). Each part only where the
+model's own `glob` or `read_file` would show it unasked: not where `--tools` leaves that tool out, a deny
+rule names it, or a `PreToolUse` hook covers it (jig can't ask a hook about a call the model didn't make).
+jig tells you once why it left a part out, and `--stats` counts each task it left one out of as
+`overview.skipped`. It runs in the task, so Ctrl+C and `--time-limit` stop it. The task is the message
+without the files: the reviewer and the Stop hooks get it (jig's notes stay in it), `jig review` and
+`jig sessions list` the request alone, and a compaction keeps or restates it, since it forgets what the
+model read. In milestone 30's runs on evolve2's 4 steps, the model spent its first two finding and reading
+the files, the test file a step after those the task named, so its first write came at step 3 or 4. It is
+on by default since milestone 31: on evolve2's 4 steps, the overview, the early budget notes and the test
+notes (below) together passed 290 of 315 attempts in three runs, against 268 of 315 for three baselines
+(+7 points, 95% interval +0.6 to +13.3), while none of them alone beat the noise. `--stats` counts it
 (`overview`, and `overview.file` for each file shown).
-`--test-notes` adds a line to a command's result when unittest or pytest ran no tests in it, by what they
-print (pytest's errors collecting them too) or by their exit code 5 (unittest's from Python 3.12): that no
-tests ran; where the command's last runner, which then exits with an error, was followed by `&&`, that the
-commands after it didn't run; and for unittest, which folders hold `test*.py` files but no `__init__.py`
-where it ran (the project, or where a `cd` to a path written out took it; none after another `cd`), which
-its discovery doesn't enter (five at most; not one the settings hide, or the command already starts it in
-or names a file or module in), and that `unittest discover -s <folder>` starts it there. In milestone 30's
-two evolve2 runs with budget notes, 29 of 210 attempts ran unittest from the project, whose `tests/` has no
-`__init__.py`, 27 of them on their last step; in 22 the model's own checks (`python - <<'PY'`) came after
-its `&&` and didn't run either, which the result didn't say. It is off until benchmarks show whether it
-helps; `--stats` counts each note (`bash.noTests`).
+
+The test notes add a line to a command's result when unittest or pytest ran no tests in it
+(`--no-test-notes` leaves it out), by what they print (pytest's errors collecting them too) or by their exit
+code 5 (unittest's from Python 3.12): that no tests ran; where the command's last runner, which then exits
+with an error, was followed by `&&`, that the commands after it didn't run (not where the command exited
+with 0 and that `&&`'s list came last, since what followed then ran); and for unittest, which folders hold
+`test*.py` files but no `__init__.py` where it ran (the project, or where a `cd` to a path written out took
+it; none after another `cd`, or one in a pipeline or the background), which its discovery doesn't enter
+(five at most; not one the settings hide, or the command already starts it in or names a file or module
+in), and that `unittest discover -s <folder>` starts it there. Not where the command runs another kind of
+runner too (`go test`, `npm test`), whose tests may have run. In milestone 30's two evolve2 runs with
+budget notes, 29 of 210 attempts ran unittest from the project, whose `tests/` has no `__init__.py`, 27 of
+them on their last step; in 22 the model's own checks (`python - <<'PY'`) came after its `&&` and didn't
+run either, which the result didn't say. They are on by default since milestone 31 (see the overview,
+above); `--stats` counts each note (`bash.noTests`).
 
 ## What it does
 
@@ -583,7 +590,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/sandbox.ts`](src/sandbox.ts) | The sandbox commands run in: a Seatbelt profile on macOS, bubblewrap's arguments and the keeper that holds the session's PID namespace on Linux; what it keeps read-only in git, and the git changes jig warns of |
 | [`src/snapshots.ts`](src/snapshots.ts) | Snapshots of the project's files, and `/undo` |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
-| [`src/overview.ts`](src/overview.ts) | `--overview`: the project's files, and those the task names, put before the task |
+| [`src/overview.ts`](src/overview.ts) | The overview: the project's files, and those the task names, put before the task |
 | [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
@@ -619,15 +626,16 @@ so the cached prefix stays the same; subagents and the reviewer get none. On evo
 steps, it took deepseek-flash from 66 of 105 attempts (twice) to 92 of 105 at the same cost (milestone 30).
 `--no-budget-notes` leaves the notes out, and `--stats` counts them (`budgetNote`, `budgetNote.lastStep`).
 
-`--early-budget-notes` starts the notes once 3 or fewer steps are left, if that comes before half: at
-evolve2's 4 steps, after the first step instead of the second (from 6 steps on, half comes first). Each
-note then also says what a step is: one reply, whose tool calls all run before the next, in the order
-given, or at the same time if none of them runs a command or changes anything. In milestone 30's runs the
-model heard its budget only after step 2, and its thinking often guessed that each call was a step, or
-that a reply's calls might run out of order, which led some attempts to put a change and its test in
-different steps. It is off until benchmarks show whether it helps (`--no-early-budget-notes` leaves it
-off, and `--no-budget-notes` alone leaves these notes out with the rest); `--stats` counts the notes it
-adds (`budgetNote.early`).
+The notes start earlier, once 3 or fewer steps are left, if that comes before half: at evolve2's 4 steps,
+after the first step instead of the second (from 6 steps on, half comes first). Each note then also says
+what a step is: one reply, whose tool calls all run before the next, in the order given, or at the same
+time if none of them runs a command or changes anything. In milestone 30's runs the model heard its budget
+only after step 2, and its thinking often guessed that each call was a step, or that a reply's calls might
+run out of order, which led some attempts to put a change and its test in different steps. This is on by
+default since milestone 31, which measured it with the overview and the test notes (the overview's
+paragraph above has the numbers): `--no-early-budget-notes` starts the notes at half again, without saying
+what a step is, and `--no-budget-notes` leaves them all out; `--stats` counts the notes it adds
+(`budgetNote.early`).
 
 With `--finish-gate`, the first time the model says it is done with a step left, and not in `--time-limit`'s
 last quarter, jig looks at what the task's calls did, with no model call, and sends the model back once,

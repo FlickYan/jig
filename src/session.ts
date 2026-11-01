@@ -8,7 +8,8 @@ type MessageParam = Anthropic.Beta.BetaMessageParam;
 /**
  * One line of a session file. A start begins with type and cwd, which paths.ts reads without the rest. Each
  * line after the start also has `at`, the time it was written. A task's message that holds more than the
- * request (jig's notes, --overview's files) has the request alone too (`request`), for listing sessions.
+ * request (jig's notes, --overview's files) has the request alone too (`request`), for listing sessions and
+ * for `jig review`, which takes it as the task (see firstRequest).
  */
 type Entry =
   | { type: "start"; cwd: string; model: string; date: string; system?: string; tools?: Anthropic.Beta.BetaTool[] }
@@ -95,14 +96,21 @@ export class SessionFile {
   }
 
   /**
-   * The first thing the user asked in a session, for listing sessions: without the notes and the files jig
-   * put before it, where the session says what the request was (see Entry).
+   * The first thing the user asked in a session, for listing sessions and as `jig review`'s task: without the
+   * notes and the files jig put before it, where the session says what the request was (see Entry).
    */
   static firstRequest(path: string): string {
     for (const line of readFileSync(path, "utf8").split("\n")) {
+      // Only a line that may hold a user's message is parsed, and checked as an entry: the start records the
+      // tools, an MCP server's schemas among them, which can hold these words too.
       if (!line.includes('"role":"user"')) continue;
-      const { message, request } = JSON.parse(line) as { message: MessageParam; request?: string };
-      if (typeof message.content === "string") return request ?? message.content;
+      let entry: Entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue; // cut off by a crash mid-write, as in load
+      }
+      if (entry.type === "message" && entry.message.role === "user" && typeof entry.message.content === "string") return entry.request ?? entry.message.content;
     }
     return "";
   }

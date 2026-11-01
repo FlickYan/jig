@@ -44,7 +44,7 @@ export interface ToolContext {
   mayRun?(command: string, script: string): boolean;
   /** --tolerant-edits: edit_file applies a unique match that differs in typographic punctuation or trailing whitespace. */
   tolerantEdits?: boolean;
-  /** --test-notes: bash says when a test run ran no tests, and what followed it that didn't run (see noTestsNote). */
+  /** Test notes (on unless --no-test-notes): bash says when a test run ran no tests, and what followed it that didn't run (see noTestsNote). */
   testNotes?: boolean;
   /** Keeps text (a skill's instructions, say) in the conversation even through compaction. */
   pin?(key: string, text: string): void;

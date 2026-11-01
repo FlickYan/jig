@@ -343,7 +343,8 @@ describe("the CLI on an OpenAI-compatible API", () => {
       const project = await tempDir("jig-openai-");
       const env = { ...process.env, JIG_HOME: await tempDir("jig-home-"), NO_COLOR: "1", OPENAI_API_KEY: "" };
       const cli = join(import.meta.dirname, "..", "src", "cli.ts");
-      const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "Say hello."], { cwd: project, env });
+      // The task alone, without the overview's list of the project's files before it.
+      const child = spawn(process.execPath, [cli, "--no-sandbox", "--yes", "--model", "local-model", "--base-url", api.url, "--no-overview", "Say hello."], { cwd: project, env });
       let output = "";
       child.stdout.on("data", (chunk) => (output += chunk));
       child.stderr.on("data", (chunk) => (output += chunk));

@@ -885,7 +885,8 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
       return typeof task === "string" ? [{ tool: "bash", input: { command: commands[task] } }] : [{ text: "Done." }];
     });
     try {
-      const { code, output } = await runJig(["--model", "claude-haiku-4-5"], { api, cwd: sub, stdin: "Make a pipe.\nMake a link.\n", timeout: 20_000 });
+      // The fake model reads the task as the whole message, without the overview's list of the files before it.
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "--no-overview"], { api, cwd: sub, stdin: "Make a pipe.\nMake a link.\n", timeout: 20_000 });
       assert.equal(code, 0, output);
       const dotGit = join(await realpath(sub), ".git");
       assert.equal(output.split(`A command created or changed ${dotGit}, `).length - 1, 2, output);

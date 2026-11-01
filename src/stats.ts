@@ -60,7 +60,7 @@ export type Mechanism =
   // An edit_file call --tolerant-edits applied: its old_string matched one place only once typographic
   // punctuation, or trailing whitespace too, didn't count.
   | "edit.tolerant"
-  // A bash result --test-notes added a note to: its unittest or pytest run ran no tests.
+  // A bash result the test notes added a note to: its unittest or pytest run ran no tests.
   | "bash.noTests"
   // A Stop hook that sent the model back to work, and one that still would after MAX_STOP_BLOCKS times, or
   // on the last step, so the task ended anyway.
@@ -77,7 +77,7 @@ export type Mechanism =
   | "loop"
   | "wrapUp"
   // The budget notes' note after a step's tool results on the steps (and time) used, the one before the last
-  // step instead, and one only --early-budget-notes gave, with less than half of the steps (and time) used.
+  // step instead, and one only the early notes gave, with less than half of the steps (and time) used.
   | "budgetNote"
   | "budgetNote.lastStep"
   | "budgetNote.early"

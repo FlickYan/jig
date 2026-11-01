@@ -3,7 +3,7 @@
 // environment. The model gets the output and the exit code; a job left in the background keeps running, in
 // bubblewrap's session until jig exits (see sandbox.ts's Keeper), and under Seatbelt or with no sandbox as
 // in a terminal, outliving jig. A long output is cut from the middle, and the whole of it goes to a file the
-// model can search. With --test-notes, the result of a test run that ran no tests says so (noTestsNote).
+// model can search. Unless --no-test-notes, the result of a test run that ran no tests says so (noTestsNote).
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -87,26 +87,37 @@ const LAST_RUNNER_THEN = /\b(unittest|pytest)\b(?![\s\S]*\b(unittest|pytest)\b)[
 const MAX_FOLDERS = 5;
 
 /**
- * --test-notes: what jig adds to the result of a test run in which unittest or pytest ran no tests, by what
- * they print or their exit code, and no run ran any; or undefined. It says that no tests ran; where the
- * command's last runner, which then exits with an error, was followed by &&, that the commands after it
- * didn't run; and for unittest, which folders its discovery doesn't enter where it ran, but not one the
- * command already starts it in or names a file or module in. In milestone 30's evolve2 runs, 29 attempts ran
- * unittest from a project whose tests/ had no __init__.py, and it found no tests; in 22 of them the model's
- * own checks came after its && (`python - <<'PY'`) and didn't run either, which the result didn't say.
+ * Test notes (on unless --no-test-notes): what jig adds to the result of a test run in which unittest or pytest
+ * ran no tests, by what they print or their exit code, and no run ran any; or undefined. It says that no tests
+ * ran; where the command's last runner, which then exits with an error, was followed by &&, and the exit code
+ * doesn't say that what followed ran, that the commands after it didn't run; and for unittest, which folders
+ * its discovery doesn't enter where it ran, but not one the command already starts it in or names a file or
+ * module in. In milestone 30's evolve2 runs, 29 attempts ran unittest from a project whose tests/ had no
+ * __init__.py, and it found no tests; in 22 of them the model's own checks came after its &&
+ * (`python - <<'PY'`) and didn't run either, which the result didn't say.
  */
 export async function noTestsNote(command: string, output: string, { cwd, dirs = [], hidden }: Pick<ToolContext, "cwd" | "dirs" | "hidden">): Promise<string | undefined> {
   if (!TEST_COMMAND.test(command) || RAN_SOME.test(output)) return undefined;
   // The exit code is the last command's, so 5 says no tests ran only where such a runner is among the commands.
   const commands = withoutHeredocs(command);
+  // Only where every runner the command names is one of these, whose output jig reads: another kind's tests
+  // may have run, before or after them, whatever they printed (`pytest -q; go test ./...`).
+  if (TEST_COMMAND.test(commands.replace(/\b(unittest|pytest)\b/g, " "))) return undefined;
   const byExitCode = /\nExit code: 5$/.test(output) && RUNNER.test(commands);
   const uncollected = UNCOLLECTED.test(output);
   if (!byExitCode && !uncollected && !RAN_NONE.test(output)) return undefined;
   const said = ["no tests ran."];
   // `2>&1` and `&>` are no lists.
   const lists = commands.replace(/\d*[<>]&\d*|&>>?/g, " ");
-  // Before Python 3.12, unittest said OK and exited with 0, so what followed ran.
-  if ((byExitCode || uncollected || /no tests ran/i.test(output)) && LAST_RUNNER_THEN.test(lists)) {
+  // Before Python 3.12, unittest said OK and exited with 0, so what followed ran. So did it where the command
+  // exited with 0 and its last list is the runner's (after the &&, only more && and pipes): the exit code is
+  // then that list's, whatever an earlier run printed (`pytest -q; python -m unittest && ...`, pytest unable
+  // to collect its tests). A later list's says nothing of it: in milestone 30's runs, a line `echo ALL_OK`
+  // after a heredoc's check that didn't run.
+  const then = LAST_RUNNER_THEN.exec(lists);
+  const after = then ? lists.slice(then.index + then[0].length).trimEnd() : "";
+  const ranOn = /\nExit code: 0$/.test(output) && !/;|\n|\|\||(?<!&)&(?!&)/.test(after);
+  if ((byExitCode || uncollected || /no tests ran/i.test(output)) && then && !ranOn) {
     said.push("The test runner exits with an error code then, so the commands after its && didn't run.");
   }
   // Where the unittest runs ran, if all in one folder jig can tell; the folders are named from there.
@@ -131,13 +142,19 @@ const LITERAL_CD = /^\s*(?:cd|pushd)\s+(?:([^\s"'`$\\~*?[\]{}()<>#-][^\s"'`$\\*?
 /**
  * What each unittest run in a command is given, up to the end of its command, and the folder it runs in: jig's
  * cwd, or where literal cd and pushd commands before it took it (`cd backend && python -m unittest`). Undefined
- * after any other cd, pushd or popd (`cd "$APP"`, one in a subshell or a quoted command), as it can't tell.
+ * after any other cd, pushd or popd (`cd "$APP"`, one in a subshell, a pipeline's or a background job's
+ * included, or in a quoted command), as it can't tell.
  */
 function unittestRuns(lists: string, cwd: string): { args: string; dir?: string }[] {
   const runs: { args: string; dir?: string }[] = [];
   let dir: string | undefined = cwd;
-  for (const part of lists.split(/&&|\|\||[;|&\n]/)) {
-    const cd = LITERAL_CD.exec(part);
+  // Each command, with the separators around it: one in a pipeline (`cd backend | cat`), or followed by a single
+  // & (`cd backend &`), runs in a subshell.
+  const parts = lists.split(/(&&|\|\||[;|&\n])/);
+  for (let i = 0; i < parts.length; i += 2) {
+    const part = parts[i];
+    const subshell = parts[i - 1] === "|" || parts[i + 1] === "|" || parts[i + 1] === "&";
+    const cd = subshell ? null : LITERAL_CD.exec(part);
     if (cd) dir &&= resolve(dir, cd[1] ?? cd[2] ?? cd[3]);
     else if (/\b(cd|pushd|popd)\b/.test(part)) dir = undefined;
     for (const [, args] of part.matchAll(/\bunittest\b(.*)/g)) runs.push({ args, dir });

@@ -75,11 +75,12 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --no-budget-notes   don't tell the model what is left of its budget: by default, once half the steps, or
                           half of --time-limit, are used, a note after each step says how many steps it has
                           used and how much time is left, and before its last step that it is the last
-      --early-budget-notes
-                          start the notes once 3 or fewer steps are left, if that comes before half, and have
-                          each say what a step is: one reply, whose tool calls all run before the next, in the
-                          order given (at the same time if none of them runs a command or changes anything);
-                          --no-early-budget-notes doesn't, and --no-budget-notes leaves these notes out too
+      --no-early-budget-notes
+                          start the notes only once half the steps or the time are used, without saying what a
+                          step is: by default they start once 3 or fewer steps are left, if that comes before
+                          half, and each says what a step is: one reply, whose tool calls all run before the
+                          next, in the order given (at the same time if none of them runs a command or changes
+                          anything)
       --finish-gate       the first time the model says it is done, with a step left, send it back once if it
                           changed files after it last ran anything, or its last test run failed (not in
                           --time-limit's last quarter)
@@ -109,14 +110,16 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           or --tools leaves it out
       --tolerant-edits    let edit_file apply an old_string that matches one place only once curly quotes,
                           dashes and no-break spaces count as ASCII, or then trailing whitespace doesn't count
-      --overview          before a task, give the model the project's files with their sizes (in a
+      --no-overview       don't give the model, before a task, the project's files with their sizes (in a
                           conversation's first message), and the files the task names as read_file shows them,
-                          which then count as read (16 KB each, 32 KB in all, line numbers included); each only
-                          where the model's own glob or read_file would show it unasked, so not where --tools
-                          leaves that tool out, a deny rule refuses it or a PreToolUse hook covers it
-      --test-notes        when a command's unittest or pytest run ran no tests, say so in its result: that the
-                          commands after the runner's && didn't run, and for unittest, which folders hold
-                          test*.py files but no __init__.py, which its discovery doesn't enter
+                          which then count as read (16 KB each, 32 KB in all, line numbers included); by
+                          default each is given where the model's own glob or read_file would show it unasked,
+                          so not where --tools leaves that tool out, a deny rule refuses it or a PreToolUse
+                          hook covers it
+      --no-test-notes     don't say in a command's result when its unittest or pytest run ran no tests: by
+                          default a note says so, that the commands after the runner's && didn't run, and for
+                          unittest, which folders hold test*.py files but no __init__.py, which its discovery
+                          doesn't enter
   -v, --version           print jig's version
   -h, --help              show this help
 
@@ -272,8 +275,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       reviewer: { type: "string" },
       "check-writes": { type: "boolean", default: false },
       "tolerant-edits": { type: "boolean", default: false },
-      overview: { type: "boolean", default: false },
-      "test-notes": { type: "boolean", default: false },
+      overview: { type: "boolean", default: true },
+      "test-notes": { type: "boolean", default: true },
       version: { type: "boolean", short: "v", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -296,7 +299,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
   if (values.check && values.reviewer) throw new Error("--check and --reviewer both check the work before the task ends: use one.");
-  // Only where --early-budget-notes is given: --no-budget-notes alone leaves the early notes out too, whatever their default.
+  // Only where --early-budget-notes is given: --no-budget-notes alone leaves the early notes, on by default, out too.
   if (values["early-budget-notes"] && !values["budget-notes"]) throw new Error("--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one.");
   const model = values.model;
   const effort = values.effort as Effort | undefined;
@@ -638,11 +641,11 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
         // named pipe (a .gitignore, say), for 30 seconds a call.
         const shown = values.overview && words !== undefined ? await overviewFor(words, signal) : undefined;
         const message = [...told, ...(shown ? [shown] : []), text].join("\n\n");
-        // The session keeps the request alone too, where the message holds more, for listing sessions.
+        // The session keeps the request alone too, where the message holds more, for jig sessions list and jig review.
         conversation.push({ role: "user", content: message }, undefined, message === text ? undefined : text);
         started = Date.now();
         // The model --escalate hands over to gets them too: it runs in the same loop.
-        const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] ?? false } : undefined;
+        const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] ?? true } : undefined;
         // The task is the message without the overview. A compaction before the first step keeps it in place
         // of the message, so jig's notes, which the model hasn't seen yet, stay in it.
         result = await runAgent(conversation, { ...agent, task: [...told, text].join("\n\n"), checkUntil, budgetNotes }, signal);

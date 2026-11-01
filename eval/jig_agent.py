@@ -91,11 +91,17 @@ class JigOptions(InstalledAgentOptions):
     no_budget_notes: Annotated[bool | None, Cli("--no-budget-notes")] = Field(
         default=None, description="jig's --no-budget-notes: don't tell the model what is left of its steps and time"
     )
+    no_early_budget_notes: Annotated[bool | None, Cli("--no-early-budget-notes")] = Field(
+        default=None, description="jig's --no-early-budget-notes: start the budget notes only at half the steps or time"
+    )
     finish_gate: Annotated[bool | None, Cli("--finish-gate")] = Field(
         default=None, description="jig's --finish-gate: send the model back once if its trace shows unchecked work"
     )
-    overview: Annotated[bool | None, Cli("--overview")] = Field(
-        default=None, description="jig's --overview: the project's files, and the files the task names, before the task"
+    no_overview: Annotated[bool | None, Cli("--no-overview")] = Field(
+        default=None, description="jig's --no-overview: don't put the project's files, and those the task names, before it"
+    )
+    no_test_notes: Annotated[bool | None, Cli("--no-test-notes")] = Field(
+        default=None, description="jig's --no-test-notes: don't say in a command's result that its test run ran no tests"
     )
     tools: Annotated[str | None, Cli("--tools")] = Field(
         default=None, description="jig's --tools: only these of its tools, e.g. bash"

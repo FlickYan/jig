@@ -680,7 +680,8 @@ describe("the task's place on the command line", () => {
   }
 
   it("reads the task from stdin when it is -", async () => {
-    const { code, received } = await runCli(["-"], "Rename server.py to app.py.\n");
+    // The task alone, without the overview's list of the project's files before it.
+    const { code, received } = await runCli(["--no-overview", "-"], "Rename server.py to app.py.\n");
     assert.equal(code, 0);
     assert.match(received, /"content":"Rename server\.py to app\.py\."/);
   });
@@ -736,8 +737,9 @@ describe("a run that reaches --max-steps", () => {
       assert.match(output, /Out of steps: asking the model where the work stands\.\nListed the files; nothing verified; the fix is left\.\nStopped after 2 steps \(raise the limit with --max-steps\)\.\n2 steps · /);
       const stats = JSON.parse(await readFile(file, "utf8"));
       assert.deepEqual([stats.stop, stats.steps, stats.modelCalls, stats.usage.input], ["max_steps", 2, 3, 30]);
-      // Budget notes are on: before the second and last step, the model was told it is the last.
-      assert.deepEqual(stats.events, { "budgetNote.lastStep": 1, wrapUp: 1 });
+      // Budget notes are on: before the second and last step, the model was told it is the last. So is the
+      // overview, which listed the project's files before the task.
+      assert.deepEqual(stats.events, { overview: 1, "budgetNote.lastStep": 1, wrapUp: 1 });
 
       const off = await runJig([...args, "--no-wrap-up", "Fix the parser."], { api, cwd: project });
       assert.equal(api.requests.length, 5);
@@ -761,7 +763,8 @@ describe("budget notes", () => {
     const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
     try {
       const file = join(outside, "stats.json");
-      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file];
+      // From half of them on only: the early notes, on by default, have their own test below.
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--no-early-budget-notes", "--stats", file];
       const { code, output } = await runJig([...args, "--time-limit", "600", "Fix the parser."], { api, cwd: project });
       assert.equal(code, 2, output);
       assert.deepEqual(notes(api.requests), [
@@ -770,12 +773,13 @@ describe("budget notes", () => {
         "(Note from jig: you have used 2 of your 4 steps, with 9 of 10 minutes left.)",
         "(Note from jig: your next reply is the last step whose tool calls run. Make sure your changes are saved and checked; don't start new exploration.)",
       ]);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { budgetNote: 1, "budgetNote.lastStep": 1 });
+      // The overview, on by default too, listed the project's files before the task.
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, budgetNote: 1, "budgetNote.lastStep": 1 });
       // On by default; --no-budget-notes turns them off.
       const off = await runJig([...args, "--no-budget-notes", "Fix the parser."], { api, cwd: project });
       assert.equal(off.code, 2, off.output);
       assert.deepEqual(notes(api.requests.slice(4)), ["", "", "", ""]);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1 });
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
       assert.match(help, /--no-budget-notes/);
     } finally {
@@ -783,11 +787,11 @@ describe("budget notes", () => {
     }
   });
 
-  it("start once 3 steps or fewer are left with --early-budget-notes, say in each what a step is, and count the notes it adds", async () => {
+  it("start once 3 steps or fewer are left, unless --no-early-budget-notes, say in each what a step is, and count the notes that adds", async () => {
     const api = await fakeMessagesApi(() => [{ tool: "glob", input: { pattern: "*" } }]);
     try {
       const file = join(outside, "stats.json");
-      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file, "--early-budget-notes"];
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-wrap-up", "--max-steps", "4", "--stats", file];
       const { code, output } = await runJig([...args, "Fix the parser."], { api, cwd: project });
       assert.equal(code, 2, output);
       const step = "A step is one reply: all its tool calls run before your next reply, in the order you give them, or at the same time if none of them runs a command or changes anything.";
@@ -797,19 +801,18 @@ describe("budget notes", () => {
         `(Note from jig: you have used 2 of your 4 steps. ${step})`,
         `(Note from jig: your next reply is the last step whose tool calls run. ${step} Make sure your changes are saved and checked; don't start new exploration.)`,
       ]);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "budgetNote.early": 1, budgetNote: 1, "budgetNote.lastStep": 1 });
-      // Without the notes it would change nothing, so asking for both is a mistake.
-      const off = await runJig([...args, "--no-budget-notes", "Fix the parser."], { api, cwd: project });
-      assert.equal(off.code, 1);
-      assert.match(off.output, /--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one\./);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "budgetNote.early": 1, budgetNote: 1, "budgetNote.lastStep": 1 });
+      // Asked for, they would change nothing without the notes, so asking for both is a mistake.
+      const both = await runJig([...args, "--early-budget-notes", "--no-budget-notes", "Fix the parser."], { api, cwd: project });
+      assert.equal(both.code, 1);
+      assert.match(both.output, /--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one\./);
       assert.equal(api.requests.length, 4);
-      // Only asking for both is: --no-budget-notes leaves the early notes out too, as it must once they are on by default.
-      const neither = await runJig([...args, "--no-early-budget-notes", "--no-budget-notes", "Fix the parser."], { api, cwd: project });
-      assert.equal(neither.code, 2, neither.output);
+      // --no-budget-notes alone leaves them out with the rest.
+      const off = await runJig([...args, "--no-budget-notes", "Fix the parser."], { api, cwd: project });
+      assert.equal(off.code, 2, off.output);
       assert.deepEqual(notes(api.requests.slice(4)), ["", "", "", ""]);
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
-      assert.match(help, /--early-budget-notes\n +start the notes once 3 or fewer steps are left/);
-      assert.match(help, / +--no-early-budget-notes doesn't, and --no-budget-notes leaves these notes out too\n/);
+      assert.match(help, /--no-early-budget-notes\n +start the notes only once half the steps or the time are used, without saying what a/);
     } finally {
       api.close();
     }
@@ -831,13 +834,14 @@ describe("--finish-gate", () => {
       const told = "(Note from jig: you changed solve.py without running anything: run it, or its tests, before you finish.)";
       assert.deepEqual((api.requests[2].messages as Anthropic.Beta.BetaMessageParam[]).at(-1), { role: "user", content: told });
       assert.match(output, /Sending the model back once \(--finish-gate\): "you changed solve\.py without running anything/);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { finishGate: 1 });
+      // The overview, on by default, listed the project's files before the task.
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, finishGate: 1 });
       // Off by default.
       await rm(join(project, "solve.py"));
       const off = await runJig([...args, "Write solve.py."], { api, cwd: project });
       assert.equal(off.code, 0, off.output);
       assert.equal(api.requests.length, 5);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1 });
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
       assert.match(help, /--finish-gate/);
     } finally {
@@ -858,13 +862,14 @@ describe("--check-writes", () => {
       const off = await runJig([...args, "Write app.py."], { api, cwd: project });
       assert.equal(off.code, 0, off.output);
       assert.match(result(1), /Created app\.py \(1 line\)\."/);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      // The overview, on by default, listed the project's files before the task.
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1 });
 
       await rm(join(project, "app.py"));
       const on = await runJig([...args, "--check-writes", "Write app.py."], { api, cwd: project });
       assert.equal(on.code, 0, on.output);
       assert.match(result(3), /Created app\.py \(1 line\)\.\\n\\nA syntax check of app\.py \(python3's ast\.parse\) failed:\\n/);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "write.syntaxError": 1 });
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "write.syntaxError": 1 });
     } finally {
       api.close();
     }
@@ -1022,13 +1027,14 @@ describe("--tolerant-edits", () => {
       assert.equal(off.code, 0, off.output);
       assert.match(result(1), /"is_error":true/);
       assert.equal(await readFile(join(project, "app.py"), "utf8"), "x = 1  \ny = 2\n");
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
+      // The overview, on by default, listed the project's files before the task.
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1 });
 
       const on = await runJig([...args, "--tolerant-edits", "Change x."], { api, cwd: project });
       assert.equal(on.code, 0, on.output);
       assert.match(result(3), /Edited app\.py: replaced 2 lines at line 1 with 2 lines \(old_string matched only ignoring trailing whitespace\)\./);
       assert.equal(await readFile(join(project, "app.py"), "utf8"), "x = 3\ny = 2\n");
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "edit.tolerant": 1 });
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "edit.tolerant": 1 });
     } finally {
       api.close();
     }
@@ -1051,7 +1057,7 @@ describe("--overview", () => {
     await writeFile(join(project, "tests", "test_app.py"), "import app\n");
   });
 
-  it("puts the project's files, and the files the task names as read_file shows them, before the task, so the model can replace one at once; and counts them", async () => {
+  it("puts the project's files, and the files the task names as read_file shows them, before the task, so the model can replace one at once; and counts them; unless --no-overview", async () => {
     // The model replaces app.py on its first step, without reading it.
     const api = await fakeMessagesApi((request) =>
       (request.messages as unknown[]).length === 1 ? [{ tool: "write_file", input: { path: "app.py", content: "print(2)\n" } }] : [{ text: "Done." }],
@@ -1060,20 +1066,21 @@ describe("--overview", () => {
       const file = join(outside, "stats.json");
       const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
       const task = "Make app.py do what NOTES.md says.";
-      const off = await runJig([...args, task], { api, cwd: project });
-      assert.equal(off.code, 0, off.output);
-      assert.equal(firstMessage(api.requests[0]), task, "off by default");
-      assert.match(firstResult(api.requests[1]), /You haven't read app\.py yet/);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
-
-      const on = await runJig([...args, "--overview", task], { api, cwd: project });
+      const on = await runJig([...args, task], { api, cwd: project });
       assert.equal(on.code, 0, on.output);
-      assert.equal(firstMessage(api.requests[2]), `${listed}\n\n${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.\n\n${task}`);
-      assert.match(firstResult(api.requests[3]), /Overwrote app\.py \(1 line\)\./);
+      assert.equal(firstMessage(api.requests[0]), `${listed}\n\n${named}\napp.py:\n     1\tprint(1)\n\nNOTES.md:\n     1\tPrint 2.\n\n${task}`, "on by default");
+      assert.match(firstResult(api.requests[1]), /Overwrote app\.py \(1 line\)\./);
       assert.equal(await readFile(join(project, "app.py"), "utf8"), "print(2)\n");
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "overview.file": 2 });
+
+      await writeFile(join(project, "app.py"), "print(1)\n");
+      const off = await runJig([...args, "--no-overview", task], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(firstMessage(api.requests[2]), task);
+      assert.match(firstResult(api.requests[3]), /You haven't read app\.py yet/);
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
-      assert.match(help, /--overview/);
+      assert.match(help, /--no-overview {7}don't give the model, before a task, the project's files/);
     } finally {
       api.close();
     }
@@ -1202,7 +1209,7 @@ describe("--overview", () => {
     }
   });
 
-  it("says the files shown count as read only where write_file can replace them: not in plan mode, nor under a deny rule", async () => {
+  it("says the files shown count as read only where write_file can replace them: in ask mode too, but not in plan mode, nor under a deny rule", async () => {
     // Nor where --tools leaves it out, above.
     const { run, close } = await overviewing();
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
@@ -1211,6 +1218,10 @@ describe("--overview", () => {
       const plan = await runJig(["--no-sandbox", "--mode", "plan", "--model", "claude-haiku-4-5", "--overview", task], { api, cwd: project });
       assert.equal(plan.code, 0, plan.output);
       assert.equal(firstMessage(api.requests[0]), `(Note from jig: Plan mode is on: you can read, search and run read-only commands, but every change is refused. Investigate, then propose a plan.)\n\n${listed}\n\n${unwritable}\n\n${task}`);
+      // Ask mode asks before write_file replaces them, but lets it.
+      const ask = await runJig(["--no-sandbox", "--mode", "ask", "--model", "claude-haiku-4-5", "--overview", task], { api, cwd: project });
+      assert.equal(ask.code, 0, ask.output);
+      assert.equal(firstMessage(api.requests[1]), `${listed}\n\n${files}\n\n${task}`);
       assert.equal((await run([task], { deny: ["write_file"] })).first, `${listed}\n\n${unwritable}\n\n${task}`);
     } finally {
       close();
@@ -1271,6 +1282,8 @@ describe("--overview", () => {
       assert.equal(code, 7, output);
       assert.ok(Date.now() - started < 15_000, "git's own timeout is 30 seconds");
       assert.equal(api.requests.length, 0);
+      // Stopped, it failed for that, which is no news to the user.
+      assert.doesNotMatch(output, /--overview left/);
     } finally {
       api.close();
     }
@@ -1278,7 +1291,7 @@ describe("--overview", () => {
 });
 
 describe("--test-notes", () => {
-  it("says in a command's result that its test run ran no tests, and why, and counts it in --stats; without it, nothing is said", async () => {
+  it("says in a command's result that its test run ran no tests, and why, and counts it in --stats; with --no-test-notes, nothing is said", async () => {
     // As milestone 30's evolve2 attempts ran unittest, with a shell function in place of Python 3.12's.
     const command = "python() { printf 'Ran 0 tests in 0.000s\\n\\nNO TESTS RAN\\n'; return 5; }; python -m unittest -v && echo checked";
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command } }] : [{ text: "Done." }]));
@@ -1286,22 +1299,23 @@ describe("--test-notes", () => {
       await mkdir(join(project, "tests"));
       await writeFile(join(project, "tests", "test_app.py"), "import unittest\n");
       const file = join(outside, "stats.json");
-      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--stats", file];
+      // The overview's list of the project's files isn't this test's subject.
+      const args = ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--no-overview", "--stats", file];
       const result = (request: number) => ((api.requests[request].messages as Anthropic.Beta.BetaMessageParam[])[2].content as Anthropic.Beta.BetaToolResultBlockParam[])[0].content;
-      const off = await runJig([...args, "Run the tests."], { api, cwd: project });
-      assert.equal(off.code, 0, off.output);
-      assert.equal(result(1), "Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\nExit code: 5");
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
-
-      const on = await runJig([...args, "--test-notes", "Run the tests."], { api, cwd: project });
+      const on = await runJig([...args, "Run the tests."], { api, cwd: project });
       assert.equal(on.code, 0, on.output);
       const note =
         "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run. " +
         "unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)";
-      assert.equal(result(3), `Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\n${note}\nExit code: 5`);
+      assert.equal(result(1), `Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\n${note}\nExit code: 5`, "on by default");
       assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "bash.noTests": 1 });
+
+      const off = await runJig([...args, "--no-test-notes", "Run the tests."], { api, cwd: project });
+      assert.equal(off.code, 0, off.output);
+      assert.equal(result(3), "Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\nExit code: 5");
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, {});
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
-      assert.match(help, /--test-notes {8}when a command's unittest or pytest run ran no tests/);
+      assert.match(help, /--no-test-notes {5}don't say in a command's result when its unittest or pytest run ran no tests/);
     } finally {
       api.close();
     }
@@ -1357,7 +1371,7 @@ describe("a one-shot run's exit code", () => {
       assert.match(output, /asking it to go on\.\nThe model replied without text or a tool call, so the task ends without an answer\.\n2 steps · /);
       assert.equal(existsSync(ran), false, "there is no answer to check");
       const stats = JSON.parse(await readFile(file, "utf8"));
-      assert.deepEqual([stats.stop, stats.events], ["empty", { "reply.empty": 1 }]);
+      assert.deepEqual([stats.stop, stats.events], ["empty", { overview: 1, "reply.empty": 1 }]);
     } finally {
       api.close();
     }
@@ -1502,7 +1516,8 @@ describe("a one-shot run with --time-limit", () => {
     assert.equal(code, 0, output);
     assert.equal(requests, 3, "the command, the answer, and the answer after the check");
     assert.doesNotMatch(output, /Too little time/);
-    assert.deepEqual(events, { check: 1 });
+    // The overview, on by default, listed the project's files before the task.
+    assert.deepEqual(events, { overview: 1, check: 1 });
   });
 
   it("doesn't check it in the last quarter, says so, and counts that", async () => {
@@ -1512,7 +1527,7 @@ describe("a one-shot run with --time-limit", () => {
     assert.equal(requests, 2);
     assert.match(output, /Too little time is left to check the work \(--time-limit\), so it stands as it is\./);
     // Past half the time, the model was told what is left of it too (budget notes are on).
-    assert.deepEqual(events, { budgetNote: 1, "check.skipped": 1 });
+    assert.deepEqual(events, { overview: 1, budgetNote: 1, "check.skipped": 1 });
   });
 
   it("is still a Ctrl+C when the deadline passes while the task stops", async () => {
@@ -1561,7 +1576,7 @@ describe("a one-shot run with no terminal", () => {
       assert.equal(api.requests.length, 3);
       assert.match(output, /Stopped: 3 tool calls needed approval, and with no terminal there is no one to give it \(see --yes\)\. Rules in jig's settings can allow them too\./);
       const stats = JSON.parse(await readFile(file, "utf8"));
-      assert.deepEqual([stats.stop, stats.events], ["unapproved", { "call.unapproved": 3, "call.refused": 3 }]);
+      assert.deepEqual([stats.stop, stats.events], ["unapproved", { overview: 1, "call.unapproved": 3, "call.refused": 3 }]);
     } finally {
       api.close();
     }
@@ -1728,7 +1743,8 @@ describe("an interactive session fed through stdin", () => {
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
       const stdin = "list the files in build\\\n/context\nsay hi\n/exit\n";
-      const { code, output } = await runJig(args, { api, cwd: project, stdin });
+      // The task alone, without the overview's list of the project's files before it.
+      const { code, output } = await runJig([...args, "--no-overview"], { api, cwd: project, stdin });
       assert.equal(code, 0, output);
       assert.equal(api.requests.length, 2, output);
       assert.equal(last(api.requests[0]), JSON.stringify("list the files in build\\"));
@@ -1785,7 +1801,7 @@ describe("a hook configured as for Claude Code", () => {
         ],
       );
       assert.deepEqual([stops[0].cwd, stops[0].session_path.endsWith(".jsonl")], [await realpath(project), true]);
-      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { "hook.stopBlocked": 1 });
+      assert.deepEqual(JSON.parse(await readFile(file, "utf8")).events, { overview: 1, "hook.stopBlocked": 1 });
     } finally {
       api.close();
     }

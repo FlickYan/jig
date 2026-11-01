@@ -971,6 +971,8 @@ describe("--test-notes", () => {
     assert.equal(await note("pytest && python check.py", `${collected}\n\nExit code: 5`), pytest);
     // The last runner's && counts, not an earlier word's.
     assert.equal(await note("pip install -q pytest && pytest -q && python check.py", "\nno tests ran in 0.01s\n\nExit code: 5"), pytest);
+    // A later line's exit code says nothing of the &&: in one of milestone 30's evolve2 attempts, the check didn't run.
+    assert.equal(await note("python -m unittest -v && python - <<'PY'\nprint('checked')\nPY\necho ALL_OK", `${NONE}ALL_OK\n\nExit code: 0`), EVOLVE2);
   });
 
   it("says the same where pytest couldn't collect the tests, and so ran none", async () => {
@@ -985,6 +987,11 @@ describe("--test-notes", () => {
     const conftest = "ImportError while loading conftest '/project/conftest.py'.\nconftest.py:1: in <module>\nE   ModuleNotFoundError: No module named 'calc'";
     assert.equal(await note("pytest -q && python check.py", `${conftest}\n\nExit code: 4`), failed);
     assert.equal(await note("pytest -q; python check.py", `${error}\n${interrupted}\nchecked\n\nExit code: 0`), "(Note from jig: no tests ran.)");
+    // Nor where it came before a later runner whose && went on: the exit code 0 says what followed ran.
+    assert.equal(
+      await note("pytest -q; python -m unittest discover -s tests && python check.py", `${error}\n${interrupted}\nRan 0 tests in 0.000s\n\nOK\nchecked\n\nExit code: 0`),
+      "(Note from jig: no tests ran.)",
+    );
     // With --continue-on-collection-errors, it runs the tests it could collect.
     assert.equal(await note("pytest -q --continue-on-collection-errors && python check.py", `.\n${error}\n1 passed, 1 error in 0.05s\n\nExit code: 1`), undefined);
   });
@@ -1061,13 +1068,15 @@ describe("--test-notes", () => {
     }
     // There, a folder the command names is named from there too.
     assert.equal(await note("cd backend && python -m unittest discover -s checks", `${NONE}\nExit code: 0`), "(Note from jig: no tests ran.)");
+    assert.equal(await note(`cd backend && python -m unittest discover -s ${join(cwd, "backend", "checks")}`, `${NONE}\nExit code: 0`), "(Note from jig: no tests ran.)");
     // A cd after the runner doesn't change where it ran.
     assert.equal(
       await note("python -m unittest -v && cd backend && ls", `${NONE}\nExit code: 5`),
       "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run. " +
         "unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)",
     );
-    // Where it went isn't written out, or the cd is in a subshell or a quoted command, so no folder is named.
+    // Where it went isn't written out, or the cd is in a subshell (a pipeline's, or in the background) or a
+    // quoted command, so no folder is named.
     for (const command of [
       'cd "$APP" && python -m unittest',
       "cd ~/backend && python -m unittest",
@@ -1075,6 +1084,9 @@ describe("--test-notes", () => {
       "cd - && python -m unittest",
       "cd backend > /dev/null && python -m unittest",
       "(cd backend && python -m unittest)",
+      "cd backend | cat; python -m unittest",
+      "ls | cd backend && python -m unittest",
+      "cd backend & python -m unittest",
       "bash -c 'cd backend && python -m unittest'",
       "popd; python -m unittest",
       "python -m unittest -v; cd backend && python -m unittest -v",
@@ -1117,6 +1129,10 @@ describe("--test-notes", () => {
     assert.equal(await note("go test ./... && ./check.sh", "ok  \texample\t0.01s\n\nExit code: 5"), undefined);
     assert.equal(await note("cat > t.py <<'PY'\nimport unittest\nPY\n./check.sh", "(no output)\n\nExit code: 5"), undefined);
     assert.equal(await note("./check.sh", `${NONE}\nExit code: 5`), undefined, "not a test run");
+    // Another kind of runner's tests may have run, whatever pytest or unittest printed before or after it.
+    const uncollected = "ERROR collecting tests/test_calc.py\nInterrupted: 1 error during collection\n1 error in 0.05s";
+    assert.equal(await note("pytest -q; go test ./...", `${uncollected}\nok  \texample\t0.01s\n\nExit code: 0`), undefined);
+    assert.equal(await note("npm test && python -m unittest", `> test\n> node --test\n\n# pass 3\n${NONE}\nExit code: 5`), undefined);
   });
 
   it("goes in bash's result on the line before the exit code, which stays last, and is counted; without it, nothing is said", async () => {
