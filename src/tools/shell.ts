@@ -14,6 +14,11 @@ function unquote(word: string): string {
   return word.replace(/^["']+|["']+$/g, "");
 }
 
+/** A word as the shell takes it whole: as it is, or in single quotes where the shell would split or expand it. */
+export function quoteWord(word: string): string {
+  return /^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", "'\\''")}'`;
+}
+
 /** Commands that run a project's tests, by the usual runners' names. */
 export const TEST_COMMAND = /\b(pytest|unittest|tox|npm (run )?test|yarn test|pnpm test|node --test|jest|vitest|mocha|go test|cargo test|make (check|test)|rspec|phpunit|dotnet test|ctest)\b/;
 

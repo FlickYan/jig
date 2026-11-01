@@ -185,14 +185,16 @@ first two finding and reading the files, the test file a step after those the ta
 write came at step 3 or 4. It is off until benchmarks show whether it helps; `--stats` counts it
 (`overview`, and `overview.file` for each file shown).
 `--test-notes` adds a line to a command's result when unittest or pytest ran no tests in it, by what they
-print or by their exit code 5 (unittest's from Python 3.12): that no tests ran; where the command's last
-runner, which then exits with an error, was followed by `&&`, that the commands after it didn't run; and
-for unittest, which of the project's folders hold `test*.py` files but no `__init__.py`, which its discovery
-doesn't enter (not one the command already starts it in, or names a file or module in), and that
-`unittest discover -s <folder>` starts it there. In milestone 30's two evolve2 runs with budget notes,
-29 of 210 attempts ran unittest from the project, whose `tests/` has no `__init__.py`, 27 of them on their
-last step; in 22 the model's own checks (`python - <<'PY'`) came after its `&&` and didn't run either,
-which the result didn't say. It is off until benchmarks show whether it helps; `--stats` counts each note (`bash.noTests`).
+print (pytest's errors collecting them too) or by their exit code 5 (unittest's from Python 3.12): that no
+tests ran; where the command's last runner, which then exits with an error, was followed by `&&`, that the
+commands after it didn't run; and for unittest, which folders hold `test*.py` files but no `__init__.py`
+where it ran (the project, or where a `cd` to a path written out took it; none after another `cd`), which
+its discovery doesn't enter (five at most; not one the settings hide, or the command already starts it in
+or names a file or module in), and that `unittest discover -s <folder>` starts it there. In milestone 30's
+two evolve2 runs with budget notes, 29 of 210 attempts ran unittest from the project, whose `tests/` has no
+`__init__.py`, 27 of them on their last step; in 22 the model's own checks (`python - <<'PY'`) came after
+its `&&` and didn't run either, which the result didn't say. It is off until benchmarks show whether it
+helps; `--stats` counts each note (`bash.noTests`).
 
 ## What it does
 
@@ -623,8 +625,9 @@ note then also says what a step is: one reply, whose tool calls all run before t
 given, or at the same time if none of them runs a command or changes anything. In milestone 30's runs the
 model heard its budget only after step 2, and its thinking often guessed that each call was a step, or
 that a reply's calls might run out of order, which led some attempts to put a change and its test in
-different steps. It is off until benchmarks show whether it helps; `--stats` counts the notes it adds
-(`budgetNote.early`).
+different steps. It is off until benchmarks show whether it helps (`--no-early-budget-notes` leaves it
+off, and `--no-budget-notes` alone leaves these notes out with the rest); `--stats` counts the notes it
+adds (`budgetNote.early`).
 
 With `--finish-gate`, the first time the model says it is done with a step left, and not in `--time-limit`'s
 last quarter, jig looks at what the task's calls did, with no model call, and sends the model back once,

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
 import type { Sandbox } from "../sandbox.ts";
 import type { Tool, ToolContext } from "./index.ts";
-import { parseCommand, TEST_COMMAND, withoutHeredocs } from "./shell.ts";
+import { parseCommand, quoteWord, TEST_COMMAND, withoutHeredocs } from "./shell.ts";
 import { type FileVersions, hiddenTest, isInside, realTargetSync, withoutKeys } from "./util.ts";
 
 const DEFAULT_TIMEOUT = 120; // seconds
@@ -72,17 +72,25 @@ export const bashTool: Tool = {
 /** What unittest and pytest print when a run ran no tests, and when one ran some. */
 const RAN_NONE = /^Ran 0 tests in |^NO TESTS RAN$|\bno tests ran in |^collected 0 items/m;
 const RAN_SOME = /^Ran [1-9]\d* tests? in |\b[1-9]\d* (passed|failed)\b/m;
+/**
+ * What pytest prints where it couldn't collect the tests: it then runs none and exits with 2, or with 4 for a
+ * conftest.py (with --continue-on-collection-errors, it runs those it could collect, and exits with 1).
+ * unittest counts a test module it can't import as a test that failed.
+ */
+const UNCOLLECTED = /^collected \d+ items? \/ \d+ errors?|\bERROR collecting |\bInterrupted: \d+ errors? during collection|^ImportError while loading conftest /m;
 /** The runners that exit with 5 when they ran no tests (unittest from Python 3.12), and the last of them followed by &&. */
 const RUNNER = /\b(unittest|pytest)\b/;
 // Not an earlier one: where its && went on to the later one, which printed the output, what followed it ran
 // (`which pytest && pytest`, `pytest --version && python -m unittest`).
 const LAST_RUNNER_THEN = /\b(unittest|pytest)\b(?![\s\S]*\b(unittest|pytest)\b)[^\n;|&]*&&/;
+/** The folders a note names at most, so that a project with many doesn't get a long note. */
+const MAX_FOLDERS = 5;
 
 /**
  * --test-notes: what jig adds to the result of a test run in which unittest or pytest ran no tests, by what
  * they print or their exit code, and no run ran any; or undefined. It says that no tests ran; where the
  * command's last runner, which then exits with an error, was followed by &&, that the commands after it
- * didn't run; and for unittest, which of the project's folders its discovery doesn't enter, but not one the
+ * didn't run; and for unittest, which folders its discovery doesn't enter where it ran, but not one the
  * command already starts it in or names a file or module in. In milestone 30's evolve2 runs, 29 attempts ran
  * unittest from a project whose tests/ had no __init__.py, and it found no tests; in 22 of them the model's
  * own checks came after its && (`python - <<'PY'`) and didn't run either, which the result didn't say.
@@ -92,40 +100,65 @@ export async function noTestsNote(command: string, output: string, { cwd, dirs =
   // The exit code is the last command's, so 5 says no tests ran only where such a runner is among the commands.
   const commands = withoutHeredocs(command);
   const byExitCode = /\nExit code: 5$/.test(output) && RUNNER.test(commands);
-  if (!byExitCode && !RAN_NONE.test(output)) return undefined;
+  const uncollected = UNCOLLECTED.test(output);
+  if (!byExitCode && !uncollected && !RAN_NONE.test(output)) return undefined;
   const said = ["no tests ran."];
   // `2>&1` and `&>` are no lists.
   const lists = commands.replace(/\d*[<>]&\d*|&>>?/g, " ");
   // Before Python 3.12, unittest said OK and exited with 0, so what followed ran.
-  if ((byExitCode || /no tests ran/i.test(output)) && LAST_RUNNER_THEN.test(lists)) {
+  if ((byExitCode || uncollected || /no tests ran/i.test(output)) && LAST_RUNNER_THEN.test(lists)) {
     said.push("The test runner exits with an error code then, so the commands after its && didn't run.");
   }
-  // What each unittest run is given, up to the end of its command.
-  const runs = [...lists.matchAll(/\bunittest\b([^\n;|&]*)/g)].map(([, args]) => args);
-  const unentered = runs.length ? await unenteredFolders(cwd, [cwd, ...dirs], hidden) : [];
-  const folders = unentered.filter((folder) => !runs.some((args) => namesFolder(args, folder, cwd)));
+  // Where the unittest runs ran, if all in one folder jig can tell; the folders are named from there.
+  const runs = unittestRuns(lists, cwd);
+  const where = runs.every(({ dir }) => dir === runs[0].dir) ? runs[0]?.dir : undefined;
+  const unentered = where ? await unenteredFolders(where, [cwd, ...dirs], hidden) : [];
+  const folders = unentered.filter((folder) => !runs.some(({ args }) => namesFolder(args, folder, where!))).map(quoteWord);
   if (folders.length) {
+    const listed = folders.length > MAX_FOLDERS ? [...folders.slice(0, MAX_FOLDERS), `${folders.length - MAX_FOLDERS} more`] : folders;
     const [named, holds, start] =
       folders.length === 1
         ? [folders[0], "holds", `\`unittest discover -s ${folders[0]}\` starts it there`]
-        : [`${folders.slice(0, -1).join(", ")} and ${folders.at(-1)}`, "hold", "`unittest discover -s <folder>` starts it in one"];
+        : [`${listed.slice(0, -1).join(", ")} and ${listed.at(-1)}`, "hold", "`unittest discover -s <folder>` starts it in one"];
     said.push(`unittest's discovery enters only packages, and ${named} ${holds} test*.py files but no __init__.py: ${start}.`);
   }
   return `(Note from jig: ${said.join(" ")})`;
 }
 
+// A cd or pushd to a path as written, with no variable, ~, glob, option or substitution: where it goes is known.
+const LITERAL_CD = /^\s*(?:cd|pushd)\s+(?:([^\s"'`$\\~*?[\]{}()<>#-][^\s"'`$\\*?[\]{}()<>]*)|"([^"`$\\]+)"|'([^']+)')\s*$/;
+
 /**
- * The project's folders with test*.py files (unittest's pattern) but no __init__.py, which unittest's discovery
- * from the project doesn't enter. Not a folder the settings hide: commands can't read it either.
+ * What each unittest run in a command is given, up to the end of its command, and the folder it runs in: jig's
+ * cwd, or where literal cd and pushd commands before it took it (`cd backend && python -m unittest`). Undefined
+ * after any other cd, pushd or popd (`cd "$APP"`, one in a subshell or a quoted command), as it can't tell.
  */
-async function unenteredFolders(cwd: string, roots: string[], hidden: string[] = []): Promise<string[]> {
+function unittestRuns(lists: string, cwd: string): { args: string; dir?: string }[] {
+  const runs: { args: string; dir?: string }[] = [];
+  let dir: string | undefined = cwd;
+  for (const part of lists.split(/&&|\|\||[;|&\n]/)) {
+    const cd = LITERAL_CD.exec(part);
+    if (cd) dir &&= resolve(dir, cd[1] ?? cd[2] ?? cd[3]);
+    else if (/\b(cd|pushd|popd)\b/.test(part)) dir = undefined;
+    for (const [, args] of part.matchAll(/\bunittest\b(.*)/g)) runs.push({ args, dir });
+  }
+  return runs;
+}
+
+/**
+ * The folders in `dir` with test*.py files (unittest's pattern) but no __init__.py, which unittest's discovery
+ * from there doesn't enter. Not a folder the settings hide, nor one whose only test files they hide: commands
+ * can't read those either.
+ */
+async function unenteredFolders(dir: string, roots: string[], hidden: string[] = []): Promise<string[]> {
   const hides = hiddenTest(hidden, roots);
+  const shown = (path: string) => !hides(realTargetSync(path) ?? path);
   const found: string[] = [];
-  for (const entry of await readdir(cwd, { withFileTypes: true }).catch(() => [])) {
-    const folder = join(cwd, entry.name);
-    if (!entry.isDirectory() || entry.name.startsWith(".") || hides(realTargetSync(folder) ?? folder)) continue;
+  for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+    const folder = join(dir, entry.name);
+    if (!entry.isDirectory() || entry.name.startsWith(".") || !shown(folder)) continue;
     const names = await readdir(folder).catch((): string[] => []);
-    if (names.some((name) => /^test.*\.py$/.test(name)) && !names.includes("__init__.py")) found.push(entry.name);
+    if (!names.includes("__init__.py") && names.some((name) => /^test.*\.py$/.test(name) && shown(join(folder, name)))) found.push(entry.name);
   }
   return found.sort();
 }
@@ -135,10 +168,11 @@ async function unenteredFolders(cwd: string, roots: string[], hidden: string[] =
  * file or module in it (`tests/test_app.py`, `tests.test_app`), which it imports without an __init__.py. Then
  * that isn't why it ran no tests. A bare `unittest tests` doesn't: it loads the folder as a module, with none.
  */
-function namesFolder(args: string, folder: string, cwd: string): boolean {
-  const words = args.split(/[\s=]+/).map((word) => word.replace(/^["']+|["']+$/g, ""));
+function namesFolder(args: string, folder: string, dir: string): boolean {
+  // Split at spaces and at =, but not in quotes, which then go: a name quoteWord quoted reads as it was.
+  const words = (args.match(/(?:'[^']*'|"[^"]*"|\\.|[^\s='"\\])+/g) ?? []).map((word) => word.replace(/'([^']*)'|"([^"]*)"|\\(.)/g, "$1$2$3"));
   return words.some((word) => {
-    const path = relative(cwd, resolve(cwd, word));
+    const path = relative(dir, resolve(dir, word));
     return path.startsWith(`${folder}${sep}`) || word.startsWith(`${folder}.`) || (path === folder && words.includes("discover"));
   });
 }

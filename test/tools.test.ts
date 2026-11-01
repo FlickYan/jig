@@ -960,8 +960,8 @@ describe("--test-notes", () => {
   const note = (command: string, output: string, more: Partial<ToolContext> = {}) => noTestsNote(command, output, { ...ctx, ...more });
 
   it("says no tests ran, that the commands after the runner's && didn't run, and which folder unittest's discovery doesn't enter", async () => {
-    // As milestone 30's evolve2 attempts ran it: a heredoc's lines are a file's, not commands.
-    const command = "cd /tmp/project && python -m unittest -v && python - <<'PY'\nprint('checked: no pytest here')\nPY";
+    // As milestone 30's evolve2 attempts ran it, from the project: a heredoc's lines are a file's, not commands.
+    const command = `cd ${cwd} && python -m unittest -v && python - <<'PY'\nprint('checked: no pytest here')\nPY`;
     assert.equal(await note(command, `${NONE}\nExit code: 5`), EVOLVE2);
     assert.equal(await note("python3 -m unittest discover -v 2>&1 && python3 check.py", `${NONE}\nExit code: 5`), EVOLVE2, "2>&1 is no list");
     // Its exit code alone says so, where the command runs unittest or pytest.
@@ -971,6 +971,22 @@ describe("--test-notes", () => {
     assert.equal(await note("pytest && python check.py", `${collected}\n\nExit code: 5`), pytest);
     // The last runner's && counts, not an earlier word's.
     assert.equal(await note("pip install -q pytest && pytest -q && python check.py", "\nno tests ran in 0.01s\n\nExit code: 5"), pytest);
+  });
+
+  it("says the same where pytest couldn't collect the tests, and so ran none", async () => {
+    // As pytest 9 prints it: then it exits with 2, or with 4 for a conftest.py, so what followed its && didn't run.
+    const failed = "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run.)";
+    const error = `${"=".repeat(20)} ERRORS ${"=".repeat(20)}\n${"_".repeat(10)} ERROR collecting tests/test_calc.py ${"_".repeat(10)}\nE   ModuleNotFoundError: No module named 'calc'`;
+    const interrupted = `${"!".repeat(20)} Interrupted: 1 error during collection ${"!".repeat(20)}`;
+    assert.equal(await note("pytest && python check.py", `collected 0 items / 1 error\n\n${error}\n${interrupted}\n=== 1 error in 0.05s ===\n\nExit code: 2`), failed);
+    // -q prints no "collected", and with other tests it collected, it still stops before running them.
+    assert.equal(await note("python -m pytest -q && python check.py", `\n${error}\nERROR tests/test_calc.py\n${interrupted}\n1 error in 0.05s\n\nExit code: 2`), failed);
+    assert.equal(await note("pytest tests && python check.py", `collected 3 items / 1 error\n\n${error}\n${interrupted}\n\nExit code: 2`), failed);
+    const conftest = "ImportError while loading conftest '/project/conftest.py'.\nconftest.py:1: in <module>\nE   ModuleNotFoundError: No module named 'calc'";
+    assert.equal(await note("pytest -q && python check.py", `${conftest}\n\nExit code: 4`), failed);
+    assert.equal(await note("pytest -q; python check.py", `${error}\n${interrupted}\nchecked\n\nExit code: 0`), "(Note from jig: no tests ran.)");
+    // With --continue-on-collection-errors, it runs the tests it could collect.
+    assert.equal(await note("pytest -q --continue-on-collection-errors && python check.py", `.\n${error}\n1 passed, 1 error in 0.05s\n\nExit code: 1`), undefined);
   });
 
   it("says only that no tests ran where what came after the runner ran", async () => {
@@ -986,19 +1002,23 @@ describe("--test-notes", () => {
     assert.equal(await note("which pytest && pytest -q tests", "/usr/bin/pytest\n\nno tests ran in 0.00s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
     assert.equal(await note("pip install -q pytest && python -m pytest -q", "\nno tests ran in 0.01s\n\nExit code: 5"), "(Note from jig: no tests ran.)");
     assert.equal(await note("pytest --version && python -m unittest -v", `pytest 9.1.1\n${NONE}\nExit code: 5`), none);
-    assert.equal(await note("cd /app/pytest-demo && python -m unittest -v", `${NONE}\nExit code: 5`), none);
+    assert.equal(await note("cd /app/pytest-demo && python -m unittest -v", `${NONE}\nExit code: 5`), "(Note from jig: no tests ran.)");
   });
 
   it("names only the folders unittest's discovery doesn't enter, and none the settings hide", async () => {
-    for (const folder of ["checks", "pkg", ".cache", "private", "docs"]) await mkdir(join(cwd, folder));
+    for (const folder of ["checks", "pkg", ".cache", "private", "docs", "keys"]) await mkdir(join(cwd, folder));
     await writeFile(join(cwd, "checks", "test_more.py"), "");
     await writeFile(join(cwd, "pkg", "test_pkg.py"), "");
     await writeFile(join(cwd, "pkg", "__init__.py"), "");
     await writeFile(join(cwd, ".cache", "test_cached.py"), "");
     await writeFile(join(cwd, "private", "test_secret.py"), "");
     await writeFile(join(cwd, "docs", "conf.py"), "");
+    // A folder whose only test file the settings hide, and one with another beside it.
+    await writeFile(join(cwd, "keys", "test_keys.py"), "");
+    await writeFile(join(cwd, "checks", "test_keys.py"), "");
+    const hidden = [join(cwd, "private"), join(cwd, "keys", "test_keys.py"), join(cwd, "checks", "test_keys.py")];
     assert.equal(
-      await note("python -m unittest", `${NONE}\nExit code: 5`, { hidden: [join(cwd, "private")] }),
+      await note("python -m unittest", `${NONE}\nExit code: 5`, { hidden }),
       "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks and tests hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
     );
     // pytest's discovery doesn't need packages.
@@ -1030,6 +1050,62 @@ describe("--test-notes", () => {
       await note("python -m unittest tests -v", `${NONE}\nExit code: 5`),
       "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks and tests hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
     );
+  });
+
+  it("names the folders where the command's cd took unittest, from there, and none where it can't tell", async () => {
+    await mkdir(join(cwd, "backend", "checks"), { recursive: true });
+    await writeFile(join(cwd, "backend", "checks", "test_api.py"), "");
+    const checks = "(Note from jig: no tests ran. unittest's discovery enters only packages, and checks holds test*.py files but no __init__.py: `unittest discover -s checks` starts it there.)";
+    for (const command of ["cd backend && python -m unittest -v", `cd '${join(cwd, "backend")}' && python -m unittest`, "pushd backend; python -m unittest", "cd backend/checks && cd .. && python -m unittest"]) {
+      assert.equal(await note(command, `${NONE}\nExit code: 0`), checks, command);
+    }
+    // There, a folder the command names is named from there too.
+    assert.equal(await note("cd backend && python -m unittest discover -s checks", `${NONE}\nExit code: 0`), "(Note from jig: no tests ran.)");
+    // A cd after the runner doesn't change where it ran.
+    assert.equal(
+      await note("python -m unittest -v && cd backend && ls", `${NONE}\nExit code: 5`),
+      "(Note from jig: no tests ran. The test runner exits with an error code then, so the commands after its && didn't run. " +
+        "unittest's discovery enters only packages, and tests holds test*.py files but no __init__.py: `unittest discover -s tests` starts it there.)",
+    );
+    // Where it went isn't written out, or the cd is in a subshell or a quoted command, so no folder is named.
+    for (const command of [
+      'cd "$APP" && python -m unittest',
+      "cd ~/backend && python -m unittest",
+      "cd && python -m unittest",
+      "cd - && python -m unittest",
+      "cd backend > /dev/null && python -m unittest",
+      "(cd backend && python -m unittest)",
+      "bash -c 'cd backend && python -m unittest'",
+      "popd; python -m unittest",
+      "python -m unittest -v; cd backend && python -m unittest -v",
+    ]) {
+      assert.equal(await note(command, `${NONE}\nExit code: 0`), "(Note from jig: no tests ran.)", command);
+    }
+  });
+
+  it("names five folders at most, and quotes a name the shell would split or expand", async () => {
+    for (const folder of ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"]) {
+      await mkdir(join(cwd, folder));
+      await writeFile(join(cwd, folder, `test_${folder}.py`), "");
+    }
+    assert.equal(
+      await note("python -m unittest", `${NONE}\nExit code: 5`),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and alpha, beta, delta, epsilon, gamma and 2 more hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
+    );
+    await mkdir(join(cwd, "app", "unit tests"), { recursive: true });
+    await writeFile(join(cwd, "app", "unit tests", "test_app.py"), "");
+    assert.equal(
+      await note("cd app && python -m unittest", `${NONE}\nExit code: 0`),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and 'unit tests' holds test*.py files but no __init__.py: `unittest discover -s 'unit tests'` starts it there.)",
+    );
+    await mkdir(join(cwd, "app", "it's"));
+    await writeFile(join(cwd, "app", "it's", "test_it.py"), "");
+    assert.equal(
+      await note("cd app && python -m unittest", `${NONE}\nExit code: 0`),
+      "(Note from jig: no tests ran. unittest's discovery enters only packages, and 'it'\\''s' and 'unit tests' hold test*.py files but no __init__.py: `unittest discover -s <folder>` starts it in one.)",
+    );
+    // Named in the command, quoted or not, it isn't named again.
+    assert.equal(await note("cd app && python -m unittest discover -s 'unit tests'", `${NONE}\nExit code: 0`), "(Note from jig: no tests ran. unittest's discovery enters only packages, and 'it'\\''s' holds test*.py files but no __init__.py: `unittest discover -s 'it'\\''s'` starts it there.)");
   });
 
   it("says nothing where tests ran, or where what exited with 5 wasn't unittest or pytest", async () => {

@@ -803,8 +803,13 @@ describe("budget notes", () => {
       assert.equal(off.code, 1);
       assert.match(off.output, /--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one\./);
       assert.equal(api.requests.length, 4);
+      // Only asking for both is: --no-budget-notes leaves the early notes out too, as it must once they are on by default.
+      const neither = await runJig([...args, "--no-early-budget-notes", "--no-budget-notes", "Fix the parser."], { api, cwd: project });
+      assert.equal(neither.code, 2, neither.output);
+      assert.deepEqual(notes(api.requests.slice(4)), ["", "", "", ""]);
       const help = execFileSync(process.execPath, [join(import.meta.dirname, "..", "src", "cli.ts"), "--help"], { encoding: "utf8" });
       assert.match(help, /--early-budget-notes\n +start the notes once 3 or fewer steps are left/);
+      assert.match(help, / +--no-early-budget-notes doesn't, and --no-budget-notes leaves these notes out too\n/);
     } finally {
       api.close();
     }

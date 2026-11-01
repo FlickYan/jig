@@ -78,7 +78,8 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --early-budget-notes
                           start the notes once 3 or fewer steps are left, if that comes before half, and have
                           each say what a step is: one reply, whose tool calls all run before the next, in the
-                          order given (at the same time if none of them runs a command or changes anything)
+                          order given (at the same time if none of them runs a command or changes anything);
+                          --no-early-budget-notes doesn't, and --no-budget-notes leaves these notes out too
       --finish-gate       the first time the model says it is done, with a step left, send it back once if it
                           changed files after it last ran anything, or its last test run failed (not in
                           --time-limit's last quarter)
@@ -257,7 +258,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       "max-steps": { type: "string", default: "50" },
       "time-limit": { type: "string" },
       "budget-notes": { type: "boolean", default: true },
-      "early-budget-notes": { type: "boolean", default: false },
+      "early-budget-notes": { type: "boolean" },
       "finish-gate": { type: "boolean", default: false },
       "wrap-up": { type: "boolean", default: true },
       escalate: { type: "string" },
@@ -295,6 +296,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // Off by default: on Terminal-Bench it cost 38-65% more without solving more (milestone 9).
   const oneShot = taskText !== "" && values.check;
   if (values.check && values.reviewer) throw new Error("--check and --reviewer both check the work before the task ends: use one.");
+  // Only where --early-budget-notes is given: --no-budget-notes alone leaves the early notes out too, whatever their default.
   if (values["early-budget-notes"] && !values["budget-notes"]) throw new Error("--early-budget-notes changes the budget notes, which --no-budget-notes leaves out: use one.");
   const model = values.model;
   const effort = values.effort as Effort | undefined;
@@ -640,7 +642,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
         conversation.push({ role: "user", content: message }, undefined, message === text ? undefined : text);
         started = Date.now();
         // The model --escalate hands over to gets them too: it runs in the same loop.
-        const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] } : undefined;
+        const budgetNotes = values["budget-notes"] ? { begun, deadline, early: values["early-budget-notes"] ?? false } : undefined;
         // The task is the message without the overview. A compaction before the first step keeps it in place
         // of the message, so jig's notes, which the model hasn't seen yet, stay in it.
         result = await runAgent(conversation, { ...agent, task: [...told, text].join("\n\n"), checkUntil, budgetNotes }, signal);
