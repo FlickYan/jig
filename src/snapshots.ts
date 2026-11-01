@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, realpathSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
@@ -106,23 +106,46 @@ export class Snapshots {
 
   /**
    * The regular files the latest snapshot holds, relative to the project, each with the object that holds
-   * its bytes, for --keep-inputs (see inputs.ts): not its symlinks, nor the nested repositories it can hold as
-   * gitlinks. Undefined without one.
+   * its bytes and that object's size, for --keep-inputs (see inputs.ts): not its symlinks, nor the nested
+   * repositories it can hold as gitlinks. Undefined without one.
    */
-  files(): { path: Buffer; object: string }[] | undefined {
+  files(): { path: Buffer; object: string; size: number }[] | undefined {
     const snapshot = this.taken.at(-1);
     if (!snapshot) return undefined;
-    return this.list("ls-tree", "-r", "-z", "--full-tree", snapshot).flatMap((entry) => {
-      // "<mode> <type> <object>\t<path>"
+    return this.list("ls-tree", "-r", "-l", "-z", "--full-tree", snapshot).flatMap((entry) => {
+      // "<mode> <type> <object> <size>\t<path>", the size padded with spaces
       const tab = entry.indexOf("\t");
-      const [mode, type, object] = entry.toString("latin1", 0, tab).split(" ");
-      return type === "blob" && (mode === "100644" || mode === "100755") ? [{ path: entry.subarray(tab + 1), object }] : [];
+      const [mode, type, object, size] = entry.toString("latin1", 0, tab).split(/ +/);
+      return type === "blob" && (mode === "100644" || mode === "100755") ? [{ path: entry.subarray(tab + 1), object, size: Number(size) }] : [];
     });
   }
 
-  /** A file's bytes as a snapshot holds them, by the object files() gave. */
-  blob(object: string): Buffer {
-    return this.run(["cat-file", "blob", object]);
+  /**
+   * Of these files, those whose attributes have git store other bytes than the file's in a way that can keep
+   * its size: a clean filter, or another encoding (working-tree-encoding). git also makes line endings LF
+   * (`text`, `eol`, core.autocrlf) and empties `$Id$` (`ident`), but those only take bytes out, so an object
+   * of the file's size tells they didn't.
+   */
+  converted(paths: Buffer[]): Set<string> {
+    const said = entries(this.run(["check-attr", "-z", "--stdin", "filter", "working-tree-encoding"], nul(paths)));
+    const converted = new Set<string>();
+    // "<path>\0<attribute>\0<value>\0" for each path and attribute
+    for (let i = 0; i + 2 < said.length; i += 3) {
+      if (!["unspecified", "unset"].includes(said[i + 2].toString())) converted.add(said[i].toString());
+    }
+    return converted;
+  }
+
+  /**
+   * A file's bytes as a snapshot holds them, by the object files() gave. Unlike the other git commands here,
+   * jig doesn't wait on this one in its own thread: it runs after a command (see inputs.ts), where Ctrl+C
+   * and --time-limit (`signal`) must still act.
+   */
+  blob(object: string, signal?: AbortSignal): Promise<Buffer> {
+    const options = { cwd: this.root, env: withoutKeys(), encoding: "buffer" as const, maxBuffer: 64 * 1024 * 1024, timeout: this.gitSeconds * 1000, signal };
+    return new Promise((resolve, reject) => {
+      execFile("git", [...this.options(), "cat-file", "blob", object], options, (err, stdout) => (err ? reject(err) : resolve(stdout)));
+    });
   }
 
   /**
@@ -210,27 +233,24 @@ export class Snapshots {
    * UTF-8, and decoded as UTF-8 it would no longer name the file.
    */
   private list(...args: string[]): Buffer[] {
-    const output = this.run(args);
-    const entries: Buffer[] = [];
-    let start = 0;
-    for (let end = output.indexOf(0); end !== -1; end = output.indexOf(0, start)) {
-      if (end > start) entries.push(output.subarray(start, end));
-      start = end + 1;
-    }
-    return entries;
+    return entries(this.run(args));
   }
 
   private git(...args: string[]): string {
     return this.run(args).toString();
   }
 
-  /** Runs git, with input (if any) on its standard input, and returns what it printed. */
-  private run(args: string[], input?: Buffer): Buffer {
+  /** What every git command here starts with: this store's repository, the project as its work tree. */
+  private options(): string[] {
     // The user's git config applies here too, but its signing and hooks are for their own commits: a
     // signer that prompts or fails would stop every snapshot, and a global post-commit hook would run on it.
-    const options = [...SAFE_GIT, "-c", "commit.gpgsign=false", `--git-dir=${this.gitDir}`, `--work-tree=${this.root}`];
+    return [...SAFE_GIT, "-c", "commit.gpgsign=false", `--git-dir=${this.gitDir}`, `--work-tree=${this.root}`];
+  }
+
+  /** Runs git, with input (if any) on its standard input, and returns what it printed. */
+  private run(args: string[], input?: Buffer): Buffer {
     try {
-      return execFileSync("git", [...options, ...args], {
+      return execFileSync("git", [...this.options(), ...args], {
         cwd: this.root,
         env: withoutKeys(),
         input,
@@ -247,6 +267,17 @@ export class Snapshots {
       throw said ? new Error(said) : err;
     }
   }
+}
+
+/** The entries of what git printed with -z, a NUL after each. */
+function entries(output: Buffer): Buffer[] {
+  const entries: Buffer[] = [];
+  let start = 0;
+  for (let end = output.indexOf(0); end !== -1; end = output.indexOf(0, start)) {
+    if (end > start) entries.push(output.subarray(start, end));
+    start = end + 1;
+  }
+  return entries;
 }
 
 /** Pathspecs, for git's standard input, for the whole project but these paths and what is under them, matched literally. */

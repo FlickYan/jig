@@ -1220,4 +1220,22 @@ describe("--keep-inputs in the loop", () => {
     assert.match(bash, /characters truncated[\s\S]*\n99999\n100000\n\n\(Note from jig: data\.bin, which was there before the task \(3 bytes\), is gone after this command\.\)\nExit code: 3$/);
     assert.doesNotMatch(write, /Note from jig/);
   });
+
+  it("stops it looking when the task is stopped, and doesn't tell the user it failed", async () => {
+    const controller = new AbortController();
+    const notices: string[] = [];
+    const inputs = {
+      before() {},
+      after: async (signal?: AbortSignal) => {
+        controller.abort(); // Ctrl+C while it looks
+        signal?.throwIfAborted();
+        return "(Note from jig: unseen.)";
+      },
+    };
+    const ui = { toolCall() {}, toolResult() {}, notice: (text: string) => void notices.push(text) };
+    const { options, conversation, messages } = setup([reply([toolUse("t1", "bash", { command: "echo hi" })])], { inputs, ui });
+    assert.equal((await runAgent(conversation, options, controller.signal)).stop, "interrupted");
+    assert.equal(resultsIn(messages[2])[0].content, "hi\n\nExit code: 0");
+    assert.deepEqual(notices, []);
+  });
 });

@@ -217,7 +217,9 @@ The copy comes from the task's snapshot or, where there is none (no git, as in m
 Terminal-Bench trials), from a store jig makes at the task's start in `~/.jig/inputs/` (in the task, so
 Ctrl+C and `--time-limit` stop it): each file gzipped and named by its SHA-256, leaving out what snapshots
 leave out and what the project's `.gitignore` files ignore (as far as jig reads them without git), 20 MB a
-file and 100 MB in all, and removed when jig exits. A file past those is named without a copy. In milestone
+file and 100 MB in all, only the latest task's files, and removed when jig exits. A file past those is named
+without a copy, as is one the snapshot holds other bytes for (git made its line endings LF, as `* text=auto`
+in `.gitattributes` has it do, say); any file of its size then counts as its backup. In milestone
 30's db-wal-recovery, the model's first look at the database with `sqlite3` deleted the task's only copy of
 its data, a write-ahead log with an invalid header; replayed with the task's files, the line gives that log
 back byte for byte. It is off until benchmarks show whether it helps; `--stats` counts each file named

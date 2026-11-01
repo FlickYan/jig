@@ -75,7 +75,7 @@ export interface AgentOptions {
    * file gone or empty, with its bytes in no other file. Only a task's own loop has it: a subagent's
    * commands only look.
    */
-  inputs?: { before(): void; after(): Promise<string | undefined> };
+  inputs?: { before(): void; after(signal?: AbortSignal): Promise<string | undefined> };
   /** The user's hooks around tool calls (see hooks.ts). */
   hooks?: ToolHooks;
   /**
@@ -729,14 +729,14 @@ async function handleToolCall(
     return fail(errorMessage(err));
   }
   // --keep-inputs' line goes in after the cut, so that it isn't cut away, before the exit code, which stays last
-  // (failedTestRun reads it there). Not once the task is stopped: the model won't see it.
+  // (failedTestRun reads it there). Not once the task is stopped, which also stops it looking: the model won't see it.
   if (inputs && !signal?.aborted) {
     try {
-      const note = await inputs.after();
+      const note = await inputs.after(signal);
       const last = output.lastIndexOf("\n") + 1;
       if (note) output = `${output.slice(0, last)}${note}\n${output.slice(last)}`;
     } catch (err) {
-      opts.ui.notice(`--keep-inputs couldn't look at the project's files after this command: ${errorMessage(err)}`);
+      if (!signal?.aborted) opts.ui.notice(`--keep-inputs couldn't look at the project's files after this command: ${errorMessage(err)}`);
     }
   }
   try {

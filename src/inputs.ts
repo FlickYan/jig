@@ -42,15 +42,20 @@ interface Input {
   mtimeMs: number;
   /** Seen to differ from how it was before the task: losing it later loses no bytes of then. */
   changed: boolean;
+  /**
+   * The hash of its bytes before the task, as Inputs' digest makes one of a file's bytes, so that a file
+   * holding them is found without reading them back; undefined where jig can't tell (see inputLimits and
+   * fromSnapshot).
+   */
+  hash?: string;
   /** Its bytes before the task, or undefined where jig kept none (see inputLimits). */
-  bytes(): Promise<Buffer | undefined>;
+  bytes(signal?: AbortSignal): Promise<Buffer | undefined>;
 }
 
-/** A file a command left gone or empty, and its bytes before the task, once they are read. */
+/** A file a command left gone or empty, and where its copy is, once there is one. */
 interface Lost {
   input: Input;
   how: "gone" | "empty";
-  bytes?: Buffer;
   copy?: string;
 }
 
@@ -80,6 +85,8 @@ export class Inputs {
   private readonly count?: (event: Mechanism) => void;
   private readonly notice: (text: string) => void;
   private readonly watched = new Map<string, Input>();
+  // How the watched files' hashes are made of their bytes: the store's, or git's (see fromSnapshot).
+  private digest = sha256;
   // This session's store, once there is one (see fromStore), and whether the user has heard what it left out.
   private store?: string;
   private toldLeftOut = false;
@@ -118,9 +125,9 @@ export class Inputs {
    * After a command: the line for its result, if it left a file that was there before the task gone or empty,
    * with its bytes in no other file of the project (see Inputs). Each such file is dropped from the watch,
    * noted or not. One that now leads into a hidden path (a folder on its way made a link there) is dropped
-   * unsaid.
+   * unsaid. Ctrl+C and --time-limit (`signal`) stop it.
    */
-  async after(): Promise<string | undefined> {
+  async after(signal?: AbortSignal): Promise<string | undefined> {
     const lost: Lost[] = [];
     for (const input of this.watched.values()) {
       // A file changed but there is no loss yet: before() sees the change before the next command.
@@ -134,14 +141,17 @@ export class Inputs {
     if (!lost.length) return undefined;
     const hides = hiddenTest(this.hidden, [this.root]);
     const shown = lost.filter(({ input }) => !hides(realTargetSync(join(this.root, input.path)) ?? ""));
-    for (const one of shown) one.bytes = await one.input.bytes();
-    const held = await heldElsewhere(this.root, this.hidden, shown);
+    const held = await heldElsewhere(this.root, this.hidden, shown, this.digest, signal);
     for (const backedUp of held) if (backedUp) this.count?.("inputs.suppressed");
     const noted = shown.filter((_, i) => !held[i]);
     if (!noted.length) return undefined;
+    // Only the files the note names are read back, for their copies: a command that lost a folder of thousands
+    // has jig read five, not wait on git for each.
     for (const [i, one] of noted.entries()) {
+      const bytes = i < NAMED ? await one.input.bytes(signal) : undefined;
+      signal?.throwIfAborted();
       this.count?.("inputs.lost");
-      one.copy = i < NAMED && one.bytes ? this.outputs.copy(basename(one.input.path), one.bytes) : undefined;
+      one.copy = bytes && this.outputs.copy(basename(one.input.path), bytes);
       if (!one.copy) this.count?.("inputs.copySkipped");
     }
     return note(noted);
@@ -165,24 +175,27 @@ export class Inputs {
 
   /**
    * The snapshot's regular files, shallowest first, as the store lists them, read by the object that holds
-   * their bytes: never a symlink, nor an older snapshot's file. A name that isn't UTF-8 is left out.
+   * their bytes: never a symlink, nor an older snapshot's file. A name that isn't UTF-8 is left out. Only
+   * where git stored a file's bytes as they were is the object its copy, and its name its hash: where the
+   * attributes or core.autocrlf have git make line endings LF, as the common `* text=auto` does, the object
+   * holds other bytes (see Snapshots.converted for the others), and such a file is noted without a copy, as
+   * one over the cap is.
    */
   private fromSnapshot(snapshots: Snapshots): Input[] {
-    const files = (snapshots.files() ?? []).flatMap(({ path, object }) => (Buffer.from(path.toString()).equals(path) ? [{ path: path.toString(), object }] : []));
+    const files = (snapshots.files() ?? []).flatMap(({ path, ...rest }) => (Buffer.from(path.toString()).equals(path) ? [{ path: path.toString(), ...rest }] : []));
     files.sort((a, b) => depth(a.path) - depth(b.path));
+    const watched = files.slice(0, inputLimits.files);
+    const converted = snapshots.converted(watched.map(({ path }) => Buffer.from(path)));
+    this.digest = gitHash(watched[0]?.object.length === 64 ? "sha256" : "sha1");
     const inputs: Input[] = [];
-    for (const { path, object } of files.slice(0, inputLimits.files)) {
+    for (const { path, object, size } of watched) {
       const info = this.stat(path);
       if (!info?.isFile()) continue;
-      const kept = info.size <= inputLimits.fileBytes;
-      const bytes = async () => {
-        try {
-          return kept ? snapshots.blob(object) : undefined;
-        } catch {
-          return undefined; // git failed: the file is noted without a copy
-        }
-      };
-      inputs.push({ path, size: info.size, mtimeMs: info.mtimeMs, changed: false, bytes });
+      const hash = size === info.size && !converted.has(path) ? object : undefined;
+      const kept = hash !== undefined && info.size <= inputLimits.fileBytes;
+      // Where git fails, the file is noted without a copy.
+      const bytes = async (signal?: AbortSignal) => (kept ? snapshots.blob(object, signal).catch(() => undefined) : undefined);
+      inputs.push({ path, size: info.size, mtimeMs: info.mtimeMs, changed: false, hash, bytes });
     }
     return inputs;
   }
@@ -194,34 +207,44 @@ export class Inputs {
    * --no-sandbox, as on Terminal-Bench, where a model's grep found jig's session files) neither names nor
    * contents match a search for the project's. A file over inputLimits' caps isn't kept, which the user
    * hears once. It never feeds /undo: a copy that left files out would have it take them for files the task
-   * made, and delete them.
+   * made, and delete them. It holds one task's files: once they are listed, the blobs of the tasks before
+   * that this one doesn't use go, as nothing reads them again, so that the caps hold however many tasks a
+   * session runs (while a task's files are listed, the last task's are there too).
    */
   private async fromStore(signal?: AbortSignal): Promise<Input[]> {
     const store = (this.store ??= join(projectDir("inputs", this.root), String(process.pid)));
     mkdirSync(store, { recursive: true, mode: 0o700 });
+    this.digest = sha256;
     const inputs: Input[] = [];
+    const used = new Set<string>();
     let total = 0;
     let left = 0;
-    for (const path of await projectFiles(this.root, this.hidden, inputLimits.files, true, signal)) {
-      signal?.throwIfAborted();
-      const input = await openRegular(join(this.root, path), async (handle, { size, mtimeMs }): Promise<Input | undefined> => {
-        if (size === 0) return undefined;
-        if (size > inputLimits.fileBytes || total + size > inputLimits.totalBytes) {
-          left++;
-          return { path, size, mtimeMs, changed: false, bytes: async () => undefined };
-        }
-        const bytes = await handle.readFile();
-        total += bytes.length;
-        const blob = join(store, `${sha256(bytes)}.gz`);
-        if (!existsSync(blob)) {
-          // Renamed into place, so that a blob is never there half written.
-          const temp = `${blob}.${randomBytes(4).toString("hex")}.tmp`;
-          writeFileSync(temp, await gzipped(bytes), { flag: "wx", mode: 0o600 });
-          renameSync(temp, blob);
-        }
-        return { path, size, mtimeMs, changed: false, bytes: () => unpack(blob) };
-      });
-      if (input) inputs.push(input);
+    try {
+      for (const path of await projectFiles(this.root, this.hidden, inputLimits.files, true, signal)) {
+        signal?.throwIfAborted();
+        const input = await openRegular(join(this.root, path), async (handle, { size, mtimeMs }): Promise<Input | undefined> => {
+          if (size === 0) return undefined;
+          if (size > inputLimits.fileBytes || total + size > inputLimits.totalBytes) {
+            left++;
+            return { path, size, mtimeMs, changed: false, bytes: async () => undefined };
+          }
+          const bytes = await handle.readFile();
+          total += bytes.length;
+          const hash = sha256(bytes);
+          used.add(`${hash}.gz`);
+          const blob = join(store, `${hash}.gz`);
+          if (!existsSync(blob)) {
+            // Renamed into place, so that a blob is never there half written.
+            const temp = `${blob}.${randomBytes(4).toString("hex")}.tmp`;
+            writeFileSync(temp, await gzipped(bytes), { flag: "wx", mode: 0o600 });
+            renameSync(temp, blob);
+          }
+          return { path, size, mtimeMs, changed: false, hash, bytes: () => unpack(blob) };
+        });
+        if (input) inputs.push(input);
+      }
+    } finally {
+      for (const name of readdirSync(store)) if (!used.has(name)) rmSync(join(store, name), { force: true });
     }
     if (left && !this.toldLeftOut) {
       this.toldLeftOut = true;
@@ -266,26 +289,31 @@ function note(noted: Lost[]): string {
 
 /**
  * For each lost file, whether another file in the project holds its bytes from before the task (a backup
- * the model made, say). Only files of its size are read; without its bytes (over the caps), any file of its
- * size counts, so that jig stays quiet where it can't tell.
+ * the model made, say), by their hash (`digest`), so that the lost file's bytes aren't read back. Only files
+ * of its size are read; without its hash (over the caps), any file of its size counts, so that jig stays
+ * quiet where it can't tell.
  */
-async function heldElsewhere(root: string, hidden: string[], lost: Lost[]): Promise<boolean[]> {
+async function heldElsewhere(root: string, hidden: string[], lost: Lost[], digest: (bytes: Buffer) => string, signal?: AbortSignal): Promise<boolean[]> {
   const held = lost.map(() => false);
-  const sizes = new Set(lost.map(({ input }) => input.size));
-  for (const path of await projectFiles(root, hidden, inputLimits.candidates, false)) {
-    if (held.every(Boolean)) break;
+  let left = lost.length;
+  const bySize = Map.groupBy(lost.keys(), (i) => lost[i].input.size);
+  for (const path of await projectFiles(root, hidden, inputLimits.candidates, false, signal)) {
+    if (!left) break;
+    signal?.throwIfAborted();
     let info: Stats | undefined;
     try {
       info = lstatSync(join(root, path), { throwIfNoEntry: false });
     } catch {
       continue;
     }
-    if (!info?.isFile() || !sizes.has(info.size)) continue;
-    let bytes: Buffer | undefined;
-    for (const [i, { input, bytes: before }] of lost.entries()) {
-      if (held[i] || input.size !== info.size) continue;
-      bytes ??= await openRegular(join(root, path), (handle) => handle.readFile());
-      held[i] = !before || !!bytes?.equals(before);
+    if (!info?.isFile()) continue;
+    let hash: string | undefined;
+    for (const i of bySize.get(info.size) ?? []) {
+      if (held[i]) continue;
+      const before = lost[i].input.hash;
+      if (before) hash ??= await openRegular(join(root, path), async (handle) => digest(await handle.readFile()));
+      held[i] = !before || hash === before;
+      if (held[i]) left--;
     }
   }
   return held;
@@ -383,6 +411,14 @@ async function unpack(blob: string): Promise<Buffer | undefined> {
 
 function sha256(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * The name git gives an object that holds these bytes, in a repository whose names are made with
+ * `algorithm`: a file holding a snapshot's object is then found without reading the object.
+ */
+function gitHash(algorithm: "sha1" | "sha256"): (bytes: Buffer) => string {
+  return (bytes) => createHash(algorithm).update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
 }
 
 /** Whether a process is running, as a store's folder is named after its session's. */

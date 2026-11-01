@@ -1846,6 +1846,85 @@ describe("--keep-inputs", () => {
     assert.deepEqual(events, ["inputs.suppressed", "inputs.suppressed"]);
   });
 
+  it("gives back no bytes but the file's own where git stored others, its line endings made LF or its encoding changed (from the snapshot)", async () => {
+    await writeFile(join(dir, ".gitattributes"), "* text=auto\n*.u16 working-tree-encoding=UTF-16\n");
+    const csv = "id,name\r\n1,alpha\r\n2,beta\r\n";
+    await writeFile(join(dir, "data.csv"), csv);
+    // "€€" in UTF-16 after its byte order mark, which git stores as UTF-8: as many bytes, but other ones.
+    await writeFile(join(dir, "euro.u16"), Buffer.from([0xff, 0xfe, 0xac, 0x20, 0xac, 0x20]));
+    await writeFile(join(dir, "notes.txt"), "LF only\n");
+    let inputs = await watching("snapshot");
+    const gone = await command(inputs, "rm data.csv euro.u16 notes.txt");
+    assert.match(gone!, /^\(Note from jig: data\.csv, which was there before the task \(26 bytes\), is gone after this command, and no file in the project holds its bytes\. jig kept no copy of it\. /);
+    assert.match(gone!, / euro\.u16, which was there before the task \(6 bytes\), is gone after this command, and no file in the project holds its bytes\. jig kept no copy of it\. /);
+    assert.match(gone!, / notes\.txt, which was there before the task \(8 bytes\), is gone after this command, .* A copy of it as it was before the task is at \S+\. If you removed them/);
+    assert.deepEqual(outputs.paths().map((path) => readFileSync(path, "utf8")), ["LF only\n"]);
+    // A backup holds the bytes git didn't store: one of the file's size counts, as for a file over the cap.
+    await writeFile(join(dir, "data.csv"), csv);
+    inputs = await watching("snapshot");
+    assert.equal(await command(inputs, "cp data.csv data.csv.bak && rm data.csv"), undefined);
+    assert.deepEqual(events, ["inputs.lost", "inputs.copySkipped", "inputs.lost", "inputs.copySkipped", "inputs.lost", "inputs.suppressed"]);
+  });
+
+  it("reads back only the files its note names, however many a command loses, and none another file holds (from the snapshot)", async () => {
+    for (const folder of ["a", "b"]) {
+      await mkdir(join(dir, folder));
+      // a/1.txt and b/1.txt are of a size, with other bytes.
+      for (let i = 0; i < 30; i++) await writeFile(join(dir, folder, `${i}.txt`), `${folder}${i}\n`.repeat(i + 1));
+    }
+    const snapshots = new Snapshots(dir);
+    snapshots.take("task");
+    const read: string[] = [];
+    const blob = snapshots.blob.bind(snapshots);
+    snapshots.blob = (object, signal) => (read.push(object), blob(object, signal));
+    const inputs = new Inputs(dir, { outputs, count: (event) => void events.push(event), notice: (text) => void notices.push(text) });
+    await inputs.start(snapshots);
+    assert.equal(await command(inputs, "mv a c"), undefined);
+    assert.deepEqual(read, [], "found in c by their hashes");
+    const gone = await command(inputs, "rm -r b");
+    assert.match(gone!, /^\(Note from jig: b\/0\.txt, .* b\/12\.txt, .* 25 more files that were there before the task are gone or empty too, with no copy\. If you removed them/);
+    assert.equal(read.length, 5, "one git for each copy, not for each file");
+    const named = [0, 1, 10, 11, 12].map((i) => `b${i}\n`.repeat(i + 1));
+    assert.deepEqual(outputs.paths().map((path) => readFileSync(path, "utf8")), named);
+    assert.equal(events.filter((event) => event === "inputs.suppressed").length, 30);
+    assert.equal(events.filter((event) => event === "inputs.copySkipped").length, 25);
+  });
+
+  for (const source of ["store", "snapshot"] as const) {
+    it(`stops looking when the task is stopped (from the ${source})`, async () => {
+      await writeFile(join(dir, "main.db-wal"), "wal bytes");
+      const inputs = await watching(source);
+      inputs.before();
+      await rm(join(dir, "main.db-wal"));
+      const controller = new AbortController();
+      controller.abort();
+      await assert.rejects(inputs.after(controller.signal), { name: "AbortError" });
+      assert.deepEqual(outputs.paths(), []);
+    });
+  }
+
+  it("keeps one task's files in the store, so that its cap holds however many tasks a session runs", async () => {
+    const { fileBytes, totalBytes } = inputLimits;
+    Object.assign(inputLimits, { fileBytes: 10, totalBytes: 20 });
+    try {
+      await writeFile(join(dir, "a.txt"), "task 1 a");
+      await writeFile(join(dir, "b.txt"), "task 1 b");
+      const inputs = await watching("store");
+      assert.deepEqual(Object.values(await kept()).sort(), ["task 1 a", "task 1 b"]);
+      // Each task changes a file: kept beside the earlier ones, they would come to 24 bytes, then 32.
+      await writeFile(join(dir, "a.txt"), "task 2 a");
+      await inputs.start(undefined);
+      assert.deepEqual(Object.values(await kept()).sort(), ["task 1 b", "task 2 a"]);
+      await writeFile(join(dir, "b.txt"), "task 3 b");
+      await inputs.start(undefined);
+      assert.deepEqual(Object.values(await kept()).sort(), ["task 2 a", "task 3 b"]);
+      assert.deepEqual(notices, [], "none left out");
+      assert.equal(await readFile(copyIn(await command(inputs, "rm a.txt")), "utf8"), "task 2 a");
+    } finally {
+      Object.assign(inputLimits, { fileBytes, totalBytes });
+    }
+  });
+
   for (const source of ["store", "snapshot"] as const) {
     it(`never keeps or gives back what a hidden path holds, nor a file whose folder became a link into one (from the ${source})`, async () => {
       await mkdir(join(dir, "secret"));

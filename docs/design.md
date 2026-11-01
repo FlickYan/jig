@@ -288,8 +288,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   the model had backed it up or decoded it in place, and only the third was a loss. The line says the file
   is gone after the command, not that the command deleted it, as a background job or an editor can do that
   between two commands; and jig restores nothing, since a stale log put back beside a database written
-  since can corrupt it. The copy comes from the task's snapshot, read by object and only for regular files;
-  without git, from a store kept for this alone, each file gzipped and named by its hash, so that where
+  since can corrupt it. The copy comes from the task's snapshot, read by object and only for regular files
+  whose bytes git stored as they were (with `* text=auto`, it stores line endings as LF, and a copy of those
+  would not be the file); without git, from a store kept for this alone, each file gzipped and named by its hash, so that where
   commands can read jig's directory (with `--no-sandbox` on Terminal-Bench, a model's `grep -r` found jig's
   session files) neither names nor contents match a search for the project's. It never feeds `/undo`, which
   would take a file a capped store left out for one the task created, and delete it. The copy goes right in
