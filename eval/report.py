@@ -16,8 +16,8 @@ containers can reach the internet. A trial in which the agent fetched anything f
 repositories counts as failed, whatever the verifier said: both agents did it now and then.
 
 A trial the verifier couldn't grade is "unscorable", neither passed nor failed: it is left out of the pass
-rates, their intervals and the differences between runs. That is one whose verifier wrote no result or ran
-out of disk (see unscorable), or one of a task whose verifier can't run on the machine, in the list that
+rates, their intervals and the differences between runs. That is one whose verifier ran but wrote no result
+or ran out of disk (see unscorable), or one of a task whose verifier can't run on the machine, in the list that
 --skip-tasks names: a task a line, with why after a "#". eval/skip-tasks.txt is the machine's own list, kept
 out of git, and tbcheck uses it when it is there. --save keeps the mark, so the summaries leave out the same.
 """
@@ -71,20 +71,25 @@ def trials(job: Path) -> list[dict]:
             # Milestone 29's review, which ran the work, and the hidden tests on the work it saw (review_before.py).
             "run_review": (agent.get("metadata") or {}).get("run_review"),
             "before": before_fix(path.parent),
-            "unscorable": unscorable(path.parent),
+            "unscorable": unscorable(path.parent, result),
         })
     return found
 
 
-def unscorable(trial: Path) -> str | None:
-    """Why the verifier couldn't grade a trial, if it couldn't: it wrote no result (Terminal-Bench's tests write
-    ctrf.json), or it ran out of disk installing what the tests need, as pytorch-model-recovery's did twice in
-    milestone 30. Neither is a verdict on the agent's work. An HTTP error in a test isn't taken for one, since a
-    task's own server may fail that way: a verifier refused its download on this machine is a task to skip."""
+def unscorable(trial: Path, result: dict) -> str | None:
+    """Why the verifier couldn't grade a trial, if it couldn't: it ran out of disk installing what the tests
+    need, as pytorch-model-recovery's did twice in milestone 30, or it ran and wrote no result (Terminal-Bench's
+    tests write ctrf.json). Neither is a verdict on the agent's work. A verifier that never started is one: the
+    agent's side failed first (jig's install, say), and Harbor skipped the tests. So are tests that ran out of
+    time on the work, which Harbor grades too. An HTTP error in a test isn't taken for the verifier's failure
+    either, since a task's own server may fail that way: a verifier refused its download on this machine is a
+    task to skip."""
     output = trial / "verifier" / "test-stdout.txt"
     if output.exists() and "No space left on device" in output.read_text(errors="replace"):
         return "its verifier ran out of disk"
-    if not (trial / "verifier" / "ctrf.json").exists():
+    started = (result.get("verifier") or {}).get("started_at")
+    timed_out = (result.get("exception_info") or {}).get("exception_type") == "VerifierTimeoutError"
+    if started and not timed_out and not (trial / "verifier" / "ctrf.json").exists():
         return "its verifier wrote no result"
     return None
 

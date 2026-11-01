@@ -7,7 +7,7 @@ import { afterEach, describe, it } from "node:test";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "../bench/evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "../bench/evolve-workspace.ts";
 import { type Attempt, compare, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split } from "../bench/evolve-referee.ts";
-import { attemptsOf, nextStart, refusedByApi, runOrder, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
+import { attemptsOf, nextStart, noVerdict, refusedByApi, runOrder, skipList, terminalBenchVerdict } from "../bench/evolve-terminal-bench.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 afterEach(removeTempDirs);
@@ -297,6 +297,30 @@ describe("the Terminal-Bench check", () => {
     const candidate = attemptsOf([{ task: "a", passed: true }, { task: "torch", passed: true }]);
     assert.deepEqual(baseline, [{ task: "a", passed: true, cost: null }]);
     assert.equal(terminalBenchVerdict(candidate, baseline).comparison.tasks, 1, "paired on the task both could be graded on");
+  });
+
+  it("gives no verdict when the verifier couldn't grade a task on one side, unless the machine skips it", () => {
+    const baseline = [
+      { task: "a", passed: true },
+      { task: "b", passed: true },
+      { task: "torch", passed: false, unscorable: "its verifier ran out of disk" },
+    ];
+    const candidate = [
+      { task: "a", passed: true },
+      { task: "b", passed: false },
+      { task: "torch", passed: true },
+    ];
+    assert.equal(noVerdict(candidate, baseline, new Set()), "the verifier couldn't grade torch on one side or both, so the comparison would leave it out");
+    assert.equal(noVerdict(candidate, baseline, skipList("torch  # torch doesn't fit the verifier's disk here\n")), null);
+    // Every trial ungraded: compared over no task, the candidate came out "no worse".
+    const ungraded = candidate.map((trial) => ({ ...trial, passed: false, unscorable: "its verifier wrote no result" }));
+    assert.equal(terminalBenchVerdict(attemptsOf(ungraded), attemptsOf(baseline)).rejected, false);
+    assert.equal(noVerdict(ungraded, baseline, new Set()), "the verifier couldn't grade a, b, torch on one side or both, so the comparison would leave them out");
+    assert.equal(noVerdict(ungraded, baseline, new Set(["a", "b", "torch"])), "no task was graded on both sides");
+  });
+
+  it("reads a list of tasks to skip as eval/report.py does", () => {
+    assert.deepEqual([...skipList("# tasks whose verifier can't run here\n\nfilter-js-from-html  # 403 on its corpus\nmteb-retrieve\n")], ["filter-js-from-html", "mteb-retrieve"]);
   });
 
   it("prices a reviewer's calls at the reviewer's prices, as eval/report.py saves them", () => {

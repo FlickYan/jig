@@ -239,11 +239,13 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   sometimes fetched them, so [`eval/report.py`](../eval/report.py) checks every command of every trial, and an
   attempt that fetched anything from the benchmark's repositories counts as failed, whatever the verifier
   said. The numbers here are all counted that way; before milestone 10, this section counted those passes.
-- **A trial the verifier couldn't grade doesn't count either way.** One whose verifier wrote no result
-  (`ctrf.json`) or ran out of disk, or of a task listed with `--skip-tasks` because its verifier can't run on
+- **A trial the verifier couldn't grade doesn't count either way.** One whose verifier ran but wrote no
+  result (`ctrf.json`) or ran out of disk, or of a task listed with `--skip-tasks` because its verifier can't run on
   the machine (a task a line, why after a `#`: `eval/skip-tasks.txt` is the machine's own, kept out of git,
   and tbcheck uses it), is unscorable: marked apart and left out of the pass rates, their intervals and the
-  differences. Milestone 30 counted six such trials as failures.
+  differences. Milestone 30 counted six such trials as failures. A verifier that never started, because
+  jig's install or the adapter failed first, or whose tests ran out of time, still fails the trial. tbcheck
+  leaves the verdict to a person when unscorable trials outside the list take a task out of the comparison.
 
 ### Results
 

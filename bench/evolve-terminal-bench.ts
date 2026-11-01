@@ -63,6 +63,28 @@ export function terminalBenchVerdict(candidate: Attempt[], baseline: Attempt[]):
 }
 
 /**
+ * Why these trials can't give a verdict, if they can't. The comparison pairs tasks, so a task the verifier
+ * couldn't grade on one side drops out (both of milestone 30's pytorch-model-recovery trials without the
+ * notes ran out of disk), and with none left it comes out even: "no worse", whatever the candidate did. Only
+ * the tasks this machine skips are meant to drop out; for any other, a person runs the trials again or
+ * skips the task.
+ */
+export function noVerdict(candidate: Trial[], baseline: Trial[], skipped: Set<string>): string | null {
+  const graded = (trials: Trial[]) => new Set(attemptsOf(trials).map((attempt) => attempt.task));
+  const [byCandidate, byBaseline] = [graded(candidate), graded(baseline)];
+  const ran = new Set(baseline.map((trial) => trial.task));
+  const lost = [...new Set(candidate.map((trial) => trial.task))].filter((task) => ran.has(task) && !skipped.has(task) && !(byCandidate.has(task) && byBaseline.has(task)));
+  if (lost.length) return `the verifier couldn't grade ${lost.sort().join(", ")} on one side or both, so the comparison would leave ${lost.length === 1 ? "it" : "them"} out`;
+  if (![...byCandidate].some((task) => byBaseline.has(task))) return "no task was graded on both sides";
+  return null;
+}
+
+/** The tasks in a list of tasks to skip (eval/skip-tasks.txt), as eval/report.py reads it: one a line, why after a "#". */
+export function skipList(text: string): Set<string> {
+  return new Set(text.split("\n").map((line) => line.split("#")[0].trim()).filter(Boolean));
+}
+
+/**
  * A trial the API refused, for want of balance or a valid key: not a result, so it is removed to run again.
  * On 2026-10-13 the balance ran out in the night and a round went on through 18 tasks, each failing in a
  * minute (milestone 24).
