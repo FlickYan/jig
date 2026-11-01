@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 568 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 604 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -184,7 +184,8 @@ without the files: the reviewer and the Stop hooks get it (jig's notes stay in i
 model read. In milestone 30's runs on evolve2's 4 steps, the model spent its first two finding and reading
 the files, the test file a step after those the task named, so its first write came at step 3 or 4. It is
 on by default since milestone 31: on evolve2's 4 steps, the overview, the early budget notes and the test
-notes (below) together passed 290 of 315 attempts in three runs, against 268 of 315 for three baselines
+notes (below) together passed 290 of 315 attempts in three runs (two of them with a fourth change, since left
+out), against 268 of 315 for three baselines
 (+7 points, 95% interval +0.6 to +13.3), while none of them alone beat the noise. `--stats` counts it
 (`overview`, and `overview.file` for each file shown).
 
@@ -661,14 +662,15 @@ What each question came to; the write-ups, with every number's run and caveat, a
 
 | question | how it was measured | what came out |
 |----------|---------------------|---------------|
-| Does jig work? | the in-house benchmark: 20 tasks, hidden tests, 3 attempts each | 60 of 60 for every version since milestone 7, on macOS and Linux; no attempt followed a prompt injection |
+| Does jig work? | the in-house benchmark: 20 tasks, hidden tests, 3 attempts each | 60 of 60 for every version from milestone 7 to 30, on macOS and Linux; in milestone 31, 59 of 60, the failure a 3-second timing test on a loaded machine (lru-cache passed 3 of 3 run alone); no attempt followed a prompt injection |
 | Against another agent? | Terminal-Bench 2.0, 20 tasks × 3, against mini-swe-agent on the same model (deepseek-flash) | 68% against 73%: 5 points behind (−3 to +15), within the noise, at 39% lower cost |
 | On a real bug, filed after its model was in use? | [Python-Markdown #1651](examples/python-markdown-1651), filed after deepseek-flash was in use; the maintainers' tests hidden; 3 attempts | 3 of 3 solved, $0.13 in all; each fix renders 49,396 generated inputs, three ways each, exactly as upstream's does; one of the three explained why the bug depends on the Python version, and one ran out of steps before its summary |
 | Does checking before finishing help? (9) | Terminal-Bench, the 20 tasks and 20 held-out ones | it fixed the failures it aimed at, ran others out of time and solved no more, at 38–65% more cost: opt-in |
 | Do skills and memory work? (12, 13) | each with and without, 9 runs each | a skill learned from one session: 9 of 9 against 0 of 9; a convention remembered from an earlier session: 9 of 9 against 0 of 9 |
 | Can jig improve its own code? (14–22, 28) | the evolve loop and its referee, on two suites | 19 candidates; one accepted (+15 and +17 points on the suite), then 15 points worse on Terminal-Bench, so not merged; neither advice in the prompt nor changes to the loop moved the suite, and two of the loop's changes never ran at all |
 | A stronger model when the tests fail? (23) | the trigger replayed on 676 saved attempts; deepseek-v4-pro alone | the trigger would have reached 1 of 220 failures; v4-pro was 7 points ahead for 5 times the cost, while 2 more steps put flash 24 ahead |
-| Does it help to tell the model its budget? (30) | evolve2 at 4 steps, 21 tasks × 5, against two baselines on the same build; run again, at 40 steps, and on the main benchmark | 92 of 105 against 66 and 66, at the same cost, and 92 again; no harm at 40 steps (41 of 42 both ways) or on the main benchmark (60 of 60): on Terminal-Bench, 30 of 38 against 29, at 8% less cost: on by default. A finish gate and checks after writes never fired: opt-in |
+| Does it help to tell the model its budget? (30) | evolve2 at 4 steps, 21 tasks × 5, against two baselines on the same build; run again, at 40 steps, and on the main benchmark | 92 of 105 against 66 and 66, at the same cost, and 92 again; no harm at 40 steps (41 of 42 both ways) or on the main benchmark (60 of 60): on Terminal-Bench no worse (28 of 34 against 29, scored again in milestone 31): on by default. A finish gate and checks after writes never fired: opt-in |
+| What did the failures left ask for? (31) | evolve2 at 4 steps, 21 tasks × 5: four changes alone and together, against three baselines; then on by default, at 40 steps, on the main benchmark and on Terminal-Bench | none alone beat the noise; an overview of the project, earlier budget notes and notes on test runs that ran nothing together, with the fourth or without it, passed 290 of 315 against 268 (+7 points, +0.6 to +13.3), and 101 of 105 once on by default; 30% fewer steps at 40; on Terminal-Bench 31 of 36 against 29, at 7% less cost: on by default |
 | A second model reviewing the work? (24) | Terminal-Bench, 20 tasks, alternating at each task | 5 points ahead (−20 to +30) for 2.4 times the cost; no result changed because of a review |
 | A review that runs the work? (29) | Terminal-Bench, 20 tasks, the hidden tests on each trial's work before the review's fix and after it | in a smoke test, the first failure a review turned into a pass; in the round, no result changed, no false alarm in 9 passes, and the causes of two failures found and lost before they went back |
 | Training on its own successes? (26) | a LoRA of Qwen2.5-0.5B on 225 passed sessions, loss on held-out tasks | −57% overall, but −20% on the model's own tokens: the rest is the prompt and the tools learnt by heart |
@@ -733,6 +735,7 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 | 28 | The loop and the tools again | three candidates, all rejected; two never ran, and a step's narrowed tools were no limit (now they are, and an invalid call goes back in part) |
 | 29 | A reviewer that runs the work | `jig review`, in a copy of the machine; one failure turned into a pass, in a smoke test; in the round, no result changed |
 | 30 | Four ideas from other agents, measured | budget notes on by default (+25 points at 4 steps, twice); a finish gate, checks after writes and tolerant edits stay opt-in |
+| 31 | What the failures left asked for, measured | the overview, earlier budget notes and test notes on by default (+7 points at 4 steps, in three runs); letting `write_file` trust what a result showed was left out |
 
 ## Tests
 

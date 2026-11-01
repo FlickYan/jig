@@ -385,7 +385,8 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   files and shows those the task names, as `glob` and `read_file` would, with no model call and only where
   the model's own calls would run unasked. At evolve2's 4 steps the model spent its first two steps finding
   and reading them. It is on by default since milestone 31, with the early budget notes and the test notes:
-  alone, none of the three beat the noise; together, 290 of 315 attempts passed against 268.
+  alone, none of the three beat the noise; together (in two of the three runs with a fourth change, since left
+  out), 290 of 315 attempts passed against 268.
 - **A test run that ran nothing says so.** unittest's discovery skips a folder without `__init__.py`, and
   finding no tests it exits with an error (from Python 3.12), so what followed its `&&` doesn't run either;
   in milestone 30's runs the results didn't say so. Now a result in which unittest or pytest ran no tests
