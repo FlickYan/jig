@@ -1,0 +1,369 @@
+import assert from "node:assert/strict";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { existsSync } from "node:fs";
+import { readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { afterEach, describe, it } from "node:test";
+import { type Config, type Service, startService } from "../server/api.ts";
+import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
+import { LocalRunner } from "../server/runners/local.ts";
+import { Scheduler } from "../server/scheduler.ts";
+import { openStore, type Task, type Tenant } from "../server/store.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+
+// The task service (server/): its API, its store, the fair scheduler and the local runner, with a fake jig
+// (fixtures/fake-jig.mjs) that writes events in the event contract's shape. No model is called.
+
+const FAKE_JIG = join(import.meta.dirname, "fixtures", "fake-jig.mjs");
+const SECRET = "the gateway's secret";
+const KEYS = { acme: "acme-key", globex: "globex-key" };
+const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+const services: Service[] = [];
+afterEach(async () => {
+  await Promise.all(services.splice(0).map((service) => service.close()));
+  await removeTempDirs();
+});
+
+/** A service on a port of its own, with the fake jig, two tenants and a database in a new folder. */
+async function service(config: Partial<Config> = {}, base?: string): Promise<Service & { dataDir: string }> {
+  base ??= await tempDir("jig-service-");
+  const dataDir = join(base, "data");
+  const started = await startService(
+    {
+      port: 0,
+      database: join(base, "jig.db"),
+      dataDir,
+      gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
+      jig: [process.execPath, FAKE_JIG],
+      graceSeconds: 5,
+      tenants: [
+        { id: "acme", keys: [sha256(KEYS.acme)], budgetUsd: 2.5 },
+        { id: "globex", keys: [sha256(KEYS.globex)] },
+      ],
+      ...config,
+    },
+    { secret: SECRET },
+  );
+  services.push(started);
+  return { ...started, dataDir };
+}
+
+async function call(service: Service, key: string | undefined, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
+  const res = await fetch(service.url + path, {
+    method,
+    headers: { ...(key && { authorization: `Bearer ${key}` }), ...(body !== undefined && { "content-type": "application/json" }) },
+    body: body === undefined ? undefined : typeof body === "string" ? body : JSON.stringify(body),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
+async function until<T>(check: () => Promise<T | undefined | false> | T | undefined | false, what: string): Promise<T> {
+  for (const deadline = Date.now() + 15_000; Date.now() < deadline; await new Promise((done) => setTimeout(done, 20))) {
+    const result = await check();
+    if (result) return result;
+  }
+  throw new Error(`Timed out waiting for ${what}`);
+}
+
+const statusOf = async (service: Service, id: string, status: string) =>
+  until(async () => {
+    const { body } = await call(service, KEYS.acme, "GET", `/v1/tasks/${id}`);
+    return body.status === status && body;
+  }, `task ${id} to be ${status}`);
+
+interface Frame {
+  id?: string;
+  event?: string;
+  data: string;
+}
+
+/** A task's server-sent events, frame by frame, as they arrive. */
+async function* sse(service: Service, path: string, headers: Record<string, string> = {}): AsyncGenerator<Frame> {
+  const res = await fetch(service.url + path, { headers: { authorization: `Bearer ${KEYS.acme}`, ...headers } });
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true });
+    for (let end; (end = buffer.indexOf("\n\n")) >= 0; buffer = buffer.slice(end + 2)) {
+      const frame: Frame = { data: "" };
+      for (const line of buffer.slice(0, end).split("\n")) {
+        const [, field, value] = /^([^:]*): ?(.*)$/.exec(line) ?? [];
+        if (field === "id" || field === "event" || field === "data") frame[field] = value;
+      }
+      if (frame.data) yield frame;
+    }
+  }
+}
+
+async function collect(frames: AsyncGenerator<Frame>): Promise<Frame[]> {
+  const all: Frame[] = [];
+  for await (const frame of frames) all.push(frame);
+  return all;
+}
+
+const work = (service: { dataDir: string }, id: string) => join(service.dataDir, "tasks", id, "work");
+const record = async (service: { dataDir: string }, id: string) =>
+  until(async () => JSON.parse(await readFile(join(work(service, id), ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
+const alive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+describe("the task service's API", () => {
+  it("needs a tenant's key, and shows a tenant only its own tasks", async () => {
+    const api = await service();
+    assert.equal((await call(api, undefined, "GET", "/v1/tasks")).status, 401);
+    assert.equal((await call(api, "not-a-key", "GET", "/v1/tasks")).status, 401);
+    const created = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" });
+    assert.equal(created.status, 201);
+    const id = created.body.id;
+    for (const [method, path] of [["GET", `/v1/tasks/${id}`], ["POST", `/v1/tasks/${id}/cancel`], ["GET", `/v1/tasks/${id}/events`]]) {
+      const { status, body } = await call(api, KEYS.globex, method, path);
+      assert.equal(status, 404, `${method} ${path}`);
+      assert.deepEqual(body, { error: "No such task" });
+    }
+    assert.deepEqual((await call(api, KEYS.globex, "GET", "/v1/tasks")).body, { tasks: [] });
+    assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks.map((task: Task) => task.id), [id]);
+    await statusOf(api, id, "running");
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued")).body.tasks.length, 0);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=running")).body.tasks.length, 1);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=lost")).status, 400);
+  });
+
+  it("runs a task from queued to succeeded, storing its events in order and streaming them as they come", async () => {
+    const api = await service();
+    const created = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait, then finish", workspace: { files: { "README.md": "hello\n", "src/app.py": "print(1)\n" } }, model: "claude-haiku-4-5" });
+    assert.deepEqual(created.body, { id: created.body.id, status: "queued" });
+    const id = created.body.id;
+
+    // The first events arrive while the run is still going (the fake jig waits for go).
+    const frames = sse(api, `/v1/tasks/${id}/events`);
+    const live: Frame[] = [];
+    for await (const frame of frames) {
+      live.push(frame);
+      if (JSON.parse(frame.data).type === "step") break;
+    }
+    assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${id}`)).body.status, "running");
+    assert.equal(await readFile(join(work(api, id), "src", "app.py"), "utf8"), "print(1)\n");
+    await writeFile(join(work(api, id), "go"), "");
+    const rest = await collect(sse(api, `/v1/tasks/${id}/events`, { "last-event-id": live.at(-1)!.id! }));
+    const all = [...live, ...rest];
+    assert.deepEqual(all.at(-1), { event: "done", data: JSON.stringify({ status: "succeeded" }) });
+    const events = all.slice(0, -1).map((frame) => ({ frameId: frame.id, ...JSON.parse(frame.data) }));
+    assert.deepEqual(events.map((event) => event.type), ["start", "tool_call", "tool_result", "step", "text", "step", "end"]);
+    assert.deepEqual(events.map((event) => event.seq), [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(events.map((event) => event.frameId), ["1", "2", "3", "4", "5", "6", "7"]);
+    assert.equal(events[0].task, "wait, then finish");
+
+    // Stored as jig wrote them, in order.
+    const written = (await readFile(join(api.dataDir, "tasks", id, "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), written);
+    const task = (await call(api, KEYS.acme, "GET", `/v1/tasks/${id}`)).body;
+    assert.equal(task.status, "succeeded");
+    assert.equal(task.exitCode, 0);
+    assert.equal(task.stop, "end_turn");
+    assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
+    assert.equal(task.cost, 0.002);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 2 });
+    assert.ok(task.started && task.ended && task.created <= task.started && task.started <= task.ended);
+
+    // A finished task's stream replays only what came after, then ends.
+    const resumed = await collect(sse(api, `/v1/tasks/${id}/events`, { "last-event-id": "4" }));
+    assert.deepEqual(resumed.map((frame) => frame.id ?? frame.event), ["5", "6", "7", "done"]);
+    assert.deepEqual((await collect(sse(api, `/v1/tasks/${id}/events?after=6`))).map((frame) => frame.id ?? frame.event), ["7", "done"]);
+  });
+
+  it("cancels a running task, killing everything it started, and a queued one at once", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 1 }] });
+    const running = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    const queued = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "hang too" })).body.id;
+    const { pid, child } = await record(api, running);
+    assert.ok(alive(pid) && alive(child));
+    assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${queued}`)).body.status, "queued");
+
+    assert.deepEqual(await call(api, KEYS.acme, "POST", `/v1/tasks/${queued}/cancel`), { status: 200, body: { id: queued, status: "cancelled" } });
+    assert.deepEqual(await call(api, KEYS.acme, "POST", `/v1/tasks/${running}/cancel`), { status: 202, body: { id: running, status: "running" } });
+    const task = await statusOf(api, running, "cancelled");
+    assert.equal(task.error, null);
+    await until(() => !alive(pid) && !alive(child), "the fake jig and its child to be gone");
+    assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${running}/cancel`)).status, 409);
+    // The cancelled queued task never ran.
+    assert.equal(existsSync(work(api, queued)), false);
+  });
+
+  it("stops a run that goes past its time limit and the grace", async () => {
+    const api = await service({ graceSeconds: 0 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "hang", timeLimit: 1 })).body.id;
+    const { pid, child } = await record(api, id);
+    const task = await statusOf(api, id, "stopped");
+    assert.equal(task.stop, "time_limit");
+    await until(() => !alive(pid) && !alive(child), "the fake jig and its child to be gone");
+  });
+
+  it("maps jig's exit codes to statuses", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 6 }], concurrency: 6 });
+    const expected = { 0: ["succeeded", "end_turn"], 1: ["error", "error"], 2: ["stopped", "max_steps"], 4: ["failed", "refusal"], 5: ["failed", "unapproved"], 7: ["stopped", "time_limit"] };
+    const ids = new Map<string, string>();
+    for (const code of Object.keys(expected)) ids.set(code, (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: `exit ${code}` })).body.id);
+    for (const [code, [status, stop]] of Object.entries(expected)) {
+      const task = await until(async () => {
+        const { body } = await call(api, KEYS.acme, "GET", `/v1/tasks/${ids.get(code)}`);
+        return body.ended && body;
+      }, `exit ${code}`);
+      assert.deepEqual([task.exitCode, task.status, task.stop], [Number(code), status, stop]);
+      assert.equal(task.error, status === "error" ? "jig exited with 1: fake jig: stopped with 1" : null);
+    }
+
+    // Every code, and the runner's own reasons.
+    const table = [0, 1, 2, 3, 4, 5, 6, 7, 8, 130, 143, null].map((exitCode) => [exitCode, statusFor({ exitCode })]);
+    assert.deepEqual(table, [[0, "succeeded"], [1, "error"], [2, "stopped"], [3, "stopped"], [4, "failed"], [5, "failed"], [6, "stopped"], [7, "stopped"], [8, "stopped"], [130, "stopped"], [143, "error"], [null, "error"]]);
+    assert.equal(statusFor({ exitCode: null, timedOut: true }), "stopped");
+    assert.equal(statusFor({ exitCode: 0, cancelled: true }), "cancelled");
+  });
+
+  it("refuses requests it can't run, workspace paths that lead out of it among them", async () => {
+    const api = await service({ maxBodyBytes: 10_000 });
+    const refused = async (body: unknown) => {
+      const { status, body: answer } = await call(api, KEYS.acme, "POST", "/v1/tasks", body);
+      assert.equal(status, 400, JSON.stringify(body));
+      return answer.error as string;
+    };
+    for (const path of ["../escape", "a/../../escape", "/etc/passwd", "C:/x", "..", "dir/", ""]) {
+      assert.match(await refused({ prompt: "hi", workspace: { files: { [path]: "x" } } }), /^workspace\.files: /);
+    }
+    assert.match(await refused({ prompt: "" }), /prompt/);
+    assert.match(await refused({ prompt: "hi", maxSteps: 51 }), /maxSteps must be a whole number from 1 to 50/);
+    assert.match(await refused({ prompt: "hi", model: "gpt-5" }), /Claude or DeepSeek/);
+    assert.match(await refused({ prompt: "hi", promt: "typo" }), /Unknown field: promt/);
+    assert.match(await refused({ prompt: "hi", workspace: { git: "--upload-pack=touch /tmp/x" } }), /workspace\.git/);
+    assert.match(await refused("{"), /isn't JSON/);
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(20_000) })).status, 413);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body, { tasks: [] });
+
+    // The runner refuses them too, for a task that didn't come through the API.
+    const base = await tempDir("jig-service-");
+    const runner = new LocalRunner({ dataDir: base, jig: [process.execPath, FAKE_JIG], gatewayBaseUrl: "http://127.0.0.1:9", gatewaySecret: SECRET, graceSeconds: 0 });
+    const task = { id: "task_1", spec: { prompt: "hi", maxSteps: 1, timeLimit: 1, model: "claude-haiku-4-5", workspace: { files: { "../../escape": "x" } } } } as unknown as Task;
+    await assert.rejects(runner.start(task, { id: "acme", limits: { concurrency: 1, maxSteps: 1, timeLimit: 1, budgetUsd: null } }), /leads out of the workspace/);
+    assert.equal(existsSync(join(base, "escape")), false);
+  });
+
+  it("gives the run a token the gateway's rule accepts, and none of the service's own secrets", async () => {
+    const saved = process.env.ANTHROPIC_AUTH_TOKEN;
+    process.env.ANTHROPIC_AUTH_TOKEN = "a provider's real token";
+    try {
+      const api = await service();
+      const before = Math.floor(Date.now() / 1000);
+      const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "the task, on stdin", model: "claude-haiku-4-5", timeLimit: 600 })).body.id;
+      await statusOf(api, id, "succeeded");
+      const { args, env, task } = await record(api, id);
+      assert.equal(task, "the task, on stdin");
+      assert.ok(!args.includes("the task, on stdin"), "the task stays out of the process list");
+      assert.deepEqual(args.slice(0, 4), ["--yes", "--model", "claude-haiku-4-5", "--base-url"]);
+      assert.equal(args[4], "http://127.0.0.1:9/anthropic");
+      assert.equal(args.at(-1), "-");
+
+      // The token contract's check, written out here as the gateway does it.
+      const token: string = env.ANTHROPIC_API_KEY;
+      const [, body, mac] = /^(jgt1\.[\w-]+)\.([\w-]+)$/.exec(token) ?? [];
+      const expected = createHmac("sha256", SECRET).update(body).digest();
+      assert.ok(timingSafeEqual(Buffer.from(mac, "base64url"), expected));
+      const payload = JSON.parse(Buffer.from(body.slice("jgt1.".length), "base64url").toString());
+      assert.deepEqual(Object.keys(payload).sort(), ["budgetUsd", "exp", "task", "tenant"]);
+      assert.equal(payload.tenant, "acme");
+      assert.equal(payload.task, id);
+      assert.equal(payload.budgetUsd, 2.5);
+      assert.ok(payload.exp >= before + 600 + 5 && payload.exp <= before + 600 + 5 + 120, `exp ${payload.exp - before}s from now`);
+      assert.ok(!timingSafeEqual(createHmac("sha256", "another secret").update(body).digest(), expected));
+
+      for (const name of ["ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "JIG_GATEWAY_SECRET"]) assert.equal(env[name], undefined, name);
+      assert.ok(!Object.values(env).includes(SECRET));
+      assert.equal(env.JIG_HOME, join(api.dataDir, "tasks", id, "home", ".jig"));
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
+      else process.env.ANTHROPIC_AUTH_TOKEN = saved;
+    }
+  });
+
+  it("ends the tasks a crashed service left running when it starts again, and runs those still queued", async () => {
+    const base = await tempDir("jig-service-");
+    // The crash: a run claimed and never finished, and a task still queued.
+    const store = openStore(join(base, "jig.db"));
+    await store.putTenant({ id: "acme", limits: { concurrency: 2, maxSteps: 50, timeLimit: 60, budgetUsd: null } }, [sha256(KEYS.acme)]);
+    const left = await store.createTask("acme", { prompt: "hang", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
+    const queued = await store.createTask("acme", { prompt: "exit 0", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
+    assert.ok(await store.claim(left.id));
+    await store.close();
+
+    const api = await service({}, base);
+    const task = (await call(api, KEYS.acme, "GET", `/v1/tasks/${left.id}`)).body;
+    assert.equal(task.status, "error");
+    assert.match(task.error, /the task service stopped while it ran/);
+    assert.ok(task.ended);
+    await statusOf(api, queued.id, "succeeded");
+  });
+});
+
+/** A runner whose runs end when the test says, recording how many run at once. */
+class FakeRunner implements Runner {
+  active = new Map<string, { tenant: string; end: () => void }>();
+  started: string[] = [];
+  most = { all: 0, byTenant: {} as Record<string, number> };
+
+  async start(task: Task, tenant: Tenant): Promise<RunHandle> {
+    let end!: () => void;
+    const ended = new Promise<void>((done) => (end = done));
+    this.active.set(task.id, { tenant: tenant.id, end });
+    this.started.push(tenant.id);
+    this.most.all = Math.max(this.most.all, this.active.size);
+    const mine = [...this.active.values()].filter((run) => run.tenant === tenant.id).length;
+    this.most.byTenant[tenant.id] = Math.max(this.most.byTenant[tenant.id] ?? 0, mine);
+    return {
+      events: (async function* () {})(),
+      wait: async () => {
+        await ended;
+        this.active.delete(task.id);
+        return { exitCode: 0, timedOut: false };
+      },
+      cancel: end,
+    };
+  }
+}
+
+describe("the scheduler", () => {
+  it("holds the global and each tenant's limit under 50 tasks from 3 tenants, and takes the tenants in turn", async () => {
+    const store = openStore(":memory:");
+    const caps: Record<string, number> = { a: 3, b: 2, c: 1 };
+    for (const [id, concurrency] of Object.entries(caps)) await store.putTenant({ id, limits: { concurrency, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const runner = new FakeRunner();
+    const scheduler = new Scheduler(store, runner, 4);
+    // a queues 30 before b's 15 and c's 5.
+    for (const [tenant, count] of [["a", 30], ["b", 15], ["c", 5]] as const) {
+      for (let i = 0; i < count; i++) await store.createTask(tenant, { prompt: `${tenant}${i}`, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    }
+    await scheduler.poke();
+    await scheduler.settled();
+    assert.deepEqual(runner.started, ["a", "b", "c", "a"]);
+    while (runner.active.size) {
+      // Each tenant's limit holds at every moment.
+      const byTenant: Record<string, number> = {};
+      for (const run of runner.active.values()) byTenant[run.tenant] = (byTenant[run.tenant] ?? 0) + 1;
+      for (const [tenant, count] of Object.entries(byTenant)) assert.ok(count <= caps[tenant], `${tenant}: ${count}`);
+      assert.ok(runner.active.size <= 4);
+      runner.active.values().next().value!.end();
+      await scheduler.settled();
+    }
+    assert.equal(runner.started.length, 50);
+    assert.deepEqual(runner.most, { all: 4, byTenant: { a: 3, b: 2, c: 1 } });
+    assert.equal((await store.inStatus("succeeded")).length, 50);
+    // c's five didn't wait for a's thirty.
+    assert.ok(runner.started.lastIndexOf("c") < runner.started.lastIndexOf("a"));
+    await store.close();
+  });
+});
