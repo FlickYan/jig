@@ -8,7 +8,7 @@ import { basename, dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { jigHome } from "./paths.ts";
 import type { Tool } from "./tools/index.ts";
-import { isInside } from "./tools/util.ts";
+import { assertVisible, type Hiding, hiddenTest, isInside, readRegularFile, realTargetSync } from "./tools/util.ts";
 
 /** An Agent Skill (agentskills.io): a directory with a SKILL.md of instructions, and maybe scripts and references. */
 export interface Skill {
@@ -42,15 +42,25 @@ export interface DiscoverOptions {
   builtin?: string | null;
   /** Skills to leave out by name (--hide-skill), as if they weren't installed. */
   hidden?: string[];
+  /** The paths the settings hide (hiddenPaths): a skill whose SKILL.md leads into one is left out. */
+  hiddenPaths?: string[];
+  /** The --add-dir directories, where the file tools work besides the project (see hiddenTest). */
+  dirs?: string[];
 }
 
 /**
  * The skills available in a project: under the project's skill directories, then the user's, then jig's
  * own. A project skill wins over a user skill of the same name, and either over one of jig's. Like the
  * integration guide suggests, problems are warnings, not errors; only a skill without a description is
- * skipped, since the model couldn't know when to use it.
+ * skipped, since the model couldn't know when to use it. So is one whose SKILL.md isn't a regular file:
+ * a project's skills are within a command's reach, and a named pipe there would hang jig (see readRegularFile).
+ * And so is one whose SKILL.md leads where the file tools don't read (see hiddenSkillFile).
  */
-export function discoverSkills(root: string, home = homedir(), { builtin = BUILTIN_SKILLS, hidden = [] }: DiscoverOptions = {}): { skills: Skill[]; warnings: string[] } {
+export function discoverSkills(
+  root: string,
+  home = homedir(),
+  { builtin = BUILTIN_SKILLS, hidden = [], hiddenPaths = [], dirs = [] }: DiscoverOptions = {},
+): { skills: Skill[]; warnings: string[] } {
   const skills = new Map<string, Skill>();
   const warnings: string[] = [];
   const user = [...new Set([userSkillsDir(), ...SKILL_DIRS.map((sub) => join(home, sub))])];
@@ -59,11 +69,23 @@ export function discoverSkills(root: string, home = homedir(), { builtin = BUILT
     ...user.map((dir): [string, SkillScope] => [dir, "user"]),
     ...(builtin ? [[builtin, "builtin"] as [string, SkillScope]] : []),
   ];
+  const hides = hiddenTest(hiddenPaths, [root, ...dirs]);
   for (const [dir, scope] of places.filter(([d]) => existsSync(d) && statSync(d).isDirectory())) {
     for (const entry of readdirSync(dir).sort()) {
       const skillDir = join(dir, entry);
-      if (!existsSync(join(skillDir, "SKILL.md"))) continue;
-      const { name = entry, description } = frontmatter(readFileSync(join(skillDir, "SKILL.md"), "utf8"));
+      const file = join(skillDir, "SKILL.md");
+      const where = existsSync(file) ? hiddenSkillFile(file, hides) : undefined;
+      if (where) {
+        warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md leads into ${where}.`);
+        continue;
+      }
+      const text = readRegularFile(file);
+      if (text === undefined) {
+        // A folder without one isn't a skill; one that is a named pipe, say, is left out unread.
+        if (existsSync(file)) warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md isn't a regular file.`);
+        continue;
+      }
+      const { name = entry, description } = frontmatter(text);
       if (hidden.includes(name)) continue;
       if (!description) {
         warnings.push(`Skipped the skill in ${skillDir}: its SKILL.md has no description.`);
@@ -76,6 +98,18 @@ export function discoverSkills(root: string, home = homedir(), { builtin = BUILT
     }
   }
   return { skills: [...skills.values()], warnings };
+}
+
+/**
+ * Where a SKILL.md leads, in words, if the file tools wouldn't read it there (see hiddenTest): a command can
+ * link a project's to a hidden file, or into jig's own directory, where another project's memory has a name
+ * and a description too, which the catalog would show to the next session.
+ */
+function hiddenSkillFile(file: string, hides: (real: string) => Hiding | undefined): string | undefined {
+  const real = realTargetSync(file);
+  const hiding = real && hides(real);
+  if (!hiding) return undefined;
+  return hiding === "settings" ? "a path the settings hide" : "jig's own directory";
 }
 
 /**
@@ -164,13 +198,21 @@ export function skillTool(skills: Skill[]): Tool {
     async run(input, ctx) {
       const { name, file } = input as { name: string; file?: string };
       const skill = skills.find((s) => s.name === name)!;
+      // A file in it, SKILL.md too, can be a link, which a command can make in a project's skill after
+      // discovery read it: it is read only where the file tools would read it, not in a hidden path or
+      // jig's own directory.
+      const assertShown = (path: string, shown: string) => assertVisible(path, shown, ctx.hidden, [ctx.cwd, ...(ctx.dirs ?? [])]);
       if (file) {
         const path = join(skill.dir, file);
-        if (!isInside(skill.dir, path) || !existsSync(path) || statSync(path).isDirectory()) {
-          throw new Error(`The skill "${name}" has no file ${file}.`);
-        }
-        return readFileSync(path, "utf8").slice(0, MAX_FILE_CHARS);
+        const missing = `The skill "${name}" has no file ${file}.`;
+        if (!isInside(skill.dir, path)) throw new Error(missing);
+        await assertShown(path, file);
+        // Enough bytes for the characters kept: UTF-8 takes 4 bytes a character at most.
+        const text = readRegularFile(path, 4 * MAX_FILE_CHARS);
+        if (text === undefined) throw new Error(missing);
+        return text.slice(0, MAX_FILE_CHARS);
       }
+      await assertShown(join(skill.dir, "SKILL.md"), "SKILL.md");
       const content = loadSkill(skill);
       ctx.pin?.(`skill:${name}`, content); // keep the instructions through compaction
       recordSkillUse(name);
@@ -179,9 +221,19 @@ export function skillTool(skills: Skill[]): Tool {
   };
 }
 
-/** A skill's instructions as the model sees them: the SKILL.md body, where it lives, and what else is there. */
-export function loadSkill(skill: Skill): string {
-  const body = readFileSync(join(skill.dir, "SKILL.md"), "utf8").replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
+/**
+ * A skill's instructions as the model sees them: the SKILL.md body, where it lives, and what else is there.
+ * Given the hidden paths and the roots, as /<skill> gives them (the skill tool checks first, in the file
+ * tools' words), a SKILL.md that leads where discovery wouldn't read it is refused: a command can link it
+ * after discovery.
+ */
+export function loadSkill(skill: Skill, hidden: string[] = [], roots?: string[]): string {
+  const file = join(skill.dir, "SKILL.md");
+  const where = hiddenSkillFile(file, hiddenTest(hidden, roots));
+  if (where) throw new Error(`The skill "${skill.name}" isn't loaded: its SKILL.md leads into ${where}.`);
+  const text = readRegularFile(file);
+  if (text === undefined) throw new Error(`The skill "${skill.name}" no longer has a SKILL.md, or it isn't a regular file (a named pipe, say).`);
+  const body = text.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, "").trim();
   const files = listSkillFiles(skill.dir).filter((file) => file !== "SKILL.md");
   const resources = files.length
     ? `\n<skill_resources>\n${files.slice(0, MAX_RESOURCES).join("\n")}${files.length > MAX_RESOURCES ? "\n…" : ""}\n</skill_resources>`

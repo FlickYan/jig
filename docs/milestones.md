@@ -35,6 +35,9 @@ the [README](../README.md) has a one-line summary of each.
 - [x] **27. A 7B model trained on jig's successes:** a LoRA of Qwen2.5-7B-Instruct on 294 passed sessions (`bench/train/modal_train.py`, an H100 on Modal, the loss on the model's own tokens only), served with vLLM next to the base model (`modal_serve.py`), and jig driving each on all 23 held-out tasks of the in-house suites, 3 attempts and 40 steps each: the held-out loss fell by 30% and the agent got worse, 2 of 69 against 6 of 69 (−6, −14 to 0); it stopped giving up (2 of 67 failures, against 59 of 63) but looped (25 attempts made the same call 5+ times in a row, against 2), and runaway output that jig echoes back in full as an invalid call ran 18 of its conversations past the server's 32k; $10.68 at Modal
 - [x] **28. The loop and the tools again:** a new baseline (33 of 63) for the analysis, and three loop-only candidates against milestone 21's comparison runs, all rejected (+2, +5 and +5 points, ahead in 57 to 65% of resamples, at 19 to 34% more cost): the sessions show two of the changes never ran (a test re-run in 0 of 30 attempts, a multi-file `edit_file` used in 0), so their +5 is what a change that does nothing scores; and a request's narrowed tools are no limit, since the model called undeclared tools in 22 of 30 attempts and jig ran them; after the round, two fixes: an invalid call goes back as the parse error, its first 2,000 characters and the 400 before the error (milestone 27's echoes held up to 155k), and the loop runs only the tools the request declared
 - [x] **29. A reviewer that runs the work:** `jig review`: once the agent is done, a model checks the work by running it in a copy of the machine (on Terminal-Bench, a sibling container from `docker commit`, with no network), each problem's command runs again in a fresh copy before it goes back, and `eval/review_before.py` runs the hidden tests on the work as the review saw it; two smoke tests found three bugs and the first failure a review turned into a pass (mteb-retrieve); on the 20 tasks, 10 of 20, no result changed (one trial got problems back and failed before and after), no false alarm in 9 passes, and the causes of two failures found and lost, one to an empty `<shows>` the re-check dropped, one to a verdict written as a tool call; replays showed a cut-off review's verdict to be a coin toss, and the verdict at the time-out is now asked at low effort, in the asked form, by the time limit, and once more when it doesn't come
+- [x] **30. Four ideas from other agents, measured:** budget notes, a finish gate, checks after writes and tolerant edits, each behind a flag and reviewed; on evolve2 at 4 steps, side by side with two baselines (66 and 66 of 105), budget notes passed 92 of 105 (+25 points, +11 to +40), twice, at the same cost, did no harm at 40 steps or on the main benchmark (60 of 60), and are on by default; the gate and the checks never fired, and tolerant edits would fix none of flash's stored failed edits, so they stay opt-in; and on Terminal-Bench they were no worse (30 of 38 against 29 as first scored; 28 of 34 against 29 once milestone 31 left out the tasks whose verifier couldn't run; none stopped at the time limit against 3)
+- [x] **31. What the failures left asked for, measured:** the 26 evolve2 failures left with budget notes, read one by one, became four changes, each reviewed: an overview of the project before a task, budget notes from 3 steps left that say what a step is, notes on test runs that ran nothing, and letting `write_file` overwrite a file a result showed whole; alone none beat the noise, and the first three, with the fourth or without it, passed 97, 98 and 95 of 105 against baselines of 91, 89 and 88 (+7 points, +0.6 to +13.3), and 101 of 105 once on by default; no harm at 40 steps (41 of 42 against 42, in 30% fewer steps) or on the main benchmark, and no worse on Terminal-Bench (31 of 36 against 29, at 7% less cost), so they are on by default; the fourth gained nothing and was left out; and milestone 30's Terminal-Bench result, without the trials whose verifier couldn't run, was −3 points, not +3
+- [x] **32. Terminal-Bench's failures, read, and a scorer that knows the ones nobody could pass:** milestone 30's 17 failures read one by one: 6 weren't the agent's, and the rest were interfaces the task left open, checks that could only agree, outputs left where the tests look, and an input a command destroyed; `eval/report.py` and tbcheck now leave out trials whose tests couldn't run, and fail closed on any other; `--keep-inputs` (opt-in) gives back a file a command deleted, with or without git, and did no harm on evolve2 (94 of 105 against 95, no false notes)
 
 ## Milestone 9: checking before finishing
 
@@ -1357,3 +1360,334 @@ printed in a fresh copy, or to drop the re-check.
 **Cost.** By jig's token counts, at list prices: the round $1.35 ($1.06 for jig, $0.30 for the 15
 reviews), the smoke tests $0.32, the replays about $0.27. The balance fell 17.7 CNY over the evening, the
 other projects' use included.
+
+## Milestone 30: four ideas from other agents, measured
+
+Reading other open-source agents for how they handle jig's problems (Codex CLI, opencode, Crush,
+gemini-cli, Goose, OpenHands, qwen-code, mini-swe-agent, aider, SWE-agent) turned up four changes to the
+loop and the tools that a test can't judge, only a benchmark. Each was built behind a flag, off by
+default, reviewed adversarially (end-to-end runs against `test/fake-api.ts`, and its tests run without
+it to see them fail) and fixed; then the four were measured side by side, on one build.
+
+- **Budget notes** (`--budget-notes`). The model was never told its step limit or its time, and on
+  evolve2's 4 steps the analyses kept finding runs that read until the calls ran out (milestones 16, 21
+  and 28). mini-swe-agent puts the steps and minutes left in its observations, Goose and Codex remind the
+  model of its turns and its time, and the BATS paper (arXiv:2511.17006) argues that agents lack budget
+  awareness. Once half the steps, or half of `--time-limit`, are used, a note after each step's tool
+  results says how much is used, and before the last step that the next reply is the last whose tool
+  calls run. It goes in the results' own message, so no earlier message changes and the cached prefix
+  stays the same.
+- **A finish gate** (`--finish-gate`). jig's known weak spot is the confident wrong "done" (milestone 24:
+  46 of 60 Terminal-Bench failures ended with jig saying it was done), and the checks so far ask every
+  time (`--check`, milestone 9) or ask a model (`--reviewer`, milestone 24). SWE-agent's review on submit
+  fires only when its trace shows a change after the reproduction script. The gate reads only what the
+  task's own calls did: the first time the model stops with a step left, it is sent back once if files
+  changed after the last command that ran something, or if the last test run failed.
+- **Checks after writes** (`--check-writes`). SWE-agent lints after every edit and shows only the errors
+  the edit added, aider lints after every edit too, and gemini-cli looks for "// ... existing code ..."
+  in a rewrite. After `write_file` and `edit_file`, python3's `ast.parse`, `node --check`, `bash -n` or
+  `JSON.parse` checks the file, and an error the change made, or a placeholder left by a rewrite that
+  made the file much shorter, is added to the result.
+- **Tolerant edits** (`--tolerant-edits`). opencode, qwen-code and Codex match an edit's text loosely when
+  it doesn't match exactly. `edit_file` then applies a unique match that differs only in curly quotes,
+  dashes and no-break spaces, or after that in trailing whitespace; indentation always counts.
+
+**Would they fire?** Tolerant edits were judged from the stored results first. Of the 544 failed
+`edit_file` calls in 2,950, 527 were milestone 27's 7B models'; deepseek-flash's failed 17 of 2,306, 2 of
+the 1,709 from milestone 4 on, and none of the 175 calls in the sessions kept on this machine failed for
+whitespace, punctuation or a line-number prefix. Run with flash, the flag would measure nothing, so it
+wasn't run; it stays, off, for models whose edits miss.
+
+**The round.** evolve2 at its 4 steps, 21 tasks × 5 attempts each, on the build with all four (`e131617`),
+five runs at once on a Saturday (no peak hours); each flag against the two baselines pooled, with the
+referee's paired bootstrap:
+
+| run | passed | fired | cost an attempt |
+|-----|--------|-------|-----------------|
+| baseline | 66 of 105 (63%) | | $0.0141 |
+| baseline, again | 66 of 105 (63%) | | $0.0135 |
+| `--budget-notes` | **92 of 105 (88%)**: +24.8 points (+10.5 to +39.5), ahead in 100% of resamples; on the training tasks +27.0, on the held-out ones +22.7 | 107 notes at half the steps, 105 before the last | $0.0138 |
+| `--finish-gate` | 68 of 105: +1.9 (−11.0 to +14.3) | never | $0.0133 |
+| `--check-writes` | 66 of 105: 0.0 (−15.7 to +15.2) | never, in 140 writes and edits | $0.0136 |
+
+- **The notes make the last step count.** With them, every attempt changed the code (without: 97 and 98
+  of 105), 86 ran the tests after their change (32 and 32), and none spent its last step only reading (10
+  and 10). The first change came no sooner: at step 3 or 4, about half each, with them or without.
+  Milestone 23 found that two more steps, 6 instead of 4, put flash 24 points ahead; the notes get as
+  much within the 4.
+- **The gate never fired.** At 4 steps flash never stops with a step left: every attempt used all four.
+  The case it is for, a long run that stops early sure it is done, is Terminal-Bench's.
+- **No write left a syntax error or a placeholder.** In 92 `write_file` and 48 `edit_file` calls the
+  checks found nothing: flash's failures here are wrong behaviour, not broken syntax. Many of its
+  changes, too, go through bash (heredocs, `python3 - <<`), which the checks don't see.
+
+**Checked as milestone 16 asks.** A result picked for being the best of three is likely to have been
+lucky, so the notes, now on by default (`3547aac`), were measured again, in the ways milestone 16 named:
+
+| | with the notes | without |
+|---|---|---|
+| this suite, 4 steps, run again | 92 of 105 (88%), $0.0146: +24.8 points (+11.0 to +39.5) against the round's baselines, ahead in 100% of resamples | 66 and 66 of 105 |
+| this suite, 40 steps, 2 attempts a task, side by side | 41 of 42, 14.2 steps, $0.0286; 53 notes, in the attempts that went past 20 steps | 41 of 42, 13.6 steps, $0.0307 |
+| the main benchmark, 40 steps | 60 of 60, 7.2 steps, $0.0046 | 60 of 60, 7.1 steps, $0.0041 (the day before) |
+
+Run again, the gain held exactly, 92 of 105, with 89 attempts testing after their change and every one
+changing the code. With 40 steps the notes did no harm, on the suite or on the main benchmark, where few
+attempts get to 20 steps and they rarely fire.
+
+**Checked on Terminal-Bench**, as [design.md](design.md) asks before a change that won on evolve2 is merged
+(milestone 16's lost 15 points there), and where the notes may matter most: its limit is the task's time,
+and the notes say how much of it is left. The same build (`3547aac`) with the notes and with
+`--no-budget-notes`, 2 rounds each on the 20 tasks; a task's four trials ran at once, so both sides met
+the same hour of DeepSeek's service and the same load. The machine was a Linux container whose Docker has
+no route out, so three things were set up there and not committed: a forward proxy on the host for the
+task containers, with the egress proxy's CA mounted into them; the key proxy listening on the Docker
+bridge, not 127.0.0.1 (Linux's `host.docker.internal` reaches the bridge, not the host's loopback, unlike
+OrbStack's and Docker Desktop's); and the images pulled one task at a time and removed after, as all
+twenty don't fit its disk. mteb-retrieve, whose image has an 8.6 GB layer, didn't fit at all and was left
+out on both sides; one trial whose `apt-get` failed in setup, before jig started, was run again.
+
+| | passed | stopped at the time limit | cost a trial |
+|---|---|---|---|
+| with the notes | 30 of 38 (79%) | 0 | $0.061 |
+| `--no-budget-notes` | 29 of 38 (76%) | 3 (two of them passed) | $0.066 |
+
++3 points (−13 to +18), behind in 32% of resamples, where tbcheck rejects at 80%: no worse on
+Terminal-Bench, at 8% less cost. The notes stay on. Without them, three trials ran into `--time-limit`;
+with them none did, which is what the time in the notes is for, though three is too few to call. One
+trial with the notes (db-wal-recovery) fetched the benchmark's own solution from GitHub, and counts as
+failed, as every look-up does (milestone 10). Results: `eval/results/tb-m30-notes-on.json` and `-off.json`.
+(Scored again in milestone 31, without filter-js-from-html, whose hidden tests couldn't run on that machine,
+and pytorch-model-recovery, whose verifier ran out of disk on both trials without the notes: 28 of 34
+against 29 of 34, −3 points, still no worse.)
+
+**Found by the reviews.** `--check-writes`' first version ran python3, node and bash on every write without
+the permission policy. With `--no-sandbox` in edits mode, a `.pth` file the model wrote into the
+project's virtualenv ran on the host, unasked; in the sandbox with `--allow-network`, it reached the
+network. A check now runs its program only where the model could run it on that file unasked, and not
+where a deny rule matches the command that would run, a PreToolUse hook covers bash or `--tools` leaves
+bash out; python3 runs without its site module; and a check left out is counted (`write.checkSkipped`)
+and told to the user once. The reviews also found the gate's command classifier treating `$(...)` in
+double quotes as quoted text (so `echo "$(python3 solve.py)"` ran nothing), the gate firing in
+`--time-limit`'s last quarter, where `--check` doesn't, a Python check that broke on Pythons before 3.10,
+and Node 22 passing a `.js` module's syntax errors; all fixed, each with a test.
+
+**What changed.** Budget notes are on (`--no-budget-notes` leaves them out). The gate, the checks after
+writes and tolerant edits stay opt-in, for runs where they can fire.
+
+**Cost.** By jig's token counts, at list prices: the round $7.18, the rerun $1.54, the 40 steps $2.49 and
+the main benchmark $0.27; Terminal-Bench $4.81. The DeepSeek balance fell 38.55 CNY over the
+evolve2 runs and 16.5 CNY over Terminal-Bench's.
+
+## Milestone 31: what the failures left asked for, measured
+
+With budget notes on, evolve2 passed 92 of 105 twice (milestone 30). Its 26 failures were read one by one,
+with what all 210 attempts did, step by step, and they fell into a few kinds:
+
+- **16: the first write came too late.** Steps 1 and 2 went to finding and reading the project. The model
+  read the files the task named at step 1, but learnt the test file's path from a listing and read it a
+  step later, so no first write came before step 3 (49 and 51 attempts at step 3, 55 and 54 at step 4), and
+  only 3 and 6 attempts saw a test result with a step left to act on it; every one of those passed.
+- **5: the check checked nothing.** `python -m unittest -v`, run from the project, found no tests, as its
+  `tests/` has no `__init__.py`; from Python 3.12 that exits with 5, so the `&&` after it skipped the
+  model's own checks too, and the result said only `NO TESTS RAN`. 29 of the 210 attempts ran it so, 27 on
+  their last step, and in 22 the checks after its `&&` didn't run.
+- **1, and a hand in several others: what a step is.** The model heard its budget only after step 2, and
+  its thinking often guessed that each tool call was a step, or that a reply's calls might run out of
+  order, so some attempts split a change and its test over two steps.
+- **1: a fix refused.** `write_file` refused, on the last step, a file the model had seen whole in
+  `cat reminders/*.py`, since bash credits only the files a command names
+  literally, not by a pattern.
+- **3: the model's own reading** of behaviour no visible test or spec example shows, which no change to
+  jig would reach. Two of the failures above also held a crash a type checker would flag (`popitem(last=
+  False)` on a plain dict); pyright would be a new dependency, so that was left.
+
+Each of the first four kinds became a change, built behind a flag (the fourth, which only loosens a
+refusal, without one, on a build of its own), reviewed adversarially and fixed, as in milestone 30:
+
+- **The overview** (`--overview`). Before a task, with no model call: in a conversation's first message,
+  the project's files, shallowest first, with their sizes (200 at most, leaving out what `glob` leaves
+  out); and with every task, the files it names, as `read_file` shows them (16 KB each, 32 KB in all),
+  which then count as read. gemini-cli puts a folder tree in the first context, and aider's repo map is on
+  by default.
+- **Early budget notes** (`--early-budget-notes`). The notes start once 3 or fewer steps are left, if that
+  comes before half (after step 1 at 4 steps), and each says what a step is: one reply, whose tool calls
+  all run before the next, in the order given, or at once if none runs a command or changes anything.
+- **Test notes** (`--test-notes`). Where unittest or pytest ran no tests, a line in the result says so;
+  where the runner was followed by `&&`, that what came after it didn't run; and for unittest, which
+  folders hold `test*.py` files but no `__init__.py`, and that `unittest discover -s <folder>` starts it
+  there.
+- **Seen counts as read.** `write_file` accepts a file it would refuse as unread when a result the model
+  saw since the last compaction showed all of its current text: as the whole result, or, from a call
+  that names it, as whole lines or a numbered listing.
+
+**The round.** evolve2 at its 4 steps, 21 tasks × 5 attempts, seven runs side by side. They ran task by
+task, every run on a task at once, each task's attempts saved as soon as they ended: the first try, run
+whole, was lost when the machine's processes were restarted 15 to 19 attempts into each run. The round ran on
+`e078a82` (seen counts as read on `97e83d8` and `63ca3f5`), before the review fixes below; the checks
+after it ran on the final build, `10df6e9`. Against the two baselines pooled, with the referee's paired
+bootstrap:
+
+| run | passed | cost an attempt |
+|-----|--------|-----------------|
+| baseline | 91 of 105 | $0.0149 |
+| baseline, again | 89 of 105 | $0.0139 |
+| `--overview` | 87 of 105: −2.9 points (−15.2 to +8.6) | $0.0150 |
+| `--early-budget-notes` | 83 of 105: −6.7 (−18.6 to +4.8) | $0.0140 |
+| `--test-notes` | 91 of 105: +1.0 (−10.0 to +11.9) | $0.0142 |
+| seen counts as read | 89 of 105: −1.0 (−15.2 to +12.4) | $0.0139 |
+| all four | **97 of 105**: +6.7 (−2.4 to +15.2), ahead in 93% of resamples | $0.0156 |
+
+None alone beat the noise, and all four together did nearly. Picked as the best of seven, that could be
+luck, so a second round ran the combination again, with a third baseline, and without each of the two
+changes it might not need:
+
+| run | passed |
+|-----|--------|
+| baseline | 88 of 105 |
+| all four | 98 of 105 |
+| all but seen counts as read | 95 of 105 |
+| all but the early notes | 92 of 105 |
+
+The three flags, with the fourth or without it, passed 97, 98 and 95 of 105 in three runs: 290 of 315
+(92%) against 268 of 315 (85%) for the three baselines, +7.0 points (+0.6 to +13.3), ahead in 98% of
+resamples; on the held-out tasks +10.3. What they changed:
+
+- **The overview moves the first write to step 2.** Without it the first change came at step 3 or 4 in
+  every baseline attempt; with it, at step 2 in 93 of 105 alone and in 99 to 101 with the others. So a
+  test result arrived with a step left in 79 of 105 attempts with the overview alone and 84 to 88 with all
+  three, against 2 to 6 without. Writes refused for a file not read went from 16 to 28 a run to 0 to 5.
+- **Alone, that wasn't enough.** With the overview alone, 22 attempts still saw their first test result
+  only on the last step, and the pass rate didn't move; with the early notes as well (after step 1, saying
+  what a step is), 13 to 16 did, and it did. The early notes alone came before anything could use them,
+  and were 6.7 points behind, within the noise.
+- **The test notes fired** in 14 attempts alone and in 24 to 28 with the others.
+- **The overview doubles what a 4-step attempt sends** (34k tokens in against 17k), but most of it comes
+  from the cache: attempts cost 4% more with the overview alone, 8% more with the other two.
+
+**Seen counts as read was left out.** It passed no more alone (−1.0 points) or in the combination (+2.4,
+ahead in 72% of resamples), and it loosens one of jig's guards. Its two reviews found the guard loosened
+further than meant: a word of wildcards alone (the `*` in `print(2 * 3)`, `SELECT *`) named every file,
+`cd old && cat config.py` named every `config.py`, a page of one file counted for another whose text
+matched its first lines, and the patterns it matched could backtrack for seconds on a word the model
+wrote. Tightened, it still showed no gain, so `write_file` refuses as before.
+
+**Found by the reviews**, and fixed, each with a test:
+- The overview read files past the user's controls on `read_file`: a deny rule naming it, `--tools`
+  leaving it out, a PreToolUse hook covering it. Each part of the overview now comes only where the
+  model's own `glob` or `read_file` would show it unasked (as `--check-writes` does for bash, milestone
+  30), and jig tells the user once why it left one out.
+- The overview became part of "the task": restated after a compaction as the task word for word (with
+  its file text, by then stale, and its note that the files count as read), given to the reviewer and
+  the Stop hooks, and shown by `jig sessions list` in place of the request. The task is now the message
+  without the files. The overview's git also ran outside the task, so a named pipe at
+  `.git/info/exclude` kept `--time-limit 3` going for 60 seconds; it runs in the task now.
+- The overview's 16 KB cap counted a file's bytes, so 16 KB of short lines could become 130 KB with line
+  numbers; it counts what is shown now.
+- The test notes said the commands after an `&&` didn't run where the runner that ran no tests wasn't
+  the one before the `&&`, or where they did run (exit 0); and suggested `discover -s tests` to a command
+  that had just run it, or a folder in the wrong directory after a `cd`.
+
+**What changed.** The overview, the early notes and the test notes are on by default (`10df6e9`);
+`--no-overview`, `--no-early-budget-notes` and `--no-test-notes` turn each off, and `--no-budget-notes`
+all the notes.
+
+**Checked as milestone 16 asks**, on the build with them on by default:
+
+| | on by default | off |
+|---|---|---|
+| this suite, 4 steps, run again | 101 of 105 (96%), $0.0156: +11.1 points (+3.8 to +18.4) against the round's three baselines | 91, 89 and 88 of 105 |
+| this suite, 40 steps, 2 attempts a task, side by side | 41 of 42, 10.1 steps, $0.0254, 111 s | 42 of 42, 14.3 steps, $0.0322, 165 s |
+| the main benchmark, 40 steps | 59 of 60, 5.3 steps, $0.0038; the failure was lru-cache's 3-second timing test, which took 6.7 s while a dozen other attempts ran on the machine's four cores, and run again with none, lru-cache passed 3 of 3 | 60 of 60, 7.2 steps, $0.0046 (milestone 30) |
+
+With 40 steps, the three took 30% of the steps off: the first change came at step 2 in 38 of 42
+attempts (at 3 to 5 without), and attempts cost 21% less. The one failure there accepted `max(1,)`, a
+reading of the spec, after 9 steps; milestone 30's 40-step runs failed one attempt on each side too.
+
+**Checked on Terminal-Bench**, as [design.md](design.md) asks: the same build (`10df6e9`) as it is by default
+and with the three turned off (`--no-overview --no-early-budget-notes --no-test-notes`), 2 rounds each on
+the 20 tasks, a task's four trials at once, on milestone 30's machine and setup. mteb-retrieve again didn't
+fit the disk. filter-js-from-html's four trials were left out, as no agent could pass them there: its
+hidden tests download their corpus from GitHub, which that machine's network refuses (403, from the host
+too). Two pytorch-model-recovery trials whose verifier ran out of disk installing torch beside the others
+were run again, one of them twice, with fewer beside them, until their verifiers ran.
+
+| | passed | stopped at the time limit | cost a trial |
+|---|---|---|---|
+| on by default | 31 of 36 (86%) | 1 | $0.046 |
+| the three off | 29 of 36 (81%) | 1 | $0.050 |
+
++6 points (−11 to +22), behind in 20% of resamples, where tbcheck rejects at 80%: no worse on
+Terminal-Bench, at 7% less cost, so the three stay on. The test notes never fired; the overview did in all
+38 trials, and showed files the task named in 14; and the early notes, which at 300 steps start at half as
+before, changed only what the budget notes said (what a step is) in the 9 trials that got notes, both of
+tune-mjcf's among them. +6 points is within the noise either way. Results:
+`eval/results/tb-m31-defaults-on.json` and `-off.json` (report.py's output for all 38 trials a side,
+filter-js-from-html's counted as failures).
+
+**Milestone 30's Terminal-Bench result, scored again.** The same two kinds of trial were in milestone 30's
+comparison, counted as failures: filter-js-from-html's four, and two pytorch-model-recovery trials without
+the notes whose verifier ran out of disk. Without filter-js-from-html, and without pytorch-model-recovery
+on both sides to keep the tasks paired (its two trials with the notes passed), the notes passed 28 of 34
+against 29 of 34: −3 points (−18 to +9), behind in 58% of resamples, not +3. That is still no worse by
+tbcheck's rule, so the notes stay on, but the +3 counted broken verifiers as the agent's failures.
+`eval/report.py` counted such trials as the agent's failures; milestone 32 changed it.
+
+**Cost.** By jig's token counts, at list prices: the round $10.66, the second round $6.27, the checks
+$4.29 (the rerun $1.64, the 40 steps $2.42, the main benchmark $0.24), and about $1.10 for the first try
+the restart cut short; Terminal-Bench $4.25, and the runs it took again. The DeepSeek balance fell 75.0
+CNY over the evolve2 runs and 14.7 CNY over Terminal-Bench's.
+
+## Milestone 32: Terminal-Bench's failures, read, and a scorer that knows the ones nobody could pass
+
+Milestone 31's numbers came out of a script, because `eval/report.py` counted a trial whose hidden tests
+couldn't run as the agent's failure. So this milestone read all 76 of milestone 30's Terminal-Bench trials,
+the 17 failures one by one, with each task's tests and instruction (never fed to jig), and asked what jig
+could have done.
+
+**What the failures were.** 6 weren't the agent's: filter-js-from-html's four (its tests download their
+corpus from GitHub, which that machine's network refuses) and two pytorch-model-recovery trials whose
+verifier ran out of disk. Of the other 11, adaptive-rejection-sampler's four put the domain in scalar
+`lower` and `upper` arguments where the hidden test passes one vector, an interface the task never states;
+two dna-assembly trials checked a stated rule through their own design's offsets, so the check could only
+agree with the design, and a third left out a clamp it had failed to look up; make-mips-interpreter's left
+the frame their own last run wrote where the hidden test waits for the VM to write it, which turned the
+test into a one-second race; one of those dismissed a reference that disagreed with an untested excuse,
+which a compaction then wrote down as fact; and a db-wal-recovery trial's first `sqlite3` read deleted the
+encrypted WAL the task was about, with no copy anywhere, and the model then fetched the benchmark's answer.
+Milestone 31's three defaults reach none of these: the projects were empty or held binary files, the notes
+start at half of Terminal-Bench's time limit, and no trial ran a test runner that ran nothing.
+
+Four mechanisms came out of it, each checked by two skeptics (is it general, and does the evidence hold):
+a check written from the task's words alone at the first stop, a note listing what the agent's own runs
+left behind, a compaction that keeps the checks still open, and giving back an input a command destroyed.
+All four survived, revised, and together reached about 2 to 3 trials in 76, which two rounds of 19 tasks
+can't tell from noise (milestone 30's interval was 31 points wide). Two were built: the scorer, which every
+later measurement needs, and the last, which is useful to anyone whether or not a benchmark shows it.
+
+**The scorer** (`eval/report.py`, and tbcheck's verdict in `bench/evolve-terminal-bench.ts`). A trial is
+left out, marked `?` with its reason, when its verifier started and wrote no `ctrf.json`, when that verifier
+ran out of disk, or when its task is named with `--skip-task` or in a `--skip-tasks` file (each machine
+keeps its own, `eval/skip-tasks.txt`, not committed). A trial whose verifier never started (jig's install
+failed) or timed out still counts as a failure, as Harbor grades it, and a graded trial counts whatever its
+output says. tbcheck gives no verdict when any trial was left out unexplained, so a candidate can't pass by
+breaking its own tests' environment. The Harbor adapter also stopped putting nvm's Node 24 on the PATH of
+the model's commands: make-mips-interpreter's model tested its VM with Node 24 while the hidden tests ran
+the image's own node.
+
+**`--keep-inputs`**, off by default. jig watches up to 5,000 files that were there before the task. When a
+bash command deletes or empties one that was unchanged until then, and no other file in the project holds
+its bytes, the command's result says so and names a copy of the file as it was before the task, in the temp
+directory, from the git snapshot or, without git (as in 68 of the 76 trials' containers), from a store of
+its own that keeps only the latest task's files and is removed at exit. jig restores nothing itself. Replayed
+on the db-wal-recovery task's own files, it named a byte-identical copy of the WAL `sqlite3` had deleted. On
+evolve2, with it and without, side by side on the same build: 94 of 105 against 95 (−1.0 points, −12.4 to
++11.4), at the same cost, and it never fired, so no false notes.
+
+**Found by the reviews** (two rounds each), and fixed, each with a test: the scorer's first rule, "no
+`ctrf.json`", also dropped trials whose install failed and whose tests hung, which are the agent's; tbcheck
+gave "no worse" to a candidate whose every trial was left out; the disk rule dropped graded trials whose
+output only mentioned a full disk. `--keep-inputs` gave back git's line-ending-normalized bytes instead of
+the file's, froze jig for seconds reading many lost files back from git, and let its store grow by its cap
+with every task of a session.
+
+**Cost.** The evolve2 runs $3.21 at list prices.

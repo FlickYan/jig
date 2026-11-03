@@ -14,7 +14,7 @@ import { costOf } from "../src/prices.ts";
 import { createSandbox } from "../src/sandbox.ts";
 import { failingTests, readAttemptLog, replySummary, taskWords } from "./evolve-analysis.ts";
 import { changedFiles, commitPatch, patchOf, workspace } from "./evolve-workspace.ts";
-import { attemptsOf, deepseekBalance, MIN_BALANCE_CNY, nextStart, refusedByApi, runOrder, type TerminalBenchVerdict, terminalBenchVerdict } from "./evolve-terminal-bench.ts";
+import { attemptsOf, deepseekBalance, MIN_BALANCE_CNY, nextStart, noVerdict, refusedByApi, runOrder, skipList, type TerminalBenchVerdict, type Trial, terminalBenchVerdict } from "./evolve-terminal-bench.ts";
 import { HOMES, hideAnswers } from "./hidden.ts";
 import { type Attempt, compare, type Comparison, forbiddenFiles, judgeHeldOut, judgeTrain, leakedWords, passRates, simulateReferee, split, type Verdict } from "./evolve-referee.ts";
 
@@ -564,12 +564,19 @@ async function checkOnTerminalBench(candidate: Candidate): Promise<void> {
       throw new Error(`${job}: the API refused ${refused.length} trial${refused.length === 1 ? "" : "s"} (out of balance?), removed to run again: fix that, then run tbcheck again to go on.`);
     }
   }
-  // Every trial, as eval/report.py counts them (a look-up of the benchmark's answers fails), kept with the candidate.
+  // Every trial, as eval/report.py counts them (a look-up of the benchmark's answers fails; one the verifier
+  // couldn't grade, or of a task in this machine's eval/skip-tasks.txt, is left out), kept with the candidate.
   const out = join(ARCHIVE, String(n), smoke ? "terminal-bench-smoke" : "terminal-bench");
   const runs = (["baseline", "candidate"] as const).map((side) => join("eval", "jobs", jobs[side].join("+")));
-  execFileSync("python3", ["eval/report.py", "--save", out, ...runs], { cwd: ROOT, stdio: "inherit" });
-  const load = (side: "baseline" | "candidate") => attemptsOf(JSON.parse(readFileSync(join(out, `${jobs[side][0]}.json`), "utf8")).trials);
-  const verdict = terminalBenchVerdict(load("candidate"), load("baseline"));
+  const skipFile = join("eval", "skip-tasks.txt");
+  const skipped = existsSync(join(ROOT, skipFile)) ? skipList(readFileSync(join(ROOT, skipFile), "utf8")) : new Set<string>();
+  const skip = skipped.size ? ["--skip-tasks", skipFile] : [];
+  execFileSync("python3", ["eval/report.py", "--save", out, ...skip, ...runs], { cwd: ROOT, stdio: "inherit" });
+  const trials = (side: "baseline" | "candidate"): Trial[] => JSON.parse(readFileSync(join(out, `${jobs[side][0]}.json`), "utf8")).trials;
+  // A trial the verifier couldn't grade drops out of the comparison, and the agent may have caused it (a full disk): a person decides.
+  const why = noVerdict(trials("candidate"), trials("baseline"), skipped);
+  if (why) throw new Error(`candidate ${n}: ${why}, and no verdict is recorded: look at their verifier/test-stdout.txt (a disk the agent filled is its own failure), run those trials again (remove them from eval/jobs) once the verifier has what it lacked, or list a task no agent can pass on this machine in eval/skip-tasks.txt; then run tbcheck again to go on.`);
+  const verdict = terminalBenchVerdict(attemptsOf(trials("candidate")), attemptsOf(trials("baseline")));
   console.log(`candidate ${n}: ${verdict.reason}`);
   if (smoke) {
     console.log("A smoke test on some of the tasks: its verdict isn't recorded.");

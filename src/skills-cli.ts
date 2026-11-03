@@ -1,8 +1,11 @@
+import { existsSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
+import { mergeSettings, readSettings } from "./settings.ts";
 import { discoverSkills, skillUsage } from "./skills.ts";
 import { testSkill } from "./skill-evals.ts";
 import {
+  assertShown,
   compareSkills,
   describeSkill,
   fetchSource,
@@ -12,7 +15,9 @@ import {
   lockedSource,
   parseSource,
   removeSkill,
+  skillDirForChange,
   skillsDir,
+  type Fetched,
   type InstallScope,
   type SkillInfo,
 } from "./skill-store.ts";
@@ -21,8 +26,8 @@ import * as ui from "./ui.ts";
 export const SKILLS_HELP = `Usage: jig skills <command>
 
   list                    the skills this project sees: where each comes from, and how often it was used
-  add <source>            install skills from a folder, a git URL, or GitHub as owner/repo/path[@ref]
-                            (jig skills add anthropics/skills/skills/pdf)
+  add <source>            install skills from a folder, an https, ssh or file git URL, or GitHub as
+                            owner/repo/path[@ref] (jig skills add anthropics/skills/skills/pdf)
       --project             into this project's .jig/skills (default: yours, in ~/.jig/skills)
       --skill <name>        only this one of the skills the source holds (repeatable)
       --ref <ref>           the branch, tag or commit (default: the repository's default branch)
@@ -62,6 +67,8 @@ export async function skillsCommand(args: string[]): Promise<void> {
   const confirm = (question: string) => (values.yes ? Promise.resolve(true) : ask(question));
 
   if (values.help || !command) return console.log(SKILLS_HELP);
+  // Checked first: add --project went as far as showing the skills, then stopped with a bare ENOENT.
+  if (!existsSync(project) || !statSync(project).isDirectory()) throw new Error(`-C: ${project} isn't a folder.`);
   if (command === "list") return list(project);
   if (command === "add") {
     if (rest.length !== 1) throw new Error("Usage: jig skills add <source>. See jig skills --help.");
@@ -69,10 +76,16 @@ export async function skillsCommand(args: string[]): Promise<void> {
   }
   if (command === "remove") {
     if (rest.length !== 1) throw new Error("Usage: jig skills remove <name>");
-    const skill = installedSkills(project).find((s) => s.name === rest[0]);
+    const { skills, problems } = installedSkills(project);
+    for (const { message } of problems) ui.notice(message);
+    const skill = skills.find((s) => s.name === rest[0]);
     if (!skill) throw new Error(`No skill "${rest[0]}" was installed with jig skills add. (Skills you wrote yourself are folders: delete the folder.)`);
+    // Only the project's skills go by the hidden paths (see skillDirForChange): settings a command broke in
+    // the project mustn't keep the user's own from being removed.
+    const hidden = skill.scope === "project" ? hiddenPaths(project) : [];
+    await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before anyone is asked
     if (!(await confirm(`Remove the skill "${skill.name}" (${skill.dir})? [y/N] `))) return ui.notice("Kept it.");
-    removeSkill(skill, project);
+    await removeSkill(skill, project, hidden);
     return ui.notice(`Removed ${skill.name}.`);
   }
   if (command === "update") return update(project, rest, confirm);
@@ -80,7 +93,7 @@ export async function skillsCommand(args: string[]): Promise<void> {
     if (rest.length !== 1) throw new Error("Usage: jig skills test <name>");
     const attempts = Number(values.attempts);
     if (!Number.isInteger(attempts) || attempts < 1) throw new Error("--attempts must be a positive integer");
-    await testSkill(project, rest[0], { attempts, model: values.model, ...(values.api && { api: values.api }) });
+    await testSkill(project, rest[0], { attempts, model: values.model, hiddenPaths: hiddenPaths(project), ...(values.api && { api: values.api }) });
     return;
   }
   throw new Error(`There is no "jig skills ${command}". See jig skills --help.`);
@@ -91,11 +104,13 @@ async function ask(question: string): Promise<boolean> {
   return (await ui.ask(question))?.trim().toLowerCase().startsWith("y") ?? false;
 }
 
+/** The skills a session in the project sees, and why it would leave any out. */
 function list(project: string): void {
-  const { skills, warnings } = discoverSkills(project);
-  for (const warning of warnings) ui.notice(warning);
+  const { skills, warnings } = discoverSkills(project, undefined, { hiddenPaths: hiddenPaths(project) });
+  const locked = installedSkills(project);
+  for (const warning of [...warnings, ...locked.problems.map((problem) => problem.message)]) ui.notice(warning);
   if (!skills.length) return ui.println("No skills yet. Add some with jig skills add, or write one with jig skills new.");
-  const installed = new Map(installedSkills(project).map((skill) => [`${skill.scope}:${skill.name}`, skill]));
+  const installed = new Map(locked.skills.map((skill) => [`${skill.scope}:${skill.name}`, skill]));
   const usage = skillUsage();
   const width = Math.max(...skills.map((skill) => skill.name.length));
   for (const skill of skills) {
@@ -122,8 +137,11 @@ interface AddOptions {
 
 async function add(spec: string, { project, scope, only, ref, path, force, confirm }: AddOptions): Promise<void> {
   const source = parseSource(spec, { cwd: project, ref, path });
+  // Refused and fetched as update would refuse and fetch it, or update would refuse what add installed.
+  const hidden = hiddenPaths(project);
+  assertShown(source, hidden);
   if (source.url) ui.notice(`Fetching ${spec}…`);
-  const fetched = fetchSource(source);
+  const fetched = fetchSource(source, hidden);
   try {
     let infos = findSkills(fetched.dir).map(describeSkill);
     if (!infos.length) throw new Error(`${spec} holds no skill (no folder with a SKILL.md).`);
@@ -136,9 +154,10 @@ async function add(spec: string, { project, scope, only, ref, path, force, confi
     const valid = infos.filter((info) => !info.problems.length);
     if (!valid.length) throw new Error("None of these skills follows the Agent Skills format, so nothing was installed.");
     const where = skillsDir(scope, project);
+    for (const info of valid) await skillDirForChange(scope, project, info.name, hidden); // refused before anyone is asked
     const what = valid.length === 1 ? `the skill "${valid[0].name}"` : `these ${valid.length} skills`;
     if (!(await confirm(`Install ${what} into ${where}? [y/N] `))) return ui.notice("Nothing installed.");
-    for (const info of valid) ui.notice(`Installed ${info.name} in ${installSkill(info, source, fetched, { scope, project, force })}.`);
+    for (const info of valid) ui.notice(`Installed ${info.name} in ${await installSkill(info, source, fetched, { scope, project, force, hidden })}.`);
     if (valid.some((info) => info.scripts.length)) ui.println(ui.dim("Its scripts run only when the model runs them, in the sandbox and under your permission mode."));
   } finally {
     fetched.cleanup();
@@ -154,14 +173,27 @@ function showSkill(info: SkillInfo): void {
 }
 
 async function update(project: string, names: string[], confirm: (question: string) => Promise<boolean>): Promise<void> {
-  const installed = installedSkills(project).filter((skill) => !names.length || names.includes(skill.name));
+  const { skills, problems } = installedSkills(project);
+  const installed = skills.filter((skill) => !names.length || names.includes(skill.name));
   const unknown = names.filter((name) => !installed.some((skill) => skill.name === name));
+  // A lockfile jig won't read is skipped like an entry it refuses, below, unless the skills named were found.
+  for (const { message } of problems) ui.notice(message);
   if (unknown.length) throw new Error(`Not installed with jig skills add: ${unknown.join(", ")}.`);
-  if (!installed.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
+  if (!installed.length && !problems.length) return ui.println("No skills were installed with jig skills add, so there is nothing to update.");
+  const skipped = names.length ? [] : problems.map(({ scope }): string => (scope === "project" ? "the project's skills" : "your skills"));
+  const hidden = hiddenPaths(project);
   for (const skill of installed) {
-    const source = lockedSource(skill.entry);
-    const fetched = fetchSource(source);
+    // A skill jig refuses, or can't fetch or install, is skipped with the reason, and the rest are still
+    // updated: a command can write the project's lockfile, which is read first, and an entry it put there
+    // (a name or a link jig refuses, a source that isn't there or that jig won't fetch, an entry that isn't
+    // one) mustn't keep the user's own skills from updating. Having no one to ask still stops it, as it
+    // does add and remove. The question names the source, which such an entry can change too.
+    let fetched: Fetched | undefined;
+    let asking = false;
     try {
+      await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before it is fetched, or anyone asked
+      const source = lockedSource(skill.entry, hidden);
+      fetched = fetchSource(source, hidden);
       const [dir] = findSkills(fetched.dir, 0);
       if (!dir) {
         ui.notice(`${skill.name}: ${skill.entry.source} no longer has the skill's folder (${skill.entry.path}); left as it is.`);
@@ -179,13 +211,27 @@ async function update(project: string, names: string[], confirm: (question: stri
       const info = describeSkill(dir);
       showSkill(info);
       ui.println(ui.dim(`  changed: ${[...changed, ...added.map((f) => `+${f}`), ...removed.map((f) => `-${f}`)].join(", ")}`));
-      if (!(await confirm(`Update ${skill.name}? [y/N] `))) continue;
-      installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true });
+      asking = true;
+      const yes = await confirm(`Update ${skill.name} from ${source.url ?? source.path}? [y/N] `);
+      asking = false;
+      if (!yes) continue;
+      await installSkill(info, { ...source, spec: skill.entry.source }, fetched, { scope: skill.scope, project, force: true, hidden });
       ui.notice(`Updated ${skill.name}.`);
+    } catch (err) {
+      if (asking) throw err;
+      ui.notice(`Not updating ${skill.name}: ${err instanceof Error ? err.message : String(err)}`);
+      skipped.push(skill.name);
     } finally {
-      fetched.cleanup();
+      fetched?.cleanup();
     }
   }
+  if (skipped.length) throw new Error(`Not updated, as said above: ${skipped.join(", ")}.`);
+}
+
+/** The hidden paths, which a session's sandbox hides whether the project's settings are trusted or not. */
+function hiddenPaths(project: string): string[] {
+  const settings = readSettings(project);
+  return mergeSettings(settings.user, settings.project?.settings, false).hiddenPaths;
 }
 
 function short(text: string, max: number): string {
