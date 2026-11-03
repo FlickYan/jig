@@ -1,0 +1,128 @@
+From 7c265bc79d8946ac42bb61a39f9052c8e261340f Mon Sep 17 00:00:00 2001
+From: facelessuser <faceless.shop@gmail.com>
+Date: Mon, 5 Oct 2026 08:17:17 -0600
+Subject: [PATCH] Ensure that unterminated HTML tags do not cause text to be
+ dropped
+
+Ensure we handle both `</` and `</content` such that content that comes
+after is not dropped.
+
+Fixes #1651
+---
+ .spell-dict                                  |  1 +
+ docs/changelog.md                            |  1 +
+ markdown/htmlparser.py                       |  6 ++-
+ tests/test_syntax/blocks/test_html_blocks.py | 57 ++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 2 deletions(-)
+
+diff --git a/.spell-dict b/.spell-dict
+index c82a11d..c0f0c88 100644
+--- a/.spell-dict
++++ b/.spell-dict
+@@ -159,6 +159,7 @@ unescaping
+ unittest
+ unordered
+ unsanitized
++unterminated
+ untrusted
+ UTF
+ uTidylib
+diff --git a/docs/changelog.md b/docs/changelog.md
+index a6939f9..c99a7c3 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -17,6 +17,7 @@ See the [Contributing Guide](contributing.md) for details.
+ * Update serializer to be non-recursive (#1644).
+ * Improve ancestor handling in the inline `Treeprocessor` (#1646).
+ * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
++* Fix issue where an unterminated end tag (`</foo`) could cause all remaining content to be dropped (#1651).
+ 
+ ## [3.11.0] - 2026-09-25
+ 
+diff --git a/markdown/htmlparser.py b/markdown/htmlparser.py
+index 488da03..d92dc0d 100644
+--- a/markdown/htmlparser.py
++++ b/markdown/htmlparser.py
+@@ -99,10 +99,12 @@ class _HTMLParser(htmlparser.HTMLParser):
+     def parse_endtag(self, i):
+         start = self.rawdata[i:i+3]
+         c = ord(start[-1])
+-        if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
++        is_data = len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122)
++        pos = super().parse_endtag(i) if not is_data else -1
++        if pos == -1:
+             self.handle_data(self.rawdata[i:i + 2])
+             return i + 2
+-        return super().parse_endtag(i)
++        return pos
+ 
+     def parse_starttag(self, i: int) -> int:  # pragma: no cover
+         # Treat `</>` as normal data as it is not a real tag.
+diff --git a/tests/test_syntax/blocks/test_html_blocks.py b/tests/test_syntax/blocks/test_html_blocks.py
+index ecc10f4..1f2f877 100644
+--- a/tests/test_syntax/blocks/test_html_blocks.py
++++ b/tests/test_syntax/blocks/test_html_blocks.py
+@@ -1787,3 +1787,60 @@ class TestHTMLBlocks(TestCase):
+                 '''
+             )
+         )
++
++    def test_unterminated_endtag_in_code_span(self):
++        """Ensure an unterminated end tag does not swallow the remaining content."""
++
++        # https://github.com/Python-Markdown/markdown/issues/1651
++        self.assertMarkdownRenders(
++            'Run `cmd 2</dev/null` here.\n\nThis paragraph should not disappear.',
++            self.dedent(
++                '''
++                <p>Run <code>cmd 2&lt;/dev/null</code> here.</p>
++                <p>This paragraph should not disappear.</p>
++                '''
++            )
++        )
++
++    def test_additional_tail_cases(self):
++        """Ensure various tail cases survive."""
++
++        # https://github.com/Python-Markdown/markdown/issues/1651
++        self.assertMarkdownRenders(
++            self.dedent(
++                """
++                `</dev` z > q
++
++                `</ab c` z
++
++                `</dev/` > q
++
++                `</dev/null` z > q
++
++                `</ab c>` z
++                """
++            ),
++            self.dedent(
++                """
++                <p><code>&lt;/dev</code> z &gt; q</p>
++                <p><code>&lt;/ab c</code> z</p>
++                <p><code>&lt;/dev/</code> &gt; q</p>
++                <p><code>&lt;/dev/null</code> z &gt; q</p>
++                <p><code>&lt;/ab c&gt;</code> z</p>
++                """
++            )
++        )
++
++    def test_unterminated_endtag(self):
++        """Ensure an unterminated end tag is treated as text."""
++
++        # https://github.com/Python-Markdown/markdown/issues/1651
++        self.assertMarkdownRenders(
++            'foo </bar\n\nbaz',
++            self.dedent(
++                '''
++                <p>foo &lt;/bar</p>
++                <p>baz</p>
++                '''
++            )
++        )
+-- 
+2.43.0
+

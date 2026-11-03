@@ -1,0 +1,12 @@
+Text disappears when our docs are rendered with this library. On Python 3.13.6 and later, everything
+after an unclosed end tag such as `</dev/null` is silently dropped, even inside a code span; on 3.13.5
+and earlier the same document renders fine. For example:
+
+    import markdown
+    markdown.markdown("Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.")
+
+returns '<p>Discard errors with `cmd 2</p>': the rest of the sentence and the whole second paragraph are
+gone, with no error. Shell redirections like `2</dev/null` and `cat </etc/hosts` in our docs lost half a
+page this way. Please fix it.
+
+A development install is in .venv: `.venv/bin/python -m unittest discover tests` runs the tests.

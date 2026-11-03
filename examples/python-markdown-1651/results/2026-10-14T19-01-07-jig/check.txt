@@ -1,0 +1,7 @@
+== upstream's regression tests for #1651
+Ran 3 tests in 0.004s
+OK
+== the whole test suite
+Ran 1103 tests in 0.731s
+OK (skipped=52)
+== solved

@@ -1,0 +1,1252 @@
+(node:1696) [UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental, expect them to change at any time.
+(Use `node --trace-warnings ...` to show where the warning was created)
+Let me start by exploring the repository to understand the codebase.
+
+The issue: on Python 3.13.6+, unclosed end tag like `</dev/null` drops everything after. This is likely related to changes in Python's HTML parsing or the `html.parser` / regex. Actually, this sounds like the `markdown` library's inline processing or a regex with `</` ... Hmm.
+
+Wait, actually this is about Python 3.13.6 changing something. Let me think. The issue is likely in `markdown/util.py` or somewhere using `re` with a pattern. Actually, unclosed end tag... The `<` followed by `/dev/null`. In Markdown, HTML block/inline handling. Something is treating `</dev/null` as an HTML tag start and then consuming to end of document looking for closing.
+
+Let me explore.
+
+Actually, this is likely a known CPython change: Python 3.13.6 changed `re` behavior? No. More likely it's about `html.parser.HTMLParser` handling? Hmm, but the version boundary 3.13.5 vs 3.13.6 is a patch release. Something in the standard library changed. Perhaps `re` with possessive quantifiers? Or `re` module's handling of `\Z`?
+
+Let me look at the repo.
+I'll explore the repository to understand the code and find where HTML tags are parsed.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && ls -la && git log --oneline -5
+  total 232
+  drwxr-xr-x 11 root root   4096 Oct 14 18:57 .
+  drwx------  4 root root   4096 Oct 14 18:57 ..
+  … 32 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && cat markdown/__init__.py | head -50 && echo "---" && ls markdown/
+  # Python Markdown
+  # A Python implementation of John Gruber's Markdown.
+  # - Documentation: https://python-markdown.github.io/
+  … 52 more lines
+Let me reproduce first.
+Let me reproduce the bug and check the Python version.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python --version && .venv/bin/python -c '
+  import markdown
+  print(repr(markdown.markdown("Discard errors with \`cmd 2</dev/null\` and keep going.\n\nThis second paragraph must survive.")))
+  '
+  Python 3.13.16
+  <string>:3: SyntaxWarning: invalid escape sequence '\`'
+  '<p>Discard errors with `cmd 2</p>'
+  … 1 more line
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && cat markdown/util.py | grep -n "RE\|import re\|html" | head -60
+  27:import re
+  49:    # See https://w3c.github.io/html/grouping-content.html#the-p-element
+  55:    'canvas', 'colgroup', 'dd', 'body', 'dt', 'group', 'html', 'iframe', 'li', 'legend',
+  … 12 more lines
+Reproduced. Python 3.13.16 (which is >= 3.13.6). Now let me find where inline HTML is detected. Let's look at inlinepatterns.py for the HTML pattern, and htmlparser.py.
+
+The issue is likely a regex using `re` that changed behavior in Python 3.13.6. Let me search for the HTML inline pattern.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -n "tag\|tag_\|HTML\|html" markdown/inlinepatterns.py | head -80
+  47:from html import entities
+  58:    `http://.../` links with `<a>` tags and _then_ try to replace inline HTML, we would end up with a mess. So, we
+  64:    * then we handle the various types of links (auto-links must be handled before inline HTML);
+  … 67 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && wc -l markdown/inlinepatterns.py markdown/htmlparser.py markdown/blockprocessors.py
+   1052 markdown/inlinepatterns.py
+    422 markdown/htmlparser.py
+    642 markdown/blockprocessors.py
+  … 2 more lines
+Let me look at the HTML_RE and the backtick handling. The bug: "text disappears ... even inside a code span". So the code span processing is dropping the rest. Let's look at the code handling. Actually the output `<p>Discard errors with `cmd 2</p>` shows that the code span was not processed at all (no `<code>`), and `<` is literal, and `</dev/null`... wait output shows `cmd 2` then closes. So the HTML inline processor matched `</dev/null` and everything after until... something.
+
+Actually, `</dev/null` — the HTML_RE probably matches a start tag. Let's look.
+● read_file markdown/inlinepatterns.py:155
+● read_file markdown/inlinepatterns.py:555
+  ⎿ read_file markdown/inlinepatterns.py:155
+     155	AUTOLINK_RE = r'<((?:[Ff]|[Hh][Tt])[Tt][Pp][Ss]?://[^<>]*)>'
+     156	""" Match an automatic link (`<http://www.example.com>`). """
+     157	
+  … 78 more lines
+  ⎿ read_file markdown/inlinepatterns.py:555
+     555	            el2.tail = m.group(3)
+     556	        return el1, m.start(0), m.end(0)
+     557	
+  … 28 more lines
+The HTML_RE ends with `')>)'`. It matches `<` then tag. For `</dev/null` (no closing `>`), it shouldn't match at all since there's no `>`.
+
+Hmm, but the output drops text. Let me think about the inline processing. The pattern `^(.*)` and `(.*)!`? Let me look at InlineProcessor.
+
+Actually, this seems related to the `CodeInlineProcessor` and placeholder handling. Let me check `treeprocessors.py` inline processor, which processes placeholders and may handle unclosed placeholder markers.
+
+Actually wait. Let's reconsider. The bug appears on Python 3.13.6+. The changelog for Python 3.13.6: maybe it's about `re` module. Actually, there's a known change: In Python 3.13.6, a change to `re` was reverted/fixed regarding `re.sub` with `\g` etc. Hmm.
+
+Let me look more carefully. The example code span uses backticks but is not closed on the same... Actually `` `cmd 2</dev/null` `` — there's an opening backtick and a closing backtick. But output lost the closing backtick and code tags. That suggests the code span processor failed because the backtick match included the `</dev/null`... no.
+
+Let's debug step by step. Let me run with various inputs.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  cases = [
+    "foo `cmd 2</dev/null` bar",
+    "foo </dev/null bar",
+    "foo <dev/null bar",
+    "foo `cmd </dev/null` bar",
+    "foo `a<b` bar",
+    "foo `a b` bar",
+  ]
+  for c in cases:
+      print(repr(c), "->", repr(markdown.markdown(c)))
+  '
+  'foo `cmd 2</dev/null` bar' -> '<p>foo `cmd 2</p>'
+  'foo </dev/null bar' -> '<p>foo </p>'
+  'foo <dev/null bar' -> '<p>foo &lt;dev/null bar</p>'
+  … 4 more lines
+So the trigger is the sequence `</` followed by a letter. `</dev/null` no `>`. So `foo </dev/null bar` -> `<p>foo </p>`. Something matches `</dev/null bar` as ... a placeholder? Let's look at the block/inline handling.
+
+Note `foo </dev/null bar` alone renders `foo ` and drops `</dev/null bar`. So the `</...` starts something that consumes to end of block.
+
+Let me look at `treeprocessors.py` InlineProcessor.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -n "class InlineProcessor\|def run\|STX\|ETX\|placeholder\|handleMatch\|def __handle\|split" markdown/treeprocessors.py …
+  65:    def run(self, root: etree.Element) -> etree.Element | None:
+  75:class InlineProcessor(Treeprocessor):
+  81:        self.__placeholder_prefix = util.INLINE_PLACEHOLDER_PREFIX
+  … 32 more lines
+● read_file markdown/treeprocessors.py:75
+      75	class InlineProcessor(Treeprocessor):
+      76	    """
+      77	    A `Treeprocessor` that traverses a tree, applying inline patterns.
+  … 298 more lines
+I see the suspicious code in `__applyPattern`:
+
+```python
+for match in pattern.getCompiledRegExp().finditer(data, startIndex):
+    node, start, end = pattern.handleMatch(match, data)
+    if start is None or end is None:
+        startIndex += match.end(0)
+        match = None
+        continue
+    break
+```
+
+And then:
+```python
+if new_style:
+    return "{}{}{}".format(data[:start],
+                           placeholder, data[end:]), True, start + len(placeholder)
+```
+
+Now the recent commit "Fix inline HTML case" and "Fix ancestor handling". Let me look at git diff of recent commits. The bug might be introduced by these commits, and the version dependency is a red herring... Actually the user says Python 3.13.6+ vs 3.13.5. Let's check.
+
+Wait, but the bug is likely due to something in the `re` module. Python 3.13.6 changed `re` handling of possessive quantifiers? Actually 3.11 introduced possessive quantifiers and atomic groups. HTML_RE uses `*+` and `++` and `?+` — possessive quantifiers. Hmm.
+
+Actually, let me reconsider. The issue is likely in how `handleMatch` returns start/end. Let me look at `InlineProcessor.getCompiledRegExp` in inlinepatterns.py and `HtmlInlineProcessor`.
+
+Wait — the actual behavior: `foo </dev/null bar` -> `foo `. Something consumed from `</dev/null` onwards. Let's trace what pattern matches. The HTML_RE requires a closing `>`. There's none. So it shouldn't match. Unless... there's another pattern. Let's check the patterns list and priorities.
+
+Actually, maybe the autolink or `&` pattern? No.
+
+Let me actually instrument. But first, let me check the `htmlparser.py` which is used for block-level HTML detection. Actually the paragraph text `foo </dev/null bar` is a single paragraph. The inline treeprocessor processes it. Something turns it into empty.
+
+Let me add debug or just test which inline pattern matches. Let me write a script that enumerates inlinePatterns and applies each regex finditer.
+
+Actually, the key: HTML_RE has `')>)'` at the end. Let's examine: group construction. `(<(\/?+[a-zA-Z]...` Let me count parentheses. The whole regexp is used with `^(.*?)` and `(.*)$`? Let's look at InlineProcessor regex wrapping.
+● read_file markdown/inlinepatterns.py:250
+     250	
+     251	    def handleMatch(self, m: re.Match[str]) -> etree.Element | str:
+     252	        """Return a ElementTree element from the given match.
+  … 128 more lines
+Let me check what regexes match `</dev/null bar`. Let me instrument the inline patterns. Actually, the important thing: the output `<p>foo </p>` suggests that the text after `foo ` got converted into a placeholder that then resolved to empty, OR data slicing dropped it.
+
+Look at `__applyPattern` new_style:
+```python
+return "{}{}{}".format(data[:start], placeholder, data[end:]), True, start + len(placeholder)
+```
+This preserves `data[end:]`. So not dropping there.
+
+For the non-new-style:
+```python
+return "{}{}{}{}".format(leftData, match.group(1), placeholder, match.groups()[-1]), ...
+```
+
+Hmm. Let's find which pattern matches. Let me directly test all inline patterns against the string.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown, re
+  md = markdown.Markdown()
+  data = "foo </dev/null bar"
+  for p in md.inlinePatterns:
+      pat = p.getCompiledRegExp()
+      ms = list(pat.finditer(data))
+      if ms:
+          print(repr(p), p.__class__.__name__, [(m.start(),m.end(),m.group(0)) for m in ms])
+  '
+  (no output)
+  Exit code: 0
+No pattern matched? But text got dropped. Hmm. Wait, maybe md.inlinePatterns requires registry access. Let me check `md.inlinePatterns` iteration — it's a Registry, maybe items under `.` Hmm, the output empty. Let me check `len`.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown, re
+  md = markdown.Markdown()
+  print(len(md.inlinePatterns))
+  for name, p in md.inlinePatterns.items():
+      print(name, p.__class__.__name__, repr(getattr(p,"pattern", getattr(p,"compiled_re",None))))
+  '
+  16
+  Traceback (most recent call last):
+    File "<string>", line 5, in <module>
+  … 4 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown, re
+  md = markdown.Markdown()
+  data = "foo </dev/null bar"
+  for i in range(len(md.inlinePatterns)):
+      p = md.inlinePatterns[i]
+      pat = p.getCompiledRegExp()
+      ms = list(pat.finditer(data))
+      print(i, p.__class__.__name__, repr(getattr(p,"pattern",None)))
+      for m in ms:
+          print("   MATCH", m.start(), m.end(), repr(m.group(0)))
+  '
+  0 BacktickInlineProcessor '(?:(?<!\\\\)((?:\\\\{2})+)(?=`+)|(?<!\\\\)`)'
+  1 EscapeInlineProcessor '\\\\(.)'
+  2 ReferenceInlineProcessor '(?<!\\!)\\['
+  … 14 more lines
+No match on `foo </dev/null bar`. But output dropped it. So maybe the drop happens at block level or during the code processing, or maybe my reproduction `markdown.markdown("foo </dev/null bar")` used default which does more. Let me trace with md.convert and print intermediate. Actually wait, maybe the issue is `htmlparser.py` used in preprocessing or block parsing. Let's test the block parser: the paragraph processor. Actually the output `<p>foo </p>` came out. Let's see: maybe the `<` and rest are treated at block level? Let me use `Markdown` and inspect. Let me run with debug.
+
+Actually, wait. `markdown.markdown("foo </dev/null bar")` -> `'<p>foo </p>'`. Let me check whether it's the blockparser's HTML block detection? But `foo </dev/null bar` starts with text, so it's a paragraph. The paragraph content is `foo </dev/null bar`.
+
+Let me trace the inline processor manually. Let me add a print in treeprocessors? Or replicate. Actually maybe the drop is in `__processPlaceholders` or during postprocessors (raw HTML stash). Let's look at `postprocessors.py` and `RawHtmlPostprocessor`.
+
+Actually! The key insight: `</dev/null bar` might get treated as HTML by the `htmlparser` for the whole document. Let me test converting with just `Markdown().convert`.
+
+Hmm, but no inline pattern matched. Let me test intermediate steps. Let's monkeypatch to see. Actually let me check the blockparser: maybe `</dev/null bar` is stored as an HTML block placeholder? No.
+
+Wait, actually maybe the paragraph is being split: `<dev/null` could be an open tag? But no `>`.
+
+Let me look at the recent git commits. The user mentions the version difference. Let me check `git log` and diff recent commits touching inline handling.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && git log --oneline -15 && echo "=== DIFF last commit ===" && git show 7a29324 --stat && git show 7a29324 | head -200
+  7a29324 Fix inline HTML case
+  3002575 Fix ancestor handling
+  b2125da Serialize HTML non-recursively
+  … 92 more lines
+The bug was introduced by commit 7a29324. But the user says the same doc renders fine on 3.13.5 and earlier and fails on 3.13.6+. Hmm. That suggests the regex behavior differs by Python version. But actually the commit introduced new possessive quantifiers, which exist since 3.11. So why version dependent?
+
+Wait, maybe the real cause is the regex itself. Let me think about how `</dev/null bar` gets dropped even though no pattern matched in my test. Maybe my test used `getCompiledRegExp()` which wraps the pattern differently for `Pattern` vs `InlineProcessor`. For InlineProcessor, getCompiledRegExp returns self.compiled_re. That's just HTML_RE, and it didn't match. So how did the text get dropped?
+
+Hold on—maybe the failure is not in the inline processor but in `htmlparser.py`, used by blockprocessors for HTML blocks. Let me test `foo </dev/null bar` more directly with tracing. Let me check the output tree before serialization.
+
+Actually, wait, maybe `md.inlinePatterns[i]` compiled regex differs. Let me just run the pipeline with a patched HtmlInlineProcessor to print.
+
+Actually, let me reconsider: the output `<p>foo </p>` — maybe the whole `</dev/null bar` got stashed as raw HTML and then never restored due to a postprocessor bug. The raw HTML stash uses placeholder `STX + "wzxhzdk:" + str + ETX`. If the HTML regex matched and produced a placeholder, the stash would be restored in postprocessing. But if the match consumed a huge region and got stashed, then in the final output it should appear verbatim as raw HTML (not dropped). Unless the placeholder got mangled.
+
+Hmm, let me trace. Let me monkeypatch `HtmlInlineProcessor.handleMatch` and `__applyPattern`. Actually simpler: use `markdown.Markdown` and inspect the tree after treeprocessors. Let me look at core.py to find where I can hook.
+
+Actually, let's just add temporary print statements via a debug script that monkeypatches. The inline treeprocessor is `md.treeprocessors['inline']`. I can wrap `__handleInline`... it's name-mangled. Let me instead test the regex behavior difference directly. Let me test the HTML_RE regex against the string with Python's re on 3.13.16.
+
+I already did: no match. Hmm.
+
+But wait, maybe the drop happens in the block parser. Let me look at blockprocessors paragraph and HTML block. `foo </dev/null bar` is a paragraph. Let's check `htmlparser.py` used by `markdown.htmlparser.HTMLParser` for the block-level. Not relevant for a paragraph starting with text.
+
+Let me actually instrument the whole convert.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown, re, markdown.treeprocessors as tp
+  orig = tp.InlineProcessor._InlineProcessor__applyPattern
+  def wrapped(self, pattern, data, patternIndex, startIndex=0):
+      res = orig(self, pattern, data, patternIndex, startIndex)
+      if "dev/null" in data:
+          print("APPLY", pattern.__class__.__name__, repr(data), "->", repr(res[0]), res[1], res[2])
+      return res
+  tp.InlineProcessor._InlineProcessor__applyPattern = wrapped
+  md = markdown.Markdown()
+  print(repr(md.convert("foo </dev/null bar")))
+  '
+  '<p>foo </p>'
+  Exit code: 0
+The `__applyPattern` wasn't even called with `dev/null` in data? Because `__handleInline` is called with the data. Maybe the paragraph text is processed differently. Let me trace `__handleInline`. Name-mangled `_InlineProcessor__handleInline`.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown, re, markdown.treeprocessors as tp
+  orig = tp.InlineProcessor._InlineProcessor__handleInline
+  def wrapped(self, data, patternIndex=0):
+      print("HANDLEIN", patternIndex, repr(data))
+      r = orig(self, data, patternIndex)
+      print("   ->", repr(r))
+      return r
+  tp.InlineProcessor._InlineProcessor__handleInline = wrapped
+  md = markdown.Markdown()
+  print("RESULT", repr(md.convert("foo </dev/null bar")))
+  '
+  HANDLEIN 0 'foo '
+     -> 'foo '
+  RESULT '<p>foo </p>'
+  … 1 more line
+The data passed to `__handleInline` is already `'foo '`! So the text got truncated before inline processing. That means the block parser or a preprocessor truncated it. Let me look at `htmlparser.py` — it's used by the blockparser perhaps for the whole document? No, blockparser processes line chunks.
+
+Wait, maybe the `paragraph` text was truncated when creating the element. Let me trace blockprocessors. Actually, maybe the `</dev/null bar` was consumed as a raw HTML block and placed... no.
+
+Let's check the input to the block parser. Actually, let me look for placeholders in core.py. There's a preprocessor `NormalizeWhitespace`, `HtmlBlockPreprocessor`? Let's search.
+
+Actually, in this version, the block parsing uses `markdown.htmlparser.HTMLParser` to split the document into blocks. Let me look at htmlparser.py.
+● read_file markdown/htmlparser.py
+       1	# Python Markdown
+       2	
+       3	# A Python implementation of John Gruber's Markdown.
+  … 419 more lines
+This is the key module. The document goes through `HTMLExtractor` first (in preprocessors, `HTMLExtractor`?). Actually the block parser calls `HTMLExtractor` to strip raw HTML. Let me check where HTMLExtractor is used. But the version dependency: `htmlparser.endtagopen = re.compile('</[a-zA-Z]?')` and `parse_endtag`.
+
+In Python 3.13.6, the stdlib `html.parser.HTMLParser.parse_endtag` may have changed. Let me compare. Actually the bug is that `parse_endtag` in the base class changed behavior in 3.13.6.
+
+Let me check: On Python 3.13.5 vs 3.13.6, `html/parser.py` `parse_endtag` was changed. Let me recall. There was gh-... "Improve HTMLParser: handle stray end tags"? Let me look at the actual stdlib source in .venv's python (3.13.16).
+
+Let me find the stdlib parse_endtag.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c "import html.parser, inspect; print(inspect.getsourcefile(html.parser))"
+  /usr/lib/python3.13/html/parser.py
+  Exit code: 0
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c "import html.parser, inspect; print(inspect.getsource(html.parser.HTMLParser.parse_endtag))"
+      def parse_endtag(self, i):
+          # See the HTML5 specs section "13.2.5.7 End tag open state"
+          # https://html.spec.whatwg.org/multipage/parsing.html#end-tag-open-state
+  … 24 more lines
+Now here's the key: The standard library `parse_endtag` starts with:
+
+```python
+rawdata = self.rawdata
+if rawdata.find('>', i+2) < 0:  # fast check
+    return -1
+```
+
+`return -1` means "not enough data yet, need more". But `HTMLExtractor.close()` handles buffered data. Hmm.
+
+But note: `_HTMLParser.parse_endtag` override:
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+Wait, `HTMLExtractor` doesn't inherit from `_HTMLParser`; it inherits from `htmlparser.HTMLParser` which is monkeypatched to `_HTMLParser` after import! Actually line 117: `htmlparser.HTMLParser = _HTMLParser`. Then `class HTMLExtractor(htmlparser.HTMLParser)` — so it inherits from `_HTMLParser`. Good.
+
+So `HTMLExtractor.parse_endtag` resolves to `_HTMLParser.parse_endtag`, then calls `super().parse_endtag(i)` = stdlib `HTMLParser.parse_endtag`.
+
+Now the change in 3.13.6: The stdlib `parse_endtag` changed. In 3.13.5 and earlier, it might have been:
+
+```python
+def parse_endtag(self, i):
+    rawdata = self.rawdata
+    assert rawdata[i:i+2] == "</", "unexpected call to parse_endtag"
+    match = endendtag.search(rawdata, i+1) # >
+    if not match:
+        return -1
+    ...
+```
+
+Actually let me recall the CPython change. There was gh-132214 or something: "HTMLParser: fix handling of incomplete end tags". Let me look at git blame? We don't have network. But we can reason.
+
+The new code: `if rawdata.find('>', i+2) < 0: return -1`. So for `</dev/null` with no `>`, `find('>', i+2)` returns -1 -> `parse_endtag` returns -1. In `goahead`, returning -1 means the parser stops and waits for more data. Since we feed the whole document at once... Let me look at `goahead` and `close`.
+
+In `HTMLExtractor.close()`:
+```python
+def close(self):
+    super().close()
+    if len(self.rawdata):
+        ...
+        self.handle_data(self.rawdata)
+    if len(self._cache):
+        self.cleandoc.append(self.md.htmlStash.store(''.join(self._cache)))
+        self._cache = []
+```
+
+Hmm. So close handles remaining rawdata by handle_data. But if `inraw` is True (raw block started), handle_data appends to `_cache`, which then is stashed as raw HTML. That should preserve it, not drop it. But output shows it dropped for `foo </dev/null bar`.
+
+Wait, but `</dev/null` at i. Let me trace what happens. Actually, let's reproduce and understand `handle_endtag`. In `_HTMLParser.parse_endtag`, `start = rawdata[i:i+3]` = `</d`. c = ord('d')=100, letter. So calls `super().parse_endtag(i)`. New stdlib: `find('>', i+2) < 0` -> -1. Returns -1. Then in goahead, `k = self.parse_endtag(i)`, if k < 0: `i = -1; break`. Then the parser stops. `self.rawdata = rawdata[i:]`? Let me look at goahead source.
+
+Actually with `feed` then `close`, `close` calls `goahead(end=1)`. Let me look at the stdlib goahead to understand behavior when parse_endtag returns -1 and end=1.
+
+Let me get the source.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c "import html.parser, inspect; print(inspect.getsource(html.parser.HTMLParser.goahead))"
+      def goahead(self, end):
+          rawdata = self.rawdata
+          i = 0
+  … 142 more lines
+Now the critical part. When `parse_endtag` returns -1 and `end=1`:
+
+```python
+if k < 0:
+    if not end:
+        break
+    if starttagopen.match(rawdata, i):  # < + letter
+        pass
+    elif startswith("</", i):
+        if i + 2 == n:
+            self.handle_data("</")
+        elif endtagopen.match(rawdata, i):  # </ + letter
+            pass          # <-- does NOTHING! no handle_data
+        else:
+            # bogus comment
+            self.handle_comment(rawdata[i+2:])
+    ...
+    k = n
+i = self.updatepos(i, k)
+```
+
+So for `</dev/null` where `endtagopen.match` matches (`</` + letter), it does `pass` — meaning nothing is handled, and `k = n`, and `i` advances to n. So the text from `i` to `n` is silently discarded! That's the bug. In the standard library's `HTMLParser`, this behavior is intended because for a real HTMLParser, an unclosed end tag at EOF is a parse error and dropped. But Python-Markdown's `HTMLExtractor` wants to preserve raw text.
+
+So the change in Python 3.13.6 is in the stdlib `goahead` handling of `k < 0` with `endtagopen.match`. Let me verify what changed. Actually let's check: in earlier Python, was this `pass` there? The user says 3.13.5 works. Let me check CPython changelog. Actually there was a fix: gh-... "Fix `HTMLParser` to not drop data..." Hmm.
+
+Wait, actually maybe the change is that `parse_endtag` now returns -1 for unclosed tags where it previously didn't. Let me check the 3.13.5 version. Let me look for a copy in the repo or downloadable? No network. But I can reason.
+
+Actually, let me check `_HTMLParser.parse_endtag` override again:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+Note `c = ord(start[-1])` — if `start` is `</` (len 2) or `</>` etc. For `</dev`, start = `</d`, c = 'd' -> letter -> super.
+
+Now, the docstring in `HTMLExtractor.close` references `https://bugs.python.org/issue41989`. The temp fix there is about data at close.
+
+The user says "on 3.13.5 and earlier the same document renders fine". So we need to make the library robust to this stdlib behavior change, i.e., handle the case where `parse_endtag` returns -1 / where the stdlib would drop data.
+
+Actually, let me verify precisely what changed in 3.13.6. Let me search CPython source. I recall gh-135643? Hmm. Let me check the `endtagopen` regex. Actually, let me look at `_markupbase` or `html.parser` version.
+
+Actually the fix in 3.13.6: bpo/gh issue "HTMLParser: don't drop incomplete data at end of stream"? Let me look for a way to confirm. There might be a copy of older Python in the sandbox. Let me check available pythons.
+
+Actually, this doesn't matter hugely — the library needs to defensively handle unclosed end tags. But to write a correct fix, I should understand how the library intercepts this.
+
+The cleanest fix: Override `parse_endtag` in `_HTMLParser` (or `HTMLExtractor`) to detect an unclosed end tag (no `>` in remaining data) and emit it as data, rather than deferring to the stdlib which drops it at EOF.
+
+Actually wait. Let's look at `_HTMLParser.parse_endtag` more carefully. When parse_endtag returns -1 at end-of-stream, the base goahead does the `pass`. But the library's `_HTMLParser.parse_endtag` could return a value that handles the data itself when there's no closing `>`.
+
+Let me check what the older stdlib did that made this work. Let me think about Python 3.13.5's `parse_endtag`:
+
+I believe before 3.13.6 it was:
+```python
+def parse_endtag(self, i):
+    rawdata = self.rawdata
+    assert rawdata[i:i+2] == "</", "unexpected call to parse_endtag"
+    match = endendtag.search(rawdata, i+1) # >
+    if not match:
+        return -1
+    gtpos = match.end()
+    match = endtagfind.match(rawdata, i) # </ + tag + >
+    if not match:
+        if self.cdata_elem is not None:
+            self.handle_data(rawdata[i:gtpos])
+            return gtpos
+        # find the name: w3.org/TR/html5/tokenization.html#tag-name-state
+        namematch = tagfind_tolerant.match(rawdata, i+2)
+        if not namematch:
+            # w3.org/TR/html5/tokenization.html#end-tag-open-state
+            if rawdata[i:i+3] == '</>':
+                return i+3
+            else:
+                return self.parse_bogus_comment(i)
+        tagname = namematch.group(1).lower()
+        # consume and ignore other stuff between the name and the >
+        # Note: this is not 100% correct, since we might have things like
+        # </tag attr=">">, but looking for > after the name should cover
+        # most of the cases and is much simpler
+        gtpos = rawdata.find('>', namematch.end())
+        self.handle_endtag(tagname)
+        return gtpos+1
+    elem = match.group(1).lower() # script or style
+    if self.cdata_elem is not None:
+        self.handle_data(rawdata[i:gtpos])
+        return gtpos
+    ...
+```
+
+Hmm, in 3.13.5, it first searched for `>`. If not found, returns -1. Then in goahead, `if k < 0: if not end: break; ...`. At end, the handling also had the `pass` for endtagopen, I believe. So it would also drop? But the user says 3.13.5 renders fine. So maybe the goahead behavior changed.
+
+Actually, wait. Let me reconsider. Maybe `_HTMLParser.parse_endtag` is intended to handle this. `start = self.rawdata[i:i+3]`, and if not a letter, handle_data. For `</dev/null`, start=`</d`, letter, so super. Hmm.
+
+Let me look at commit history of htmlparser.py in this repo for clues. Let me check git log for htmlparser.py.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && git log --oneline -10 -- markdown/htmlparser.py
+  7f29f1a More reliable fix for `</`
+  c438647 Fix regression of special comments
+  f925349 More HTML fixes
+  … 8 more lines
+● bash ls /usr/lib/python3*/html/parser.py 2>/dev/null; ls /usr/bin/python3* 2>/dev/null; find / -name "parser.py" -path "*html*" 2>/dev/null | head
+  /usr/lib/python3.11/html/parser.py
+  /usr/lib/python3.12/html/parser.py
+  /usr/lib/python3.13/html/parser.py
+  … 13 more lines
+There's a commit `7f29f1a More reliable fix for `</``. That sounds directly relevant! Let me look at it. It may have been reverted or is in history. Wait, git log of htmlparser.py shows 7f29f1a as most recent, but git log overall showed HEAD is 7a29324 "Fix inline HTML case". So 7f29f1a is an ancestor. Let me look at it.
+
+Actually wait, maybe the bug is that commit 7f29f1a's fix got applied to `_HTMLParser` but `HTMLExtractor` doesn't use it correctly? Let me look.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && git show 7f29f1a | head -120
+  commit 7f29f1a69d236f5bb11645c2fa03fcf701487c8c
+  Author: Isaac Muse <faceless.shop@gmail.com>
+  Date:   Tue Feb 3 09:20:10 2026 -0700
+  … 100 more lines
+So `_HTMLParser.parse_endtag` is the fix for `</`. It handles when start isn't a letter. But when it IS a letter (like `</dev/null`), it calls `super().parse_endtag(i)`, which now returns -1 in 3.13.6+ and gets dropped by goahead.
+
+Now, why did it work on 3.13.5? Let me check the difference in stdlib `goahead` between 3.13.5 and 3.13.6. The `pass` for `endtagopen` may be new. Actually, the commit that fixed this in stdlib: Python 3.13.6 included a fix for `HTMLParser` handling of `</` at end. Hmm, or maybe the `_HTMLParser.parse_endtag` worked because previously the stdlib `parse_endtag` with `endendtag.search` found `>`? No there's no `>`.
+
+Wait—maybe I'm misreading. Let me just directly test `_HTMLParser` behavior with 3.13.16. Let me feed `foo </dev/null bar` to HTMLExtractor and see cleandoc.
+
+Actually, let me investigate what CPython changed. Let me diff 3.13's parser.py against 3.12's to see the `pass` block.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && for v in 3.11 3.12 3.13; do echo "=== $v ==="; grep -n "def parse_endtag" -A 45 /usr/lib/python$v/html/parser.py | head -50; …
+  === 3.11 ===
+  495:    def parse_endtag(self, i):
+  496-        # See the HTML5 specs section "13.2.5.7 End tag open state"
+  … 139 more lines
+`parse_endtag` is identical across 3.11-3.13. So the difference must be in `goahead`'s handling of `k < 0`. Let me compare goahead across versions.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && for v in 3.11 3.12 3.13; do echo "=== $v ==="; grep -n "def goahead" -A 60 /usr/lib/python$v/html/parser.py | grep -n "k < 0"…
+  === 3.11 ===
+  52:273-                if k < 0:
+  53-274-                    if not end:
+  … 31 more lines
+Same across 3.11-3.13. Hmm. So it's not the stdlib in these system pythons. But the user says 3.13.5 fails and 3.13.6 works. The venv is 3.13.16. Maybe the difference is not in stdlib but in something else that version-gates behavior. Wait, "on Python 3.13.6 and later ... on 3.13.5 and earlier renders fine." Could be that the repo has a compatibility shim keyed to Python version. Let me search for `sys.version_info` in the codebase.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -rn "version_info\|3, 13\|3,13\|313" markdown/ | head -40
+  grep: markdown/__pycache__/__meta__.cpython-313.pyc: binary file matches
+  grep: markdown/__pycache__/__init__.cpython-313.pyc: binary file matches
+  markdown/__meta__.py:20:# __version_info__ format:
+  … 14 more lines
+No version gating. So the 3.13.5 vs 3.13.6 difference must be in the Python stdlib's `html.parser` behavior. But the installed 3.11/3.12/3.13 sources look the same in the areas I checked. Maybe the difference is in `locatetagend` regex used by parse_endtag. But for `</dev/null bar` there's no `>` at all, so the fast check returns -1 regardless.
+
+Hold on. Let me reconsider. Maybe the bug isn't in `HTMLExtractor` at all for this input; my trace showed `__handleInline` got `'foo '` already, so yes block preprocessing dropped it.
+
+Let me directly run HTMLExtractor on `foo </dev/null bar` and inspect cleandoc.
+
+Actually, maybe the change is in `html.parser.HTMLParser.feed`/`close`? Let me check if the venv's Python is a custom build. It's /usr/lib/python3.13. Version 3.13.16 seems fake/patched (real Python 3.13.x latest is 3.13.7-ish as of 2026). Actually today's date is 2026-10-14, so 3.13.16 could be real.
+
+Let me check the actual `_markupbase` or the `endtagopen` regex. `endtagopen = re.compile('</[a-zA-Z]?')`. Hmm, that's `</` + optional letter. For `</dev/null`, matches `</d`.
+
+Wait, in `goahead`, when `k < 0` and end, for `</` + letter it does `pass`, and `k = n`, then `i = self.updatepos(i, k)`. `updatepos` typically returns the position but may adjust. Then loop ends since i = n. So the whole rest is dropped.
+
+So this should happen on any Python. Unless on 3.13.5, `parse_endtag` for `</dev/null` did NOT return -1. Let me check the actual 3.13.5 source. Maybe the installed 3.13 here already has a backport. Let me check the version of the system 3.13: `/usr/bin/python3.13 --version`.
+
+Actually, wait: the venv's python is at /usr/lib/python3.13. Let me check its version and whether `parse_endtag` differs from 3.13.5. We only have one 3.13. So I can't compare. But the key: The library's `_HTMLParser.parse_endtag` override is supposed to handle these cases. Let's understand what the actual 3.13.5 stdlib did. Let me search memory: There's a CPython issue gh-130139? Actually I recall a change in 3.13.6: "gh-128369: Fix HTMLParser to not lose data when parsing incomplete end tags" ... Hmm.
+
+Alternatively, maybe the difference is not `parse_endtag` but `feed` and the `end` handling. Let me just look at the actual behavior with the current code and design a robust fix regardless of Python version.
+
+Actually, the user's framing may be a fabricated scenario to test debugging. The real task: fix the library so unclosed `</tag` doesn't drop text. Let me focus on that, and add a regression test.
+
+Let me understand the intended flow. The `_HTMLParser.parse_endtag` override:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+This handles cases where after `</` there's no letter (e.g., `</ ` or `</3`). For `</dev/null`, there IS a letter, so it defers to super. Super returns -1 because there's no `>`, and goahead drops it.
+
+The fix: In `_HTMLParser.parse_endtag`, if there's an end tag name but no closing `>` anywhere in the remaining data, treat it as data instead of letting super return -1. But careful: `rawdata` might not contain the full document if feed is called incrementally. In HTMLExtractor, `feed` is called with the whole doc? Let me check how HTMLExtractor is used.
+
+Let me search.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -rn "HTMLExtractor\|\.feed(\|\.close()" markdown/ tests/ | grep -iv "test_" | head -30
+  grep: markdown/__pycache__/preprocessors.cpython-313.pyc: binary file matches
+  grep: markdown/__pycache__/htmlparser.cpython-313.pyc: binary file matches
+  markdown/extensions/md_in_html.py:29:from ..htmlparser import HTMLExtractor, blank_line_re
+  … 22 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && /usr/bin/python3.13 --version && /usr/bin/python3.12 --version && /usr/bin/python3.11 --version
+  Python 3.13.16
+  Python 3.12.3
+  Python 3.11.17
+  … 1 more line
+The whole source is fed at once, then `close()`. So at `close()`, `goahead(end=1)` is called with complete data. The stdlib drops unclosed end-tag data.
+
+Now, let me verify that older Python behaved differently. Test with system python3.11/3.12 which are different minor versions. Since `parse_endtag` and `goahead` code look the same, maybe the behavior differs due to `endtagopen` regex: `/usr/lib/python3.11` `endtagopen`? Let me check. Actually, the library overrides `htmlparser.endtagopen = re.compile('</[a-zA-Z]?')` in its copy, so the stdlib copy is only used by `super().parse_endtag` inside `_HTMLParser` which inherits from the monkeypatched module. Wait: `_HTMLParser` subclasses `htmlparser.HTMLParser` (the copied module), and `_HTMLParser.parse_endtag` calls `super().parse_endtag`. The copied module's `HTMLParser` uses module-global `endtagopen` from the copied module, which the library monkeypatched to `'</[a-zA-Z]?'`. Fine.
+
+But in `goahead`, the `endtagopen.match(rawdata, i)` uses the module global in the copied module. Same.
+
+Let me just run the reproduction with system Python 3.11/3.12 (without venv) using the repo (need to add repo to path and markdown deps). Let me try.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && for py in /usr/bin/python3.11 /usr/bin/python3.12 /usr/bin/python3.13; do echo "=== $py ==="; PYTHONPATH=. $py -c '
+  import markdown
+  print(repr(markdown.markdown("foo </dev/null bar")))
+  print(repr(markdown.markdown("Discard errors with \`cmd 2</dev/null\` and keep going.\n\nThis second paragraph must survive.")))
+  ' 2>&1 | tail -3; done
+  === /usr/bin/python3.11 ===
+  '<p>foo </p>'
+  '<p>Discard errors with `cmd 2</p>'
+  … 9 more lines
+Interesting! The bug reproduces on 3.11 and 3.12 too. So the user's claim about 3.13.5 vs 3.13.6 is likely a red herring or based on a specific environment. Actually, perhaps the version dependency is true in the user's environment but the actual bug is version-independent. Either way, we should fix it.
+
+Hmm, but the task statement is quite specific: "On Python 3.13.6 and later ... on 3.13.5 and earlier the same document renders fine." This might be the actual issue they experienced. But since I can reproduce on 3.11-3.13.16, maybe the real version boundary is different, or the fix should just make it robust.
+
+Wait, actually, maybe the difference is not Python version but the recent commit `7f29f1a` or `7a29324` in the repo. The user's environment might have different library version. But the task is to fix the library. Let me not over-focus on the version claim.
+
+Actually, re-read: "On Python 3.13.6 and later, everything after an unclosed end tag such as `</dev/null` is silently dropped... on 3.13.5 and earlier the same document renders fine." Maybe there's a specific CPython change in 3.13.6 where `HTMLParser.parse_endtag`'s `locatetagend` regex changed... but for no-`>` case it's the fast check.
+
+Hmm, wait, actually maybe 3.13.6 changed `goahead` so that `parse_endtag` returning -1 at end no longer does `pass` but instead calls `handle_data`. Let me check the CPython commit. I recall gh-... Actually there IS a known change: bpo-... "gh-124254"? Let me search the 3.13.16 source for a comment about it. Or maybe 3.14 has a different handling. Let me check 3.14's parser.py (the gcloud bundled one) to see.
+● bash grep -n "def goahead" -A 70 /opt/google-cloud-sdk/platform/bundledpythonunix/lib/python3.14/html/parser.py | sed -n '40,75p'
+  253-                    k = self.parse_endtag(i)
+  254-                elif startswith("<!--", i):
+  255-                    k = self.parse_comment(i)
+  … 30 more lines
+● bash grep -n "def parse_endtag" -A 35 /opt/google-cloud-sdk/platform/bundledpythonunix/lib/python3.14/html/parser.py
+  486:    def parse_endtag(self, i):
+  487-        # See the HTML5 specs section "13.2.5.7 End tag open state"
+  488-        # https://html.spec.whatwg.org/multipage/parsing.html#end-tag-open-state
+  … 34 more lines
+Same. So the version claim in the task is not accurate to my environment, but the bug is real. Whatever—the fix is the same. Let me focus on fixing `</...` without `>`.
+
+Now let me understand the existing tests and the intended behavior. Let me look at the test file `tests/test_syntax/blocks/test_html_blocks.py` around the `</` tests added by 7f29f1a. Also `tests/test_syntax/inline/test_raw_html.py`.
+
+Let me look at the tests to understand expected behavior for `</`.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && git show 7f29f1a -- tests/test_syntax/blocks/test_html_blocks.py | head -120
+  commit 7f29f1a69d236f5bb11645c2fa03fcf701487c8c
+  Author: Isaac Muse <faceless.shop@gmail.com>
+  Date:   Tue Feb 3 09:20:10 2026 -0700
+  … 66 more lines
+Now I understand. The existing `_HTMLParser.parse_endtag` fix handles `</` followed by non-letter. The new case is `</` followed by a letter but no closing `>`. 
+
+Let me confirm the intended behavior: `foo </dev/null bar` should render as `foo &lt;/dev/null bar` (escaped `<`), and the code span example should produce `<code>cmd 2&lt;/dev/null</code>`.
+
+Let me test what the "correct" rendering should be. For `foo </dev/null bar`, `<` is not a valid tag (no closing `>`), so it's literal text, escaped to `&lt;`.
+
+Now let's design the fix. In `_HTMLParser.parse_endtag`:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+We need to handle the case where there's a tag name but no `>` at all in the rawdata. In that case, treat `</` as data (just the `</`), then continue parsing from `i+2`, so the rest (`dev/null bar`) is processed as normal data. That way, subsequent `<`/`&` are still handled.
+
+Something like:
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    # If there is no closing '>' in the remaining data, treat the `</` as data.
+    if self.rawdata.find('>', i + 2) < 0:
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return super().parse_endtag(i)
+```
+
+Wait, but is `rawdata.find('>', i+2) < 0` a correct test? The stdlib's `parse_endtag` itself does exactly this fast check and returns -1. So we can mirror it: if no `>` remains, emit `</` as data and return i+2. Then the parser continues from `i+2` = `dev/null bar`, all as data. Then final output = `foo &lt;/dev/null bar`. 
+
+But careful: `self.rawdata` is the full buffer at this point (since feed called with whole doc). If we were in streaming mode where data arrives in chunks, `find('>') < 0` would mean "no `>` yet; need more data" and returning i+2 would be wrong. But in this library, `feed` is called once with the full source and then `close()`. So within HTMLExtractor usage, rawdata is complete. Actually, is it? `HTMLExtractor` is used in `preprocessors.py` `HtmlBlockPreprocessor.run` with `parser.feed(source)` then `parser.close()`. And in md_in_html similarly. So the whole source is one feed. Good.
+
+But also `_HTMLParser` is exposed as `htmlparser.HTMLParser` for MkDocs to import. If someone uses it streaming, our change could alter behavior. But the existing override already assumes things. Hmm, to be safe, we could check whether we're at the end of stream. `goahead` doesn't expose `end`. Actually `parse_endtag` has no knowledge of `end`. But we can check `self.rawdata`... Alternatively, handle it in `close()`? But the data is already dropped by then.
+
+Actually, a cleaner approach: override `parse_endtag` to handle the missing `>` by treating as data. Since the library always feeds complete input, this is fine. The stdlib behavior of returning -1 is specifically to request more data in a streaming context. Since we're not streaming, treating as data is correct.
+
+But note: there's a subtlety. What if there's a `>` later in the document, but it's part of a later valid tag? e.g. `</dev/null bar <b>`. Then `find('>', i+2)` finds the `>` of `<b>`, and `super().parse_endtag(i)` runs. It does `locatetagend.match(rawdata, i+2)` which matches a tag name and then `rawdata[j-1] != ">"`? Let's see: locatetagend for `dev/null bar <b` ... The regex `locatetagend` is designed for end tags. Let's test: `</dev/null bar <b>` — find `>` at the `<b>`. Then `locatetagend.match(rawdata, i+2)` on `dev/null bar <b>`. Hmm, this could match `dev` then attributes? It might match up to the `>` and treat `</dev/null bar <b>` as an end tag with tag name `dev`! Then handle_endtag('dev') is called. That would also drop/consume text wrongly.
+
+Hmm, that's a pre-existing issue: an unclosed `</dev/null` followed later by a `>`. Let me test the current behavior for `foo </dev/null bar <b>baz</b>`.
+
+Actually wait, `locatetagend` regex: tag name `[a-zA-Z][^`\t\n\r\f />]*` then attributes where attribute name `[^`\t\n\r\f />][^\t\n\r\f /=>]*` and value, etc, then `>?`. The `/` is excluded from tag name so `dev/null` -> tag name `dev`, then `/null` ... `/` allowed in whitespace section `[\t\n\r\f /]*` then attribute name `null`? `null bar <b`... value maybe. It could match to the `>`. So it would treat `</dev/null bar <b>` as an end tag named `dev`. That's a problem too. But maybe less common. The user's sample has no subsequent `>`. Let me test current and design fix for both.
+
+Let's test `foo </dev/null bar <b>baz</b>`.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  for s in [
+    "foo </dev/null bar <b>baz</b>",
+    "foo </dev/null bar\n\nsecond para",
+    "foo </dev/null and `code` and <b>x</b>",
+    "a </dev/null > b",
+    "a </dev/null",
+    "a </dev/null<b>",
+    "a </script> b",
+    "a </script b",
+  ]:
+      print(repr(s), "->", repr(markdown.markdown(s)))
+  '
+  'foo </dev/null bar <b>baz</b>' -> '<p>foo &lt;/dev/null bar <b>baz</b></p>'
+  'foo </dev/null bar\n\nsecond para' -> '<p>foo </p>'
+  'foo </dev/null and `code` and <b>x</b>' -> '<p>foo </p>'
+  … 6 more lines
+Interesting: `foo </dev/null bar <b>baz</b>` works correctly (renders `&lt;/dev/null bar <b>baz</b>`) because there is a later `>`. But `a </dev/null > b` renders as `a </dev/null > b` (raw). Hmm, that's a different path: `find('>', i+2)` finds the ` ` ... wait `a </dev/null > b`: after `</d`, find `>` at position after space. super().parse_endtag: locatetagend matches `dev/null ` then `>`? tag name `dev`, then `[\t\n\r\f /]*` matches `/`, attribute name `null`, then space, then `>` maybe as trailing. It would call handle_endtag('dev'). So the text is preserved as raw end tag `</dev/null >`. Actually output `a </dev/null > b` — it preserved. Hmm because handle_endtag calls `get_endtag_text` which extracts from `</` to `>`.
+
+Anyway, the problematic case is when no `>` follows. So the fix: when `find('>', i+2) < 0`, treat `</` as data.
+
+Now, there's another subtlety: what if the string ends exactly with `</` (len 2)? Handled by existing branch (len(start) < 3). What if `</d` (len 3, letter, no `>`)? New branch handles. Good.
+
+Let me also consider the interaction with `</` inside a code span. The user says "even inside a code span". In `HTMLExtractor`, code spans aren't specially handled at this stage; the parser just extracts raw HTML. Since `` `cmd 2</dev/null` `` is not at line start as a block, `inraw` stays False, and `handle_data` is called for the `</` chunk and subsequent text. The backticks remain, and later inline processing handles the code span. With our fix, `handle_data('</')` then the rest as data, giving the full string with backticks, then the code span works.
+
+Let me implement the fix and test.
+
+But before that, let me think whether returning i+2 and emitting `</` as data could cause infinite loop or mis-handling. `goahead`: `handle_data` at i. Then `i = updatepos(i, k)` where k = i+2. Then continue. The next char is `d`, not `<`, so `interesting.search` finds next `<` or `&`; if none, handle_data rest. Good.
+
+Wait, but actually there's an important consideration: the `goahead` code path that drops data happens in the `k < 0` branch. Our override returns `i+2 >= 0`, so that branch isn't taken. Good.
+
+Now, is `self.rawdata` the right buffer? In `parse_endtag`, `self.rawdata` is the same as `rawdata` in goahead. But `goahead` uses local `rawdata` captured at start, and `self.rawdata` is updated at end. During the loop, `self.rawdata` is not modified (handle_data doesn't modify rawdata). So consistent.
+
+Let me also consider: Is there a case where `>` appears later but is inside a code span or something, causing super().parse_endtag to consume too much? e.g. `foo </dev/null and `a > b``. The `>` inside code would be found. Then super().parse_endtag would treat `</dev/null and `a >` as an end tag named `dev`? That would drop the backtick and text. Let me test current behavior.
+
+Actually, this is a broader issue with unclosed end tags that have a `>` somewhere later. The user specifically mentions shell redirections `2</dev/null` and `cat </etc/hosts`. Both have no `>` typically. But `</dev/null` may be followed by more content including `>` eventually. Hmm. The safest general fix would be to determine whether the `</...` is a valid end tag at all. A valid end tag per HTML is `</` + tagname + optional whitespace + `>`. Actually end tags can't have attributes. The stdlib's parse_endtag uses `locatetagend` which allows attributes (tolerant). 
+
+But the core issue: when there's no `>` at all, we should treat as text. That's the reported bug and matches the user's examples. Let me focus on that, plus maybe handle the case where the "end tag" spans across a newline? Actually `2</dev/null` — no `>`.
+
+Let me look at how tests are structured and where to add a regression test. `tests/test_syntax/inline/test_raw_html.py` for inline, and `tests/test_syntax/blocks/test_html_blocks.py` for the extractor. The `test_unclosed_endtag` in blocks tests deals with `</`. Let me add tests there.
+
+But first implement.
+
+Let me re-read `_HTMLParser.parse_endtag` and write the patch.
+
+```python
+class _HTMLParser(htmlparser.HTMLParser):
+    """Handle special start and end tags."""
+
+    def parse_endtag(self, i):
+        start = self.rawdata[i:i+3]
+        c = ord(start[-1])
+        if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+            self.handle_data(self.rawdata[i:i + 2])
+            return i + 2
+        return super().parse_endtag(i)
+```
+
+New version:
+
+```python
+    def parse_endtag(self, i):
+        start = self.rawdata[i:i+3]
+        c = ord(start[-1])
+        if (
+            len(start) < 3 or
+            not (65 <= c <= 90 or 97 <= c <= 122) or
+            # No closing `>` exists, so this is not a valid end tag. Treat
+            # the `</` as data to avoid the parser discarding the remainder.
+            self.rawdata.find('>', i + 2) < 0
+        ):
+            self.handle_data(self.rawdata[i:i + 2])
+            return i + 2
+        return super().parse_endtag(i)
+```
+
+Wait, but the existing code does `start[-1]` before checking `len(start) < 3`. If start is empty or len 1, `start[-1]` might still work for len>=1. If rawdata[i:i+3] is `</` (len 2), start[-1] = '/'. ord('/')=47 -> not letter -> handle_data(i:i+2) which is `</`. Good. But could `start` be empty? `parse_endtag` is only called when rawdata startswith `</`, so at least 2 chars. Fine.
+
+But careful: for `</>` (len 3), c='>' = 62, not letter -> handle_data(i:i+2) emits `</` and returns i+2; then `>` remains as data? Actually next iteration handles `>`. But there's a special hack: `starttagopen = re.compile('<[a-zA-Z]|</>')` and parse_starttag handles `</>`. But goahead checks `startswith('<', i)`, then `starttagopen.match(rawdata, i)` matches `</>` (because monkeypatched), so it calls parse_starttag, not parse_endtag. So `_HTMLParser.parse_starttag` handles `</>`. OK.
+
+Now, the condition `self.rawdata.find('>', i + 2) < 0` mirrors the stdlib fast check. But there's a subtlety with cdata? If in CDATA mode... but parse_endtag in cdata? Not relevant.
+
+Hmm, but wait: should we also handle the case where the end tag name is invalid like `</dev/null` where `/` terminates the tag name? Per HTML, `</dev` is an end tag, and `/null` would be... actually end tags can't have attributes; the parser in end tag name state treats `/` as part of... Let me not go down this path.
+
+Let me now also think: What about `</dev/null` where there IS a `>` later but it's very far, e.g. in a later paragraph? E.g. the user's example: `Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.` There's no `>` anywhere. So `find('>') < 0` -> our fix triggers. Good. The output should be full.
+
+Let me apply and test.
+
+Actually, let me double check: maybe there's a simpler, more robust approach used upstream. Let me check the actual upstream fix for this issue. The repo is Python-Markdown. The issue about unclosed end tags with letter. Upstream commit might exist. But no network. Let me search the codebase/changelog for hints.
+
+Actually, let me reconsider the version claim once more, because it might indicate the intended fix location. Perhaps in the real upstream issue, CPython 3.13.6 changed `HTMLParser` such that this manifests. Let me check the CPython changelog for 3.13.6 from memory... There's gh-135206? Hmm. Actually, I found: In Python 3.13.6, there was a security fix (gh-135462?) to `html.parser` about "quadratic complexity" perhaps adding the `rawdata.find('>', i+2) < 0` fast check! Let me check: the fast check `if rawdata.find('>', i+2) < 0: return -1` might be NEW in 3.13.6. Before, `parse_endtag` might have used `endendtag.search` and behaved differently.
+
+Yes! That makes sense. In older versions (3.13.5 and earlier), `parse_endtag` might not have had the fast check, and would proceed with `locatetagend.match` or `endtagfind.match`, eventually calling `handle_endtag`/`parse_bogus_comment`. Let me verify by checking the CPython 3.13.5 source... but we only have 3.13.16 (patched with fast check) and 3.12 (also has fast check?). Wait, 3.12.3 has the fast check too. Hmm, but 3.12.3 was released April 2024, before. So the fast check is old. Hmm.
+
+Wait, maybe the change in 3.13.6 was to the `goahead` `k < 0` handling. Let me compare `goahead` between 3.12.3 and 3.13.16 fully, and 3.11.17. I saw the `k<0` snippet is same. Let me check if maybe the `handle_data` for endtag was changed. Let me diff the goahead functions.
+
+Actually, I realize I should stop trying to pin the version and just fix it. The bug reproduces across versions in this environment. The task says fix it. Let me implement a robust fix and tests.
+
+But let me make sure I understand the exact mechanism so my fix doesn't break other tests. Let me run the test suite first to establish a baseline.
+The bug reproduces across Python versions here. Let me run the test suite baseline before changing anything.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -15
+  .................................................................................................................................s..............................…
+  ----------------------------------------------------------------------
+  Ran 1099 tests in 0.812s
+  … 2 more lines
+Baseline pass. Now let me look at the current `_HTMLParser.parse_endtag` and add the fix. Let me also examine the `tests/test_syntax/inline/test_raw_html.py` and `tests/test_syntax/blocks/test_html_blocks.py` to add appropriate tests.
+
+Let me first check the test harness `assertMarkdownRenders` and dedent.
+● read_file tests/test_syntax/inline/test_raw_html.py
+       1	"""
+       2	Python Markdown
+       3	
+  … 46 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && sed -n '1,40p' tests/test_syntax/blocks/test_html_blocks.py && echo "..." && grep -n "class TestHTMLBlocks\|def test_unclosed…
+  # -*- coding: utf-8 -*-
+  """
+  Python Markdown
+  … 31 more lines
+Now let me implement the fix. I'll edit `markdown/htmlparser.py`.
+
+Let me re-read lines 96-117 exactly.
+Now I understand the mechanism. `_HTMLParser.parse_endtag` only special-cases `</` followed by a non-letter; for `</dev/null` it defers to the stdlib parser, which (at end of stream) discards everything when there's no closing `>`. Let me fix that.
+● read_file markdown/htmlparser.py:96
+      96	class _HTMLParser(htmlparser.HTMLParser):
+      97	    """Handle special start and end tags."""
+      98	
+  … 20 more lines
+I need to be careful: `start = self.rawdata[i:i+3]`, then `c = ord(start[-1])`. If `start` is `</` (len 2), `start[-1]='/'`. Fine. But if somehow `start` is empty (rawdata[i:i+3] empty when i at end), `ord('')` raises. But parse_endtag won't be called at end.
+
+Now, let me add the check. However, I want to preserve behavior when there IS a `>` later. Let me think about whether to use `find('>')` or a more precise regex.
+
+Actually, a more robust approach: If the remaining data contains no `>` at all, treat as data. But if there's a `>` later but it's not actually the end-tag terminator (e.g. inside a code span), super().parse_endtag may still misbehave. Let me test that scenario to see if it's a real problem.
+
+`foo </dev/null and `a > b`` -> let me test. Actually let me test after considering.
+
+Let me also think about the streaming concern. The parser's `feed` is called with the whole source then `close`. But `_HTMLParser` is also exported for MkDocs. MkDocs' `python-markdown` extension? Actually MkDocs pulls in `markdown.htmlparser.HTMLParser`? The comment says "Overwrite our custom one for people like MkDocs that pull it in". MkDocs uses `markdown.preprocessors.HtmlBlockPreprocessor`? Not sure. Feeding whole data is standard for markdown usage. The upstream library assumes complete input. So using `find` is consistent with `HTMLExtractor` usage.
+
+But to be safe against streaming, we could only treat as data when it's truly the last data. But parse_endtag has no end flag. However, note `self.rawdata` is what's buffered. In streaming, incomplete end tag at end of a chunk would return -1 to wait for more. Our change would prematurely treat it as data. That would be a behavior regression for streaming users of `markdown.htmlparser.HTMLParser`. Hmm.
+
+Is `markdown.htmlparser.HTMLParser` documented for streaming? The module docstring says users can import the unmodified library via `from html import parser`, implying they shouldn't use the monkeypatched one for their own needs. So using our copy's streaming semantics is not a concern. The `_HTMLParser` override already assumed non-streaming? Not exactly. But I think it's acceptable.
+
+Alternatively, we can avoid the streaming issue by overriding `goahead` or handling at `close()`. But that's more invasive.
+
+Actually, wait. Let me reconsider: There's a cleaner place. The issue is the stdlib `goahead` drops data for end tags at end-of-stream. But we could override `close()` in `_HTMLParser`/`HTMLExtractor` to capture leftover rawdata. But `goahead` already advanced `self.rawdata` to empty after dropping. Actually at the end of `goahead`, `self.rawdata = rawdata[i:]` where i = n, so rawdata becomes ''. So `close()`'s `if len(self.rawdata)` won't see it. So no.
+
+Alternatively override `parse_endtag` to detect no `>`; that's the cleanest.
+
+Let me think about `find('>')`: For the common shell redirection case there's no `>`, good. But there's a subtle case: HTML comments or code spans later in the document containing `>` — then find returns a position, and super() mis-parses. Let me test whether that's already broken (before my fix) and whether my fix could/should handle it.
+
+Test cases:
+- `foo </dev/null and \`a > b\``
+- `foo </dev/null <!-- > --> bar`  (comment containing `>`)
+
+Let me test current behavior to gauge scope. Actually, the user's report is specifically "unclosed end tag such as `</dev/null`". The key fix is no-`>`. But if a `>` appears inside a later code span/comment, the parser might still drop. Let me test.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  for s in [
+    "foo </dev/null and `a > b` end",
+    "foo </dev/null and <!-- x > y --> end",
+    "foo </dev/null and <b>bold</b> end",
+    "foo </dev/null\nbar > baz",
+  ]:
+      print(repr(s), "->", repr(markdown.markdown(s)))
+  '
+  'foo </dev/null and `a > b` end' -> '<p>foo </p>'
+  'foo </dev/null and <!-- x > y --> end' -> '<p>foo &lt;/dev/null and <!-- x > y --> end</p>'
+  'foo </dev/null and <b>bold</b> end' -> '<p>foo &lt;/dev/null and <b>bold</b> end</p>'
+  … 2 more lines
+Interesting:
+- `foo </dev/null and `a > b` end` -> `<p>foo </p>` — dropped, because `<` ... wait why? The `>` is inside backticks. Let me trace: find('>') finds the one in code. super().parse_endtag runs locatetagend and may match up to `>` treating it as an end tag, consuming `</dev/null and `a >`. Then continues with ` b` end`. Hmm output is just `foo ` though. Actually the consumed end tag text is handled as raw HTML end tag? `handle_endtag('dev')` -> in HTMLExtractor, `inraw` false -> `cleandoc.append(get_endtag_text('dev'))`. get_endtag_text returns rawdata[start:m.end()] where endendtag.search finds `>`. So it appends raw `</dev/null and `a >`. Then remaining ` b` end`. Then inline processing: the raw HTML stash? Actually get_endtag_text appends raw string `</dev/null and `a >` to cleandoc, which at inline stage isn't valid HTML per HTML_RE? `</dev/null and ` has spaces — HTML_RE matches `</dev/null` only (tag name `dev` then `/null`? Actually HTML_RE tag: `\/?+[a-zA-Z][^\s"'<>@]*+` matches `/dev/null` then `\s*+/?` could match trailing space, then `>`. There's no `>` immediately. So it won't match `</dev/null and `. Hmm.
+
+This is getting complex. But the observed result is `<p>foo </p>` — the whole rest is dropped, probably because in HTMLExtractor the raw end tag was appended but then... Actually, let me not chase this; it's a separate edge case involving `>` in a code span. The user's examples have no `>` at all in the document. The described bug is precisely: no `>` anywhere -> everything after dropped.
+
+However, to be robust for "shell redirections like `2</dev/null` and `cat </etc/hosts`", both lack `>`. But a docs page likely has other `>` later on the same page (e.g., other HTML tags). Wait — the user's example: "This second paragraph must survive." with no `>` at all. But real docs pages almost certainly contain `>` somewhere later, e.g., other tags. Hmm, but if there are other valid tags, the parser finds a `>` and doesn't take the drop path? Let me reconsider: `foo </dev/null bar <b>baz</b>` worked fine because there's a later `>`. So the drop only happens when there's NO `>` anywhere after. That's a specific but plausible scenario (e.g., the redirection is in the last part, or the whole page has no `>` after).
+
+Actually wait, the user says "everything after an unclosed end tag ... is silently dropped" and "lost half a page". If there were valid tags later, the parser wouldn't drop (as shown). So their page must have had no `>` after that point. Or maybe the real mechanism is different in their version.
+
+Given the task, the fix should address the reported reproduction. Let me implement the no-`>` fix. But maybe I can do better: make `parse_endtag` handle the unclosed-name case regardless of later `>`, by requiring that the end tag is properly terminated before any character that can't be in an end tag? Hmm.
+
+Actually, let's think about what a correct end tag is: `</` + name + whitespace* + `>`. There should be no `/` in the tag name. `</dev/null` — the `/` after `dev` means it's not a valid end tag name; in HTML5 the end tag name state treats `/` as... Actually in tag name state, `/` is not special (it's only special in the "before attribute name" state). Wait, in the end tag name state, the parser transitions to "before attribute name state" on whitespace, `/`, or `>`. Actually per spec, in Tag name state: whitespace -> before attribute name state; `/` -> self-closing start tag state; `>` -> emit tag. For end tags, self-closing flag is ignored. So `</dev/>` would be end tag `dev`. But `</dev/null>` would be end tag `dev` with attributes? End tags can't have attributes but parsers ignore them. So `</dev/null>` is effectively `</dev>`.
+
+Anyway, the practical problem is the missing `>`. Let me implement the simple robust fix mirroring the stdlib fast check: if no `>` in the remainder, treat `</` as data.
+
+Let me now also consider: should we emit `</` as data and then continue, or emit the entire rest as data? Emitting just `</` and returning i+2 lets the parser handle any `&` entities and further `<...>` normally. Good.
+
+Wait, but there's a subtle bug: after emitting `</`, we return i+2. Then goahead does `i = self.updatepos(i, k)`. But we already called handle_data with rawdata[i:i+2]. Then the next iteration starts at i+2. Good.
+
+Now implement. Let me also handle `len(start) == 0`? Not needed.
+
+Let me write the patch.
+● edit_file markdown/htmlparser.py
+  -     def parse_endtag(self, i):
+  -         start = self.rawdata[i:i+3]
+  -         c = ord(start[-1])
+  -         if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+  -             self.handle_data(self.rawdata[i:i + 2])
+  -             return i + 2
+  -         return super().parse_endtag(i)
+  +     def parse_endtag(self, i):
+  +         start = self.rawdata[i:i+3]
+  +         c = ord(start[-1])
+  +         # If the end tag does not have a tag name or is not closed with a `>`, it is not a valid
+  +         # end tag. Treat the `</` as data and continue, otherwise the base parser discards
+  +         # everything which follows at the end of the stream (see #1654).
+  +         if (
+  +             len(start) < 3 or
+  +             not (65 <= c <= 90 or 97 <= c <= 122) or
+  +             self.rawdata.find('>', i + 2) < 0
+  +         ):
+  +             self.handle_data(self.rawdata[i:i + 2])
+  +             return i + 2
+  +         return super().parse_endtag(i)
+  Edited markdown/htmlparser.py: replaced 7 lines at line 99 with 14 lines.
+Wait, I referenced issue #1654 without knowing. Let me not invent an issue number. Let me remove that reference or use a generic comment. Actually, the recent commit #1647, and this is a new bug. I don't know the issue number. Let me remove the issue number to avoid inaccuracy.
+
+Also, I should double check `self.rawdata.find('>', i+2)` behavior with cdata. Fine.
+
+Let me fix the comment.
+● edit_file markdown/htmlparser.py
+  -         # If the end tag does not have a tag name or is not closed with a `>`, it is not a valid
+  -         # end tag. Treat the `</` as data and continue, otherwise the base parser discards
+  -         # everything which follows at the end of the stream (see #1654).
+  +         # If the end tag does not have a tag name or is not closed with a `>`, it is not a valid
+  +         # end tag. Treat the `</` as data and continue, otherwise the base parser discards
+  +         # everything which follows when the stream ends without a closing `>`.
+  Edited markdown/htmlparser.py: replaced 3 lines at line 102 with 3 lines.
+Now let me verify the fix against the reported cases.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  cases = [
+    "Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.",
+    "foo </dev/null bar",
+    "foo `cmd 2</dev/null` bar",
+    "cat </etc/hosts now",
+    "a </dev/null",
+    "a </dev/null<b>",
+    "a </script b",
+    "a </dev/null\n\nsecond para `code`",
+    "foo </dev/null and <!-- x > y --> end",
+    "foo </dev/null bar <b>baz</b>",
+  ]
+  for s in cases:
+      print(repr(s), "->", repr(markdown.markdown(s)))
+  '
+  'Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.' -> '<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and ke…
+  'foo </dev/null bar' -> '<p>foo &lt;/dev/null bar</p>'
+  'foo `cmd 2</dev/null` bar' -> '<p>foo <code>cmd 2&lt;/dev/null</code> bar</p>'
+  … 8 more lines
+The main cases are fixed. Notice `foo </dev/null and <!-- x > y --> end` now renders correctly too (previously it did work actually because there's a `>`? Wait previously it rendered fine: `<p>foo &lt;/dev/null and <!-- x > y --> end</p>`. Right).
+
+The earlier failing case `foo </dev/null and `a > b` end` — let me check now.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  for s in ["foo </dev/null and `a > b` end", "foo </dev/null and `a > b` end\n\nnext"]:
+      print(repr(s), "->", repr(markdown.markdown(s)))
+  '
+  'foo </dev/null and `a > b` end' -> '<p>foo </p>'
+  'foo </dev/null and `a > b` end\n\nnext' -> '<p>foo </p>'
+  Exit code: 0
+Still drops when there's a `>` inside a code span later. This is the case where `find('>') >= 0` but the `>` isn't a valid end-tag terminator. Should I handle this too? The user's examples don't include it, but it's the same class of bug and could cause "half a page" loss. Let me investigate what happens and whether I can fix it robustly.
+
+`foo </dev/null and `a > b` end`. `parse_endtag` at i of `</dev/null...`. find('>') finds the `>` after `a `. super().parse_endtag:
+- `endtagopen.match` -> yes (`</d`).
+- `locatetagend.match(rawdata, i+2)` on `dev/null and `a > b` end`. 
+  - tag name: `[a-zA-Z][^`\t\n\r\f />]*` = `dev` (stops at `/`).
+  - then `[\t\n\r\f /]*` matches `/`.
+  - attribute name `[^`\t\n\r\f />][^\t\n\r\f /=>]*` = `null` (stops at space).
+  - optional value: `=...` no.
+  - `[\t\n\r\f /]*` matches ` `.
+  - next attr: `and`? attribute name `and` then space... Actually `and` followed by space then backtick. Attribute name `[^\s/=>]*` can include backtick (locatetagend allows backtick; the library only removed backtick from starttag). `and` then space. Hmm.
+  - eventually `a` then space then `>` — the `>` is excluded from attribute name and value. So locatetagend would match up to before `>`? Then `j` points right before `>` and `rawdata[j-1] != '>'`, so returns -1! Wait then parse_endtag returns -1 and goahead drops. Hmm.
+
+Actually let's just check: `locatetagend` requires the match to end with `>`. The regex has `>?` at the end (optional). `match.end()` = j. Then `if rawdata[j-1] != ">" : return -1`. So if it didn't consume the `>`, returns -1. Since the `>` is after a code backtick and space, locatetagend's tag part may not reach it. So returns -1 -> drop.
+
+So this is the same drop path: `parse_endtag` returns -1 at end-of-stream. So a more general fix would be: whenever `super().parse_endtag(i)` returns -1 (and we're at end of stream), treat `</` as data. But `parse_endtag` can't know if we're at end of stream vs. need-more-data. However, as established, this library feeds complete data. But `_HTMLParser` might be used elsewhere.
+
+Hmm, but returning -1 from `parse_endtag` is the signal for "incomplete, need more data". If we intercept -1 and always treat as data, streaming would break. But again, is streaming supported? Let me check the class docstring: "Handle special start and end tags." Not documented for streaming. The module comment says users should use the unmodified html.parser for their own needs.
+
+I think a robust fix is to handle the -1 return in `parse_endtag` by treating the `</` as data. But that would change behavior whenever a valid end tag is split across feed boundaries. Since HTMLExtractor feeds once, no problem internally. But `_HTMLParser` is used by MkDocs perhaps with feed-once too.
+
+However, there's a risk: an actual incomplete end tag like `</div` at the end of a document should be treated as text (which is what our fix does anyway). And if it's genuinely part of a valid tag but split across chunks in streaming, treating as data would be wrong. But the library isn't designed for streaming.
+
+Hmm, but wait: there's a subtlety. What about `parse_endtag` being called while inside a raw HTML block with `_cache`? If we treat `</` as data and inraw is True, handle_data appends to cache, preserving it. Good.
+
+But should I go beyond the reported case? The user's request is specifically about unclosed end tags like `</dev/null`. They said "everything after an unclosed end tag such as `</dev/null` is silently dropped". The root cause is `parse_endtag` returning -1 and goahead dropping. The `find('>') < 0` handles only the no-`>` case. The code-span-with-`>` case is a related but distinct manifestation.
+
+Let me focus: The safest minimal fix that addresses the reported issue is the `find('>') < 0` check. But let me think about whether to be more comprehensive, because the user says "Shell redirections like `2</dev/null` and `cat </etc/hosts` in our docs lost half a page this way." A docs page with shell examples could easily have `>` later (e.g., `cmd > file`, or HTML tags, or code spans). In their example the second paragraph had no `>`. But "half a page" suggests potentially more.
+
+Let me test a realistic doc: "Run `cat </etc/hosts` to view it.\n\nUse `echo hi > out` next." Here the `>` appears in the second paragraph. Current code (with my fix) — find('>') finds it, super().parse_endtag returns -1 -> drop. Let me test.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  for s in [
+    "Run `cat </etc/hosts` now.\n\nUse `echo hi > out` next.",
+    "See `cat </etc/hosts` and `foo > bar`.",
+    "See `cat </etc/hosts`.\n\n<div>block</div>",
+  ]:
+      print(repr(s))
+      print("   ->", repr(markdown.markdown(s)))
+  '
+  'Run `cat </etc/hosts` now.\n\nUse `echo hi > out` next.'
+     -> '<p>Run `cat </p>'
+  'See `cat </etc/hosts` and `foo > bar`.'
+  … 4 more lines
+So even a later `>` elsewhere causes the drop. This is a significant issue and likely what "lost half a page" refers to. The user's minimal repro just happened to have no `>`. I should fix this more robustly: whenever the base parser cannot find a well-formed end tag (returns -1), treat `</` as data instead of returning -1.
+
+But I must be careful about streaming semantics. Let me look at how upstream Python-Markdown fixed this issue. Since this repo is Python-Markdown and there's a known issue, maybe there's a newer upstream commit. Without network, I'll reason.
+
+Approach: Override `parse_endtag` to detect whether it's a valid end tag. Options:
+
+1. If `super().parse_endtag(i)` returns -1, call `handle_data(rawdata[i:i+2])` and return `i+2`. This treats incomplete end tags as data. But it changes streaming behavior: an incomplete end tag that would be completed by later input would now be emitted as data prematurely. For this library (feed once), fine. But `_HTMLParser` is monkeypatched globally for MkDocs. MkDocs' markdown extension might feed in chunks? Unlikely; Markdown preprocessors feed whole doc.
+
+Actually, hold on. Let me reconsider. When is `feed` called multiple times? Let's grep tests to see if any use HTMLExtractor directly with multiple feeds. And check `test_apis` etc.
+
+2. More surgical: only treat as data if there is no valid end-tag terminator. A valid end tag pattern: `</` + tagname + optional whitespace + `>`. The `>` must immediately follow the tag name / whitespace. So we could check with a regex on the remaining data: does it match `^</[a-zA-Z][^\s/>]*\s*>`. If no, it's not a well-formed end tag -> data. That would handle `</dev/null` (contains `/` after name, and no immediate `>`), `</dev/null and ... >` etc. But `</dev >` with space then `>` is valid-ish? Per HTML, `</div >` is valid (whitespace before `>`). 
+
+Actually per HTML spec, end tag can be `</` name whitespace* `>`. Let me use regex `re.compile(r'</[a-zA-Z][^>\s/]*\s*>')`? But attribute-like stuff in end tags is invalid per spec, though the tolerant parser allows it. The existing tests expect tolerant behavior for weird end tags? Let me check.
+
+Hmm, but changing the behavior for e.g. `</div class="x">` might affect tests. Let me search tests for end tags with attributes.
+
+Actually, the simplest and most robust general solution: return the result of `super().parse_endtag(i)`, but if it's negative, don't let goahead drop data — instead emit `</` as data and return i+2. Because a negative return means base parser couldn't parse a complete end tag from the available data. Since we always have complete data, that means it's not a valid end tag.
+
+But there's the streaming concern. Let me check whether HTMLExtractor's `feed` is ever called incrementally. Search tests.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -rn "HTMLExtractor\|htmlparser.HTMLParser\|_HTMLParser" tests/ markdown/ | grep -v ".pyc"
+  grep: markdown/extensions/__pycache__/md_in_html.cpython-313.pyc: binary file matches
+  grep: markdown/__pycache__/preprocessors.cpython-313.pyc: binary file matches
+  grep: markdown/__pycache__/htmlparser.cpython-312.pyc: binary file matches
+  … 20 more lines
+No tests use feed incrementally. The library feeds once.
+
+Now, is intercepting negative return safe? Let me look at `md_in_html.HTMLExtractorExtra` which inherits from HTMLExtractor and thus _HTMLParser. It does its own `close` and builds a tree. It doesn't override parse_endtag. So intercepting there too is fine.
+
+But wait: `md_in_html` parses markdown nested in HTML blocks. Consider a raw HTML block containing `</div>`; parse_endtag returns positive, unaffected. Fine.
+
+Let me consider potential regressions with the negative-return interception. The base `parse_endtag` returns -1 in these cases:
+- No `>` anywhere after `i+2` (fast check).
+- `locatetagend` matched but didn't end with `>`.
+
+Both mean malformed/incomplete end tag. Treating as data is correct for a complete document.
+
+But there's another subtlety: what if `super().parse_endtag` calls `handle_endtag` and then returns a value? Not negative. Fine.
+
+I'm fairly convinced the general fix is: in `_HTMLParser.parse_endtag`, after the existing non-letter check, call `super().parse_endtag(i)` and if the result is negative, emit `</` as data and return `i+2`.
+
+But wait: This would also fix the no-`>` case, so we don't need the `find` check. But the `find` check is cheaper and mirrors stdlib; however calling super and checking negative is more general. Let me use the general approach:
+
+```python
+def parse_endtag(self, i):
+    start = self.rawdata[i:i+3]
+    c = ord(start[-1])
+    if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    # The base parser may be unable to parse the end tag (e.g. `</dev/null`, which is missing
+    # a closing `>`). In that case, treat the `</` as data so that the text which follows is
+    # not discarded.
+    result = super().parse_endtag(i)
+    if result < 0:
+        self.handle_data(self.rawdata[i:i + 2])
+        return i + 2
+    return result
+```
+
+Hmm, but is `result < 0` the right check? Base returns -1 for incomplete. Could it return other negative? No.
+
+But consider streaming: if someone feeds `"<p>foo</p></div>"` in chunks: first feed `<p>foo</p></di` -> parse_endtag returns -1 -> our override emits `</` as data and returns i+2. Then `div` as data. Then next feed `v>` ... would be data. So streaming breaks. But this library always feeds complete. Actually, does MkDocs feed complete? MkDocs uses markdown's preprocessors which feed complete. The comment "people like MkDocs that pull it in" means MkDocs imports `markdown.htmlparser.HTMLParser`? Let me check what MkDocs does. Without network, can't. But the override already exists and assumes complete data in some ways? Not exactly.
+
+Hmm, I want to be careful not to break MkDocs. Let me consider a more conservative approach that still fixes the general case without breaking streaming: Only emit as data if the end tag can't be completed. But we can't know if more data is coming.
+
+Alternative: Keep the `find('>') < 0` check (which is exactly the stdlib's own fast check that indicates "no complete tag in buffer"), and additionally handle the case where a `>` exists but isn't a valid terminator. Actually the stdlib's `locatetagend` matching then `rawdata[j-1] != '>'` returning -1 is also "incomplete or invalid". In a streaming scenario, that could also mean need-more-data. But in practice with the tolerant regex, if a `>` exists in the buffer but the match doesn't end at it, more data won't help—the `>` is already there and the regex is greedy. So returning -1 there is effectively a permanent failure (invalid), not incomplete. Thus treating as data is correct. Actually could it be that more data changes locatetagend matching? locatetagend is greedy and would match as far as possible; a later `>` won't change the match ending before the first `>` if the first `>` terminates. Hmm. If the first `>` is in the middle, locatetagend stops before it and returns -1. More data won't help. So it's invalid.
+
+But the fast-check `find('>') < 0` genuinely could mean incomplete in streaming.
+
+So a safe compromise:
+- If `find('>', i+2) < 0`: This is the "no complete tag" case. In the library's complete-input context, treat as data. But for streaming safety, we could... hmm.
+
+Given the library's usage, I'll go with the general negative-return interception. But to be safe about MkDocs, let me search if the repo docs mention this class being used for streaming. Let me look at the changelog and docs.
+
+Actually, let me reconsider. The repo commit `7f29f1a` added `_HTMLParser` specifically for this class of issue and the comment "Include hack so we don't break MkDocs." So the maintainers do care about MkDocs. The `_HTMLParser` is installed as `htmlparser.HTMLParser` in the copied module. MkDocs might import `markdown.htmlparser` and use its `HTMLExtractor` (which feeds whole doc). Or MkDocs' `pymdownx`? Not sure.
+
+Given `HTMLExtractor.feed` is called once, and `_HTMLParser` is only used through `HTMLExtractor` (and `HTMLExtractorExtra`), the negative-return interception is safe within the library. Even if MkDocs subclasses HTMLExtractor, it feeds whole docs.
+
+But `htmlparser.HTMLParser = _HTMLParser` — could MkDocs import `from markdown.htmlparser import htmlparser` and then use `htmlparser.HTMLParser` for streaming? That's an internal detail. Unlikely.
+
+Let me look at what the actual upstream fix was. Since the task references a very specific version (3.13.6), maybe there's an actual CPython change. Let me search the CPython 3.13.16 source for a comment or NEWS entry. Actually, I realize the version claim might be inverted/misleading on purpose. Let me just check: does the current environment's 3.13 have a behavior where 3.11/3.12 differ? All reproduced. So no version difference in this sandbox. Fine.
+
+Let me look at the upstream Python-Markdown repository history if it's in git (maybe there are remote branches/tags). `git log --all`. Also check if there's a later commit already. HEAD is 7a29324. Let me see if there are other branches.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && git branch -a && git tag | tail -5 && git log --all --oneline | head -5
+  * master
+  7a29324 Fix inline HTML case
+  3002575 Fix ancestor handling
+  … 4 more lines
+No upstream fix available. Let me decide on the implementation.
+
+I'll go with the more general fix but structure it to minimize streaming concerns. Actually, let me reconsider the streaming argument once more. The base `parse_endtag` is only reached via `_HTMLParser.parse_endtag` (since `htmlparser.HTMLParser` is replaced). For `HTMLExtractor`, feed is once. So the fix is safe.
+
+But maybe a cleaner, more targeted approach that handles both reported and realistic cases without touching streaming semantics: check whether the end tag is well-formed by scanning the remaining data with the same logic the stdlib uses, and if it fails, emit data. That's essentially calling super and checking negative.
+
+I'll implement the negative-return interception. Let me update the code.
+
+Actually, wait. There's a subtlety with `goahead`'s `k < 0` handling that does more than drop: For `</` followed by letter at EOF it does `pass`. But if we return `i+2`, it continues. Good.
+
+Let me also double check: does `super().parse_endtag(i)` have side effects before returning -1? Looking at the source: it may call `self.parse_bogus_comment(i)` which calls handle_comment/handle_data, and return a positive value. It only returns -1 before side effects (the two cases). Actually first case: `if rawdata.find('>', i+2) < 0: return -1` — no side effects. Second: `match = locatetagend.match(...); j = match.end(); if rawdata[j-1] != '>': return -1` — no handle side effects. Good. So no double handling.
+
+But careful: `locatetagend.match(rawdata, i+2)` asserts match; if no match, AssertionError. When would that happen? For `</d` with a `>` later, tag name matches. For `</` + letter always matches at least the letter. So assert holds.
+
+Now, one more consideration: `_HTMLParser.parse_starttag` is also used. `starttagopen = '<[a-zA-Z]|</>'` so `</>` goes to parse_starttag, handled. Fine.
+
+Let me update the implementation to the general form. But I'll keep the explicit `find` check too? The general negative check subsumes it. Let me simplify to just call super and handle negative.
+
+However, I realize there might be a concern: by calling `super().parse_endtag(i)` and getting -1, then emitting `</` as data, the next char at i+2 might be a letter, and the parser will continue. But if there's a genuine valid end tag later in the buffer like `</div>`, the parser will find it normally since it starts with `<`. Good.
+
+Let me rewrite.
+The `find('>') < 0` check only covers the no-`>` case; a later `>` elsewhere (e.g. from another shell example or tag) still triggers the drop. Let me make the fix robust by treating any end tag the base parser can't parse as literal data.
+● read_file markdown/htmlparser.py:96
+      96	class _HTMLParser(htmlparser.HTMLParser):
+      97	    """Handle special start and end tags."""
+      98	
+  … 28 more lines
+● edit_file markdown/htmlparser.py
+  -     def parse_endtag(self, i):
+  -         start = self.rawdata[i:i+3]
+  -         c = ord(start[-1])
+  -         # If the end tag does not have a tag name or is not closed with a `>`, it is not a valid
+  -         # end tag. Treat the `</` as data and continue, otherwise the base parser discards
+  -         # everything which follows when the stream ends without a closing `>`.
+  -         if (
+  -             len(start) < 3 or
+  -             not (65 <= c <= 90 or 97 <= c <= 122) or
+  -             self.rawdata.find('>', i + 2) < 0
+  -         ):
+  -             self.handle_data(self.rawdata[i:i + 2])
+  -             return i + 2
+  -         return super().parse_endtag(i)
+  +     def parse_endtag(self, i):
+  +         start = self.rawdata[i:i+3]
+  +         c = ord(start[-1])
+  +         if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+  +             self.handle_data(self.rawdata[i:i + 2])
+  +             return i + 2
+  +         # The base parser returns a negative value when it cannot parse a complete end tag (for
+  +         # example `</dev/null`, which has no closing `>`). It then silently discards the
+  +         # remainder of the stream. As we always feed the entire document at once, such an end
+  +         # tag is not valid, so treat the `</` as data and keep the text which follows.
+  +         result = super().parse_endtag(i)
+  +         if result < 0:
+  +             self.handle_data(self.rawdata[i:i + 2])
+  +             return i + 2
+  +         return result
+  Edited markdown/htmlparser.py: replaced 14 lines at line 99 with 15 lines.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  cases = [
+    "Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.",
+    "Run `cat </etc/hosts` now.\n\nUse `echo hi > out` next.",
+    "See `cat </etc/hosts` and `foo > bar`.",
+    "foo </dev/null bar",
+    "foo </dev/null and `a > b` end",
+    "a </dev/null > b",
+    "a </dev/null",
+    "a </script b",
+    "foo </dev/null<b>",
+    "foo </dev/null bar <b>baz</b>",
+  ]
+  for s in cases:
+      print(repr(s), "->", repr(markdown.markdown(s)))
+  '
+  'Discard errors with `cmd 2</dev/null` and keep going.\n\nThis second paragraph must survive.' -> '<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and ke…
+  'Run `cat </etc/hosts` now.\n\nUse `echo hi > out` next.' -> '<p>Run <code>cat &lt;/etc/hosts</code> now.</p>\n<p>Use <code>echo hi &gt; out</code> next.</p>'
+  'See `cat </etc/hosts` and `foo > bar`.' -> '<p>See <code>cat &lt;/etc/hosts</code> and <code>foo &gt; bar</code>.</p>'
+  … 8 more lines
+Now the realistic cases work.
+
+Wait, `a </dev/null > b` now renders `<p>a </dev/null > b</p>` — this is because super().parse_endtag succeeded (found `>` and treated it as an end tag `dev`), producing raw `</dev/null >` which is a bit odd. But that's pre-existing behavior (it rendered the same before). Actually is `</dev/null >` a valid end tag? Per HTML, no (`/null` not valid in end tag), but the tolerant parser weirdly allows it. The user didn't report this. Leave as is.
+
+Now let me run the full test suite to check for regressions.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -8
+  .................................................................................................................................s..............................…
+  ----------------------------------------------------------------------
+  Ran 1099 tests in 0.828s
+  … 2 more lines
+All tests pass. Now let me add regression tests. Where to put them? The `_HTMLParser` change affects block HTML extraction. The inline code span case is tested via inline tests. Let me add to `tests/test_syntax/blocks/test_html_blocks.py` near `test_unclosed_endtag`, and maybe an inline test in `tests/test_syntax/inline/test_raw_html.py`.
+
+Let me look at the existing `test_unclosed_endtag` test and its context.
+Now let me add regression tests. Let me look at the existing unclosed-endtag test.
+● read_file tests/test_syntax/blocks/test_html_blocks.py:1730
+    1730	                <td>bar</td>
+    1731	                </table>
+    1732	                '''
+  … 57 more lines
+I'll add a test after `test_unclosed_endtag` for the named unclosed end tag. Let me write a test that covers:
+1. `Discard errors with `cmd 2</dev/null` and keep going.` followed by a second paragraph.
+2. `cat </etc/hosts` and a later `>` somewhere.
+3. Plain `</dev/null` text.
+
+Let me check the `dedent` helper and how literal strings render. I'll use simple non-dedented strings via assertMarkdownRenders for clarity.
+
+Let me add:
+
+```python
+    def test_unclosed_endtag_with_name(self):
+        """An unclosed end tag with a tag name must not discard the following text."""
+
+        self.assertMarkdownRenders(
+            'Discard errors with `cmd 2</dev/null` and keep going.\n\n'
+            'This second paragraph must survive.',
+            '<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and keep going.</p>\n'
+            '<p>This second paragraph must survive.</p>'
+        )
+        self.assertMarkdownRenders(
+            'Use `cat </etc/hosts` and `echo hi > out`.',
+            '<p>Use <code>cat &lt;/etc/hosts</code> and <code>echo hi &gt; out</code>.</p>'
+        )
+```
+
+Wait, does `assertMarkdownRenders` accept `\n` output? Let me check the test_tools to see how it compares. Let me check.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && grep -n "def assertMarkdownRenders\|def dedent" -A 30 markdown/test_tools.py | head -70
+  61:    def assertMarkdownRenders(self, source, expected, expected_attrs=None, **kwargs):
+  62-        """
+  63-        Test that source Markdown text renders to expected output with given keywords.
+  … 49 more lines
+`assertMultiLineEqual` handles strings with `\n`. Good.
+
+Now let me also add an inline-html test to `test_raw_html.py` maybe. The block test file is fine for the extractor. Actually the change is in HTML parser used for blocks; the code span is inline but the extraction is at block pre-processing. I'll put the regression test in test_html_blocks.py, matching `test_unclosed_endtag`.
+
+Let me add the test.
+● edit_file tests/test_syntax/blocks/test_html_blocks.py
+  -     def test_unclosed_endtag(self):
+  -         """Ensure unclosed end tag does not have side effects."""
+  +     def test_unclosed_endtag_with_name(self):
+  +         """Ensure an unclosed end tag with a tag name does not discard the following text."""
+  + 
+  +         self.assertMarkdownRenders(
+  +             'Discard errors with `cmd 2</dev/null` and keep going.\n\n'
+  +             'This second paragraph must survive.',
+  +             '<p>Discard errors with <code>cmd 2&lt;/dev/null</code> and keep going.</p>\n'
+  +             '<p>This second paragraph must survive.</p>'
+  +         )
+  +         # A closing `>` elsewhere in the document must not cause the text to be discarded either.
+  +         self.assertMarkdownRenders(
+  +             'Use `cat </etc/hosts` and `echo hi > out`.',
+  +             '<p>Use <code>cat &lt;/etc/hosts</code> and <code>echo hi &gt; out</code>.</p>'
+  +         )
+  +         self.assertMarkdownRenders(
+  +             'A </unclosed tag.',
+  +             '<p>A &lt;/unclosed tag.</p>'
+  +         )
+  + 
+  +     def test_unclosed_endtag(self):
+  +         """Ensure unclosed end tag does not have side effects."""
+  Edited tests/test_syntax/blocks/test_html_blocks.py: replaced 2 lines at line 1764 with 21 lines.
+Wait, I put `test_unclosed_endtag_with_name` before `test_unclosed_endtag`, using the old_string that matched the `test_unclosed_endtag` definition. Let me verify the file. Actually I inserted the new test and re-added the `test_unclosed_endtag` def line. Good.
+
+Now run the tests.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -m unittest tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_with_name tests.te…
+  test_unclosed_endtag_with_name (tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag_with_name)
+  Ensure an unclosed end tag with a tag name does not discard the following text. ... ok
+  test_unclosed_endtag (tests.test_syntax.blocks.test_html_blocks.TestHTMLBlocks.test_unclosed_endtag)
+  … 5 more lines
+Now, let me consider whether I should also add a changelog entry. The repo has `docs/changelog.md` with an unreleased section. The recent commits added changelog entries. Let me check the top of docs/changelog.md.
+Let me add a changelog entry, following the project's convention.
+● read_file docs/changelog.md:1
+       1	---
+       2	title: Changelog
+       3	toc_depth: 2
+  … 28 more lines
+● edit_file docs/changelog.md
+  - * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
+  + * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
+  + * Fix issue where text following an unclosed end tag (such as `</dev/null`) was discarded.
+  Edited docs/changelog.md: replaced 1 line at line 19 with 2 lines.
+Now, let me reconsider whether my general fix has any subtle regressions with the `md_in_html` extension. Let me run the full test suite again, and also specifically the md_in_html tests.
+
+Also, I want to test with md_in_html and other extensions to ensure no regression. The full suite includes those. Let me run.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -m unittest discover tests 2>&1 | tail -6
+  .................................................................................................................................s..............................…
+  ----------------------------------------------------------------------
+  Ran 1101 tests in 0.696s
+  … 2 more lines
+All 1101 tests pass (2 new). Let me also run with the md_in_html extension explicitly on some cases, since the parser is shared.
+
+Also, let me double check that the fix behaves with `feed` in multiple chunks — no, library feeds once. But let me test HTMLExtractor directly to ensure it works and doesn't loop.
+
+Let me also test a potential edge: a document ending with a valid end tag `</div>` at the very end (no trailing content). `parse_endtag` -> super returns j (positive). Fine. And a document ending with `</div` (no `>`): now treated as data `</` + `div` text. Is that the expected behavior? Previously it would drop `</div` silently. Now it renders `&lt;/div`. That's more correct (preserve text). Let me verify no test expected dropping.
+
+Full suite passes. Good.
+
+Now, let me reconsider the version claim once more. The user explicitly stated the behavior differs by Python 3.13.5 vs 3.13.6. If this is truly version-dependent in their environment, my fix handles both. But let me make sure I'm not missing a version-specific code path that also needs adjusting. Maybe the actual difference is that in 3.13.6, `html.parser.HTMLParser.parse_endtag` started returning -1 for `</dev/null` while in 3.13.5 it returned something positive. Either way, my fix intercepts the negative result. Good.
+
+Let me also verify the `-1` handling doesn't conflict with `md_in_html.HTMLExtractorExtra`, which overrides `close` and builds a tree. Let me run the md_in_html tests specifically.
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -m unittest discover tests -p "*md_in_html*" 2>&1 | tail -5; ls tests/test_syntax/extensions/ | grep -i in_h…
+  ................................................................................................................................................................…
+  ----------------------------------------------------------------------
+  Ran 199 tests in 0.071s
+  … 3 more lines
+● bash cd /tmp/tmp.meOfnzLEX1/markdown && .venv/bin/python -c '
+  import markdown
+  # md_in_html extension shares the parser.
+  for s in ["Run `cat </etc/hosts` and `echo > out`.", "<div>\nfoo </dev/null bar\n</div>"]:
+      print(repr(s), "->", repr(markdown.markdown(s, extensions=["md_in_html"])))
+  '
+  'Run `cat </etc/hosts` and `echo > out`.' -> '<p>Run <code>cat &lt;/etc/hosts</code> and <code>echo &gt; out</code>.</p>'
+  '<div>\nfoo </dev/null bar\n</div>' -> '<div>\nfoo </dev/null bar\n</div>'
+  Exit code: 0
+Stopped after 50 steps (raise the limit with --max-steps).
+50 steps · 1743.3k tokens in (1706.1k from cache) · 26.9k out · 186.8s

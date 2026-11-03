@@ -1,0 +1,80 @@
+diff --git a/docs/changelog.md b/docs/changelog.md
+index a6939f9..c2092d4 100644
+--- a/docs/changelog.md
++++ b/docs/changelog.md
+@@ -17,6 +17,8 @@ See the [Contributing Guide](contributing.md) for details.
+ * Update serializer to be non-recursive (#1644).
+ * Improve ancestor handling in the inline `Treeprocessor` (#1646).
+ * Fix issue where inline HTML attributes were rejected if they had `<` or `>` in the attribute (#1647).
++* Fix a regression where an unclosed end tag which starts with a letter (e.g. `</dev/null`) caused
++  the remainder of the document to be silently dropped.
+ 
+ ## [3.11.0] - 2026-09-25
+ 
+diff --git a/markdown/htmlparser.py b/markdown/htmlparser.py
+index 488da03..d6a27d3 100644
+--- a/markdown/htmlparser.py
++++ b/markdown/htmlparser.py
+@@ -102,7 +102,15 @@ class _HTMLParser(htmlparser.HTMLParser):
+         if len(start) < 3 or not (65 <= c <= 90 or 97 <= c <= 122):
+             self.handle_data(self.rawdata[i:i + 2])
+             return i + 2
+-        return super().parse_endtag(i)
++        endpos = super().parse_endtag(i)
++        if endpos == -1:
++            # The end tag is not properly closed (e.g. `</dev/null` with no `>`).
++            # Treat it as data so the rest of the document is not silently
++            # discarded by `goahead`, which drops everything remaining when an
++            # incomplete tag is encountered at the end of the data.
++            self.handle_data(self.rawdata[i:i + 2])
++            return i + 2
++        return endpos
+ 
+     def parse_starttag(self, i: int) -> int:  # pragma: no cover
+         # Treat `</>` as normal data as it is not a real tag.
+diff --git a/tests/test_syntax/blocks/test_html_blocks.py b/tests/test_syntax/blocks/test_html_blocks.py
+index ecc10f4..37a9df4 100644
+--- a/tests/test_syntax/blocks/test_html_blocks.py
++++ b/tests/test_syntax/blocks/test_html_blocks.py
+@@ -1787,3 +1787,41 @@ class TestHTMLBlocks(TestCase):
+                 '''
+             )
+         )
++
++    def test_unclosed_endtag_with_name(self):
++        """An unclosed end tag which starts with a letter must not discard the rest of the document."""
++
++        self.assertMarkdownRenders(
++            self.dedent(
++                '''
++                Discard errors with `cmd 2</dev/null` and keep going.
++
++                This second paragraph must survive.
++                '''
++            ),
++            self.dedent(
++                '''
++                <p>Discard errors with <code>cmd 2&lt;/dev/null</code> and keep going.</p>
++                <p>This second paragraph must survive.</p>
++                '''
++            )
++        )
++
++    def test_shell_redirection(self):
++        """Shell redirections which contain unclosed end tags must render in code spans."""
++
++        self.assertMarkdownRenders(
++            self.dedent(
++                '''
++                Use `cat </etc/hosts` and `cmd 2</dev/null` to redirect.
++
++                A second paragraph.
++                '''
++            ),
++            self.dedent(
++                '''
++                <p>Use <code>cat &lt;/etc/hosts</code> and <code>cmd 2&lt;/dev/null</code> to redirect.</p>
++                <p>A second paragraph.</p>
++                '''
++            )
++        )
