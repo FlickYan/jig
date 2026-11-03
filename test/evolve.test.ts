@@ -310,13 +310,29 @@ describe("the Terminal-Bench check", () => {
       { task: "b", passed: false },
       { task: "torch", passed: true },
     ];
-    assert.equal(noVerdict(candidate, baseline, new Set()), "the verifier couldn't grade torch on one side or both, so the comparison would leave it out");
+    assert.equal(noVerdict(candidate, baseline, new Set()), "the verifier couldn't grade a trial of torch, so the comparison would leave it out");
     assert.equal(noVerdict(candidate, baseline, skipList("torch  # torch doesn't fit the verifier's disk here\n")), null);
     // Every trial ungraded: compared over no task, the candidate came out "no worse".
-    const ungraded = candidate.map((trial) => ({ ...trial, passed: false, unscorable: "its verifier wrote no result" }));
+    const ungraded = candidate.map((trial) => ({ ...trial, passed: false, unscorable: "its verifier ran out of disk" }));
     assert.equal(terminalBenchVerdict(attemptsOf(ungraded), attemptsOf(baseline)).rejected, false);
-    assert.equal(noVerdict(ungraded, baseline, new Set()), "the verifier couldn't grade a, b, torch on one side or both, so the comparison would leave them out");
+    assert.equal(noVerdict(ungraded, baseline, new Set()), "the verifier couldn't grade 4 trials of a, b, torch, so the comparison would leave them out");
     assert.equal(noVerdict(ungraded, baseline, new Set(["a", "b", "torch"])), "no task was graded on both sides");
+  });
+
+  it("gives no verdict when the verifier couldn't grade one of a task's trials, though the other was graded", () => {
+    // The candidate filled the disk on its first try at five of ten tasks, and passed everything else.
+    const tasks = Array.from({ length: 10 }, (_, i) => `t${i}`);
+    const baseline = tasks.flatMap((task) => [{ task, passed: true }, { task, passed: true }]);
+    const candidate = tasks.flatMap((task, i) => [
+      i < 5 ? { task, passed: false, unscorable: "its verifier ran out of disk" } : { task, passed: true },
+      { task, passed: true },
+    ]);
+    // Scored on the trials left, it is "no worse"; counted as failures, those five sink it.
+    assert.equal(terminalBenchVerdict(attemptsOf(candidate), attemptsOf(baseline)).rejected, false);
+    assert.equal(terminalBenchVerdict(attemptsOf(candidate.map((trial) => ({ ...trial, unscorable: null }))), attemptsOf(baseline)).rejected, true);
+    assert.equal(noVerdict(candidate, baseline, new Set()), "the verifier couldn't grade 5 trials of t0, t1, t2, t3, t4, so the comparison would leave them out");
+    assert.equal(noVerdict(baseline, candidate, new Set()), "the verifier couldn't grade 5 trials of t0, t1, t2, t3, t4, so the comparison would leave them out", "on the baseline's side too");
+    assert.equal(noVerdict(candidate, baseline, new Set(["t0", "t1", "t2", "t3", "t4"])), null, "unless this machine skips those tasks");
   });
 
   it("reads a list of tasks to skip as eval/report.py does", () => {

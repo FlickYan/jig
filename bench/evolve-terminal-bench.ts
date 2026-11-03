@@ -63,19 +63,23 @@ export function terminalBenchVerdict(candidate: Attempt[], baseline: Attempt[]):
 }
 
 /**
- * Why these trials can't give a verdict, if they can't. The comparison pairs tasks, so a task the verifier
- * couldn't grade on one side drops out (both of milestone 30's pytorch-model-recovery trials without the
- * notes ran out of disk), and with none left it comes out even: "no worse", whatever the candidate did. Only
- * the tasks this machine skips are meant to drop out; for any other, a person runs the trials again or
- * skips the task.
+ * Why these trials can't give a verdict, if they can't. A trial the verifier couldn't grade drops out of the
+ * comparison, and it may have been the agent's doing (one that fills the disk leaves the mark the machine's
+ * own shortage does), so any such trial outside the tasks this machine skips stops the verdict, on either
+ * side and even when the task keeps a graded trial: a candidate that broke the tests on some trials would
+ * otherwise be scored on the rest. With every task out, the comparison comes out even, "no worse", whatever
+ * the candidate did (both of milestone 30's pytorch-model-recovery trials without the notes ran out of disk).
+ * A person runs those trials again or skips the task.
  */
 export function noVerdict(candidate: Trial[], baseline: Trial[], skipped: Set<string>): string | null {
-  const graded = (trials: Trial[]) => new Set(attemptsOf(trials).map((attempt) => attempt.task));
-  const [byCandidate, byBaseline] = [graded(candidate), graded(baseline)];
-  const ran = new Set(baseline.map((trial) => trial.task));
-  const lost = [...new Set(candidate.map((trial) => trial.task))].filter((task) => ran.has(task) && !skipped.has(task) && !(byCandidate.has(task) && byBaseline.has(task)));
-  if (lost.length) return `the verifier couldn't grade ${lost.sort().join(", ")} on one side or both, so the comparison would leave ${lost.length === 1 ? "it" : "them"} out`;
-  if (![...byCandidate].some((task) => byBaseline.has(task))) return "no task was graded on both sides";
+  const ungraded = [...candidate, ...baseline].filter((trial) => trial.unscorable && !skipped.has(trial.task));
+  if (ungraded.length) {
+    const tasks = [...new Set(ungraded.map((trial) => trial.task))].sort().join(", ");
+    const trials = ungraded.length === 1 ? "a trial" : `${ungraded.length} trials`;
+    return `the verifier couldn't grade ${trials} of ${tasks}, so the comparison would leave ${ungraded.length === 1 ? "it" : "them"} out`;
+  }
+  const byBaseline = new Set(attemptsOf(baseline).map((attempt) => attempt.task));
+  if (!attemptsOf(candidate).some((attempt) => byBaseline.has(attempt.task))) return "no task was graded on both sides";
   return null;
 }
 

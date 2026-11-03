@@ -573,9 +573,9 @@ async function checkOnTerminalBench(candidate: Candidate): Promise<void> {
   const skip = skipped.size ? ["--skip-tasks", skipFile] : [];
   execFileSync("python3", ["eval/report.py", "--save", out, ...skip, ...runs], { cwd: ROOT, stdio: "inherit" });
   const trials = (side: "baseline" | "candidate"): Trial[] => JSON.parse(readFileSync(join(out, `${jobs[side][0]}.json`), "utf8")).trials;
-  // A task the verifier couldn't grade here drops out of the comparison, which with none left comes out even: a person decides.
+  // A trial the verifier couldn't grade drops out of the comparison, and the agent may have caused it (a full disk): a person decides.
   const why = noVerdict(trials("candidate"), trials("baseline"), skipped);
-  if (why) throw new Error(`candidate ${n}: ${why}, and no verdict is recorded: run those trials again (remove them from eval/jobs) once the verifier has what it lacked, or list a task no agent can pass on this machine in eval/skip-tasks.txt; then run tbcheck again to go on.`);
+  if (why) throw new Error(`candidate ${n}: ${why}, and no verdict is recorded: look at their verifier/test-stdout.txt (a disk the agent filled is its own failure), run those trials again (remove them from eval/jobs) once the verifier has what it lacked, or list a task no agent can pass on this machine in eval/skip-tasks.txt; then run tbcheck again to go on.`);
   const verdict = terminalBenchVerdict(attemptsOf(trials("candidate")), attemptsOf(trials("baseline")));
   console.log(`candidate ${n}: ${verdict.reason}`);
   if (smoke) {
