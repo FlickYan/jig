@@ -13,6 +13,7 @@ import { parseArgs } from "node:util";
 import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { Conversation } from "./conversation.ts";
+import { Events } from "./events.ts";
 import { hooksFor, runHooks, runStopHooks } from "./hooks.ts";
 import { Inputs } from "./inputs.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
@@ -93,6 +94,9 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
                           (from ${TOOL_NAMES.join(", ")}; default: all)
       --stats <file>      keep a JSON file with the model calls, tokens and tool calls so far, and how often
                           each of jig's mechanisms fired (retries, compactions, the wrap-up, ...)
+      --events <file>     write a task's events as JSON lines, as they happen: its start, each step with its
+                          tokens, the tool calls and results, the text, the notices and its end (- for stdout,
+                          the terminal's output then going to stderr; see the README)
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
@@ -275,6 +279,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       subagents: { type: "boolean", default: true },
       tools: { type: "string" },
       stats: { type: "string" },
+      events: { type: "string" },
       "system-prompt": { type: "string" },
       "hide-skill": { type: "string", multiple: true, default: [] },
       memory: { type: "boolean", default: true },
@@ -323,6 +328,15 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (timeLimit !== undefined && !(timeLimit > 0 && timeLimit * 1000 < 2 ** 31)) throw new Error("--time-limit must be a positive number of seconds, under 24 days");
   const compactAt = Number(values["compact-at"]);
   if (!Number.isInteger(compactAt) || compactAt < 0) throw new Error("--compact-at must be a whole number of tokens");
+  // --events: a task's events as JSON lines, for a backend that runs it (see events.ts). Opened now, before
+  // anything runs; only for a task, since a session has no end to report.
+  if (values.events !== undefined) {
+    if (!taskText || skillsVerb || memoryVerb) throw new Error('--events is for a task given on the command line or stdin: jig --events <file> "task".');
+    events = new Events(values.events === "-" ? "-" : resolve(values.events), model);
+    if (values.events === "-") ui.toStderr();
+    ui.onTold((text) => events?.notice(text));
+    events.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
+  }
   ui.setThinkingVisible(!values["hide-thinking"]);
   const dirs = values["add-dir"].map((dir) => resolve(dir));
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
@@ -358,7 +372,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   // When jig exits, on a forced quit (a second Ctrl+C) too, the files go, a command still running is killed
   // as Ctrl+C kills it, and the session's keeper (sandbox.ts) ends with the whole PID namespace, so a job a
   // command left in the background dies too: only bubblewrap's sandbox would otherwise take them down with jig.
-  process.on("exit", () => {
+  process.on("exit", (code) => {
+    // A task's end is written when it ends: jig exits before that only on a signal or a second Ctrl+C.
+    events?.end("interrupted", code);
     killCommands();
     sandbox?.close?.();
     outputs.remove();
@@ -414,7 +430,10 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   const research = new Permissions("plan", cwd, { deny, contained, dirs });
   const researchFrom = (extra: Tool[]) => [...own, ...extra].filter((tool) => tool.kind === "read" || tool.kind === "run");
   let researchTools = researchFrom(extensions);
-  const metered = (callModel: CallModel, subagent = false, share?: Share) => stats?.meter(callModel, { subagent, share }) ?? callModel;
+  const metered = (callModel: CallModel, subagent = false, share?: Share) => {
+    const counted = stats?.meter(callModel, { subagent, share }) ?? callModel;
+    return events?.meter(counted, share?.model ?? model) ?? counted;
+  };
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
     return metered(createModel({ model, effort, api, baseURL, quiet: true, system, tools: researchTools, count }), true);
@@ -593,7 +612,7 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     finishGate: values["finish-gate"] ? { changed: changedFiles } : undefined,
     wrapUp: values["wrap-up"],
     count,
-    ui: stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI,
+    ui: withEvents(stats ? countToolCalls(ui.terminalUI, stats) : ui.terminalUI),
   };
   conversation.describe(context);
 
@@ -672,6 +691,8 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       if (result.stop === "interrupted" && signal.reason === NO_APPROVER) result.stop = "unapproved";
       if (result.stop === "interrupted" && signal.reason === TIME_UP) result.stop = "time_limit";
       stats?.finish(result);
+      // The wrap-up's report, which report() prints, is the model's text after the last step.
+      if (result.stop === "max_steps" && result.text.trim()) events?.text(result.text.trim());
       report(result, Date.now() - started, maxSteps);
       return result.stop;
     });
@@ -902,7 +923,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
       : memoryVerb
         ? runTask(taskText, `jig memory reflect ${given}`)
         : runTask(taskText, taskText, taskText);
-    process.exitCode = EXIT_CODES[await run] ?? 1;
+    const ending = await run;
+    process.exitCode = EXIT_CODES[ending] ?? 1;
+    events?.end(ending, process.exitCode);
     return;
   }
 
@@ -1067,10 +1090,14 @@ function describeError(err: unknown): string {
 
 /** What to shut down before exiting, like the MCP servers. */
 const cleanup: Array<() => Promise<void>> = [];
+/** --events' writer, once the arguments are read: an error that ends main ends the task's events too. */
+let events: Events | undefined;
+const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
 
 main()
   .catch((err: unknown) => {
     ui.error(describeError(err));
     process.exitCode = 1;
+    events?.end("error", 1);
   })
   .finally(() => Promise.allSettled(cleanup.map((close) => close())));

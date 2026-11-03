@@ -103,6 +103,7 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --no-memory       leave out what jig remembers from earlier sessions
       --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
+      --events <file>   write a task's events as JSON lines as they happen (- for stdout; see below)
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
       --check-writes    after write_file and edit_file, tell the model of a syntax error the change made, or of
@@ -140,6 +141,22 @@ included), the main loop's tool calls by name (those that didn't run included), 
 often each of jig's mechanisms fired (retries, compactions, calls that didn't run as asked, hooks' blocks,
 the reviewer, the wrap-up and more: `src/stats.ts` lists them). So you can see that a change to one runs at
 all: in milestone 28, two candidates' changes never ran, which only reading the sessions showed.
+
+`--events` writes a task's events as JSON lines, one written as each happens, for a service that runs jig as
+a task and follows it there rather than in the terminal's output (`-` puts them on stdout, and the terminal's
+output on stderr). Each line is `{"v":1,"seq":n,"ts":"<ISO time>","type":...}` with the type's fields:
+`start` (the task, `cwd`, `model`, `version`, `limits` with `maxSteps` and `timeLimit`), then for each step
+`step` (its number, its call's `usage` and `cost`), the model's `text`, each `tool_call` (`id`, `name` and the
+`description` the terminal shows) and its `tool_result` (`isError`, and the `output`, cut from the middle to
+4,000 characters, with `"truncated":true` when cut), each `notice` jig prints (errors included), and last
+`end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and `cost` of every model
+call in the task (subagents', the reviewer's, compactions' and the wrap-up's included; the wrap-up's report
+is a `text` after the last step). A cost is in US dollars, or null for a model `src/prices.ts` has no price
+for. Every string goes through the redaction `jig sessions export` uses. A reader should pass over a type it
+doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
+file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
+written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP
+or a second Ctrl+C, jig still writes an `end`, its stop `interrupted`.
 
 `--check-writes` checks what `write_file` and `edit_file` wrote, and adds what is wrong to their result: a
 syntax error the change made in a Python, JavaScript, shell or JSON file (python3's `ast.parse`,
@@ -619,6 +636,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
+| [`src/events.ts`](src/events.ts) | `--events`: a task's start, steps, tool calls, text, notices and end as JSON lines, for a service that runs jig |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 

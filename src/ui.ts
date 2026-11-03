@@ -22,17 +22,31 @@ const MAX_LINE_CHARS = 160;
 let atLineStart = true; // so every block starts on a fresh line
 let statusShown = false; // a transient "⋯ thinking…" line that the next output replaces
 let blockHasOutput = false;
+// Where jig's output goes: stdout, or stderr with --events -, whose events then have stdout to themselves.
+let out: NodeJS.WriteStream = process.stdout;
+// --events: what jig tells the user, which is written as an event too.
+let told: ((text: string) => void) | undefined;
+
+/** Sends jig's output, the questions it asks included, to stderr from now on. */
+export function toStderr(): void {
+  out = process.stderr;
+}
+
+/** Hears each notice and error jig prints for the user (but a subagent's, which are its own). */
+export function onTold(listener: (text: string) => void): void {
+  told = listener;
+}
 
 function write(text: string): void {
   if (!text) return;
   clearStatus();
-  process.stdout.write(text);
+  out.write(text);
   atLineStart = text.endsWith("\n");
 }
 
 function clearStatus(): void {
   if (!statusShown) return;
-  process.stdout.write("\r\x1b[2K"); // back to column 0, erase the line
+  out.write("\r\x1b[2K"); // back to column 0, erase the line
   statusShown = false;
 }
 
@@ -48,20 +62,22 @@ export function println(text = ""): void {
 
 /** Shows what we are waiting for until the next output replaces it. Only on a terminal. */
 export function status(text: string): void {
-  if (!process.stdout.isTTY) return;
+  if (!out.isTTY) return;
   freshLine();
   clearStatus();
-  process.stdout.write(dim(`⋯ ${text}`));
+  out.write(dim(`⋯ ${text}`));
   statusShown = true;
 }
 
 /** Something the user should know, in yellow: a retry, a compaction, a warning. */
 export function notice(text: string): void {
   println(yellow(text));
+  told?.(text);
 }
 
 export function error(text: string): void {
   println(red(text));
+  told?.(text);
 }
 
 // Streaming model output. Text is the reply itself. Thinking is shown dimmed: for Claude that is short
@@ -145,7 +161,7 @@ export const terminalUI: AgentUI = {
     if (lines.length > shown.length) println(dim(`  … ${moreLines(lines.length - shown.length)}`));
   },
 
-  notice: (text) => println(yellow(text)),
+  notice,
 };
 
 /**
@@ -325,7 +341,7 @@ export class Input {
 }
 
 let stdin: Input | undefined;
-const userInput = () => (stdin ??= new Input(process.stdin, process.stdout));
+const userInput = () => (stdin ??= new Input(process.stdin, out));
 
 async function read(prompt: string, keep: boolean, from: Input, signal?: AbortSignal): Promise<Entry> {
   freshLine();

@@ -101,8 +101,8 @@ function hasToolCalls(message: MessageParam): boolean {
   return typeof message.content !== "string" && message.content.some((block) => block.type === "tool_use");
 }
 
-/** Every string in a value, redacted (strings, not the JSON text, so escapes can't be cut in half). */
-function redact<T>(value: T): { value: T; count: number } {
+/** Every string in a value, redacted (strings, not the JSON text, so escapes can't be cut in half). --events' too. */
+export function redact<T>(value: T): { value: T; count: number } {
   let count = 0;
   const walk = (item: unknown): unknown => {
     if (typeof item === "string") {
