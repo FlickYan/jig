@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 604 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 630 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -694,6 +694,7 @@ What each question came to; the write-ups, with every number's run and caveat, a
 | A stronger model when the tests fail? (23) | the trigger replayed on 676 saved attempts; deepseek-v4-pro alone | the trigger would have reached 1 of 220 failures; v4-pro was 7 points ahead for 5 times the cost, while 2 more steps put flash 24 ahead |
 | Does it help to tell the model its budget? (30) | evolve2 at 4 steps, 21 tasks × 5, against two baselines on the same build; run again, at 40 steps, and on the main benchmark | 92 of 105 against 66 and 66, at the same cost, and 92 again; no harm at 40 steps (41 of 42 both ways) or on the main benchmark (60 of 60): on Terminal-Bench no worse (28 of 34 against 29, scored again in milestone 31): on by default. A finish gate and checks after writes never fired: opt-in |
 | What did the failures left ask for? (31) | evolve2 at 4 steps, 21 tasks × 5: four changes alone and together, against three baselines; then on by default, at 40 steps, on the main benchmark and on Terminal-Bench | none alone beat the noise; an overview of the project, earlier budget notes and notes on test runs that ran nothing together, with the fourth or without it, passed 290 of 315 against 268 (+7 points, +0.6 to +13.3), and 101 of 105 once on by default; 30% fewer steps at 40; on Terminal-Bench 31 of 36 against 29, at 7% less cost: on by default |
+| Why does jig fail Terminal-Bench? (32) | milestone 30's 76 trials, the 17 failures read one by one, each candidate checked by two skeptics | 6 failures weren't the agent's (a refused download, a full disk), which the scorer now leaves out; the rest are mostly beyond the model; `--keep-inputs` gives back a file a command destroyed (opt-in; no harm on evolve2) |
 | A second model reviewing the work? (24) | Terminal-Bench, 20 tasks, alternating at each task | 5 points ahead (−20 to +30) for 2.4 times the cost; no result changed because of a review |
 | A review that runs the work? (29) | Terminal-Bench, 20 tasks, the hidden tests on each trial's work before the review's fix and after it | in a smoke test, the first failure a review turned into a pass; in the round, no result changed, no false alarm in 9 passes, and the causes of two failures found and lost before they went back |
 | Training on its own successes? (26) | a LoRA of Qwen2.5-0.5B on 225 passed sessions, loss on held-out tasks | −57% overall, but −20% on the model's own tokens: the rest is the prompt and the tools learnt by heart |
@@ -759,6 +760,7 @@ and the design decisions behind them in [docs/design.md](docs/design.md).
 | 29 | A reviewer that runs the work | `jig review`, in a copy of the machine; one failure turned into a pass, in a smoke test; in the round, no result changed |
 | 30 | Four ideas from other agents, measured | budget notes on by default (+25 points at 4 steps, twice); a finish gate, checks after writes and tolerant edits stay opt-in |
 | 31 | What the failures left asked for, measured | the overview, earlier budget notes and test notes on by default (+7 points at 4 steps, in three runs); letting `write_file` trust what a result showed was left out |
+| 32 | Terminal-Bench's failures, read | a scorer that leaves out trials nobody could pass, and `--keep-inputs` |
 
 ## Tests
 
