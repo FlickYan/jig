@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { context } from "../context.ts";
 import { jigHome } from "../paths.ts";
 
 /**
@@ -167,8 +168,11 @@ export const SAFE_GIT = ["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/de
 // into the conversation and the logs, and a prompt injection could send it somewhere instead.
 const PRIVATE_ENV = ["DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"];
 
-/** jig's environment, or `env`, without its credentials, for commands and for the git it runs in a project. */
-export function withoutKeys(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+/**
+ * jig's environment (the run's, see context.ts), or `env`, without its credentials, for commands and for the
+ * git it runs in a project.
+ */
+export function withoutKeys(env: NodeJS.ProcessEnv = context().env ?? process.env): NodeJS.ProcessEnv {
   return Object.fromEntries(Object.entries(env).filter(([name]) => !PRIVATE_ENV.includes(name)));
 }
 

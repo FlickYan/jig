@@ -1,7 +1,10 @@
 // --events: a one-shot task as JSON lines, for a backend that runs jig as a task and follows it there
 // rather than in the terminal's output. One object a line, each written as it happens, with what the
 // terminal shows (the steps, the tool calls and their results, the notices) and how the task ended.
+// Where an approver answers in the terminal's place (--approve-via's service, or a library's), the calls put
+// to it and its answers too.
 // The fields are a contract (version 1): a reader ignores a type it doesn't know, and a field may be added.
+// A library's task (lib.ts) gets the same objects, handed to its listener instead of written.
 
 import { closeSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -16,6 +19,19 @@ export const EVENT_OUTPUT_CHARS = 4_000;
 // What truncate's line saying how much it cut takes, at most, so the output with it stays under the limit.
 const CUT_LINE = 64;
 
+/** One event, as a line of --events holds it. */
+export type Event = { v: 1; seq: number; ts: string; type: string } & Record<string, unknown>;
+
+/** How the task ended, as its end event says. */
+export interface End {
+  stop: string;
+  exitCode: number;
+  steps: number;
+  usage: Usage;
+  cost: number | null;
+  seconds: number;
+}
+
 /** What the start of a task says about it. */
 export interface Start {
   task: string;
@@ -26,14 +42,16 @@ export interface Start {
 }
 
 /**
- * The events of one run, written to `path`, or to stdout for "-". The file is opened before the task starts
- * and written anew: made beside the path and renamed into place, so a link a command left there (one an
- * earlier run's background job made, say) is replaced, not written through, as --stats' file is. A path in
- * /dev or /proc is written to as it is. Each event is one write to that file, so a crash loses at most the
- * line being written. Every string goes through the redaction `jig sessions export` uses.
+ * The events of one run, written to `path`, or to stdout for "-", or handed to a listener as objects. The
+ * file is opened before the task starts and written anew: made beside the path and renamed into place, so a
+ * link a command left there (one an earlier run's background job made, say) is replaced, not written
+ * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is one write to
+ * that file, so a crash loses at most the line being written. Every string goes through the redaction
+ * `jig sessions export` uses.
  */
 export class Events {
-  private readonly fd: number | undefined; // undefined: stdout
+  private readonly fd: number | undefined; // undefined: stdout, or the listener
+  private readonly listener: ((event: Event) => void) | undefined;
   private readonly model: string;
   private readonly started = Date.now();
   private seq = 0;
@@ -42,10 +60,11 @@ export class Events {
   private cost: number | null;
   private ended = false;
 
-  constructor(path: string, model: string) {
+  constructor(path: string | ((event: Event) => void), model: string) {
     this.model = model;
     this.cost = costOf(model, this.usage) ?? null;
-    if (path === "-") return;
+    if (typeof path === "function") this.listener = path;
+    if (typeof path === "function" || path === "-") return;
     if (/^\/(dev|proc)\//.test(path)) {
       this.fd = openSync(path, "a");
       return;
@@ -114,18 +133,32 @@ export class Events {
     this.write("notice", { text });
   }
 
-  /** How the task ended, and the code jig exits with. Only the first end is written. */
-  end(stop: string, exitCode: number): void {
-    if (this.ended) return;
+  /** A tool call put to the approver, before it is asked: the service learns of it here (see approvals.ts). */
+  approvalRequest(request: { step: number; id: string; tool: string; description: string }): void {
+    const { step, id, tool, description } = request;
+    this.write("approval_request", { step, id, tool, description });
+  }
+
+  /** The approver's answer, or the timeout's deny, as the call goes on with it. */
+  approval(answer: { id: string; decision: "allow" | "deny"; always: boolean; by: "api" | "timeout" }): void {
+    this.write("approval", { ...answer });
+  }
+
+  /** How the task ended, and the code jig exits with. Only the first end is written, and returned. */
+  end(stop: string, exitCode: number): End | undefined {
+    if (this.ended) return undefined;
     this.ended = true;
     const seconds = Math.round((Date.now() - this.started) / 100) / 10;
-    this.write("end", { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds });
+    const end = { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds };
+    this.write("end", { ...end });
     if (this.fd !== undefined) closeSync(this.fd);
+    return end;
   }
 
   private write(type: string, fields: Record<string, unknown>): void {
     if (this.ended && type !== "end") return;
-    const event = redact({ v: 1, seq: ++this.seq, ts: new Date().toISOString(), type, ...fields }).value;
+    const event = redact({ v: 1, seq: ++this.seq, ts: new Date().toISOString(), type, ...fields }).value as Event;
+    if (this.listener) return this.listener(event);
     const line = `${JSON.stringify(event)}\n`;
     if (this.fd === undefined) process.stdout.write(line);
     else writeSync(this.fd, line);

@@ -1,10 +1,12 @@
 // The terminal: the model's reply and thinking as they stream, each tool call with a few lines of its
 // result, notices, a status line while waiting, and the prompt for the user's input. Everything jig prints
-// goes through here, so lines and blocks don't run into each other.
+// goes through here, so lines and blocks don't run into each other. A library's task (see context.ts)
+// prints nothing, and its notices go to its own listener alone.
 
 import * as readline from "node:readline";
 import { styleText } from "node:util";
 import type { AgentUI } from "./agent.ts";
+import { context } from "./context.ts";
 
 // styleText drops the colors when stdout is not a terminal or NO_COLOR is set.
 const style = (format: Parameters<typeof styleText>[0]) => (text: string) => styleText(format, text);
@@ -24,21 +26,17 @@ let statusShown = false; // a transient "⋯ thinking…" line that the next out
 let blockHasOutput = false;
 // Where jig's output goes: stdout, or stderr with --events -, whose events then have stdout to themselves.
 let out: NodeJS.WriteStream = process.stdout;
-// --events: what jig tells the user, which is written as an event too.
-let told: ((text: string) => void) | undefined;
 
 /** Sends jig's output, the questions it asks included, to stderr from now on. */
 export function toStderr(): void {
   out = process.stderr;
 }
 
-/** Hears each notice and error jig prints for the user (but a subagent's, which are its own). */
-export function onTold(listener: (text: string) => void): void {
-  told = listener;
-}
+/** Whether this run prints nothing (see context.ts): the terminal's state then stays as it is. */
+const silent = () => !!context().silent;
 
 function write(text: string): void {
-  if (!text) return;
+  if (!text || silent()) return;
   clearStatus();
   out.write(text);
   atLineStart = text.endsWith("\n");
@@ -62,7 +60,7 @@ export function println(text = ""): void {
 
 /** Shows what we are waiting for until the next output replaces it. Only on a terminal. */
 export function status(text: string): void {
-  if (!out.isTTY) return;
+  if (!out.isTTY || silent()) return;
   freshLine();
   clearStatus();
   out.write(dim(`⋯ ${text}`));
@@ -72,12 +70,12 @@ export function status(text: string): void {
 /** Something the user should know, in yellow: a retry, a compaction, a warning. */
 export function notice(text: string): void {
   println(yellow(text));
-  told?.(text);
+  context().told?.(text);
 }
 
 export function error(text: string): void {
   println(red(text));
-  told?.(text);
+  context().told?.(text);
 }
 
 // Streaming model output. Text is the reply itself. Thinking is shown dimmed: for Claude that is short
@@ -98,13 +96,14 @@ export function thinkingVisible(): boolean {
 
 /** A piece of the model's reply, as it streams. */
 export function text(delta: string): void {
+  if (silent()) return;
   startBlockOutput(delta);
   write(delta);
 }
 
 /** A piece of the model's thinking: dimmed, or, when hidden, a status line counting the seconds. */
 export function thinking(delta: string): void {
-  if (!delta) return;
+  if (!delta || silent()) return;
   if (showThinking) {
     startBlockOutput(delta);
     write(dim(delta));
@@ -121,6 +120,7 @@ export function thinking(delta: string): void {
 
 /** A content block of the reply has ended: the next one starts on a line of its own. */
 export function endBlock(): void {
+  if (silent()) return;
   if (blockHasOutput) freshLine();
   blockHasOutput = false;
   thinkingStarted = 0;

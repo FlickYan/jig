@@ -66,3 +66,8 @@ jobs:
       - run: npm pack
       - run: npm install -g ./*.tgz
       - run: jig --version && jig --help
+      - name: Import runTask from the package, installed in a project of its own
+        run: |
+          mkdir "$RUNNER_TEMP/uses-jig" && cp ./*.tgz "$RUNNER_TEMP/uses-jig/"
+          cd "$RUNNER_TEMP/uses-jig" && npm init -y && npm install ./*.tgz
+          node -e "import('jig-agent').then(({ runTask }) => { if (typeof runTask !== 'function') throw new Error('runTask is ' + typeof runTask) })"

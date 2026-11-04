@@ -76,6 +76,9 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
                           edits  change files in the project freely; ask before commands the sandbox doesn't contain
                           auto   never ask
   -y, --yes             same as --mode auto
+      --approve-via <url>  in a one-shot task, ask a service over HTTP where the mode would ask at the
+                        terminal (see below)
+      --approval-timeout <s>  deny a call --approve-via has no answer for after this long (default: 600)
       --no-sandbox      run commands directly on this machine instead of in the sandbox (Seatbelt on
                         macOS, bubblewrap on Linux)
       --allow-network   let sandboxed commands use the network
@@ -157,6 +160,18 @@ doesn't know: later versions may add some. It is only for a task given on the co
 file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
 written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP
 or a second Ctrl+C, jig still writes an `end`, its stop `interrupted`.
+
+`--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
+task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the
+terminal, jig writes an `approval_request` event (`step`, `id`: `ap_1`, `ap_2`, ..., `tool`, `description`)
+and polls `GET <url>/<id>?wait=25`, with `Authorization: Bearer <the model's API key>`, for the answer:
+200 with `{"decision": "allow" | "deny", "always": true}` (`always` optional), or 204 for none yet, asked
+again at once; any other status, or a failed connection, is asked again after 1, 2, 4 ... seconds, 10 at
+most. `allow` is the terminal's yes, with `always` its always, and `deny` its no; with no answer after
+`--approval-timeout` seconds (600) the call is denied. An `approval` event (`id`, `decision`, `always`,
+`by`: `api`, or `timeout`) follows, and the task goes on as after the terminal's answer. `--time-limit`,
+Ctrl+C and SIGTERM stop the wait as they stop the task. It is only for a task given on the command line or
+stdin, and not with `--yes` or `--mode auto`, which never ask.
 
 `--check-writes` checks what `write_file` and `edit_file` wrote, and adds what is wrong to their result: a
 syntax error the change made in a Python, JavaScript, shell or JSON file (python3's `ast.parse`,
@@ -242,6 +257,45 @@ its data, a write-ahead log with an invalid header; replayed with the task's fil
 back byte for byte. It is off until benchmarks show whether it helps; `--stats` counts each file named
 (`inputs.lost`), each without a copy (`inputs.copySkipped`), and each one gone or empty it kept quiet about
 (`inputs.suppressed`).
+
+## As a library
+
+A program can run jig's tasks itself, without a process for each: `runTask` runs one as
+`jig --events - "task"` would, and resolves to how it ended.
+
+```js
+import { runTask } from "jig-agent";
+
+const controller = new AbortController();
+const result = await runTask({
+  prompt: "the login test is failing, fix it",
+  cwd: "/work/some-project",
+  model: "claude-opus-5-5",
+  signal: controller.signal,                    // abort() stops the task: it ends "interrupted"
+  onEvent: (event) => console.log(event.type),  // start, step, text, tool_call, tool_result, notice, end
+  approve: async (request) => ({ decision: "allow" }), // request: {id, step, tool, description}
+});
+// { stop: "end_turn", exitCode: 0, steps: 4, usage: {...}, cost: 0.0123, seconds: 21.4, text: "Fixed ..." }
+```
+
+`prompt` and `cwd` are needed; the rest are as their flags: `model` (`deepseek-flash` without one),
+`baseUrl`, `maxSteps` (50), `timeLimit` (seconds), `mode` (`edits`), `yes`, `sandbox` (false is
+`--no-sandbox`) and `stats` (the file's path). `apiKey` is the key, or without one the environment variable
+jig uses for the model; `home` is jig's directory for the task (`JIG_HOME`: its sessions, snapshots,
+memories and settings), or the process's; `env` is the environment its commands get (less the API keys), or
+the process's. Each event is the object `--events` would write as a line (see above). `approve` is asked
+where the CLI would ask at a terminal, before a tool call the mode doesn't allow, with the call's `id`
+(`ap_1`, `ap_2`, ...), `step`, `tool` and `description`: `allow` is the terminal's yes, `allow` with
+`always: true` its always, `deny` its no. Without `approve` or `yes`, such a call is refused as with no
+terminal, and the third ends the task `unapproved`. Each call put to `approve`, and its answer, are
+`approval_request` and `approval` events, as `--approve-via`'s are. `exitCode` is what `jig` would exit
+with. A failure ends the task with `stop: "error"` and says what failed in `error`; only options that are
+wrong, before it starts, reject. A task prints nothing, and leaves the process's signal handlers, exit
+code and working directory alone. Several can run at once in one process, each with its own project, jig directory, model
+and API, and each sees only its own events, permissions, memories, sessions and stats: what the CLI leaves
+to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but for the skills in
+your home directory's `.agents/skills` and `.claude/skills`, which are the process's, as `HOME` is. The
+CLI runs the same code ([`src/run.ts`](src/run.ts)), so the two can't drift.
 
 ## What it does
 
@@ -354,7 +408,7 @@ back byte for byte. It is off until benchmarks show whether it helps; `--stats` 
   When jig does ask, `[a]lways` approves that program (say, `python3`) for the rest of the session. On a
   file change it approves file changes only: commands still ask, even ones the sandbox contains.
   With no terminal to ask in (a script, CI), such a call is refused instead, and the third in a task
-  stops it: `--yes`, or allow rules, let them run.
+  stops it: `--yes`, or allow rules, let them run, and `--approve-via` asks a service instead (see above).
 - **Rules.** `~/.jig/settings.json` and the project's `.jig/settings.json` can list commands to always
   allow or always refuse:
 
@@ -632,10 +686,13 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/inputs.ts`](src/inputs.ts) | `--keep-inputs`: the files there before a task, watched around its commands, and a copy of one a command lost |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/overview.ts`](src/overview.ts) | The overview: the project's files, and those the task names, put before the task |
-| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
+| [`src/cli.ts`](src/cli.ts) | Arguments, and what is the process's: its title, a task on stdin, its exit code |
+| [`src/run.ts`](src/run.ts) | What jig runs, for the CLI and the library: the setup, a task or the interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
+| [`src/lib.ts`](src/lib.ts), [`src/context.ts`](src/context.ts) | jig as a library: `runTask`, and what is a task's own rather than the process's (jig's directory, its commands' environment, who hears its notices) |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
+| [`src/approvals.ts`](src/approvals.ts) | `--approve-via`: the tool calls jig would ask about at a terminal, asked of a service over HTTP |
 | [`src/events.ts`](src/events.ts) | `--events`: a task's start, steps, tool calls, text, notices and end as JSON lines, for a service that runs jig |
 | [`server/`](server) | jig as a service ([docs/server.md](docs/server.md)): the task service's HTTP API for many tenants, its SQLite store, a fair scheduler, and the runners that start jig for each task: on this machine, in a Docker container or as a Kubernetes Job |
 | [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits, usage and budgets |
@@ -797,8 +854,8 @@ npm run typecheck
 [CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests included
 (on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and checks the
 benchmark's tasks with the oracle and noop agents, which needs no API key, and packs, installs and runs the
-npm package. The Linux setup was tried locally in Debian containers as an ordinary user, with Node 22 and
-24, before it went in.
+npm package, and imports `runTask` from it. The Linux setup was tried locally in Debian containers as an
+ordinary user, with Node 22 and 24, before it went in.
 
 ## Releasing
 
