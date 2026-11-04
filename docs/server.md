@@ -325,8 +325,10 @@ ticket out of its environment before it starts jig; spent, it opens nothing anyw
 `maxIdleSeconds` is told so (410) and stopped, and another started in its place; one that exits before it
 claims is started again after a pause that doubles, up to a minute, so an image that can't run doesn't
 loop; on Kubernetes, where only its claim says a worker is up, one that never claims is found at its
-`maxIdleSeconds`. A service that stops stops its idle workers. A replica that crashes leaves them waiting
-on a connection that breaks, and they exit (an idle Job's own deadline is `maxIdleSeconds` and a minute).
+`maxIdleSeconds`. A service that stops stops its idle workers, and on Docker removes their folders
+(`dataDir/tasks/pool_<hex>`) before it exits. A replica that crashes leaves them waiting on a connection
+that breaks, and they exit (an idle Job's own deadline is `maxIdleSeconds` and a minute); their folders
+stay, as a running task's does, since replicas may share `dataDir` and another's may be in use.
 
 A worker claims from the replica that started it, which alone holds its ticket. `pool.baseUrl` is that
 replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on

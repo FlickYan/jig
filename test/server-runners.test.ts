@@ -302,6 +302,8 @@ describe("the Docker runner", () => {
     const pids = await Promise.all(idle.map((name) => pidOf(state, name)));
     services.splice(services.indexOf(api), 1);
     await api.close();
+    // Their folders are gone by then: a process that exits once the service has closed leaves none behind.
+    assert.deepEqual(await readdir(join(runner.dir("none"), "..")), []);
     // Told so in the answer to their claims, and sent docker kill.
     await until(() => !pids.some(alive), "the idle workers to be gone");
     await until(async () => (await kills(state)).length === 2, "the kills");

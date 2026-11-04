@@ -154,11 +154,12 @@ export class DockerRunner implements Runner {
     const args = [...this.runArgs(name, dir, ["--label", `jig.pool=${id}`], "JIG_POOL_TICKET"), ...worker, "--pool", this.poolUrl];
     const container = this.launch(name, args, { JIG_POOL_TICKET: ticket }, join(dir, "output.log"));
     const slot: Slot = { dir, container, assigned: false };
-    // A worker that never got a task leaves its folder; one that did, the task's.
-    void container.exit.then(async () => {
+    // A worker that never got a task leaves its folder; one that did, the task's. The pool waits on this,
+    // not on the exit alone, so a service that closes has removed the folders of its idle workers.
+    const exited = container.exit.then(async () => {
       if (!slot.assigned) await rm(dir, { recursive: true, force: true }).catch(() => {});
     });
-    return { slot, exited: container.exit, stop: container.stop };
+    return { slot, exited, stop: container.stop };
   }
 
   private async makeFolder(dir: string): Promise<void> {
