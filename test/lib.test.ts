@@ -58,8 +58,9 @@ describe("runTask", () => {
   });
 
   it("runs tasks at once in one process, each with only its own events, usage, files, environment, memories, sessions and stats", async () => {
-    // Task i calls bash i times, then answers: so i + 1 steps, each 10 tokens in and 5 out. Its commands take
-    // a moment, so the three are running at the same time.
+    // Task i calls bash i + 1 times, then answers: so i + 2 steps, each 10 tokens in and 5 out. Its commands
+    // take a moment, so the three are running at the same time. Task a has one step only: out of steps after
+    // its command, while the others still run, it is told so, and they must not be.
     const names = ["a", "b", "c"];
     const order: string[] = [];
     const tasks = await Promise.all(
@@ -70,7 +71,13 @@ describe("runTask", () => {
           return [{ tool: "bash", input: { command: `sleep 0.2; echo "$TASK" $((${calls} + 1)) >> who.txt` }, id: `${name}_${calls + 1}` }];
         });
         const env = { ...(process.env as Record<string, string>), TASK: name };
-        const set = await setUp(api, { prompt: `Do task ${name}.`, yes: true, env, onEvent: (event) => (set.events.push(event), order.push(`${name}:${event.type}`)) });
+        const set = await setUp(api, {
+          prompt: `Do task ${name}.`,
+          yes: true,
+          env,
+          ...(name === "a" && { maxSteps: 1 }),
+          onEvent: (event) => (set.events.push(event), order.push(`${name}:${event.type}`)),
+        });
         // A memory in task a's jig directory alone, and settings jig warns of in task b's.
         if (name === "a") {
           await mkdir(join(set.home, "memory", "user"), { recursive: true });
@@ -84,9 +91,11 @@ describe("runTask", () => {
     try {
       const results = await Promise.all(tasks.map((task) => runTask(task.options)));
       assert.ok(order.indexOf("c:start") < order.indexOf("a:end"), "the three ran at the same time");
+      // Task a's one step and its wrap-up call; the others' steps.
+      const ends = [{ stop: "max_steps", steps: 1, calls: 2 }, ...[3, 4].map((steps) => ({ stop: "end_turn", steps, calls: steps }))];
       tasks.forEach(({ name, api, home, events }, i) => {
-        const steps = i + 2;
-        assert.deepEqual([results[i].stop, results[i].steps, results[i].usage.input, results[i].text], ["end_turn", steps, 10 * steps, `Task ${name} is done.`]);
+        const { stop, steps, calls } = ends[i];
+        assert.deepEqual([results[i].stop, results[i].steps, results[i].usage.input, results[i].text], [stop, steps, 10 * calls, `Task ${name} is done.`]);
         assert.equal(events[0].task, `Do task ${name}.`);
         assert.equal(events.at(-1)!.steps, steps);
         assert.deepEqual(
@@ -95,13 +104,18 @@ describe("runTask", () => {
         );
         assert.deepEqual(
           ofType(events, "notice").map((event) => String(event.text).replace(home, "<home>")),
-          name === "b" ? ['<home>/settings.json: jig has no hook event "SessionStart", so those hooks don\'t run (it has PreToolUse, PostToolUse, Stop).'] : [],
+          {
+            a: ["Out of steps: asking the model where the work stands.", "Stopped after 1 steps (raise the limit with --max-steps)."],
+            b: ['<home>/settings.json: jig has no hook event "SessionStart", so those hooks don\'t run (it has PreToolUse, PostToolUse, Stop).'],
+            c: [],
+          }[name],
         );
         // Its own API saw only its own task, and only task a's saw the memory.
-        assert.equal(api.requests.length, steps);
+        assert.equal(api.requests.length, calls);
         for (const request of api.requests) assert.match(JSON.stringify(request.messages), new RegExp(`Do task ${name}\\.`));
         assert.equal(systemText(api.requests[0] as { system: string }).includes("The user indents with tabs."), name === "a");
       });
+      assert.ok(order.indexOf("c:start") < order.indexOf("a:notice"), "task a was told after all three had started");
       for (const [i, { name, project, home }] of tasks.entries()) {
         // Its commands ran in its project with its environment.
         assert.equal(await readFile(join(project, "who.txt"), "utf8"), Array.from({ length: i + 1 }, (_, call) => `${name} ${call + 1}\n`).join(""));
@@ -112,7 +126,7 @@ describe("runTask", () => {
         const session = await readFile(join(home, "sessions", key, sessions[0]), "utf8");
         assert.ok(session.includes(`Do task ${name}.`) && !names.some((other) => other !== name && session.includes(`Do task ${other}.`)));
         const stats = JSON.parse(await readFile(join(project, "..", "stats.json"), "utf8"));
-        assert.deepEqual([stats.stop, stats.modelCalls, stats.toolCalls.bash], ["end_turn", i + 2, i + 1]);
+        assert.deepEqual([stats.stop, stats.modelCalls, stats.toolCalls.bash], [ends[i].stop, ends[i].calls, i + 1]);
       }
     } finally {
       for (const { api } of tasks) api.close();
