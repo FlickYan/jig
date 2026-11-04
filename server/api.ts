@@ -35,6 +35,8 @@ export interface TenantConfig {
 }
 
 export interface Config {
+  /** The region this service is (router.ts): its tasks' ids carry it. */
+  region?: string;
   host?: string;
   port?: number;
   /** The listener only tasks reach, where their jig waits for approvals' answers (default 127.0.0.1:8082). */
@@ -95,7 +97,7 @@ export interface Service {
 export async function startService(config: Config, { secret, runner, webhookRetryMs }: { secret: string; runner?: Runner; webhookRetryMs?: number }): Promise<Service> {
   checkConfig(config);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
-  const store = await openStore(config.database);
+  const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
   const handler = (serve: (req: IncomingMessage, res: ServerResponse) => Promise<void>) => (req: IncomingMessage, res: ServerResponse) =>
     void serve(req, res).catch((err) => {
@@ -131,7 +133,7 @@ export async function startService(config: Config, { secret, runner, webhookRetr
     await store.close();
     throw err;
   }
-  const context = { store, scheduler, answers, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 };
+  const context = { store, scheduler, answers, region: config.region ?? null, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 };
   const server = createServer(handler((req, res) => handle(req, res, context)));
   const close = async () => {
     webhooks.close();
@@ -208,6 +210,7 @@ function configProblem(config: Config): string | undefined {
     : !isObject(pool) ? `${block}.pool must be an object, {size, maxIdleSeconds}`
     : (whole(`${block}.pool.size`, pool.size, 0) ?? positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ?? http(`${block}.pool.baseUrl`, pool.baseUrl));
   const problem =
+    (config.region === undefined || (typeof config.region === "string" && /^[a-z0-9]{1,16}$/.test(config.region)) ? undefined : `region must be 1 to 16 lowercase letters and digits, not ${JSON.stringify(config.region)}`) ??
     text("database", config.database, true) ??
     text("dataDir", config.dataDir, true) ??
     text("gatewayBaseUrl", config.gatewayBaseUrl, true) ??
@@ -267,6 +270,7 @@ interface Context {
   store: Store;
   scheduler: Scheduler;
   answers: Answers;
+  region: string | null;
   model: string;
   maxBody: number;
   heartbeatMs: number;
@@ -274,7 +278,7 @@ interface Context {
 
 async function handle(req: IncomingMessage, res: ServerResponse, context: Context): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
-  if (url.pathname === "/healthz") return reply(res, 200, { ok: true });
+  if (url.pathname === "/healthz") return reply(res, 200, { ok: true, region: context.region });
   const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
   const tenant = key && (await context.store.tenantByKey(createHash("sha256").update(key).digest("hex")));
   if (!tenant) return reply(res, 401, { error: "A tenant's API key is needed: Authorization: Bearer <key>" }, { "www-authenticate": "Bearer" });
@@ -293,14 +297,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
     const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
     // A full page may have more after it: the next is read with before=<next>.
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
   // Another tenant's task is as missing as one that never was.
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]))) : reply(res, 405, { error: "Use GET" });
+  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
   if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
@@ -326,6 +330,13 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     input = JSON.parse(body);
   } catch {
     return reply(res, 400, { error: "The body isn't JSON" });
+  }
+  // A spec may name the region it is for, as the router reads it; the task is made only in that region.
+  if (isObject(input) && input.region !== undefined) {
+    const { region, ...rest } = input;
+    if (typeof region !== "string" || !/^[a-z0-9]{1,16}$/.test(region)) return reply(res, 400, { error: "region must be a region's name" });
+    if (region !== context.region) return reply(res, 400, { error: `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router` });
+    input = rest;
   }
   const spec = taskSpec(input, tenant, context.model);
   if (typeof spec === "string") return reply(res, 400, { error: spec });
@@ -428,13 +439,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * A task as the API shows it, with how many of its approvals wait for an answer (none, once it has ended);
- * the list leaves out the stats, and the prompt unless asked.
+ * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
+ * (none, once it has ended); the list leaves out the stats, and the prompt unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>) {
+function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>, region: string | null) {
   const { spec, tenant, stats, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

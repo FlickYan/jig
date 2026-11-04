@@ -209,10 +209,13 @@ export interface Store {
   close(): Promise<void>;
 }
 
-/** Opens the store: Postgres for a postgres:// URL, else SQLite at the path (":memory:" for one in memory). */
-export async function openStore(database: string): Promise<Store> {
-  if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database);
-  return new SqliteStore(database);
+/**
+ * Opens the store: Postgres for a postgres:// URL, else SQLite at the path (":memory:" for one in memory).
+ * With a region, the ids of the tasks it makes carry it.
+ */
+export async function openStore(database: string, { region }: { region?: string } = {}): Promise<Store> {
+  if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database, region);
+  return new SqliteStore(database, region);
 }
 
 // Each entry moves the schema one version on (PRAGMA user_version counts them). Never edit one that has
@@ -252,8 +255,10 @@ class SqliteStore implements Store {
   // Each stream and each wait for an approval's answer listens.
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   readonly live = false;
+  private region?: string;
 
-  constructor(path: string) {
+  constructor(path: string, region?: string) {
+    this.region = region;
     try {
       // A fresh checkout has no folder for the file yet.
       if (path !== ":memory:" && path !== "") mkdirSync(dirname(path), { recursive: true });
@@ -318,7 +323,7 @@ class SqliteStore implements Store {
   }
 
   async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
-    const id = newTaskId();
+    const id = newTaskId(this.region);
     const { prompt, ...rest } = spec;
     this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), new Date().toISOString());
     return (await this.task(id))!;
@@ -463,8 +468,9 @@ class SqliteStore implements Store {
   }
 }
 
-export function newTaskId(): string {
-  return `task_${randomUUID().replaceAll("-", "")}`;
+/** task_<32 hex digits>, or task_<region>_<32 hex digits>, which says where the task lives (router.ts). */
+export function newTaskId(region?: string): string {
+  return `task_${region ? `${region}_` : ""}${randomUUID().replaceAll("-", "")}`;
 }
 
 /** A value for a JSON column, as text. */
