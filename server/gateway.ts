@@ -344,6 +344,9 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       reply.once("close", () => {
         reader.end();
         if (status === 200) meter(token, model, reader);
+        // A reply the provider broke off never ends, so pipe() would leave jig's open; breaking it off too
+        // lets jig ask again at once, and gives back the request's slot.
+        if (!reply.complete) res.destroy();
       });
       reply.pipe(res);
       if (!res.closed) await new Promise((done) => res.once("close", done));

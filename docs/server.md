@@ -59,7 +59,8 @@ constant time, and answers 401 to anything else, expired tokens included, withou
 **Routes.** `POST /anthropic/v1/messages` goes to the provider's `/v1/messages`, with the query as it came.
 The body goes byte for byte, since prompt caching depends on it, and the headers as they came, but for the
 credentials and `accept-encoding`: the gateway asks for the reply uncompressed, so it can read the usage in
-it. A streamed reply comes back event by event as the provider sends it. `GET /healthz` answers `ok`.
+it. A streamed reply comes back event by event as the provider sends it; if the provider breaks it off,
+the gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`.
 `GET /metrics` is Prometheus's text format: `jig_gateway_requests_total`, `jig_gateway_rate_limited_total`
 and `jig_gateway_budget_exceeded_total` by tenant, `jig_gateway_upstream_errors_total` by status,
 `jig_gateway_tokens_total` by tenant and kind, `jig_gateway_cost_usd_total`, and the gauges

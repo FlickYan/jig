@@ -271,6 +271,26 @@ describe("the gateway", () => {
     assert.equal(await metric(gw, "jig_gateway_in_flight"), 0);
   });
 
+  it("breaks off its reply when the provider's does, counting what came before", async () => {
+    // The provider sends its first event, 10 tokens in, then drops the connection.
+    const reply = messagesReply([{ text: "Done." }]);
+    const provider = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(reply.slice(0, reply.indexOf("\n\n") + 2), () => setTimeout(() => res.socket?.destroy(), 50));
+    });
+    const gw = await gateway(provider.url);
+    const response = await ask(gw, token({ task: "dropped" }));
+    assert.equal(response.status, 200);
+    // jig sees the break and can ask again, rather than waiting on a stream that never ends.
+    let timer: NodeJS.Timeout | undefined;
+    const hung = new Promise<string>((done) => (timer = setTimeout(() => done("hung"), 3000)));
+    const outcome = await Promise.race([response.text().then(() => "ended", () => "broke off"), hung]).finally(() => clearTimeout(timer));
+    assert.equal(outcome, "broke off");
+    await until(async () => (await metric(gw, "jig_gateway_in_flight")) === 0, "the request to give back its slot");
+    const spent = await (await fetch(`${gw.url}/usage/dropped`, { headers: { "x-api-key": token({ task: "dropped" }) } })).json();
+    assert.deepEqual([spent.requests, spent.usage.input, spent.usage.output], [1, 10, 1]);
+  });
+
   it("answers 402 once a task has spent its budget", async () => {
     const provider = await fakeProvider();
     const gw = await gateway(provider.url);
