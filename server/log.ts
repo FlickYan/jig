@@ -1,6 +1,7 @@
 // What the task service, the gateway and the router say about themselves, on stderr: as the plain lines
 // they always wrote ("jig service: ..."), or as one JSON object a line for a log pipeline to index, with
-// the task, tenant and request each line is about as fields of their own. JIG_LOG_FORMAT=json picks JSON.
+// the task, tenant and request each line is about as fields of their own. JIG_LOG_FORMAT=json picks JSON;
+// JIG_LOG_LEVEL (debug, info, warn or error) the least a line must be to be written.
 
 export type Level = "debug" | "info" | "warn" | "error";
 export type Fields = Record<string, unknown>;
@@ -16,7 +17,7 @@ export interface Log {
 
 export interface LogOptions {
   format?: "text" | "json";
-  /** Lines below it are dropped (default: info). */
+  /** Lines below it are dropped (default: JIG_LOG_LEVEL, or info). */
   level?: Level;
   /** Where the lines go (default: stderr). */
   write?: (line: string) => void;
@@ -37,10 +38,16 @@ export function logFormat(env: NodeJS.ProcessEnv = process.env): "text" | "json"
   return env.JIG_LOG_FORMAT === "json" ? "json" : "text";
 }
 
+/** The level the environment asks for. */
+export function logLevel(env: NodeJS.ProcessEnv = process.env): Level {
+  return ORDER.includes(env.JIG_LOG_LEVEL as Level) ? (env.JIG_LOG_LEVEL as Level) : "info";
+}
+
 /** A log for `component` ("service", "gateway", "router"). */
 export function createLog(component: string, options: LogOptions = {}, bound: Fields = {}): Log {
   const format = options.format ?? logFormat();
-  const least = ORDER.indexOf(options.level ?? "info");
+  const level = options.level ?? logLevel();
+  const least = ORDER.indexOf(level);
   const write = options.write ?? ((line: string) => process.stderr.write(`${line}\n`));
   const now = options.now ?? (() => new Date());
   const emit = (level: Level, message: string, fields: Fields = {}) => {
@@ -64,6 +71,6 @@ export function createLog(component: string, options: LogOptions = {}, bound: Fi
     info: (message, fields) => emit("info", message, fields),
     warn: (message, fields) => emit("warn", message, fields),
     error: (message, fields) => emit("error", message, fields),
-    with: (fields) => createLog(component, { ...options, format, write, now }, { ...bound, ...fields }),
+    with: (fields) => createLog(component, { ...options, format, level, write, now }, { ...bound, ...fields }),
   };
 }
