@@ -230,6 +230,17 @@ export function createModel(options: ModelOptions): CallModel {
   };
 }
 
+/**
+ * The key jig sends for `model` through `api`, from the environment as the clients below read it, for
+ * --approve-via, which sends it to the service too. Undefined where there is none.
+ */
+export function apiKeyFor(model: string, api: Api): string | undefined {
+  const env = process.env;
+  if (model.startsWith("deepseek")) return env.DEEPSEEK_API_KEY || undefined;
+  if (api === "openai") return env.OPENAI_API_KEY || undefined;
+  return env.ANTHROPIC_API_KEY || env.ANTHROPIC_AUTH_TOKEN || undefined;
+}
+
 type ClientSettings = { timeout: number; logger: ReturnType<typeof retryNotices>; logLevel: "info" };
 
 /** Claude, or DeepSeek through its Anthropic-compatible endpoint. */

@@ -34,6 +34,11 @@ Options:
       --mode <mode>       when to ask before a tool call (default: edits)
 ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP[mode]}`).join("\n")}
   -y, --yes               same as --mode auto
+      --approve-via <url> in a task given on the command line or stdin, ask a service where the mode would
+                          ask at the terminal: jig writes an approval_request event (see --events) and polls
+                          <url>/<id> with the model's API key for the answer (see docs/server.md)
+      --approval-timeout <s>
+                          deny a tool call --approve-via has no answer for after this long (default: 600)
       --no-sandbox        run commands directly on this machine instead of in the sandbox (Seatbelt on
                           macOS, bubblewrap on Linux)
       --allow-network     let sandboxed commands use the network

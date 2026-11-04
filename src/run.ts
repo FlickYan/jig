@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import { constants } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs, type ParseArgsOptionsConfig } from "node:util";
+import { type Answer, httpApprover } from "./approvals.ts";
 import { AFTER_EMPTY, type AgentOptions, type AgentUI, formatTokens, type Reviewer, type ReviewVerdict, runAgent, type RunResult, SAME_STEPS, type ToolHooks, type Usage } from "./agent.ts";
 import { compact } from "./compact.ts";
 import { type Context, context, withContext } from "./context.ts";
@@ -22,7 +23,7 @@ import { hooksFor, runHooks, runStopHooks } from "./hooks.ts";
 import { Inputs } from "./inputs.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
-import { type Api, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
+import { type Api, apiKeyFor, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { overview, type Part } from "./overview.ts";
 import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
@@ -128,6 +129,8 @@ const OPTIONS = {
   effort: { type: "string", short: "e" },
   mode: { type: "string", default: "edits" },
   yes: { type: "boolean", short: "y", default: false },
+  "approve-via": { type: "string" },
+  "approval-timeout": { type: "string" },
   sandbox: { type: "boolean" },
   "allow-network": { type: "boolean" },
   "hide-thinking": { type: "boolean", default: false },
@@ -281,6 +284,11 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   // listener. Opened now, before anything runs; only for a task, since a session has no end to report.
   const sink = library?.onEvent ?? (values.events === "-" ? "-" : values.events === undefined ? undefined : resolve(values.events));
   if (sink !== undefined && (!taskText || skillsVerb || memoryVerb)) throw new Error('--events is for a task given on the command line or stdin: jig --events <file> "task".');
+  const viaService = approveVia(values, model, api, library?.apiKey);
+  if (viaService && (!taskText || skillsVerb || memoryVerb)) throw new Error('--approve-via is for a task given on the command line or stdin: jig --approve-via <url> "task".');
+  if (viaService && mode === "auto") throw new Error("--approve-via asks before the tool calls the mode doesn't allow, and --yes (--mode auto) allows them all: use one.");
+  // Who answers in the terminal's place: a library's approver, or the service.
+  const approver = library?.approve ?? viaService;
   const events = (state.events = sink === undefined ? undefined : new Events(sink, model));
   events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
@@ -474,7 +482,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     const decision = permissions.decide(tool, input);
     if (decision === "allow") return null;
     if (decision !== "ask") return decision.refuse;
-    if (library?.approve) return approval(library.approve, tool, input);
+    if (approver) return approval(approver, tool, input);
     if (!terminal) {
       // The model would try call after call that can't run until its steps ran out. It may manage without
       // one or two (a check it can skip), so the task stops at the third.
@@ -499,19 +507,24 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   }
 
   /**
-   * A library's approver, asked where the terminal would ask, and answered as there: allow is [y]es, allow
-   * with `always` [a]lways (where the terminal offers it), deny [n]o. The task stopping (at --time-limit, or
-   * by its signal) stops the wait.
+   * A library's approver or --approve-via's service, asked where the terminal would ask, and answered as
+   * there: allow is [y]es, allow with `always` [a]lways (where the terminal offers it), deny [n]o. The task
+   * stopping (at --time-limit, or by its signal) stops the wait. The events say what was asked, and the
+   * answer as given, unless the task stopped first.
    */
-  async function approval(approve: Approver, tool: Tool, input: ToolInput): Promise<string | null> {
+  async function approval(approve: (request: ApprovalRequest, signal: AbortSignal) => Promise<Answer>, tool: Tool, input: ToolInput): Promise<string | null> {
     const signal = task!.signal;
     const request = { id: `ap_${++approvals}`, step, tool: tool.definition.name, description: tool.describe(input) };
+    events?.approvalRequest(request);
     let onAbort = () => {};
     const stopped = new Promise<undefined>((done) => signal.addEventListener("abort", (onAbort = () => done(undefined)), { once: true }));
     const answer = await Promise.race([approve(request, signal), stopped]).finally(() => signal.removeEventListener("abort", onAbort));
     if (signal.aborted) return `Not run: ${whyStopped(signal, "the task was stopped")}.`;
-    if (answer?.decision !== "allow") return "The user declined this tool call. Ask them how they want to proceed.";
-    if (answer.always && permissions.alwaysLabel(tool, input)) permissions.allowAlways(tool, input);
+    const allow = answer?.decision === "allow";
+    const always = allow && answer.always === true;
+    events?.approval({ id: request.id, decision: allow ? "allow" : "deny", always, by: answer?.by ?? "api" });
+    if (!allow) return "The user declined this tool call. Ask them how they want to proceed.";
+    if (always && permissions.alwaysLabel(tool, input)) permissions.allowAlways(tool, input);
     return null;
   }
 
@@ -969,6 +982,30 @@ async function loadSettings(cwd: string, terminal: boolean): Promise<Settings> {
     ui.notice(`Not using ${file} (apart from its deny rules and hidden paths) until you trust it.${how}`);
   }
   return mergeSettings(user, project.settings, trusted);
+}
+
+/**
+ * --approve-via's approver, or undefined without the flag. Refuses an address that isn't http or https, a
+ * --approval-timeout (600 seconds by default) that isn't a positive number or comes without it, and a model
+ * with no API key to send.
+ */
+function approveVia(values: Values, model: string, api: Api, apiKey?: string) {
+  const url = values["approve-via"];
+  const given = values["approval-timeout"];
+  if (url === undefined) {
+    if (given !== undefined) throw new Error("--approval-timeout is for --approve-via: how long a tool call waits for its answer.");
+    return undefined;
+  }
+  let protocol = "";
+  try {
+    protocol = new URL(url).protocol;
+  } catch {}
+  if (protocol !== "http:" && protocol !== "https:") throw new Error("--approve-via must be an http or https address, like http://127.0.0.1:8082/internal/approvals");
+  const timeout = given === undefined ? 600 : Number(given);
+  if (!(timeout > 0 && timeout * 1000 < 2 ** 31)) throw new Error("--approval-timeout must be a positive number of seconds, under 24 days");
+  const key = apiKey ?? apiKeyFor(model, api);
+  if (!key) throw new Error("--approve-via sends the API key jig uses for the model to the service, and there is none: set DEEPSEEK_API_KEY (DeepSeek models), ANTHROPIC_API_KEY (Claude models) or OPENAI_API_KEY (others).");
+  return httpApprover(url, key, timeout);
 }
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */

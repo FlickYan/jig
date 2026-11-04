@@ -156,6 +156,15 @@ describe("runTask", () => {
         [false, true, true, true],
       );
       assert.match(String(ofType(events, "tool_result")[0].output), /The user declined this tool call/);
+      // What was asked and answered, as --approve-via's events say it.
+      assert.deepEqual(
+        ofType(events, "approval_request").map(({ id, step }) => [id, step]),
+        [["ap_1", 1], ["ap_2", 2], ["ap_3", 3]],
+      );
+      assert.deepEqual(
+        ofType(events, "approval").map(({ id, decision, always, by }) => [id, decision, always, by]),
+        [["ap_1", "deny", false, "api"], ["ap_2", "allow", false, "api"], ["ap_3", "allow", true, "api"]],
+      );
     } finally {
       api.close();
     }

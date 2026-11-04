@@ -218,10 +218,19 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `tool_call` | `step`, `id`, `name`, `description` |
 | `tool_result` | `step`, `id`, `isError`, `output` (at most 4,000 characters, cut from the middle), `truncated` |
 | `notice` | `text`: what jig told the user |
+| `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
+| `approval` | `id`, `decision` (`allow` or `deny`), `always`, `by`: `api` when answered, `timeout` when `--approval-timeout` passed first |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call, `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
 goes to stdout: the terminal's output goes to stderr.
+
+`jig --approve-via <url>` asks for the tool calls the mode would ask about at a terminal over HTTP: after the
+call's `approval_request` it polls `GET <url>/<id>?wait=25` with `Authorization: Bearer <its API key>` (a
+task's gateway token) until a 200 gives `{"decision": "allow" | "deny", "always"?: boolean}`; a 204 is asked
+again at once, any other status or a failed connection after 1, 2, 4 ... seconds, 10 at most. With no
+answer in `--approval-timeout` seconds (600) the call is denied. Both event types are additions to version 1:
+`v` stays 1. A task stopped while it waits (by `--time-limit`, a signal or a cancel) writes no `approval`.
 
 A program can also run a task in its own process with `runTask` (`src/lib.ts`, the README's "As a
 library"), which hands it these events as objects, in the same order and with the same fields, and resolves

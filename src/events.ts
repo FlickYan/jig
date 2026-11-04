@@ -1,6 +1,8 @@
 // --events: a one-shot task as JSON lines, for a backend that runs jig as a task and follows it there
 // rather than in the terminal's output. One object a line, each written as it happens, with what the
 // terminal shows (the steps, the tool calls and their results, the notices) and how the task ended.
+// Where an approver answers in the terminal's place (--approve-via's service, or a library's), the calls put
+// to it and its answers too.
 // The fields are a contract (version 1): a reader ignores a type it doesn't know, and a field may be added.
 // A library's task (lib.ts) gets the same objects, handed to its listener instead of written.
 
@@ -129,6 +131,17 @@ export class Events {
 
   notice(text: string): void {
     this.write("notice", { text });
+  }
+
+  /** A tool call put to the approver, before it is asked: the service learns of it here (see approvals.ts). */
+  approvalRequest(request: { step: number; id: string; tool: string; description: string }): void {
+    const { step, id, tool, description } = request;
+    this.write("approval_request", { step, id, tool, description });
+  }
+
+  /** The approver's answer, or the timeout's deny, as the call goes on with it. */
+  approval(answer: { id: string; decision: "allow" | "deny"; always: boolean; by: "api" | "timeout" }): void {
+    this.write("approval", { ...answer });
   }
 
   /** How the task ended, and the code jig exits with. Only the first end is written, and returned. */
