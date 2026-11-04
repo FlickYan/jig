@@ -1,12 +1,12 @@
-# The model gateway, which holds the provider keys. One replica: it keeps the tenants' rate limits and
-# spending in memory.
+# The model gateway, which holds the provider keys. Two replicas, acting as one: they keep the tenants'
+# limits and spending in Redis (redis.yaml, named in jig-gateway-config's "state").
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: jig-gateway
   namespace: jig
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: jig

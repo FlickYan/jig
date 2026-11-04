@@ -22,7 +22,8 @@ data:
       "tenants": []
     }
 ---
-# The gateway's config: the provider and the variables (in jig-provider-keys) that hold its keys, and the limits.
+# The gateway's config: the provider and the variables (in jig-provider-keys) that hold its keys, the limits,
+# and the Redis its replicas share (redis.yaml).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -33,5 +34,6 @@ data:
     {
       "listen": { "host": "0.0.0.0", "port": 8081 },
       "upstream": { "baseUrl": "https://api.deepseek.com/anthropic", "keyEnv": ["DEEPSEEK_API_KEY"] },
-      "limits": { "concurrent": 256, "maxWaitMs": 30000, "tenantDefaults": { "requestsPerMinute": 120, "concurrent": 16 } }
+      "limits": { "concurrent": 256, "maxWaitMs": 30000, "tenantDefaults": { "requestsPerMinute": 120, "concurrent": 16 } },
+      "state": { "redis": "redis://jig-redis.jig.svc:6379/0" }
     }

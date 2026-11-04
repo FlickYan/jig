@@ -695,7 +695,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/approvals.ts`](src/approvals.ts) | `--approve-via`: the tool calls jig would ask about at a terminal, asked of a service over HTTP |
 | [`src/events.ts`](src/events.ts) | `--events`: a task's start, steps, tool calls, text, notices and end as JSON lines, for a service that runs jig |
 | [`server/`](server) | jig as a service ([docs/server.md](docs/server.md)): the task service's HTTP API for many tenants, its SQLite store, a fair scheduler, and the runners that start jig for each task: on this machine, in a Docker container or as a Kubernetes Job |
-| [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits, usage and budgets |
+| [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts), [`state.ts`](server/state.ts), [`redis.ts`](server/redis.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits, usage and budgets, in memory or in Redis for several replicas |
 | [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, and Kubernetes manifests |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |

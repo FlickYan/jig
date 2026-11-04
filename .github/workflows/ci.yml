@@ -32,6 +32,25 @@ jobs:
       - name: Tests (the sandbox tests run on both systems)
         run: npm test
 
+  gateway-redis:
+    # The gateway's tests against a real Redis: those that need one are skipped without JIG_TEST_REDIS_URL.
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node --test test/server-gateway.test.ts test/redis.test.ts
+        env:
+          JIG_TEST_REDIS_URL: redis://127.0.0.1:6379/1
+
   benchmark-tasks:
     # Every task must be solvable (the reference solutions pass) and not already solved (doing nothing
     # fails). No model is called.
