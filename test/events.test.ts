@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -55,7 +55,7 @@ describe("--events", () => {
       const [start, step, text, call, result, , answer, end] = events;
       assert.deepEqual(
         { task: start.task, cwd: start.cwd, model: start.model, limits: start.limits },
-        { task: "Fix the parser.", cwd: project, model: "claude-opus-5-5", limits: { maxSteps: 50, timeLimit: null } },
+        { task: "Fix the parser.", cwd: await realpath(project), model: "claude-opus-5-5", limits: { maxSteps: 50, timeLimit: null } },
       );
       assert.match(String(start.version), /^\d+\.\d+\.\d+/);
       // The fake API reports 10 tokens in and 5 out for each reply; claude-opus-5-5 costs $4 and $20 a million.

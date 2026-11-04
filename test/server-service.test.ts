@@ -22,7 +22,16 @@ const KEYS = { acme: "acme-key", globex: "globex-key" };
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 const services: Service[] = [];
+/**
+ * What a test opened that keeps the process going (a store's connections, a scheduler's timer), closed
+ * after it, newest first, even when it failed: a test file that never exits hangs the run instead of
+ * failing it. Each is given a few seconds, as a failed test may leave a run that never ends.
+ */
+const opened: (() => Promise<unknown>)[] = [];
 afterEach(async () => {
+  for (const close of opened.splice(0).reverse()) {
+    await Promise.race([close().catch(() => {}), new Promise((done) => setTimeout(done, 5000).unref())]);
+  }
   await Promise.all(services.splice(0).map((service) => service.close()));
   await removeTempDirs();
   await dropPostgresDatabases();
@@ -42,7 +51,22 @@ async function database(base: string): Promise<string> {
 
 /** A new store of the backend's, empty. */
 async function newStore(): Promise<Store> {
-  return openStore(backend === "SQLite" ? ":memory:" : await postgresDatabase());
+  const store = await openStore(backend === "SQLite" ? ":memory:" : await postgresDatabase());
+  let open = true;
+  const close = store.close.bind(store);
+  store.close = async () => {
+    if (open) await close();
+    open = false;
+  };
+  opened.push(() => store.close());
+  return store;
+}
+
+/** A scheduler on the store, closed after the test (newStore's store after it). */
+function newScheduler(...args: ConstructorParameters<typeof Scheduler>): Scheduler {
+  const scheduler = new Scheduler(...args);
+  opened.push(() => scheduler.close());
+  return scheduler;
 }
 
 /**
@@ -460,7 +484,7 @@ const schedulerTests = () => {
     const caps: Record<string, number> = { a: 3, b: 2, c: 1 };
     for (const [id, concurrency] of Object.entries(caps)) await store.putTenant({ id, limits: { concurrency, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     const runner = new FakeRunner();
-    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
+    const scheduler = newScheduler(store, runner, { concurrency: 4 });
     // a queues 30 before b's 15 and c's 5.
     for (const [tenant, count] of [["a", 30], ["b", 15], ["c", 5]] as const) {
       for (let i = 0; i < count; i++) await store.createTask(tenant, { prompt: `${tenant}${i}`, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
@@ -509,7 +533,7 @@ const schedulerTests = () => {
         };
       },
     };
-    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
+    const scheduler = newScheduler(store, runner, { concurrency: 4 });
     await scheduler.poke();
     while (!cancels) await new Promise((done) => setImmediate(done));
     await scheduler.settled();
@@ -544,7 +568,7 @@ const schedulerTests = () => {
       },
     });
     const runner = new FakeRunner();
-    const scheduler = new Scheduler(counted, runner, { concurrency: 4 });
+    const scheduler = newScheduler(counted, runner, { concurrency: 4 });
     await scheduler.poke();
     assert.deepEqual([runner.started, read], [["a", "b"], 2]);
     // a is at its limit and b's queue is empty: another poke starts nothing and reads nothing.
@@ -576,10 +600,13 @@ const schedulerTests = () => {
         };
       },
     };
-    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
+    const scheduler = newScheduler(store, runner, { concurrency: 4 });
     await scheduler.poke();
-    await scheduler.settled();
-    const ended = (await store.task(task.id))!;
+    // settled() doesn't wait for a run still storing its events, as this one may be on Postgres.
+    const ended = await until(async () => {
+      const now = (await store.task(task.id))!;
+      return now.status !== "running" && now.status !== "queued" && now;
+    }, "the run's outcome to be stored");
     assert.deepEqual([ended.status, ended.exitCode, ended.stop, ended.error, ended.cost], ["error", 1, "error\uFFFDx", "jig exited with 1: jig said: \uFFFDoops", 0.5]);
     assert.deepEqual(ended.usage, { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 });
     await scheduler.close();
@@ -603,7 +630,7 @@ const schedulerTests = () => {
       },
     });
     const runner = new FakeRunner();
-    const scheduler = new Scheduler(failing, runner, { concurrency: 4, leaseMs: 300 });
+    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300 });
     const logged = console.error;
     console.error = () => {};
     try {
