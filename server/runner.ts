@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import { isAbsolute } from "node:path";
 import type { Task, TaskStatus, Tenant } from "./store.ts";
 
-// What runs a task: the interface every runner keeps (the local one in runners/local.ts; containers later),
+// What runs a task: the interface every runner keeps (runners/local.ts, docker.ts and k8s.ts),
 // and what they share: jig's command line, the task's gateway token, and how jig's exit becomes a status.
 
 /** One line of jig's --events file (the event contract, v1). Readers ignore types they don't know. */
@@ -53,6 +53,12 @@ export interface TokenPayload {
 export function mintToken(secret: string, payload: TokenPayload): string {
   const body = `jgt1.${Buffer.from(JSON.stringify(payload)).toString("base64url")}`;
   return `${body}.${createHmac("sha256", secret).update(body).digest("base64url")}`;
+}
+
+/** The token a task's run gets as its key: good until its time limit, the grace and a minute more. */
+export function taskToken(secret: string, task: Task, tenant: Tenant, graceSeconds: number): string {
+  const exp = Math.floor(Date.now() / 1000) + task.spec.timeLimit + graceSeconds + 60;
+  return mintToken(secret, { tenant: tenant.id, task: task.id, exp, budgetUsd: tenant.limits.budgetUsd });
 }
 
 /** The variable jig reads its key from, for a model it runs on the Anthropic API (as src/model.ts does). */

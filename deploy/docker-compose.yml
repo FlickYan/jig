@@ -1,0 +1,44 @@
+# One machine: the task service and the gateway in containers, and each task in a container of its own,
+# which the service starts through the host's Docker (docs/server.md, Deploying). Build the worker image
+# first (deploy/Dockerfile.worker), write gateway.json beside this file (the gateway's config), then:
+#   JIG_GATEWAY_SECRET=... ANTHROPIC_API_KEY=... docker compose -f deploy/docker-compose.yml up
+name: jig
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    command: ["node", "server/gateway.ts", "--config", "/etc/jig/gateway.json"]
+    environment:
+      - JIG_GATEWAY_SECRET
+      - ANTHROPIC_API_KEY
+      - DEEPSEEK_API_KEY
+    volumes:
+      - ./gateway.json:/etc/jig/gateway.json:ro
+    # On tasks too, the only other thing there, where the tasks reach it as gateway.
+    networks:
+      - default
+      - tasks
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
+    # The docker socket is root's, and whoever holds it is root on the host anyway.
+    user: root
+    environment:
+      - JIG_GATEWAY_SECRET
+    ports:
+      - "127.0.0.1:8080:8080"
+    # The daemon binds each task's folder by its path on the host: the data is at the same path in here.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./service.docker.json:/etc/jig/service.json:ro
+      - /var/lib/jig:/var/lib/jig
+    depends_on:
+      - gateway
+networks:
+  # Internal: no way out but to the gateway.
+  tasks:
+    name: jig-tasks
+    internal: true

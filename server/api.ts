@@ -6,6 +6,8 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { type Runner, workspaceProblem } from "./runner.ts";
+import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
+import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
 import { Scheduler, type Update } from "./scheduler.ts";
 import { FINISHED, openStore, STATUSES, type Store, type Limits, type Task, type TaskSpec, type TaskStatus, type Tenant } from "./store.ts";
@@ -41,8 +43,15 @@ export interface Config {
   gitProtocols?: string[];
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
+  /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
+  runner?: "local" | "docker" | "kubernetes";
+  docker?: Omit<DockerRunnerConfig, Shared>;
+  kubernetes?: Omit<KubernetesRunnerConfig, Shared>;
   tenants: TenantConfig[];
 }
+
+/** What every runner takes from the config's top level. */
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols";
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000 };
 const MAX_PROMPT = 100_000;
@@ -69,14 +78,7 @@ export async function startService(config: Config, { secret, runner }: { secret:
   // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
   const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
   if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
-  runner ??= new LocalRunner({
-    dataDir: config.dataDir,
-    jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")],
-    gatewayBaseUrl: config.gatewayBaseUrl,
-    gatewaySecret: secret,
-    graceSeconds: config.graceSeconds ?? 30,
-    gitProtocols: config.gitProtocols,
-  });
+  runner ??= runnerFor(config, secret);
   const scheduler = new Scheduler(store, runner, config.concurrency ?? 4);
   const recovered = await scheduler.recover();
   if (recovered.length) console.error(`jig service: ${recovered.length} task(s) left running by the last run of the service marked as errors`);
@@ -102,6 +104,17 @@ export async function startService(config: Config, { secret, runner }: { secret:
       await store.close();
     },
   };
+}
+
+function runnerFor(config: Config, secret: string): Runner {
+  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols };
+  const { runner = "local", docker, kubernetes } = config;
+  if (runner === "local") return new LocalRunner({ ...shared, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+  if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
+  if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
+  if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
+  if (runner === "kubernetes") throw new Error('The kubernetes runner needs "kubernetes": {"image"}: the worker image');
+  throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
 }
 
 interface Context {

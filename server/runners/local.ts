@@ -1,10 +1,10 @@
 import { execFile, spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
-import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
+import { closeSync, constants, openSync } from "node:fs";
+import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import { type JigEvent, jigArgs, keyVariable, mintToken, type RunExit, type RunHandle, type Runner, workspaceProblem } from "../runner.ts";
+import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
@@ -30,7 +30,7 @@ export interface LocalRunnerConfig {
 // The service's environment holds its own secrets (and maybe real provider keys): jig gets only these of it.
 const PASSED = ["PATH", "LANG", "LC_ALL", "TZ", "TMPDIR"];
 // After SIGTERM, how long jig has to stop its commands before the whole process group is killed.
-const TERM_MS = 5_000;
+export const TERM_MS = 5_000;
 
 export class LocalRunner implements Runner {
   private config: LocalRunnerConfig;
@@ -55,8 +55,7 @@ export class LocalRunner implements Runner {
     await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"]);
 
     const timeLimit = task.spec.timeLimit;
-    const exp = Math.floor(Date.now() / 1000) + timeLimit + graceSeconds + 60;
-    const token = mintToken(this.config.gatewaySecret, { tenant: tenant.id, task: task.id, exp, budgetUsd: tenant.limits.budgetUsd });
+    const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
     const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
     for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
 
@@ -101,7 +100,7 @@ export class LocalRunner implements Runner {
       });
     }).then(async (result) => ({
       ...result,
-      stats: await readFile(stats, "utf8").then(JSON.parse, () => undefined),
+      stats: await readStats(stats),
       message: result.message ?? (result.exitCode === 0 ? undefined : await lastLine(log)),
     }));
     return { events: tail(events, () => exited, pollMs), wait: () => exit, cancel: stop };
@@ -109,7 +108,7 @@ export class LocalRunner implements Runner {
 }
 
 /** Writes a task's files into its (empty) workspace, or clones its repository there. */
-async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[]): Promise<void> {
+export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[]): Promise<void> {
   for (const [path, contents] of Object.entries(workspace?.files ?? {})) {
     const problem = workspaceProblem(path);
     if (problem) throw new Error(`The workspace file ${JSON.stringify(path)} ${problem}.`);
@@ -130,7 +129,7 @@ async function prepareWorkspace(work: string, workspace: Workspace | undefined, 
  * The events jig appends to `file`, as it writes them, until `finished()` and the last of them is read. A
  * line that isn't an event (or a last one cut short by a crash) is left out.
  */
-async function* tail(file: string, finished: () => boolean, pollMs: number): AsyncGenerator<JigEvent> {
+export async function* tail(file: string, finished: () => boolean, pollMs: number): AsyncGenerator<JigEvent> {
   const decoder = new StringDecoder("utf8");
   const chunk = Buffer.alloc(64 * 1024);
   let offset = 0;
@@ -138,7 +137,7 @@ async function* tail(file: string, finished: () => boolean, pollMs: number): Asy
   for (;;) {
     // Looked at before the read, so the read after jig's exit gets all it wrote.
     const last = finished();
-    const handle = await open(file, "r").catch(() => undefined);
+    const handle = await openRegular(file);
     if (handle) {
       try {
         for (let read; (read = (await handle.read(chunk, 0, chunk.length, offset)).bytesRead) > 0; offset += read) partial += decoder.write(chunk.subarray(0, read));
@@ -157,7 +156,8 @@ async function* tail(file: string, finished: () => boolean, pollMs: number): Asy
   }
 }
 
-function parseEvent(line: string): JigEvent | undefined {
+/** The event a line holds, or undefined if it isn't one. */
+export function parseEvent(line: string): JigEvent | undefined {
   try {
     const event = JSON.parse(line);
     return event && Number.isInteger(event.seq) && event.seq > 0 && typeof event.type === "string" ? event : undefined;
@@ -167,8 +167,8 @@ function parseEvent(line: string): JigEvent | undefined {
 }
 
 /** The last line of what jig printed (of its last 4 KB), cut to 500 characters. */
-async function lastLine(log: string): Promise<string | undefined> {
-  const handle = await open(log, "r").catch(() => undefined);
+export async function lastLine(log: string): Promise<string | undefined> {
+  const handle = await openRegular(log);
   if (!handle) return undefined;
   try {
     const { size } = await handle.stat();
@@ -176,5 +176,31 @@ async function lastLine(log: string): Promise<string | undefined> {
     return buffer.subarray(0, bytesRead).toString("utf8").trim().split("\n").at(-1)?.slice(-500) || undefined;
   } finally {
     await handle.close();
+  }
+}
+
+/**
+ * A file the run wrote, opened for reading only if it is a regular file there: a command that could write
+ * the task's folder (in a container, where jig runs without its sandbox) could leave a link to a file of
+ * the service's in its place, or a named pipe that would hold the read up for good.
+ */
+export async function openRegular(path: string): Promise<FileHandle | undefined> {
+  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => undefined);
+  if (handle && !(await handle.stat()).isFile()) {
+    await handle.close();
+    return undefined;
+  }
+  return handle;
+}
+
+/** jig's --stats file, if it left one. */
+export async function readStats(path: string): Promise<unknown> {
+  const handle = await openRegular(path);
+  try {
+    return handle && JSON.parse(await handle.readFile("utf8"));
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close();
   }
 }

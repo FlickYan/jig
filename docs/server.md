@@ -17,7 +17,9 @@ modules, and it isn't part of the npm package.
 `node:sqlite`, in WAL mode, the schema moved on by `PRAGMA user_version`), `server/scheduler.ts` starts
 queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, tenant)` gives a handle with
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
-process on the same machine.
+process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
+own, which is what keeps tenants apart: jig's sandbox protects a user's machine from the model, but its
+commands share the machine's kernel, so it is no wall between tenants.
 
 Run it with a config file and the secret it shares with the gateway:
 
@@ -46,7 +48,8 @@ to none and `maxQueued` (its tasks that may wait at once) to 1000. The config ho
 each key: `printf %s "$KEY" | sha256sum` gives it. A tenant taken out of the config is shut out at the next
 start: its keys stop working, and its queued tasks are cancelled. Also: `graceSeconds` (30), `jig` (the program and first
 arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols` (`["https"]`),
-`maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15).
+`maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default), `docker` or
+`kubernetes`, with its settings in a `docker` or `kubernetes` block.
 
 ### The API
 
@@ -124,3 +127,87 @@ environment is the service's `PATH`, `LANG`, `LC_ALL`, `TZ` and `TMPDIR`, and as
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
+
+### The Docker runner
+
+`"runner": "docker"` starts each task with the docker CLI (`docker` on the `PATH`, or the program and first
+arguments in `docker.docker`). The task's folder is made as the local runner makes it and bound into the
+container at `/task`, and the service reads the events file jig writes there:
+
+```
+docker run --rm --interactive --init --name jig-<task id> --label jig.task=<id> --label jig.tenant=<tenant> --user 10001:10001
+    --cpus 1 --memory 2g --memory-swap 2g --pids-limit 512 --read-only --tmpfs /tmp:rw,nosuid,nodev,size=512m
+    --mount type=bind,source=<dataDir>/tasks/<id>,target=/task --workdir /task/work
+    --cap-drop ALL --security-opt no-new-privileges [--runtime runsc] --network jig-tasks
+    --env HOME=/task/home --env JIG_HOME=/task/home/.jig --env NO_COLOR=1 --env ANTHROPIC_API_KEY
+    <image> jig --no-sandbox --yes --model <model> ... --events /task/events.jsonl --stats /task/stats.json -C /task/work -
+```
+
+```json
+"runner": "docker",
+"docker": { "image": "jig-worker", "network": "jig-tasks", "runtime": "runsc", "cpus": 1, "memory": "2g", "pidsLimit": 512, "tmpSize": "512m" }
+```
+
+`image` (built from `deploy/Dockerfile.worker`) and `network` are needed; `runtime` (`runsc` for gVisor,
+`kata` for Kata Containers) is left to the daemon's default without one; the limits default as above. The
+token is passed by name, its value in the docker CLI's environment, which holds only `PATH`, `HOME` and
+the `DOCKER_*` variables of the service's. jig runs with `--no-sandbox` in the container: bubblewrap would
+need Docker's seccomp filter and `/proc` masks loosened, which would weaken the container, the wall that
+matters here. So its commands can write anything in `/task`, the events included: the service reads those
+files only where they are regular files, not links, and the events are the task's own account of itself
+(what it costs is the gateway's to count). A cancel or the time limit is `docker kill --signal TERM`, then
+`docker kill` 5 seconds later; a container a crashed service left runs until jig's own `--time-limit`.
+
+The network must reach only the gateway: an internal network (`docker network create --internal
+jig-tasks`) with the gateway attached to it too (`docker network connect jig-tasks <gateway>`), so the
+tasks reach it by its name there (`"gatewayBaseUrl": "http://gateway:8081/anthropic"`) and nothing else.
+The daemon binds the task folders by their path on its own machine, so a service in a container must have
+`dataDir` at the same path as on the host. A service running as root gives each task folder to
+`docker.user` (10001:10001, the image's `jig` user); one that doesn't must run as that user. The task
+folders are on the host's disk with no quota of their own: put `dataDir` on a file system of its own.
+
+### The Kubernetes runner
+
+`"runner": "kubernetes"` makes each task a `batch/v1` Job, through the API server with the service
+account's token (read again at each request, as the kubelet renews it) and CA, from
+`/var/run/secrets/kubernetes.io/serviceaccount/` unless `tokenFile`, `caFile`, `namespace` and `apiUrl`
+say otherwise. The Job is named `jig-<task id>`; its pod runs once (`backoffLimit: 0`), as uid 10001 with
+no privilege escalation, no capabilities, a read-only root, seccomp's `RuntimeDefault`, no service account
+token and `runtimeClassName` if one is set (`gvisor`, with `deploy/k8s/runtimeclass.yaml`); the Job's
+`activeDeadlineSeconds` is the task's time limit and the grace, and `ttlSecondsAfterFinished` (600) how long
+it stays after. A Secret the Job owns, so deleted with it, holds the task's token, which jig gets as its
+key, and the prompt and workspace.
+
+```json
+"runner": "kubernetes",
+"kubernetes": { "image": "registry.example.com/jig-worker:0.1.0", "runtimeClassName": "gvisor",
+  "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "cpu": "1", "memory": "2Gi", "ephemeral-storage": "4Gi" } } }
+```
+
+A pod's files are on its node, out of the service's reach, so the events come in its log: the pod runs
+`node server/worker.ts`, which makes the workspace (writing the files, or cloning the repository there),
+starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
+with its exit code and `--stats`. The service follows the log (from the start again, without the events
+it has, should the stream break) and takes the exit code from the pod, the stats from that line and a
+reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
+says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
+reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
+and Secret with it.
+
+`deploy/k8s/networkpolicy.yaml` lets the task pods reach only the gateway and the cluster's DNS, where the
+cluster's network plugin enforces NetworkPolicy. A git workspace is cloned in the pod, so it needs its git
+host allowed as well (the file has an example rule).
+
+## Deploying
+
+`deploy/` has the images and the files to run them, to adapt rather than apply as they are:
+`Dockerfile.worker`, the image tasks run in (jig, git, python3 and bubblewrap, as user 10001), and
+`Dockerfile.server`, the service's and the gateway's (with the docker CLI). On one machine,
+`deploy/docker-compose.yml` runs the service, with the host's docker socket and the Docker runner
+(`deploy/service.docker.json`), and the gateway, on the internal `jig-tasks` network the tasks join; the
+gateway's config goes in `deploy/gateway.json`. On Kubernetes, `deploy/k8s/` has the namespace, the
+service's and the gateway's Deployments and Services, the service's account with a Role to run Jobs, the
+tasks' account with none, the NetworkPolicy, a gVisor RuntimeClass and the service's config; the Secrets
+(`jig-secrets` with `gateway-secret`, and `jig-provider-keys`) and the gateway's config
+(`jig-gateway-config`) are yours to make. The service runs one replica, as its SQLite store takes one
+writer, and so does the gateway, which counts limits and spending in memory.

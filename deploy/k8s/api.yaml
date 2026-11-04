@@ -1,0 +1,90 @@
+# The task service: one replica, as its SQLite store takes one writer, on a volume that outlives the pod.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: jig-data
+  namespace: jig
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jig-api
+  namespace: jig
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jig
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: jig-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: registry.example.com/jig-server:0.1.0
+          command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: JIG_GATEWAY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jig-secrets
+                  key: gateway-secret
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jig
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/jig
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: jig-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: jig-data
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-api
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: api
+  ports:
+    - port: 8080
+      targetPort: 8080

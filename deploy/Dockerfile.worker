@@ -1,0 +1,19 @@
+# The image a task runs in, with the Docker and Kubernetes runners (docs/server.md): jig, git, python3 for
+# the projects tasks often bring, and bubblewrap for jig's sandbox where a container allows it (the runners
+# turn the sandbox off: the container is the boundary). Build it from the repository's root:
+#   docker build -f deploy/Dockerfile.worker -t jig-worker .
+FROM node:22-slim
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends git bubblewrap python3 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /opt/jig
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+COPY src src
+COPY skills skills
+COPY server server
+RUN printf '#!/bin/sh\nexec node /opt/jig/src/cli.ts "$@"\n' > /usr/local/bin/jig && chmod 755 /usr/local/bin/jig
+# Not root: the runners run jig as 10001 too, and the Kubernetes runner's pods refuse root.
+RUN useradd --uid 10001 --user-group --no-create-home --home-dir /task/home jig
+USER 10001:10001
+WORKDIR /task/work
