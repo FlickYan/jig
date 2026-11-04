@@ -2,8 +2,9 @@
 // The model gateway: jig's tasks call the Messages API through it with a token of their own (token.ts),
 // and it calls the provider with a real key from its pool, so a sandbox never holds one. Each tenant's
 // requests are held to its limits (limits.ts), and what each task and tenant spent is counted from the
-// replies. The body goes upstream byte for byte (prompt caching depends on it) and the reply comes back as
-// it arrives; only the credentials change. docs/server.md describes the routes and the config.
+// replies, in this process or, for several replicas acting as one, in Redis (state.ts). The body goes
+// upstream byte for byte (prompt caching depends on it) and the reply comes back as it arrives; only the
+// credentials change. docs/server.md describes the routes and the config.
 //
 //   node server/gateway.ts --config gateway.json
 
@@ -17,6 +18,8 @@ import { parseArgs } from "node:util";
 import type { Usage } from "../src/agent.ts";
 import { costOf, PRICES } from "../src/prices.ts";
 import { type Admission, type Limits, Limiter } from "./limits.ts";
+import { parseRedisUrl } from "./redis.ts";
+import { MemoryState, RedisState, SharedState, type Spent, type State, StateError } from "./state.ts";
 import { type TokenPayload, verifyToken } from "./token.ts";
 
 export interface GatewayConfig {
@@ -36,6 +39,20 @@ export interface GatewayConfig {
   };
   /** The environment variable holding a token that may read any task's usage. */
   adminTokenEnv?: string;
+  /**
+   * Limits, spending and the keys' standing in Redis, shared by every gateway with the same URL and prefix,
+   * so they can run as replicas; without it, in this process.
+   */
+  state?: {
+    /** redis://[[username]:password@]host:port[/db], or rediss:// for TLS. */
+    redis: string;
+    /** Before every key (default: "jig:gw:"). */
+    prefix?: string;
+    /** How long a request's slot outlives a gateway that died with it, in milliseconds (default: 60 seconds). */
+    leaseMs?: number;
+    /** Redis can't be reached: refuse requests with 503 ("closed", the default), or use this replica's own limits and counts ("open"). */
+    onStateError?: "closed" | "open";
+  };
 }
 
 export interface Gateway {
@@ -70,6 +87,8 @@ function credential(headers: IncomingHttpHeaders): string {
 interface Key {
   name: string;
   value: string;
+  /** What other gateways know it by: never the key itself. */
+  id: string;
   /** Refused by the provider (401 or 403): never used again. */
   bad: boolean;
   /** Rate-limited by the provider: rests until then. */
@@ -83,6 +102,16 @@ class KeyPool {
 
   constructor(keys: Key[]) {
     this.keys = keys;
+  }
+
+  /** Takes in what other gateways learned of the keys: which the provider refused, and which rest. */
+  async refresh(state: State): Promise<void> {
+    if (!state.keys) return;
+    const shared = await state.keys(this.keys.map((key) => key.id));
+    shared.forEach(({ bad, coolUntil }, i) => {
+      this.keys[i].bad ||= bad;
+      this.keys[i].coolUntil = Math.max(this.keys[i].coolUntil, coolUntil);
+    });
   }
 
   /** The next usable key not in `tried`, without taking it with `peek`. */
@@ -179,22 +208,6 @@ class UsageReader {
   }
 }
 
-interface Spent {
-  tenant: string;
-  /** Replies counted. */
-  requests: number;
-  usage: Usage;
-  costUsd: number;
-  /** Requests whose model has no price in src/prices.ts: their tokens count, their cost doesn't. */
-  unpriced: number;
-  /** The task's budget, as its token gave it; null for none, and for a tenant. */
-  budgetUsd: number | null;
-}
-
-function addUsage(total: Usage, usage: Usage): void {
-  for (const field of Object.keys(total) as (keyof Usage)[]) total[field] += usage[field];
-}
-
 /** Counters and gauges, written in Prometheus's text format. */
 class Metrics {
   private readonly values = new Map<string, Map<string, number>>();
@@ -205,6 +218,7 @@ class Metrics {
     jig_gateway_upstream_errors_total: ["counter", "Provider replies with status 5xx, 401 or 403, and requests that could not reach it."],
     jig_gateway_tokens_total: ["counter", "Tokens the provider counted, by tenant and kind."],
     jig_gateway_cost_usd_total: ["counter", "What the priced replies cost, in USD, by tenant."],
+    jig_gateway_state_errors_total: ["counter", "Reads and writes of the shared state (Redis) that failed."],
     jig_gateway_in_flight: ["gauge", "Requests sent upstream whose reply is not over."],
     jig_gateway_queued: ["gauge", "Requests waiting for their turn."],
   };
@@ -238,6 +252,15 @@ function check(config: GatewayConfig, env: NodeJS.ProcessEnv): void {
   if (!Array.isArray(names) || !names.length) throw new Error("upstream.keyEnv must name at least one environment variable holding a key.");
   const missing = names.filter((name) => !env[name]);
   if (missing.length) throw new Error(`No key in ${missing.join(", ")}.`);
+  if (config.state) {
+    try {
+      parseRedisUrl(config.state.redis);
+    } catch (err) {
+      throw new Error(`state.redis must be a Redis URL, redis://[:password@]host:port[/db]: ${(err as Error).message}`);
+    }
+    const { onStateError } = config.state;
+    if (onStateError !== undefined && onStateError !== "closed" && onStateError !== "open") throw new Error('state.onStateError must be "closed" or "open".');
+  }
 }
 
 /** Starts a gateway with `config`, its secret and keys read from `env`. */
@@ -245,18 +268,19 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   check(config, env);
   const secret = env.JIG_GATEWAY_SECRET!;
   const base = new URL(config.upstream.baseUrl);
-  const pool = new KeyPool(config.upstream.keyEnv.map((name) => ({ name, value: env[name]!, bad: false, coolUntil: 0 })));
-  const { maxWaitMs = 30_000, tenantDefaults, tenants, ...global } = config.limits ?? {};
-  const limiter = new Limiter({ global, tenantDefaults, tenants, maxWaitMs });
-  const admin = config.adminTokenEnv ? env[config.adminTokenEnv] : undefined;
+  const keyId = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
+  const pool = new KeyPool(config.upstream.keyEnv.map((name) => ({ name, value: env[name]!, id: keyId(env[name]!), bad: false, coolUntil: 0 })));
   const metrics = new Metrics();
-  const tasks = new Map<string, Spent>();
-  const byTenant = new Map<string, Spent>();
-
-  const spent = (map: Map<string, Spent>, id: string, tenant: string, budgetUsd: number | null = null): Spent => {
-    if (!map.has(id)) map.set(id, { tenant, requests: 0, usage: { ...NO_USAGE }, costUsd: 0, unpriced: 0, budgetUsd });
-    return map.get(id)!;
-  };
+  metrics.add("jig_gateway_state_errors_total", {}, 0);
+  const state: State = config.state
+    ? new SharedState(new RedisState(config.state.redis, { prefix: config.state.prefix, leaseMs: config.state.leaseMs }), {
+        onStateError: config.state.onStateError ?? "closed",
+        onError: () => metrics.add("jig_gateway_state_errors_total", {}),
+      })
+    : new MemoryState();
+  const { maxWaitMs = 30_000, tenantDefaults, tenants, ...global } = config.limits ?? {};
+  const limiter = new Limiter({ global, tenantDefaults, tenants, maxWaitMs }, state);
+  const admin = config.adminTokenEnv ? env[config.adminTokenEnv] : undefined;
 
   const isAdmin = (given: string): boolean => {
     if (!admin || !given) return false;
@@ -265,17 +289,13 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   };
 
   /** Counts a reply's usage toward its task and tenant, priced by the model the reply names, or the request did. */
-  const meter = (token: TokenPayload, requested: string | undefined, reader: UsageReader): void => {
+  const meter = async (token: TokenPayload, requested: string | undefined, reader: UsageReader): Promise<void> => {
     const model = reader.model && PRICES[reader.model] ? reader.model : requested;
     const cost = model ? costOf(model, reader.usage) : undefined;
-    for (const total of [spent(tasks, token.task, token.tenant, token.budgetUsd), spent(byTenant, token.tenant, token.tenant)]) {
-      total.requests++;
-      addUsage(total.usage, reader.usage);
-      if (cost === undefined) total.unpriced++;
-      else total.costUsd += cost;
-    }
     for (const [kind, n] of Object.entries(reader.usage)) if (n) metrics.add("jig_gateway_tokens_total", { tenant: token.tenant, kind }, n);
     if (cost) metrics.add("jig_gateway_cost_usd_total", { tenant: token.tenant }, cost);
+    // Without Redis ("closed"), what the reply cost goes uncounted: it is counted as a state error and said.
+    await state.spend(token, reader.usage, cost).catch(() => {});
   };
 
   /** One request to the provider with `key`; resolves with its reply's status and headers. */
@@ -302,6 +322,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     const path = url.pathname.replace(/^\/anthropic/, "") + url.search;
     const headers = Object.fromEntries(Object.entries(req.headers).filter(([name]) => !HOP_BY_HOP.has(name) && !SET_HERE.has(name)));
     const tried = new Set<Key>();
+    await pool.refresh(state);
     for (;;) {
       const key = pool.take(tried);
       if (!key) {
@@ -323,8 +344,14 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       const status = reply.statusCode ?? 502;
       const refused = status === 401 || status === 403;
       if (refused || status >= 500) metrics.add("jig_gateway_upstream_errors_total", { status: String(status) });
-      if (refused) key.bad = true;
-      if (status === 429) key.coolUntil = Date.now() + retryAfterMs(reply.headers["retry-after"]);
+      if (refused) {
+        key.bad = true;
+        void state.markKey?.(key.id, "bad");
+      }
+      if (status === 429) {
+        key.coolUntil = Date.now() + retryAfterMs(reply.headers["retry-after"]);
+        void state.markKey?.(key.id, key.coolUntil);
+      }
       if (refused || status === 429) {
         if (pool.take(tried, true)) {
           reply.resume();
@@ -341,14 +368,17 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       res.flushHeaders();
       reply.on("data", (chunk: Buffer) => reader.add(chunk));
       // Counted however the reply ends: tokens the provider sent before jig went away were spent too.
+      let counted: Promise<void> | undefined;
+      const count = () => (counted ??= (reader.end(), status === 200 ? meter(token, model, reader) : Promise.resolve()));
+      // jig's reply ends once it is counted, so the task's next request, through any replica, sees it.
+      reply.once("end", () => void count().finally(() => res.end()));
       reply.once("close", () => {
-        reader.end();
-        if (status === 200) meter(token, model, reader);
-        // A reply the provider broke off never ends, so pipe() would leave jig's open; breaking it off too
-        // lets jig ask again at once, and gives back the request's slot.
+        void count();
+        // A reply the provider broke off never ends, so jig's would stay open; breaking it off too lets jig
+        // ask again at once, and gives back the request's slot.
         if (!reply.complete) res.destroy();
       });
-      reply.pipe(res);
+      reply.pipe(res, { end: false });
       if (!res.closed) await new Promise((done) => res.once("close", done));
       return;
     }
@@ -374,10 +404,11 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       // the provider says what is wrong with it
     }
     if (token.budgetUsd !== null) {
-      const task = tasks.get(token.task);
-      if (task && task.costUsd >= token.budgetUsd) {
+      // Nothing spent yet is $0, so a budget of 0 refuses the first request too.
+      const spentUsd = (await state.spent(token.tenant, token.task))?.costUsd ?? 0;
+      if (spentUsd >= token.budgetUsd) {
         metrics.add("jig_gateway_budget_exceeded_total", { tenant: token.tenant });
-        return fail(res, 402, "billing_error", `This task has spent its budget: $${task.costUsd.toFixed(4)} of $${token.budgetUsd}.`);
+        return fail(res, 402, "billing_error", `This task has spent its budget: $${spentUsd.toFixed(4)} of $${token.budgetUsd}.`);
       }
       // A budget the gateway can't price toward would not hold.
       if (!model || !PRICES[model]) {
@@ -389,6 +420,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     const admission: Admission = await limiter.acquire(token.tenant, client.signal);
     if ("retryAfter" in admission) {
       if (client.signal.aborted) return;
+      if (admission.error) throw admission.error;
       metrics.add("jig_gateway_rate_limited_total", { tenant: token.tenant });
       return fail(res, 429, "rate_limit_error", "This tenant's requests are over its limits; try again later.", { "retry-after": String(admission.retryAfter) });
     }
@@ -399,35 +431,53 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     }
   };
 
-  const usage = (req: IncomingMessage, res: ServerResponse, task: string): void => {
+  /** A task's spending, to its own token, or to the admin token with ?tenant=: task ids are only unique within a tenant. */
+  const usage = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> => {
+    let task: string;
+    try {
+      task = decodeURIComponent(url.pathname.slice("/usage/".length));
+    } catch {
+      return fail(res, 400, "invalid_request_error", "The task in the path is not percent-encoded right.");
+    }
     const given = credential(req.headers);
     const token = verifyToken(secret, given);
-    if (!isAdmin(given)) {
+    const asked = url.searchParams.get("tenant");
+    let tenant: string;
+    if (isAdmin(given)) {
+      if (!asked) return fail(res, 400, "invalid_request_error", "Name the task's tenant: /usage/<task>?tenant=<tenant>.");
+      tenant = asked;
+    } else {
       if (token instanceof Error) return fail(res, 401, "authentication_error", `Not a valid gateway token: ${token.message}.`);
-      if (token.task !== task) return fail(res, 403, "permission_error", "A task's token reads only its own usage.");
+      if (token.task !== task || (asked !== null && asked !== token.tenant)) return fail(res, 403, "permission_error", "A task's token reads only its own usage.");
+      tenant = token.tenant;
     }
     // A task's own token reads nothing spent yet as zeros; to an admin, a task the gateway hasn't seen is unknown.
-    const found = tasks.get(task) ?? (token instanceof Error ? undefined : spent(new Map(), task, token.tenant, token.budgetUsd));
-    if (!found) return fail(res, 404, "not_found_error", `No usage for task ${task}.`);
+    const nothing: Spent | undefined = token instanceof Error ? undefined : { tenant, requests: 0, usage: { ...NO_USAGE }, costUsd: 0, unpriced: 0, budgetUsd: token.budgetUsd };
+    const found = (await state.spent(tenant, task)) ?? nothing;
+    if (!found) return fail(res, 404, "not_found_error", `No usage for task ${task} of ${tenant}.`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ task, ...found }));
   };
 
   const route = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    const { pathname } = new URL(req.url ?? "/", "http://gateway");
+    const url = new URL(req.url ?? "/", "http://gateway");
+    const { pathname } = url;
     const route = `${req.method} ${pathname}`;
     if (route === "POST /anthropic/v1/messages") return messages(req, res);
     if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
     if (route === "GET /metrics") {
-      const gauges = { jig_gateway_in_flight: limiter.inFlight.total, jig_gateway_queued: limiter.queued };
+      const gauges = { jig_gateway_in_flight: limiter.inFlight, jig_gateway_queued: limiter.queued };
       return void res.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(metrics.text(gauges));
     }
-    if (req.method === "GET" && pathname.startsWith("/usage/")) return usage(req, res, decodeURIComponent(pathname.slice("/usage/".length)));
+    if (req.method === "GET" && pathname.startsWith("/usage/")) return usage(req, res, url);
     fail(res, 404, "not_found_error", `The gateway has no ${route}.`);
   };
 
   const server = createServer((req, res) => {
-    route(req, res).catch((err) => fail(res, 500, "api_error", `The gateway failed: ${(err as Error).message}`));
+    route(req, res).catch((err) => {
+      if (err instanceof StateError) return fail(res, 503, "api_error", `${err.message}; try again shortly.`, { "retry-after": "1" });
+      fail(res, 500, "api_error", `The gateway failed: ${(err as Error).message}`);
+    });
   });
   const { host = "127.0.0.1", port = 8787 } = config.listen ?? {};
   await new Promise<void>((done, failed) => server.once("error", failed).listen(port, host, done));
@@ -438,6 +488,9 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       limiter.close();
       server.closeAllConnections();
       await new Promise((done) => server.close(done));
+      // The requests just broken off give their slots back before the state goes.
+      await limiter.settle(2000);
+      state.close();
     },
   };
 }

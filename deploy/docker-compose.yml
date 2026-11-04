@@ -19,6 +19,15 @@ services:
     networks:
       - default
       - tasks
+    depends_on:
+      - redis
+  # The gateway's counts (gateway.json's "state"), so a restart of the gateway forgets nothing; only on the
+  # default network, out of the tasks' reach.
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis:/data
   api:
     build:
       context: ..
@@ -42,3 +51,5 @@ networks:
   tasks:
     name: jig-tasks
     internal: true
+volumes:
+  redis:

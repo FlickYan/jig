@@ -255,7 +255,8 @@ ANTHROPIC_API_KEY=<the task's token> jig --model claude-opus-5-5 --base-url http
 
 `upstream.baseUrl` is the provider's Anthropic-compatible address (`https://api.deepseek.com/anthropic`
 for DeepSeek, with `--model deepseek-...` and the token in `DEEPSEEK_API_KEY`), and `keyEnv` names the
-environment variables that hold its keys. Only `upstream` is required.
+environment variables that hold its keys. Only `upstream` is required; `state` (below) lets several
+gateways run as one.
 
 **Tokens.** A task's token is `"jgt1." + base64url(payload) + "." + base64url(HMAC-SHA256(secret,
 "jgt1." + base64url(payload)))`, where the payload is `{"tenant": id, "task": id, "exp": <Unix seconds>,
@@ -270,10 +271,13 @@ it. A streamed reply comes back event by event as the provider sends it; if the 
 the gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`.
 `GET /metrics` is Prometheus's text format: `jig_gateway_requests_total`, `jig_gateway_rate_limited_total`
 and `jig_gateway_budget_exceeded_total` by tenant, `jig_gateway_upstream_errors_total` by status,
-`jig_gateway_tokens_total` by tenant and kind, `jig_gateway_cost_usd_total`, and the gauges
-`jig_gateway_in_flight` and `jig_gateway_queued`. Neither of those two GETs asks for a token, so keep the
-gateway's address inside the cluster. `GET /usage/<task>` gives what a task spent, `{tenant, requests,
-usage, costUsd, unpriced, budgetUsd}`, to that task's token or to the admin token (`adminTokenEnv`).
+`jig_gateway_tokens_total` by tenant and kind, `jig_gateway_cost_usd_total`,
+`jig_gateway_state_errors_total`, and the gauges `jig_gateway_in_flight` and `jig_gateway_queued`, all of
+them this replica's own. Neither of those two GETs asks for a token, so keep the gateway's address inside
+the cluster. `GET /usage/<task>` gives what a task spent, `{task, tenant, requests, usage, costUsd,
+unpriced, budgetUsd}`, to that task's token (its tenant's task of that id), or to the admin token
+(`adminTokenEnv`) with the tenant named, `/usage/<task>?tenant=<tenant>`, since a task id is only unique
+within its tenant.
 
 **Limits.** Each tenant has a rate (`requestsPerMinute`, a token bucket refilled continuously, holding
 `burst` requests, by default a minute's worth) and a number of requests in flight (`concurrent`, a
@@ -293,11 +297,39 @@ rate limit doesn't become a storm. Server errors go back as they came, and jig's
 **Usage and budgets.** The gateway reads each reply's usage as it passes (a whole reply's `usage`, or a
 stream's `message_start` and `message_delta`), also of a stream jig left halfway, and adds it to the task's
 and the tenant's totals, priced by `src/prices.ts`. A model without a price there counts its tokens but no
-cost (`unpriced`). A task whose spending has reached its token's `budgetUsd` gets 402 (`billing_error`)
-on its next request, which ends the jig run with an error; requests already in flight finish, so a task
-can go over by what they cost. A task with a budget may only use a priced model: one without a price gets
-400, since its spending couldn't be counted against the budget. Totals live in the gateway's memory, so a
-restart forgets them; keeping them in a store is Phase 2's.
+cost (`unpriced`). Spending is kept by tenant and task, so two tenants' tasks of the same id are two
+tasks, and jig's reply ends only once it is counted. A task whose spending has reached its token's
+`budgetUsd` gets 402 (`billing_error`) on its next request, which ends the jig run with an error (a budget
+of 0 refuses the first); requests already in flight finish, so a task can go over by what they cost. A
+task with a budget may only use a priced model: one without a price gets 400, since its spending couldn't
+be counted against the budget. Each tenant's spending by UTC day is kept too, for quotas and billing to
+read. Without `state`, all this is in the gateway's memory: a task is forgotten a day after its token
+expires, a tenant's day after 35 days, and a restart forgets everything.
+
+**Several replicas.** With `state`, the gateway keeps its counts in Redis, so any number of replicas
+behind one Service act as one gateway, and a restart forgets nothing:
+
+```json
+"state": { "redis": "redis://:password@redis:6379/0", "prefix": "jig:gw:", "leaseMs": 60000, "onStateError": "closed" }
+```
+
+`redis` is `redis://[[username]:password@]host:port[/db]` (`rediss://` for TLS); `server/redis.ts` is a
+small client of its own, with no dependency. Each check and change is one Lua script, run atomically by
+Redis on its own clock. A tenant's and the global rate buckets and requests in flight hold across all
+replicas; a request in flight is a lease that its gateway renews every `leaseMs`/3 while the reply goes
+on, so the slots of a replica that died come back within `leaseMs` (60 seconds). The queue that takes the
+tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
+the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
+week after its token expires, a tenant's day for 35 days; a key the provider refused or rate-limited is
+passed over by every replica (Redis has its SHA-256, never the key), a refused one for a day after it was
+last refused. `prefix` (`jig:gw:`) starts every key, so gateways of different setups can share a Redis.
+
+When Redis can't be reached (a command waits 2 seconds at most), `onStateError` says what happens:
+`closed`, the default, answers each request 503 with `retry-after: 1` (jig's SDK tries again), and the
+spending of replies still in flight goes uncounted; `open` goes on with this replica's own limits and
+counts until Redis is back, so for that while each replica holds a tenant to its limits alone, and budgets
+count only what went through it. Either way the gateway says so once on stderr and counts each failure in
+`jig_gateway_state_errors_total`.
 
 ## Deploying
 
@@ -311,5 +343,8 @@ gateway's config is `deploy/gateway.json` (DeepSeek, its key in `DEEPSEEK_API_KE
 account with a Role to run Jobs, the tasks' account with none, the NetworkPolicy, a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
 (`jig-secrets` with `gateway-secret`, and `jig-provider-keys`) are yours to make. The service runs one
-replica, as its SQLite store takes one writer, and so does the gateway, which counts limits and spending in
-memory.
+replica, as its SQLite store takes one writer. The gateway runs two replicas, sharing the Redis in
+`deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts, as a lone gateway's
+restart would. For spending that must last, use a managed Redis instead, or give that one a volume and
+`--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one gateway, with a
+Redis that keeps its data in a volume, so a restart of either forgets nothing.
