@@ -18,6 +18,8 @@ export interface Spent {
   costUsd: number;
   /** Requests whose model has no price in src/prices.ts: their tokens count, their cost doesn't. */
   unpriced: number;
+  /** Replies counted, by the upstream (provider) that gave them. */
+  upstreams: Record<string, number>;
   /** The task's budget, as its token gave it; null for none, and for a tenant. */
   budgetUsd: number | null;
 }
@@ -42,8 +44,11 @@ export interface State {
   renew(tenant: string, id: string): Promise<void>;
   /** Calls `listener` when another gateway gives back a slot. */
   onRelease(listener: () => void): void;
-  /** Adds a reply's usage to its task's and its tenant's day's totals; `cost` undefined for an unpriced model. */
-  spend(token: TokenPayload, usage: Usage, cost: number | undefined): Promise<void>;
+  /**
+   * Adds a reply's usage to its task's and its tenant's day's totals; `cost` undefined for an unpriced
+   * model, `upstream` the name of the upstream that gave the reply.
+   */
+  spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void>;
   /** What `tenant`'s task `task` spent; undefined if nothing yet. */
   spent(tenant: string, task: string): Promise<Spent | undefined>;
   /** What `tenant` spent on a UTC day (YYYY-MM-DD), for quotas and billing to read. */
@@ -70,11 +75,13 @@ export function utcDay(ms = Date.now()): string {
 }
 
 function nothingSpent(tenant: string, budgetUsd: number | null): Spent {
-  return { tenant, requests: 0, usage: { ...NO_USAGE }, costUsd: 0, unpriced: 0, budgetUsd };
+  return { tenant, requests: 0, usage: { ...NO_USAGE }, costUsd: 0, unpriced: 0, upstreams: {}, budgetUsd };
 }
 
-function addTo(total: Spent, usage: Usage, cost: number | undefined): void {
+function addTo(total: Spent, usage: Usage, cost: number | undefined, upstream: string | undefined): void {
   total.requests++;
+  // Own counts only: an upstream may be named "constructor".
+  if (upstream) total.upstreams[upstream] = (Object.hasOwn(total.upstreams, upstream) ? total.upstreams[upstream] : 0) + 1;
   for (const field of USAGE_FIELDS) total.usage[field] += usage[field];
   if (cost === undefined) total.unpriced++;
   else total.costUsd += cost;
@@ -153,7 +160,7 @@ export class MemoryState implements State {
 
   onRelease(): void {}
 
-  async spend(token: TokenPayload, usage: Usage, cost: number | undefined): Promise<void> {
+  async spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void> {
     const now = Date.now();
     const task = JSON.stringify([token.tenant, token.task]);
     if (!this.tasks.has(task)) this.tasks.set(task, { ...nothingSpent(token.tenant, token.budgetUsd), until: 0 });
@@ -162,8 +169,8 @@ export class MemoryState implements State {
     const spent = this.tasks.get(task)!;
     // Kept a day past the token's end, by when no request of the task can come.
     spent.until = Math.max(spent.until, token.exp * 1000 + DAY_MS);
-    addTo(spent, usage, cost);
-    addTo(this.days.get(day)!, usage, cost);
+    addTo(spent, usage, cost, upstream);
+    addTo(this.days.get(day)!, usage, cost, upstream);
   }
 
   async spent(tenant: string, task: string): Promise<Spent | undefined> {
@@ -192,7 +199,7 @@ export class MemoryState implements State {
   private copy(spent: (Spent & { until: number }) | undefined): Spent | undefined {
     if (!spent) return undefined;
     const { until: _, ...rest } = spent;
-    return { ...rest, usage: { ...rest.usage } };
+    return { ...rest, usage: { ...rest.usage }, upstreams: { ...rest.upstreams } };
   }
 }
 
@@ -251,13 +258,15 @@ return 0`);
 
 /**
  * KEYS: the task's and the tenant's day's hashes. ARGV: input, cacheRead, cacheWrite, output, the cost
- * ('' when unpriced), each key's expiry (Unix seconds), the tenant, the task's budget ('' for none).
+ * ('' when unpriced), each key's expiry (Unix seconds), the tenant, the task's budget ('' for none), the
+ * upstream that gave the reply ('' for none), counted in the field upstream:<name>.
  */
 const SPEND = redisScript(`local fields = { 'input', 'cacheRead', 'cacheWrite', 'output' }
 for i, key in ipairs(KEYS) do
   redis.call('HINCRBY', key, 'requests', 1)
   for j, field in ipairs(fields) do redis.call('HINCRBY', key, field, ARGV[j]) end
   if ARGV[5] == '' then redis.call('HINCRBY', key, 'unpriced', 1) else redis.call('HINCRBYFLOAT', key, 'costUsd', ARGV[5]) end
+  if ARGV[10] ~= '' then redis.call('HINCRBY', key, 'upstream:' .. ARGV[10], 1) end
   redis.call('HSET', key, 'tenant', ARGV[8])
   redis.call('EXPIREAT', key, ARGV[5 + i])
 end
@@ -332,13 +341,13 @@ export class RedisState implements State {
     void this.subscriber.subscribe(this.key("released")).catch(() => {}); // it subscribes again when Redis is back
   }
 
-  async spend(token: TokenPayload, usage: Usage, cost: number | undefined): Promise<void> {
+  async spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void> {
     const now = Date.now();
     // A task's spending is kept a week past its token: its budget holds as long as the token works.
     const taskUntil = token.exp + 7 * 86_400;
     const dayUntil = Math.floor(now / 1000) + DAYS_KEPT * 86_400;
     const keys = [this.key("spent", token.tenant, token.task), this.key("day", token.tenant, utcDay(now))];
-    const args = [...USAGE_FIELDS.map((field) => usage[field]), cost === undefined ? "" : cost, taskUntil, dayUntil, token.tenant, token.budgetUsd ?? ""];
+    const args = [...USAGE_FIELDS.map((field) => usage[field]), cost === undefined ? "" : cost, taskUntil, dayUntil, token.tenant, token.budgetUsd ?? "", upstream ?? ""];
     await this.redis.eval(SPEND, keys, args);
   }
 
@@ -371,12 +380,14 @@ export class RedisState implements State {
     const fields: Record<string, string> = {};
     for (let i = 0; i < reply.length; i += 2) fields[reply[i]] = reply[i + 1];
     const number = (field: string) => Number(fields[field] ?? 0);
+    const upstreams = Object.entries(fields).flatMap(([field, n]) => (field.startsWith("upstream:") ? [[field.slice("upstream:".length), Number(n)]] : []));
     return {
       tenant,
       requests: number("requests"),
       usage: Object.fromEntries(USAGE_FIELDS.map((field) => [field, number(field)])) as unknown as Usage,
       costUsd: number("costUsd"),
       unpriced: number("unpriced"),
+      upstreams: Object.fromEntries(upstreams),
       budgetUsd: fields.budgetUsd ? Number(fields.budgetUsd) : null,
     };
   }
@@ -455,8 +466,8 @@ export class SharedState implements State {
     this.redis.onRelease(listener);
   }
 
-  async spend(token: TokenPayload, usage: Usage, cost: number | undefined): Promise<void> {
-    await this.either(() => this.redis.spend(token, usage, cost), (fallback) => fallback.spend(token, usage, cost));
+  async spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void> {
+    await this.either(() => this.redis.spend(token, usage, cost, upstream), (fallback) => fallback.spend(token, usage, cost, upstream));
   }
 
   async spent(tenant: string, task: string): Promise<Spent | undefined> {

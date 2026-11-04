@@ -402,8 +402,8 @@ ANTHROPIC_API_KEY=<the task's token> jig --model claude-opus-5-5 --base-url http
 
 `upstream.baseUrl` is the provider's Anthropic-compatible address (`https://api.deepseek.com/anthropic`
 for DeepSeek, with `--model deepseek-...` and the token in `DEEPSEEK_API_KEY`), and `keyEnv` names the
-environment variables that hold its keys. Only `upstream` is required; `state` (below) lets several
-gateways run as one.
+environment variables that hold its keys. Only `upstream` (or `upstreams`, below: several providers to
+fail over between) is required; `state` (below) lets several gateways run as one.
 
 **Tokens.** A task's token is `"jgt1." + base64url(payload) + "." + base64url(HMAC-SHA256(secret,
 "jgt1." + base64url(payload)))`, where the payload is `{"tenant": id, "task": id, "exp": <Unix seconds>,
@@ -419,11 +419,12 @@ the gateway breaks off its own, so jig asks again at once. `GET /healthz` answer
 `GET /metrics` is Prometheus's text format: `jig_gateway_requests_total`, `jig_gateway_rate_limited_total`
 and `jig_gateway_budget_exceeded_total` by tenant, `jig_gateway_upstream_errors_total` by status,
 `jig_gateway_tokens_total` by tenant and kind, `jig_gateway_cost_usd_total`,
-`jig_gateway_state_errors_total`, and the gauges `jig_gateway_in_flight` and `jig_gateway_queued`, all of
-them this replica's own. Neither of those two GETs asks for a token, so keep the gateway's address inside
-the cluster. `GET /usage/<task>` gives what a task spent, `{task, tenant, requests, usage, costUsd,
-unpriced, budgetUsd}`, to that task's token (its tenant's task of that id), or to the admin token
-(`adminTokenEnv`) with the tenant named, `/usage/<task>?tenant=<tenant>`, since a task id is only unique
+`jig_gateway_state_errors_total`, `jig_gateway_upstream_failures_total` by upstream, and the gauges
+`jig_gateway_in_flight` and `jig_gateway_queued`, all of them this replica's own. Neither of those two GETs
+asks for a token, so keep the gateway's address inside the cluster. `GET /usage/<task>` gives what a task
+spent, `{task, tenant, requests, usage, costUsd, unpriced, upstreams, budgetUsd}` (`upstreams`: the
+replies counted, by the upstream that gave them), to that task's token (its tenant's task of that id), or
+to the admin token (`adminTokenEnv`) with the tenant named, `/usage/<task>?tenant=<tenant>`, since a task id is only unique
 within its tenant.
 
 **Limits.** Each tenant has a rate (`requestsPerMinute`, a token bucket refilled continuously, holding
@@ -440,7 +441,50 @@ until a restart (with `state`, below, until its mark in Redis is gone), and one 
 rests for the reply's `retry-after` (30 seconds without one); either way the request goes again with
 another usable key, once each. With none left the provider's 429 goes back to jig
 as it came, and while every key rests the gateway answers 429 itself: it doesn't retry on its own, so a
-rate limit doesn't become a storm. Server errors go back as they came, and jig's SDK retries them.
+rate limit doesn't become a storm. Server errors go back as they came, and jig's SDK retries them; with
+`upstreams`, both first go on to the next provider (below).
+
+**Provider failover.** One provider is a single point of failure: when it is down or overloaded, every
+task of every tenant fails at once, and jig's few retries help against a blip, not an outage. In place of
+`upstream`, `upstreams` lists several, in the order a request tries them (giving both is an error):
+
+```json
+"upstreams": [
+  { "name": "anthropic", "baseUrl": "https://api.anthropic.com", "keyEnv": ["ANTHROPIC_KEY_1", "ANTHROPIC_KEY_2"],
+    "models": { "claude-opus-5-5": "claude-opus-5-5", "claude-sonnet-5-5": "claude-sonnet-5-5" } },
+  { "name": "anthropic-eu", "baseUrl": "https://anthropic.eu.example.com", "keyEnv": ["ANTHROPIC_EU_KEY"],
+    "models": { "claude-opus-5-5": "claude-opus-5-5", "claude-sonnet-5-5": "claude-sonnet-5-5" } },
+  { "name": "deepseek", "baseUrl": "https://api.deepseek.com/anthropic", "keyEnv": ["DEEPSEEK_API_KEY"],
+    "models": { "deepseek-flash": "deepseek-flash", "deepseek-v4-pro": "deepseek-v4-pro" } }
+],
+"failover": { "firstByteMs": 60000, "failures": 5, "openMs": 30000 }
+```
+
+`name` (`a-z`, `0-9` and `-`, 32 at most, each its own) is what the reply's `x-jig-upstream` header,
+`/usage` and the metrics call it; `upstream` alone is one named `default`. An upstream with `models` serves
+only those models, each under the provider's id (the request's `model` is changed to it, the rest of the
+body is sent as it came); one without serves any model as it is. Here a Claude model goes to `anthropic`,
+then, if that fails, to `anthropic-eu` (another Anthropic endpoint, with keys of its own), and never to
+DeepSeek; a DeepSeek model goes to `deepseek` alone. A model no upstream serves gets 400
+(`invalid_request_error`) without a provider being called.
+
+A request goes on to the next upstream that serves its model when the one it tried can't be reached,
+sends no reply's headers within `firstByteMs`, answers 500, 502, 503, 504 or 529, or rate-limits it (429)
+with no key of its pool left to try, or has every key refused; all of these before any of a reply has
+gone to jig. A reply that breaks off once it streams is jig's to retry, as with one upstream, since what
+jig has seen can't be taken back; and a 400, 404, 413 or other 4xx goes back as it came, since a bad
+request is bad everywhere. The body is already held in memory, so it can be sent again. When every
+upstream fails, the last failed reply goes back as it came (a 429 with its `retry-after`), or 503
+(`overloaded_error`) if none answered.
+
+Each upstream has a circuit breaker, each replica its own: `failures` failures in a row (those that send
+a request on; a 400 that goes back to jig is the upstream answering) open it, and for `openMs` it is
+passed over, no request reaching it. Then one request at a time tries it; its reply closes the circuit,
+its failure opens it for another `openMs`. With every upstream for a model open, the gateway answers 503
+at once, with a `retry-after` for when one may be tried. The gateway says on stderr when an upstream is passed over and when it answers again.
+
+Usage is priced by the model the reply names, or else the provider's id where `src/prices.ts` has a price
+for it, or else the model jig asked for; budgets hold as with one upstream.
 
 **Usage and budgets.** The gateway reads each reply's usage as it passes (a whole reply's `usage`, or a
 stream's `message_start` and `message_delta`), also of a stream jig left halfway, and adds it to the task's

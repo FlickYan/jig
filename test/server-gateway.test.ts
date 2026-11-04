@@ -7,7 +7,7 @@ import { type AddressInfo, connect, createServer as createTcpServer, type Server
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { costOf } from "../src/prices.ts";
-import { type Gateway, type GatewayConfig, startGateway } from "../server/gateway.ts";
+import { Breaker, type Gateway, type GatewayConfig, startGateway, withModel } from "../server/gateway.ts";
 import { Redis } from "../server/redis.ts";
 import { MemoryState, RedisState, utcDay } from "../server/state.ts";
 import { mintToken, type TokenPayload, verifyToken } from "../server/token.ts";
@@ -257,11 +257,14 @@ describe("the gateway", () => {
     });
     const gw = await gateway(provider.url, { adminTokenEnv: "ADMIN_TOKEN" }, { ADMIN_TOKEN: "admin-secret" });
     const credential = token({ task: "t1" });
-    assert.equal(await (await ask(gw, credential, "streamed")).text(), messagesReply([{ text: "Done." }]));
+    const streamedReply = await ask(gw, credential, "streamed");
+    assert.equal(streamedReply.headers.get("x-jig-upstream"), "default");
+    assert.equal(await streamedReply.text(), messagesReply([{ text: "Done." }]));
     assert.deepEqual(await (await ask(gw, credential, "whole")).json(), whole);
     const usage = { input: 110, cacheRead: 1000, cacheWrite: 50, output: 25 };
     const costUsd = costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 })! + costOf(MODEL, { input: 100, cacheRead: 1000, cacheWrite: 50, output: 20 })!;
-    const expected = { task: "t1", tenant: "acme", requests: 2, usage, costUsd, unpriced: 0, budgetUsd: null };
+    // One upstream given as `upstream` is named "default".
+    const expected = { task: "t1", tenant: "acme", requests: 2, usage, costUsd, unpriced: 0, upstreams: { default: 2 }, budgetUsd: null };
     const read = (task: string, credential: string) => fetch(`${gw.url}/usage/${task}`, { headers: { authorization: `Bearer ${credential}` } });
     assert.deepEqual(await (await read("t1", credential)).json(), expected);
     assert.deepEqual(await (await read("t1?tenant=acme", "admin-secret")).json(), expected);
@@ -272,7 +275,7 @@ describe("the gateway", () => {
     assert.equal((await read("t9?tenant=acme", "admin-secret")).status, 404);
     assert.equal((await (await read("t2", token({ task: "t2" }))).json()).requests, 0);
     // Another tenant's task t1 is another task: its token reads its own, nothing yet, and never acme's.
-    assert.deepEqual(await (await read("t1", token({ tenant: "rival" }))).json(), { ...expected, tenant: "rival", requests: 0, usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, costUsd: 0 });
+    assert.deepEqual(await (await read("t1", token({ tenant: "rival" }))).json(), { ...expected, tenant: "rival", requests: 0, usage: { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 }, costUsd: 0, upstreams: {} });
     assert.equal((await read("t1?tenant=acme", token({ tenant: "rival" }))).status, 403);
     assert.equal((await read("%E0", credential)).status, 400);
     assert.equal(await metric(gw, 'jig_gateway_tokens_total{tenant="acme",kind="output"}'), 25);
@@ -359,6 +362,198 @@ describe("the gateway", () => {
     assert.equal(await (await fetch(`${url}/healthz`)).text(), "ok\n");
     started.child.kill("SIGTERM");
     assert.equal(await started.exited, 0);
+  });
+});
+
+describe("the gateway with several upstreams", () => {
+  const overloaded = (res: ServerResponse) => void res.writeHead(529, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
+  const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+  /** A gateway with these upstreams, in this order, each with the key POOL_KEY_1. */
+  async function failover(upstreams: { name: string; url: string; models?: Record<string, string> }[], config: Partial<GatewayConfig> = {}): Promise<Gateway> {
+    const listed = upstreams.map(({ name, url, models }) => ({ name, baseUrl: url, keyEnv: ["POOL_KEY_1"], models }));
+    const gw = await startGateway({ listen: { port: 0 }, upstreams: listed, ...config }, { JIG_GATEWAY_SECRET: SECRET, ...KEYS });
+    closing.push(() => gw.close());
+    return gw;
+  }
+
+  /** A request for `model`, as ask() makes one for the default. */
+  function askFor(gw: Gateway, credential: string, model: string): Promise<Response> {
+    return fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": credential }, body: body("hi", model) });
+  }
+
+  it("goes on to the next upstream when one is overloaded, failing, unreachable, slow or refuses its keys", async () => {
+    const second = await fakeProvider();
+    const firsts = {
+      overloaded: await fakeProvider((_, res) => overloaded(res)),
+      failing: await fakeProvider((_, res) => void res.writeHead(500).end("oops")),
+      unreachable: { url: `http://127.0.0.1:${await deadPort()}`, seen: [] },
+      slow: await fakeProvider(() => {}), // never answers
+      refusing: await fakeProvider((_, res) => void res.writeHead(401).end()),
+    };
+    for (const [what, first] of Object.entries(firsts)) {
+      const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { firstByteMs: 300 } });
+      const credential = token({ task: what });
+      const response = await ask(gw, credential);
+      assert.deepEqual([response.status, response.headers.get("x-jig-upstream")], [200, "second"], what);
+      assert.equal(await response.text(), messagesReply([{ text: "Done." }]));
+      const spent = await (await fetch(`${gw.url}/usage/${what}`, { headers: { "x-api-key": credential } })).json();
+      assert.deepEqual([spent.requests, spent.upstreams], [1, { second: 1 }], what);
+      assert.equal(await metric(gw, 'jig_gateway_upstream_failures_total{upstream="first"}'), 1, what);
+      if (what !== "unreachable") assert.equal(first.seen.length, 1, `${what}: the first upstream was asked`);
+    }
+    // Each went to the second as it came.
+    assert.equal(second.seen.length, Object.keys(firsts).length);
+    for (const seen of second.seen) assert.ok(seen.body.equals(Buffer.from(body())));
+  });
+
+  it("gives a bad request's reply back as it is, and fails no other over", async () => {
+    const first = await fakeProvider((_, res) => void res.writeHead(400, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}'));
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }]);
+    const response = await ask(gw, token());
+    assert.deepEqual([response.status, response.headers.get("x-jig-upstream")], [400, "first"]);
+    assert.equal((await response.json()).error.message, "bad");
+    assert.equal(second.seen.length, 0);
+  });
+
+  it("breaks off a reply that fails once it streams, rather than sending the request again", async () => {
+    const reply = messagesReply([{ text: "Done." }]);
+    const first = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(reply.slice(0, reply.indexOf("\n\n") + 2), () => setTimeout(() => res.socket?.destroy(), 50));
+    });
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }]);
+    const response = await ask(gw, token());
+    assert.deepEqual([response.status, response.headers.get("x-jig-upstream")], [200, "first"]);
+    await assert.rejects(response.text(), "jig sees the break");
+    assert.equal(second.seen.length, 0);
+  });
+
+  it("answers with the last failure when every upstream fails, or 503 when none answered", async () => {
+    const first = await fakeProvider((_, res) => overloaded(res));
+    const second = await fakeProvider((_, res) => void res.writeHead(500, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"api_error","message":"second failed"}}'));
+    const both = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }]);
+    const failed = await ask(both, token());
+    assert.deepEqual([failed.status, failed.headers.get("x-jig-upstream")], [500, "second"]);
+    assert.equal((await failed.json()).error.message, "second failed");
+
+    const dead = `http://127.0.0.1:${await deadPort()}`;
+    const none = await failover([{ name: "first", url: dead }, { name: "second", url: dead }]);
+    const unanswered = await ask(none, token());
+    assert.equal(unanswered.status, 503);
+    const { error } = await unanswered.json();
+    assert.equal(error.type, "overloaded_error");
+    assert.match(error.message, /first: could not reach .*; second: could not reach/);
+  });
+
+  it("opens an upstream's circuit after failures in a row, passes it over, then lets one probe through", async () => {
+    let mode: "fail" | "hold" | "ok" = "fail";
+    const held: ServerResponse[] = [];
+    const first = await fakeProvider((_, res) => (mode === "fail" ? overloaded(res) : mode === "hold" ? void held.push(res) : streamed(res)));
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { failures: 2, openMs: 300 } });
+    const via = async (content: string) => {
+      const response = await ask(gw, token(), content);
+      await response.text();
+      return response.headers.get("x-jig-upstream");
+    };
+    assert.deepEqual([await via("a"), await via("b")], ["second", "second"]);
+    assert.equal(first.seen.length, 2);
+    // Open: no request reaches the first.
+    assert.equal(await via("c"), "second");
+    assert.equal(first.seen.length, 2);
+    // Once openMs is over, one request tries it; that one fails, and the circuit opens again.
+    await sleep(350);
+    assert.equal(await via("d"), "second");
+    assert.equal(await via("e"), "second");
+    assert.equal(first.seen.length, 3);
+    // The first is back. While the probe waits for its reply, the other requests still pass it over.
+    await sleep(350);
+    mode = "hold";
+    const probe = ask(gw, token(), "probe");
+    await until(() => first.seen.length === 4, "the probe");
+    assert.equal(await via("f"), "second");
+    assert.equal(first.seen.length, 4);
+    mode = "ok";
+    held.forEach((res) => streamed(res));
+    const probed = await probe;
+    assert.equal(probed.headers.get("x-jig-upstream"), "first");
+    await probed.text();
+    // Closed: the first takes requests again.
+    assert.deepEqual([await via("g"), await via("h")], ["first", "first"]);
+    assert.equal(await metric(gw, 'jig_gateway_upstream_failures_total{upstream="first"}'), 3);
+
+    // With every upstream's circuit open, nothing is sent, and jig is told when to try again.
+    const lone = await fakeProvider((_, res) => overloaded(res));
+    const alone = await failover([{ name: "lone", url: lone.url }], { failover: { failures: 1, openMs: 5000 } });
+    assert.equal((await ask(alone, token())).status, 529);
+    const open = await ask(alone, token());
+    assert.deepEqual([open.status, (await open.json()).error.type, lone.seen.length], [503, "overloaded_error", 1]);
+    assert.ok(Number(open.headers.get("retry-after")) >= 1);
+  });
+
+  it("lets one probe through at a time, and another once the probe's client went away", () => {
+    const breaker = new Breaker(1, 100);
+    assert.equal(breaker.take(0), "closed");
+    assert.equal(breaker.failed("closed", 0), true);
+    assert.equal(breaker.take(50), undefined);
+    assert.equal(breaker.take(100), "probe");
+    assert.equal(breaker.take(100), undefined);
+    breaker.abandoned("probe");
+    assert.equal(breaker.take(100), "probe");
+    assert.equal(breaker.succeeded(), true);
+    assert.equal(breaker.take(100), "closed");
+  });
+
+  it("sends each model to the upstreams that serve it, under the provider's id, and refuses one none serves", async () => {
+    const anthropic = await fakeProvider();
+    const deepseek = await fakeProvider();
+    const gw = await failover([
+      { name: "anthropic", url: anthropic.url, models: { [MODEL]: "claude-sonnet-5-5-20261001" } },
+      { name: "deepseek", url: deepseek.url, models: { "deepseek-flash": "deepseek-v4-pro" } },
+    ]);
+    const claude = await askFor(gw, token({ task: "claude" }), MODEL);
+    assert.deepEqual([claude.status, claude.headers.get("x-jig-upstream")], [200, "anthropic"]);
+    await claude.text();
+    // Only the model changed, the rest of the body byte for byte.
+    assert.equal(anthropic.seen[0].body.toString(), body().replace(`"model":"${MODEL}"`, '"model":"claude-sonnet-5-5-20261001"'));
+    const flash = await askFor(gw, token({ task: "flash" }), "deepseek-flash");
+    assert.deepEqual([flash.status, flash.headers.get("x-jig-upstream")], [200, "deepseek"]);
+    await flash.text();
+    assert.equal(JSON.parse(deepseek.seen[0].body.toString()).model, "deepseek-v4-pro");
+    // Priced by the provider's id where it has a price, else by the model jig asked for.
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const spent = async (task: string) => (await fetch(`${gw.url}/usage/${task}`, { headers: { "x-api-key": token({ task }) } })).json();
+    assert.equal((await spent("flash")).costUsd, costOf("deepseek-v4-pro", usage));
+    assert.equal((await spent("claude")).costUsd, costOf(MODEL, usage));
+
+    const unserved = await askFor(gw, token(), "gpt-9");
+    assert.equal(unserved.status, 400);
+    const { error } = await unserved.json();
+    assert.equal(error.type, "invalid_request_error");
+    assert.match(error.message, /gpt-9/);
+    assert.equal(anthropic.seen.length + deepseek.seen.length, 2);
+  });
+
+  it("sets only the top-level model of a body, the rest byte for byte", () => {
+    const raw = '{"system":"a \\"}{ \\"model\\":\\"x\\"","messages":[{"role":"user","content":{"model":"x"}}], "model" : "a", "metadata":{"model":"y"}, "é":1}';
+    assert.equal(withModel(Buffer.from(raw), "b").toString(), raw.replace('"model" : "a"', '"model" : "b"'));
+    // A key it can't see for its escapes is set all the same.
+    assert.equal(JSON.parse(withModel(Buffer.from('{"mod\\u0065l":"a","max_tokens":1}'), "b").toString()).model, "b");
+  });
+
+  it("says what is wrong with its upstreams before it starts", async () => {
+    const one = { baseUrl: "http://127.0.0.1:9", keyEnv: ["POOL_KEY_1"] };
+    const start = (config: Partial<GatewayConfig>) => startGateway({ listen: { port: 0 }, ...config }, { JIG_GATEWAY_SECRET: SECRET, ...KEYS });
+    await assert.rejects(start({ upstream: one, upstreams: [{ name: "a", ...one }] }), /not both/);
+    await assert.rejects(start({}), /Set upstream, or upstreams/);
+    await assert.rejects(start({ upstreams: [{ name: "Big Name", ...one }] }), /upstreams\[0\]\.name/);
+    await assert.rejects(start({ upstreams: [{ name: "a", ...one }, { name: "a", ...one }] }), /two upstreams are named a/);
+    await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: { x: 1 as unknown as string } }] }), /models must map/);
+    await assert.rejects(start({ upstreams: [{ name: "a", ...one, keyEnv: ["NOWHERE"] }] }), /No key in NOWHERE/);
+    await assert.rejects(start({ upstream: one, failover: { failures: 0 } }), /failover.failures/);
   });
 });
 
@@ -469,7 +664,7 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     const credential = token({ task: "capped", budgetUsd: 0.0001 });
     assert.deepEqual([(await ask(a, credential)).status, (await ask(b, credential)).status, (await ask(a, credential)).status], [200, 200, 402]);
     const read = (gw: Gateway) => fetch(`${gw.url}/usage/capped`, { headers: { "x-api-key": credential } }).then((r) => r.json());
-    assert.deepEqual([(await read(b)).requests, (await read(b)).usage.output], [2, 10]);
+    assert.deepEqual([(await read(b)).requests, (await read(b)).usage.output, (await read(b)).upstreams], [2, 10, { default: 2 }]);
     await a.close();
     await b.close();
     const again = await gateway(provider.url, { state });
