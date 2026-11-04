@@ -297,10 +297,17 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
   return {
     status,
     exitCode,
-    stop,
-    error,
+    // Both come from what the run wrote (its end event, its last line of output, a clone's errors), which
+    // may hold a NUL: Postgres text can't, and the outcome would never be stored.
+    stop: stop && withoutNul(stop),
+    error: error && withoutNul(error),
     stats: exit?.stats ?? null,
     usage: (end?.usage as Usage | undefined) ?? null,
     cost: typeof end?.cost === "number" ? end.cost : null,
   };
+}
+
+/** The text with each NUL character replaced by U+FFFD, which shows something was there. */
+function withoutNul(text: string): string {
+  return text.replaceAll("\0", "\uFFFD");
 }

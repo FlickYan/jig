@@ -86,7 +86,8 @@ curl -sN localhost:8080/v1/tasks/$ID/events -H "Authorization: Bearer $KEY" -H '
 
 A request is refused with 400 and the reason when a field is unknown or out of bounds, the model isn't a
 Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file's path is absolute, goes
-through `..` or names a folder, or the workspace has both files and a repository; with 413 when the body is
+through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
+character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued. A cancel answers 200 for
 a queued task (it is cancelled at once), 202 for a running one (its jig and everything it started are
 killed, and the task ends `cancelled`) and 409 for one that has ended. A stream sends a comment every
@@ -103,7 +104,8 @@ A task is `queued`, then `running`, then one of:
 | `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, or the service stopping while it ran |
 
 `stop` is how jig's run ended, from its `end` event (or its exit code, without one), and `usage` and `cost`
-come from that event too.
+come from that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is
+stored as U+FFFD.
 
 ### Scheduling
 

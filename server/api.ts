@@ -287,6 +287,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): 
   const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel } = input;
   if (typeof prompt !== "string" || !prompt.trim()) return "prompt must be a string that isn't empty";
   if (prompt.length > MAX_PROMPT) return `prompt must be at most ${MAX_PROMPT} characters`;
+  // Postgres text can't hold one, and jig has no use for it: refused on every store alike.
+  if (prompt.includes("\0")) return "prompt must not hold a NUL character (\\u0000)";
   if (!Number.isInteger(maxSteps) || (maxSteps as number) < 1 || (maxSteps as number) > tenant.limits.maxSteps) return `maxSteps must be a whole number from 1 to ${tenant.limits.maxSteps}`;
   if (!Number.isInteger(timeLimit) || (timeLimit as number) < 1 || (timeLimit as number) > tenant.limits.timeLimit) return `timeLimit must be a whole number of seconds from 1 to ${tenant.limits.timeLimit}`;
   // The gateway serves the Anthropic API, which jig uses for Claude and DeepSeek models.

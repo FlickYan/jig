@@ -268,6 +268,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(await refused({ prompt: "hi", promt: "typo" }), /Unknown field: promt/);
     assert.match(await refused({ prompt: "hi", workspace: { git: "--upload-pack=touch /tmp/x" } }), /workspace\.git/);
     assert.match(await refused("{"), /isn't JSON/);
+    // Postgres text can't hold a NUL: it is refused on both stores, not stored on one and a 500 on the other.
+    assert.match(await refused({ prompt: "hi\u0000there" }), /NUL/);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(20_000) })).status, 413);
     assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body, { tasks: [] });
 
@@ -553,6 +555,32 @@ const schedulerTests = () => {
     await scheduler.settled();
     assert.equal(read, 1);
     for (const run of runner.active.values()) run.end();
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stores the outcome of a run whose end and last words hold a NUL", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // A task's commands can write the events file, and jig's last line of output.
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "end", stop: "error\u0000x", usage: { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 }, cost: 0.5 };
+          })(),
+          wait: async () => ({ exitCode: 1, timedOut: false, message: "jig said: \u0000oops" }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
+    await scheduler.poke();
+    await scheduler.settled();
+    const ended = (await store.task(task.id))!;
+    assert.deepEqual([ended.status, ended.exitCode, ended.stop, ended.error, ended.cost], ["error", 1, "error\uFFFDx", "jig exited with 1: jig said: \uFFFDoops", 0.5]);
+    assert.deepEqual(ended.usage, { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 });
     await scheduler.close();
     await store.close();
   });
