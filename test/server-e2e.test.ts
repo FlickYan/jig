@@ -9,6 +9,7 @@ import { randomUUID } from "node:crypto";
 import { type Service, startService } from "../server/api.ts";
 import { type Gateway, startGateway } from "../server/gateway.ts";
 import { Redis } from "../server/redis.ts";
+import { startRouter } from "../server/router.ts";
 import { mintToken } from "../server/token.ts";
 import { costOf } from "../src/prices.ts";
 import { type Block, messagesReply } from "./fake-api.ts";
@@ -287,6 +288,201 @@ for (const { name, backends, skip } of [
       assert.equal(task.pendingApprovals, 0);
       assert.ok(Date.now() - started < 15_000, "the cancel took too long");
       assert.equal((await call(service, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" })).status, 409);
+    });
+  });
+}
+
+// Phase 3 at once, with nothing faked but the providers: a router in front of two regions, each a task
+// service of its own, whose tasks' model calls go through one gateway that fails over from an overloaded
+// provider to a second one; the service's and the gateway's quotas; and what the three say at /metrics.
+
+const PRIMARY_KEY = "sk-the-primary-key";
+
+/** A provider that is overloaded: every call gets 529, as the Messages API says it is. */
+async function overloaded(): Promise<{ url: string; calls: () => number }> {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      calls++;
+      assert.equal(req.headers["x-api-key"], PRIMARY_KEY);
+      res.writeHead(529, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }));
+    });
+  });
+  await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+  closers.push(() => {
+    server.closeAllConnections();
+    return new Promise((done) => server.close(done));
+  });
+  return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, calls: () => calls };
+}
+
+/** A metric's value in a scrape, by its labels (in the order the metric names them). */
+function metric(text: string, name: string, labels: Record<string, string> = {}): number {
+  const pairs = Object.entries(labels).map(([key, value]) => `${key}="${value}"`);
+  const line = text.split("\n").find((line) => line.startsWith(`${name}${pairs.length ? `{${pairs.join(",")}}` : ""} `));
+  return line ? Number(line.split(" ").at(-1)) : 0;
+}
+
+const scrape = async (url: string) => (await fetch(`${url}/metrics`)).text();
+
+for (const { name, backends, skip } of [
+  { name: "SQLite and memory", backends: {} as Backends, skip: false },
+  { name: "Postgres and Redis", backends: { postgres: true, redis: true } as Backends, skip: NO_POSTGRES || (!REDIS && "JIG_TEST_REDIS_URL isn't set") },
+]) {
+  describe(`Phase 3 end to end, the state in ${name}: router, two regions, failover, quotas and metrics`, { skip }, () => {
+    it("routes tenants' tasks to their regions and fails over, between providers and between regions, within quotas, and counts it all", async () => {
+      // Two model calls a task, each of 10 input and 5 output tokens: the gateway's daily quota lets three tasks through.
+      const replies: Block[][] = [[{ tool: "bash", input: { command: "echo hi" } }], [{ text: "Done." }]];
+      const perTask = costOf(MODEL, { input: 20, output: 10, cacheRead: 0, cacheWrite: 0 })!;
+      const primary = await overloaded();
+      const backup = await provider([...replies, ...replies, ...replies, ...replies]);
+      const gateway = await startGateway(
+        {
+          listen: { port: 0 },
+          metrics: { port: 0 },
+          upstreams: [
+            { name: "primary", baseUrl: primary.url, keyEnv: ["PRIMARY_KEY"] },
+            { name: "backup", baseUrl: backup.url, keyEnv: ["PROVIDER_KEY"] },
+          ],
+          // Every call tries the primary first: no circuit opens in this test.
+          failover: { failures: 1000 },
+          limits: { tenantDefaults: { dailyUsd: perTask * 2.9 } },
+          ...(backends.redis && { state: { redis: REDIS!, prefix: redisPrefix() } }),
+        },
+        { JIG_GATEWAY_SECRET: SECRET, PROVIDER_KEY, PRIMARY_KEY },
+      );
+      closers.push(() => gateway.close());
+
+      const region = async (name: string, quotas?: { tasksPerDay: number }) => {
+        const base = await tempDir(`jig-e2e-${name}-`);
+        const service = await startService(
+          {
+            region: name,
+            port: 0,
+            internal: { port: 0 },
+            metrics: { port: 0 },
+            database: backends.postgres ? await postgresDatabase() : join(base, "jig.db"),
+            dataDir: join(base, "data"),
+            model: MODEL,
+            gatewayBaseUrl: `${gateway.url}/anthropic`,
+            graceSeconds: 5,
+            tenants: [{ id: "acme", keys: [sha256(TENANT_KEY)], budgetUsd: 1, ...(quotas && { quotas }) }],
+          },
+          { secret: SECRET },
+        );
+        let open = true;
+        const close = async () => {
+          if (open) await service.close();
+          open = false;
+        };
+        closers.push(close);
+        return { service, close };
+      };
+      const us = await region("us", { tasksPerDay: 1 });
+      const eu = await region("eu");
+      const router = await startRouter({
+        listen: { port: 0 },
+        metrics: { port: 0 },
+        regions: [
+          { name: "us", url: us.service.url },
+          { name: "eu", url: eu.service.url },
+        ],
+        tenants: [{ id: "acme", keys: [sha256(TENANT_KEY)], home: "us", allowed: ["us", "eu"], failover: true }],
+        health: { intervalMs: 100, failures: 1 },
+      });
+      closers.push(() => router.close());
+
+      const send = async (method: string, path: string, body?: unknown) => {
+        const res = await fetch(router.url + path, {
+          method,
+          headers: { authorization: `Bearer ${TENANT_KEY}`, ...(body !== undefined && { "content-type": "application/json" }) },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        return { status: res.status, region: res.headers.get("x-jig-region"), retryAfter: res.headers.get("retry-after"), body: await res.json() };
+      };
+      const finished = (id: string) =>
+        until(async () => {
+          const { body } = await send("GET", `/v1/tasks/${id}`);
+          return !["queued", "running"].includes(body.status) && body;
+        }, `task ${id} to end`);
+
+      // Home: the tenant's task goes to us, its id says so, and it is read back from there.
+      const home = await send("POST", "/v1/tasks", { prompt: "say hi", maxSteps: 5 });
+      assert.equal(home.status, 201, JSON.stringify(home.body));
+      assert.equal(home.region, "us");
+      assert.match(home.body.id, /^task_us_[0-9a-f]{32}$/);
+      const first = await finished(home.body.id);
+      assert.equal(first.status, "succeeded", JSON.stringify(first));
+      // The primary was overloaded at both of its calls, and the backup answered them.
+      assert.equal(primary.calls(), 2);
+      assert.equal(backup.seen.length, 2);
+      for (const request of backup.seen) assert.equal(request.headers["x-api-key"], PROVIDER_KEY);
+      const token = mintToken(SECRET, { tenant: "acme", task: first.id, exp: Math.floor(Date.now() / 1000) + 600, budgetUsd: 1 });
+      const used = await (await fetch(`${gateway.url}/usage/${first.id}`, { headers: { authorization: `Bearer ${token}` } })).json();
+      assert.deepEqual(used.upstreams, { backup: 2 });
+      assert.ok(Math.abs(used.costUsd - perTask) < 1e-9);
+
+      // A spec that names a region is made there.
+      const named = await send("POST", "/v1/tasks", { prompt: "say hi", maxSteps: 5, region: "eu" });
+      assert.equal(named.status, 201, JSON.stringify(named.body));
+      assert.equal(named.region, "eu");
+      assert.match(named.body.id, /^task_eu_/);
+      assert.equal((await finished(named.body.id)).status, "succeeded");
+
+      // us lets the tenant create one task a day: the next is refused there, with when it may try again.
+      const over = await send("POST", "/v1/tasks", { prompt: "say hi", maxSteps: 5 });
+      assert.equal(over.status, 429, JSON.stringify(over.body));
+      assert.equal(over.region, "us");
+      assert.equal(over.body.quota, "tasksPerDay");
+      assert.ok(Number(over.retryAfter) > 0);
+
+      // The usage of both regions as one report.
+      const usage = await send("GET", "/v1/usage?region=all");
+      assert.equal(usage.status, 200, JSON.stringify(usage.body));
+      assert.deepEqual(usage.body.regions.sort(), ["eu", "us"]);
+      assert.equal(usage.body.total.tasks, 2);
+      assert.ok(Math.abs(usage.body.total.costUsd - 2 * perTask) < 1e-9, JSON.stringify(usage.body));
+
+      // us goes down: its tasks wait for it (their data stays there), and new ones go to eu.
+      await us.close();
+      await until(async () => router.regions().us === false, "the router to see us down", 10_000);
+      assert.equal((await send("GET", `/v1/tasks/${first.id}`)).status, 503);
+      const moved = await send("POST", "/v1/tasks", { prompt: "say hi", maxSteps: 5 });
+      assert.equal(moved.status, 201, JSON.stringify(moved.body));
+      assert.equal(moved.region, "eu");
+      assert.match(moved.body.id, /^task_eu_/);
+      assert.equal((await finished(moved.body.id)).status, "succeeded");
+
+      // Three tasks spent past the gateway's daily quota: a fourth task's model call is refused.
+      const fourth = mintToken(SECRET, { tenant: "acme", task: "task_eu_late", exp: Math.floor(Date.now() / 1000) + 600, budgetUsd: null });
+      const refused = await fetch(`${gateway.url}/anthropic/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": fourth, "content-type": "application/json", "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: MODEL, max_tokens: 10, messages: [{ role: "user", content: "hi" }] }),
+      });
+      assert.equal(refused.status, 402);
+      assert.equal(((await refused.json()) as any).error.type, "billing_error");
+      assert.ok(Number(refused.headers.get("retry-after")) > 0);
+      assert.equal(primary.calls(), 6);
+      assert.equal(backup.seen.length, 6);
+
+      // What the gateway, the service in eu and the router say about it all.
+      const gw = await scrape(gateway.metricsUrl!);
+      assert.equal(metric(gw, "jig_gateway_failovers_total", { from: "primary", to: "backup", reason: "status_529" }), 6);
+      assert.equal(metric(gw, "jig_gateway_requests_total", { tenant: "acme", upstream: "backup", status: "200" }), 6);
+      assert.equal(metric(gw, "jig_gateway_refused_total", { tenant: "acme", reason: "quota" }), 1);
+      assert.ok(Math.abs(metric(gw, "jig_gateway_cost_usd_total", { tenant: "acme" }) - 3 * perTask) < 1e-9);
+      const service = await scrape(eu.service.metricsUrl!);
+      assert.equal(metric(service, "jig_service_tasks_created_total", { tenant: "acme" }), 2);
+      assert.equal(metric(service, "jig_service_tasks_ended_total", { tenant: "acme", status: "succeeded" }), 2);
+      assert.ok(Math.abs(metric(service, "jig_service_cost_usd_total", { tenant: "acme" }) - 2 * perTask) < 1e-9);
+      const routed = await scrape(router.metricsUrl!);
+      assert.equal(metric(routed, "jig_router_requests_total", { region: "us", route: "create", status: "201" }), 1);
+      assert.equal(metric(routed, "jig_router_requests_total", { region: "us", route: "create", status: "429" }), 1);
+      assert.equal(metric(routed, "jig_router_requests_total", { region: "eu", route: "create", status: "201" }), 2);
+      assert.equal(metric(routed, "jig_router_failovers_total", { from: "us", to: "eu" }), 1);
+      assert.equal(metric(routed, "jig_router_region_up", { region: "us" }), 0);
     });
   });
 }
