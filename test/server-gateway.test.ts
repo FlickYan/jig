@@ -620,6 +620,30 @@ describe("the gateway's metrics and logs", () => {
     await assert.rejects(gateway(provider.url, { metrics: { port: -1 } }), /metrics.port/);
   });
 
+  it("answers a request target that is no URL on either listener, and keeps serving", async () => {
+    const provider = await fakeProvider();
+    const gw = await gateway(provider.url);
+    let uncaught: unknown;
+    const hook = (err: unknown) => (uncaught = err);
+    process.on("uncaughtException", hook);
+    try {
+      // fetch() cannot send this target, so it goes over a socket as it is.
+      const raw = (url: string) =>
+        new Promise<string>((done, failed) => {
+          const { hostname, port } = new URL(url);
+          const socket = connect(Number(port), hostname, () => socket.end("GET http://[x/ HTTP/1.1\r\nhost: gateway\r\nconnection: close\r\n\r\n"));
+          let reply = "";
+          socket.setEncoding("utf8").on("data", (chunk) => (reply += chunk)).on("error", failed).on("close", () => done(reply));
+        });
+      assert.match(await raw(gw.metricsUrl!), /^HTTP\/1\.1 400 /);
+      assert.match(await raw(gw.url), /^HTTP\/1\.1 500 /);
+    } finally {
+      process.off("uncaughtException", hook);
+    }
+    assert.equal(uncaught, undefined);
+    for (const url of [gw.url, gw.metricsUrl]) assert.equal(await (await fetch(`${url}/healthz`)).text(), "ok\n");
+  });
+
   it("counts calls by status and upstream, their tokens, cost, refusals and failovers", async () => {
     const first = await fakeProvider((_, res) => overloaded(res));
     const second = await fakeProvider();

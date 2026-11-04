@@ -858,7 +858,14 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   // The metrics on a listener of their own, never the port the tasks reach, as they need no token.
   const scrape = config.metrics && createServer((req, res) => {
     res.setHeader("x-request-id", requestId(req));
-    const route = `${req.method} ${new URL(req.url ?? "/", "http://gateway").pathname}`;
+    // A throw here is uncaught and would end the process, so a target that is no URL is answered 400.
+    let pathname: string;
+    try {
+      pathname = new URL(req.url ?? "/", "http://gateway").pathname;
+    } catch {
+      return fail(res, 400, "invalid_request_error", "The request's target is not a URL path.");
+    }
+    const route = `${req.method} ${pathname}`;
     if (route === "GET /metrics") return void registry.serve(res).catch((err) => fail(res, 500, "api_error", `The metrics failed: ${(err as Error).message}`));
     if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
     fail(res, 404, "not_found_error", `The gateway's metrics listener has no ${route}.`);
