@@ -194,16 +194,46 @@ const observeTests = () => {
     assert.equal((await scrape(api)).value("jig_service_approvals_pending"), 0);
     await ended(api, KEYS.acme, id);
 
-    // Unanswered, globex's is denied at its timeout, a second on.
+    // Unanswered, globex's is denied at its timeout, a second on: timed by jig's clock, so the runner's
+    // reads of its events, a poll apart and later under load, don't shorten it.
     const late = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id;
     await ended(api, KEYS.globex, late);
     const { value, text } = await scrape(api);
     assert.equal(value('jig_service_approval_wait_seconds_count{decision="allow"}'), 1);
     assert.equal(value('jig_service_approval_wait_seconds_count{decision="timeout"}'), 1);
-    assert.ok(value('jig_service_approval_wait_seconds_sum{decision="timeout"}')! >= 0.9);
+    const waited = value('jig_service_approval_wait_seconds_sum{decision="timeout"}')!;
+    assert.ok(waited >= 1 && waited < 10, `waited ${waited}`);
     assert.equal(value("jig_service_approvals_pending"), 0);
     assert.equal(value('jig_service_http_requests_total{route="/v1/tasks/:id/approvals/:aid",status="200"}'), 1);
     assert.ok(!text.includes("ap_1"));
+  });
+
+  it("times a timeout by the service's clock where the run's event times can't be right", async () => {
+    // A run's commands may write its events: one asked years before the run, and one at no time.
+    const runner: Runner = {
+      async start() {
+        const event = (seq: number, ts: string, type: string, fields: object) => ({ v: 1, seq, ts, type, ...fields });
+        const now = () => new Date().toISOString();
+        return {
+          events: (async function* () {
+            yield event(1, "2000-01-01T00:00:00.000Z", "approval_request", { step: 1, id: "ap_1", tool: "bash", description: "ls" });
+            yield event(2, now(), "approval", { id: "ap_1", decision: "deny", always: false, by: "timeout" });
+            yield event(3, "soon", "approval_request", { step: 1, id: "ap_2", tool: "bash", description: "ls" });
+            yield event(4, now(), "approval", { id: "ap_2", decision: "deny", always: false, by: "timeout" });
+            yield event(5, now(), "end", { stop: "done", steps: 1 });
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel: () => {},
+        };
+      },
+    };
+    const api = await service({}, runner);
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "ask 2", approvals: true })).body.id;
+    await ended(api, KEYS.acme, id);
+    const { value } = await scrape(api);
+    assert.equal(value('jig_service_approval_wait_seconds_count{decision="timeout"}'), 2);
+    const waited = value('jig_service_approval_wait_seconds_sum{decision="timeout"}')!;
+    assert.ok(waited >= 0 && waited < 10, `waited ${waited}`);
   });
 
   it("counts the replicas whose heartbeat is in the store, and forgets one that stops", async () => {

@@ -279,6 +279,8 @@ export class Scheduler {
     let end: JigEvent | undefined;
     let stored = 0;
     let dropping = false;
+    // When jig asked for each approval this run stored, by its own clock, to time a timeout's wait.
+    const asked = new Map<string, number>();
     try {
       run.handle = await this.runner.start(task, tenant);
       if (run.stopping) run.handle.cancel();
@@ -300,6 +302,7 @@ export class Scheduler {
         // and jig's wait for it ends at its timeout, as a deny.
         const request = approvalRequest(kept);
         const approval = request && (await this.store.addApproval(task.id, request));
+        if (approval) asked.set(approval.id, Date.parse(kept.ts));
         await this.store.addEvent(task.id, kept.seq, kept);
         stored++;
         // jig's own word on how it was answered is the record, but for an answer by the API it never gave:
@@ -311,7 +314,7 @@ export class Scheduler {
           this.log.warn(`the run says the API answered ${answered.id} with ${said}, which it didn't: left out of the record`, { tenant: task.tenant, task: task.id });
         }
         // An answer through the API is counted as it is given (api.ts); a timeout, as jig records it.
-        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id).catch(() => this.metrics.storeErrors.inc());
+        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id, Date.parse(kept.ts) - (asked.get(answered.id) ?? NaN), run).catch(() => this.metrics.storeErrors.inc());
         this.updates.emit(task.id, { event: kept } satisfies Update);
         if (approval) this.onApproval?.(task, approval);
       }
@@ -334,8 +337,17 @@ export class Scheduler {
     await recorded.finally(() => this.recording.delete(recorded));
   }
 
-  /** Counts how long an approval jig's timeout denied waited. */
-  private async waited(task: string, id: string): Promise<void> {
+  /**
+   * Counts how long an approval jig's timeout denied waited: `ms` from its two events, by jig's clock, as
+   * the service stores each a poll or so after jig writes it, and the two delays differ. A run's commands
+   * may write its events, so a wait that isn't a number, or is longer than the run has run, is the
+   * stored approval's instead.
+   */
+  private async waited(task: string, id: string, ms: number, run: Run): Promise<void> {
+    if (ms >= 0 && ms <= Date.now() - run.claimed) {
+      this.metrics.approvalWait.observe({ decision: "timeout" }, ms / 1000);
+      return;
+    }
     const approval = await this.store.approval(task, id);
     if (approval?.decidedAt) this.metrics.approvalWait.observe({ decision: "timeout" }, Math.max(0, Date.parse(approval.decidedAt) - Date.parse(approval.requestedAt)) / 1000);
   }
