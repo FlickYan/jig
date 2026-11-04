@@ -94,6 +94,15 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   `jig`, which hides its arguments on macOS and Linux, and reads the task from stdin when it is `-`, for
   the places the title can't reach (an x86-64 container on Apple Silicon, where Rosetta keeps the
   original command line, and the shell that started jig).
+- **A library's task keeps what the CLI leaves to the process.** The CLI runs one task a process, so jig's
+  directory came from `JIG_HOME`, its commands' environment from the process's, and its notices went to
+  one listener set for the process. `runTask` can run several tasks at once in one process, so those are a
+  task's own, in a context (`src/context.ts`, Node's `AsyncLocalStorage`) that the few places reading them
+  look up: `jigHome()`, `withoutKeys()` and `ui.ts`. Passing them down instead would have meant a parameter
+  through most of jig's modules, for three values. The rest of a run (the permissions, the sandbox, the
+  sessions, the stats, the events) was already made per run, in what is now `src/run.ts`, which the CLI and
+  the library both run: the library builds the command line's options from their defaults, so a task given
+  to it runs as one given to `jig` would.
 - **A command is done when its shell exits.** Waiting until the output pipes close, as jig did before
   milestone 10, also waits for whatever still holds them, and a server started with
   `cd app && server > log &` does: `&` puts the whole list in the background, and the subshell running it

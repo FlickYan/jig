@@ -76,6 +76,8 @@ export interface ModelOptions {
   api?: Api;
   /** The API's address, instead of the provider's own. */
   baseURL?: string;
+  /** The key, for the environment's (DEEPSEEK_API_KEY, ANTHROPIC_API_KEY or OPENAI_API_KEY): a library task's own. */
+  apiKey?: string;
   /** Told each time a request or a reply is tried again, for --stats. */
   count?(event: Mechanism): void;
 }
@@ -234,8 +236,9 @@ type ClientSettings = { timeout: number; logger: ReturnType<typeof retryNotices>
 function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
   const deepseek = options.model.startsWith("deepseek");
   const baseURL = options.baseURL ? { baseURL: options.baseURL } : {};
-  // Anthropic() reads ANTHROPIC_API_KEY.
-  const client = deepseek ? deepseekClient({ ...settings, ...baseURL }) : new Anthropic({ ...settings, ...baseURL });
+  // Anthropic() reads ANTHROPIC_API_KEY, and ANTHROPIC_AUTH_TOKEN, which a key of the task's own leaves out.
+  const key = options.apiKey ? { apiKey: options.apiKey, authToken: null } : {};
+  const client = deepseek ? deepseekClient({ ...settings, ...baseURL, ...key }) : new Anthropic({ ...settings, ...baseURL, ...key });
   const request = deepseek ? deepseekRequest(options) : claudeRequest(options);
   return (messages, watchdog, summarize) => {
     const sent = deepseek ? withoutIsError(messages) : messages;
@@ -252,9 +255,9 @@ function messagesApi(options: ModelOptions, settings: ClientSettings): Turn {
 function chatCompletions(options: ModelOptions, settings: ClientSettings): Turn {
   if (options.model.startsWith("claude")) throw new Error("Claude models are reached through the Anthropic API: leave out --api openai.");
   const deepseek = options.model.startsWith("deepseek");
-  if (deepseek && !process.env.DEEPSEEK_API_KEY) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
+  if (deepseek && !(options.apiKey ?? process.env.DEEPSEEK_API_KEY)) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
   const baseURL = options.baseURL ?? (deepseek ? DEEPSEEK_OPENAI_BASE_URL : process.env.OPENAI_BASE_URL);
-  const apiKey = deepseek ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY || (baseURL ? "none" : undefined);
+  const apiKey = options.apiKey ?? (deepseek ? process.env.DEEPSEEK_API_KEY : process.env.OPENAI_API_KEY || (baseURL ? "none" : undefined));
   // Without an apiKey (no OPENAI_API_KEY, and OpenAI's own address) the SDK stops with an error naming the variable.
   const client = new OpenAI({ ...settings, apiKey, baseURL });
   // DeepSeek gets the output limit its Anthropic endpoint gets; elsewhere the server's default stands (OpenAI's
@@ -287,7 +290,7 @@ function claudeRequest({ model, effort = CLAUDE_EFFORT, system, tools }: ModelOp
 }
 
 function deepseekClient(settings: ConstructorParameters<typeof Anthropic>[0]): Anthropic {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
+  const apiKey = settings?.apiKey ?? process.env.DEEPSEEK_API_KEY;
   if (!apiKey) throw new Error("Set DEEPSEEK_API_KEY to use DeepSeek models.");
   // Without authToken: null, the SDK would also send ANTHROPIC_AUTH_TOKEN from the environment to DeepSeek.
   // --base-url wins (Terminal-Bench's adapter points it at a proxy that holds the key), but

@@ -2,10 +2,11 @@ import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync, renameSync, rmdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { context } from "./context.ts";
 
-/** jig's own directory: sessions, snapshots and user settings. $JIG_HOME, or ~/.jig. */
+/** jig's own directory: sessions, snapshots and user settings. The run's (see context.ts), $JIG_HOME, or ~/.jig. */
 export function jigHome(): string {
-  return process.env.JIG_HOME ?? join(homedir(), ".jig");
+  return context().home ?? process.env.JIG_HOME ?? join(homedir(), ".jig");
 }
 
 /**

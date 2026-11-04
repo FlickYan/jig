@@ -243,6 +243,44 @@ back byte for byte. It is off until benchmarks show whether it helps; `--stats` 
 (`inputs.lost`), each without a copy (`inputs.copySkipped`), and each one gone or empty it kept quiet about
 (`inputs.suppressed`).
 
+## As a library
+
+A program can run jig's tasks itself, without a process for each: `runTask` runs one as
+`jig --events - "task"` would, and resolves to how it ended.
+
+```js
+import { runTask } from "jig-agent";
+
+const controller = new AbortController();
+const result = await runTask({
+  prompt: "the login test is failing, fix it",
+  cwd: "/work/some-project",
+  model: "claude-opus-5-5",
+  signal: controller.signal,                    // abort() stops the task: it ends "interrupted"
+  onEvent: (event) => console.log(event.type),  // start, step, text, tool_call, tool_result, notice, end
+  approve: async (request) => ({ decision: "allow" }), // request: {id, step, tool, description}
+});
+// { stop: "end_turn", exitCode: 0, steps: 4, usage: {...}, cost: 0.0123, seconds: 21.4, text: "Fixed ..." }
+```
+
+`prompt` and `cwd` are needed; the rest are as their flags: `model` (`deepseek-flash` without one),
+`baseUrl`, `maxSteps` (50), `timeLimit` (seconds), `mode` (`edits`), `yes`, `sandbox` (false is
+`--no-sandbox`) and `stats` (the file's path). `apiKey` is the key, or without one the environment variable
+jig uses for the model; `home` is jig's directory for the task (`JIG_HOME`: its sessions, snapshots,
+memories and settings), or the process's; `env` is the environment its commands get (less the API keys), or
+the process's. Each event is the object `--events` would write as a line (see above). `approve` is asked
+where the CLI would ask at a terminal, before a tool call the mode doesn't allow, with the call's `id`
+(`ap_1`, `ap_2`, ...), `step`, `tool` and `description`: `allow` is the terminal's yes, `allow` with
+`always: true` its always, `deny` its no. Without `approve` or `yes`, such a call is refused as with no
+terminal, and the third ends the task `unapproved`. `exitCode` is what `jig` would exit with. A failure ends
+the task with `stop: "error"` and says what failed in `error`; only options that are wrong, before it
+starts, reject. A task prints nothing, and leaves the process's signal handlers, exit code and working
+directory alone. Several can run at once in one process, each with its own project, jig directory, model
+and API, and each sees only its own events, permissions, memories, sessions and stats: what the CLI leaves
+to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but for the skills in
+your home directory's `.agents/skills` and `.claude/skills`, which are the process's, as `HOME` is. The
+CLI runs the same code ([`src/run.ts`](src/run.ts)), so the two can't drift.
+
 ## What it does
 
 ### Safety
@@ -632,7 +670,9 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/inputs.ts`](src/inputs.ts) | `--keep-inputs`: the files there before a task, watched around its commands, and a copy of one a command lost |
 | [`src/prompt.ts`](src/prompt.ts) | System prompt: how to work, facts about the environment, and the project's AGENTS.md |
 | [`src/overview.ts`](src/overview.ts) | The overview: the project's files, and those the task names, put before the task |
-| [`src/cli.ts`](src/cli.ts) | Arguments, interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
+| [`src/cli.ts`](src/cli.ts) | Arguments, and what is the process's: its title, a task on stdin, its exit code |
+| [`src/run.ts`](src/run.ts) | What jig runs, for the CLI and the library: the setup, a task or the interactive session, slash commands, approval and trust prompts, notes to the model, Ctrl+C |
+| [`src/lib.ts`](src/lib.ts), [`src/context.ts`](src/context.ts) | jig as a library: `runTask`, and what is a task's own rather than the process's (jig's directory, its commands' environment, who hears its notices) |
 | [`src/ui.ts`](src/ui.ts) | Terminal output: streamed text and thinking, tool calls, result previews; and the input, one readline for the session |
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
@@ -797,8 +837,8 @@ npm run typecheck
 [CI](.github/workflows/ci.yml) runs both on Linux and macOS with Node 22 and 24, the sandbox tests included
 (on Linux it installs bubblewrap and lifts Ubuntu's AppArmor limit on user namespaces), and checks the
 benchmark's tasks with the oracle and noop agents, which needs no API key, and packs, installs and runs the
-npm package. The Linux setup was tried locally in Debian containers as an ordinary user, with Node 22 and
-24, before it went in.
+npm package, and imports `runTask` from it. The Linux setup was tried locally in Debian containers as an
+ordinary user, with Node 22 and 24, before it went in.
 
 ## Releasing
 

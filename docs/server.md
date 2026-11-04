@@ -223,6 +223,12 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
 goes to stdout: the terminal's output goes to stderr.
 
+A program can also run a task in its own process with `runTask` (`src/lib.ts`, the README's "As a
+library"), which hands it these events as objects, in the same order and with the same fields, and resolves
+to the end's fields and the final reply's text; an `AbortSignal` stops it, and a callback answers the tool
+calls the CLI would ask about. Several run at once in one process, each with its own jig directory and
+commands' environment. The runners above still start jig as a process for each task.
+
 ## Model gateway
 
 `server/gateway.ts` stands between jig and the provider. A task gets a token instead of an API key; the
