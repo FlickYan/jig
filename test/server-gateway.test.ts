@@ -503,7 +503,10 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     assert.ok(Date.now() - start >= 200, `it waited for the lease to end (${Date.now() - start} ms)`);
     const redis = new Redis(REDIS!);
     closing.push(() => redis.close());
-    assert.deepEqual(await redis.command(["ZRANGE", `${state.prefix}inflight:acme`, 0, -1]), ["live"], "only the live lease is left");
+    // The crashed lease is gone; this request's own goes once its reply is counted, just after its headers.
+    const leases = () => redis.command(["ZRANGE", `${state.prefix}inflight:acme`, 0, -1]) as Promise<string[]>;
+    assert.ok(!(await leases()).includes("crashed"), "the crashed lease ended");
+    await until(async () => JSON.stringify(await leases()) === '["live"]', "only the live lease to be left");
     clearInterval(renewing);
     await live.release("acme", "live");
 

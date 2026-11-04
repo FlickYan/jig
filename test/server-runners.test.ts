@@ -291,7 +291,8 @@ describe("the Docker runner", () => {
     // Its claim is answered 410, and docker kill sent, a second after it started; another takes its place.
     await until(async () => (await runs(state)).size >= 2, "a worker in its place");
     await until(() => !alive(pid), "the first worker to be gone");
-    assert.ok((await kills(state)).some((kill) => kill.name === first && kill.signal === "TERM"));
+    // The worker may leave on its 410 before the fake docker's kill, started at once, has written it down.
+    await until(async () => (await kills(state)).some((kill) => kill.name === first && kill.signal === "TERM"), "docker kill sent to it");
     await until(() => runner.pool!.stats().idle === 1, "the new one waiting");
   });
 

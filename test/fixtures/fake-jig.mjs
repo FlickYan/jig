@@ -7,7 +7,7 @@
 // events of its own that allow, as a task's commands could, before its poll and after. It records its arguments,
 // environment, process ids and the polls' statuses in .fake-jig.json in its project.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 
@@ -39,7 +39,11 @@ const emit = (type, fields) => {
 };
 const pause = (ms) => new Promise((done) => setTimeout(done, ms));
 const record = { args: process.argv.slice(2), env: process.env, task, pid: process.pid, polls: [] };
-const save = () => writeFileSync(join(values.cwd, ".fake-jig.json"), JSON.stringify(record));
+// Written whole and then renamed into place, so a test reading it as it changes never sees half of it.
+const save = () => {
+  writeFileSync(join(values.cwd, ".fake-jig.json.part"), JSON.stringify(record));
+  renameSync(join(values.cwd, ".fake-jig.json.part"), join(values.cwd, ".fake-jig.json"));
+};
 
 emit("start", { task, cwd: values.cwd, model: values.model, version: "0.1.0", limits: { maxSteps: Number(values["max-steps"]), timeLimit: Number(values["time-limit"]) } });
 await pause(20);

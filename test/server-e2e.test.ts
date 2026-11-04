@@ -5,16 +5,21 @@ import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { randomUUID } from "node:crypto";
 import { type Service, startService } from "../server/api.ts";
 import { type Gateway, startGateway } from "../server/gateway.ts";
+import { Redis } from "../server/redis.ts";
 import { mintToken } from "../server/token.ts";
 import { costOf } from "../src/prices.ts";
 import { type Block, messagesReply } from "./fake-api.ts";
+import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // The whole of Phase 1 at once, with nothing faked but the provider: a task posted to the task service's API
 // is scheduled, run by the local runner as the real jig (src/cli.ts) with --events, whose model calls go
 // through the gateway with the task's token, to a stand-in for the Messages API that sees only the real key.
+// Then Phase 2's approvals the same way: the real jig's --approve-via, answered through the API, with the
+// task service's state in SQLite or Postgres and the gateway's in memory or Redis.
 
 const SECRET = "the secret the service and the gateway share";
 const PROVIDER_KEY = "sk-the-provider-key";
@@ -26,6 +31,7 @@ const closers: (() => unknown)[] = [];
 afterEach(async () => {
   for (const close of closers.splice(0).reverse()) await close();
   await removeTempDirs();
+  await dropPostgresDatabases();
 });
 
 interface Seen {
@@ -57,9 +63,32 @@ async function provider(replies: Block[][]): Promise<{ url: string; seen: Seen[]
   return { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, seen };
 }
 
-async function stack(replies: Block[][]): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
+const REDIS = process.env.JIG_TEST_REDIS_URL;
+
+/** Where the service and the gateway keep their state: SQLite and memory, or Postgres and Redis. */
+interface Backends {
+  postgres?: boolean;
+  redis?: boolean;
+}
+
+/** A Redis prefix of the test's own, its keys deleted after (once the gateway is closed). */
+function redisPrefix(): string {
+  const prefix = `jig:e2e:${randomUUID()}:`;
+  closers.unshift(async () => {
+    const redis = new Redis(REDIS!);
+    const keys = (await redis.command(["KEYS", `${prefix}*`])) as string[];
+    if (keys.length) await redis.command(["DEL", ...keys]);
+    redis.close();
+  });
+  return prefix;
+}
+
+async function stack(replies: Block[][], backends: Backends = {}): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
   const upstream = await provider(replies);
-  const gateway = await startGateway({ listen: { port: 0 }, upstream: { baseUrl: upstream.url, keyEnv: ["PROVIDER_KEY"] } }, { JIG_GATEWAY_SECRET: SECRET, PROVIDER_KEY });
+  const gateway = await startGateway(
+    { listen: { port: 0 }, upstream: { baseUrl: upstream.url, keyEnv: ["PROVIDER_KEY"] }, ...(backends.redis && { state: { redis: REDIS!, prefix: redisPrefix() } }) },
+    { JIG_GATEWAY_SECRET: SECRET, PROVIDER_KEY },
+  );
   closers.push(() => gateway.close());
   const base = await tempDir("jig-e2e-");
   const dataDir = join(base, "data");
@@ -67,7 +96,7 @@ async function stack(replies: Block[][]): Promise<{ service: Service; gateway: G
     {
       port: 0,
       internal: { port: 0 },
-      database: join(base, "jig.db"),
+      database: backends.postgres ? await postgresDatabase() : join(base, "jig.db"),
       dataDir,
       model: MODEL,
       gatewayBaseUrl: `${gateway.url}/anthropic`,
@@ -189,4 +218,75 @@ async function firstOf(service: Service, id: string, type: string): Promise<void
     clearTimeout(timer);
     abort.abort();
   }
+}
+
+for (const { name, backends, skip } of [
+  { name: "SQLite and memory", backends: {}, skip: false },
+  { name: "Postgres and Redis", backends: { postgres: true, redis: true }, skip: NO_POSTGRES || (!REDIS && "JIG_TEST_REDIS_URL isn't set") },
+]) {
+  describe(`Phase 2 end to end, the state in ${name}: the real jig asks through the API before a command`, { skip }, () => {
+    /** Posts a task that asks before its command, and waits until the approval waits for an answer. */
+    async function asking(service: Service): Promise<{ id: string; approval: any }> {
+      const posted = await call(service, "POST", "/v1/tasks", { prompt: "write the file", approvals: true, mode: "ask", maxSteps: 5 });
+      assert.equal(posted.status, 201, JSON.stringify(posted.body));
+      const { id } = posted.body;
+      await until(async () => (await call(service, "GET", `/v1/tasks/${id}`)).body.pendingApprovals === 1, "the approval to wait");
+      const listed = await call(service, "GET", `/v1/tasks/${id}/approvals`);
+      assert.equal(listed.body.approvals.length, 1);
+      return { id, approval: listed.body.approvals[0] };
+    }
+
+    it("runs the command once the API allows it, and the record says the API answered", async () => {
+      const { service, seen } = await stack([[{ tool: "bash", input: { command: "echo allowed > out.txt && cat out.txt" } }], [{ text: "Written." }]], backends);
+      const { id, approval } = await asking(service);
+      assert.equal(approval.id, "ap_1");
+      assert.equal(approval.tool, "bash");
+      assert.match(approval.description, /echo allowed/);
+      assert.equal(approval.decision, undefined);
+
+      const answered = await call(service, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" });
+      assert.equal(answered.status, 200, JSON.stringify(answered.body));
+      assert.equal((await call(service, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "deny" })).status, 409);
+      const task = await ended(service, id);
+      assert.equal(task.status, "succeeded", JSON.stringify(task));
+      assert.equal(task.pendingApprovals, 0);
+
+      const stream = await events(service, id);
+      const types = stream.filter((frame) => !frame.event).map((frame) => frame.data.type);
+      assert.deepEqual(types, ["start", "step", "tool_call", "approval_request", "approval", "tool_result", "step", "text", "end"]);
+      const { id: approvalId, decision, by } = stream.find((frame) => frame.data.type === "approval")!.data;
+      assert.deepEqual({ approvalId, decision, by }, { approvalId: "ap_1", decision: "allow", by: "api" });
+      assert.match(stream.find((frame) => frame.data.type === "tool_result")!.data.output, /^allowed\n/);
+      assert.match(JSON.stringify(seen[1]!.body.messages.at(-1)), /allowed/);
+      const record = (await call(service, "GET", `/v1/tasks/${id}/approvals`)).body.approvals[0];
+      assert.equal(record.decision, "allow");
+      assert.equal(record.by, "api");
+    });
+
+    it("doesn't run the command the API denies, and the model hears it was denied", async () => {
+      const { service, seen } = await stack([[{ tool: "bash", input: { command: "echo nope > out.txt" } }], [{ text: "I won't, then." }]], backends);
+      const { id } = await asking(service);
+      assert.equal((await call(service, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "deny" })).status, 200);
+      const task = await ended(service, id);
+      assert.equal(task.status, "succeeded", JSON.stringify(task));
+      const stream = await events(service, id);
+      assert.equal(stream.find((frame) => frame.data.type === "approval")!.data.decision, "deny");
+      assert.equal(seen.length, 2);
+      const told = JSON.stringify(seen[1]!.body.messages.at(-1));
+      assert.doesNotMatch(told, /Exit code/);
+      assert.match(told, /den|declin|not allowed|refus/i);
+    });
+
+    it("cancels a task while its approval waits, and the approval waits no more", async () => {
+      const { service } = await stack([[{ tool: "bash", input: { command: "echo never > never.txt" } }], [{ text: "done" }]], backends);
+      const { id } = await asking(service);
+      const started = Date.now();
+      assert.ok([200, 202].includes((await call(service, "POST", `/v1/tasks/${id}/cancel`)).status));
+      const task = await ended(service, id);
+      assert.equal(task.status, "cancelled");
+      assert.equal(task.pendingApprovals, 0);
+      assert.ok(Date.now() - started < 15_000, "the cancel took too long");
+      assert.equal((await call(service, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" })).status, 409);
+    });
+  });
 }
