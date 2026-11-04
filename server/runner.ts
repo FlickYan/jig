@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { isAbsolute } from "node:path";
 import type { Task, TaskStatus, Tenant } from "./store.ts";
 
@@ -35,6 +36,14 @@ export interface RunHandle {
 
 export interface Runner {
   start(task: Task, tenant: Tenant): Promise<RunHandle>;
+  /** Removes what a task's run left on this machine (its folder), once the run has ended. */
+  removeFiles?(id: string): Promise<void>;
+  /** Starts the workers it keeps warm (pool.ts), which claim their tasks at the internal listener, as they reach it. */
+  warm?(internalBaseUrl: string): void;
+  /** Answers a warm worker's claim, POST /internal/pool/claim on the internal listener. */
+  claim?(req: IncomingMessage, res: ServerResponse): Promise<void>;
+  /** Stops the workers it keeps warm, and settles once they are gone: the service is shutting down. */
+  close?(): Promise<void>;
 }
 
 /** A gateway token's payload (the token contract). */
@@ -66,10 +75,18 @@ export function keyVariable(model: string): string {
   return model.startsWith("deepseek") ? "DEEPSEEK_API_KEY" : "ANTHROPIC_API_KEY";
 }
 
-/** jig's arguments for a task, its prompt to come on stdin (`-`), which keeps it out of the process list. */
-export function jigArgs(task: Task, paths: { cwd: string; events: string; stats: string; baseUrl: string }): string[] {
-  const { model, maxSteps, timeLimit } = task.spec;
-  return ["--yes", "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, "-C", paths.cwd, "-"];
+/**
+ * jig's arguments for a task, its prompt to come on stdin (`-`), which keeps it out of the process list. A
+ * task with approvals runs in its mode and asks at the service's internal listener (`internalBaseUrl`)
+ * before the tool calls that mode doesn't allow; any other runs with --yes.
+ */
+export function jigArgs(task: Task, tenant: Tenant, paths: { cwd: string; events: string; stats: string; baseUrl: string; internalBaseUrl?: string }): string[] {
+  const { model, maxSteps, timeLimit, approvals, mode = "edits" } = task.spec;
+  if (approvals && !paths.internalBaseUrl) throw new Error("A task with approvals needs the service's internalBaseUrl, where its jig asks for them");
+  const asks = approvals
+    ? ["--mode", mode, "--approve-via", `${paths.internalBaseUrl!.replace(/\/+$/, "")}/internal/approvals`, "--approval-timeout", String(tenant.limits.approvalTimeout ?? 600)]
+    : ["--yes"];
+  return [...asks, "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, "-C", paths.cwd, "-"];
 }
 
 /** Why a workspace file's path can't be written, or undefined if it lies inside the workspace. */

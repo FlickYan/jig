@@ -3,12 +3,13 @@ import { execFileSync, spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
-import type { IncomingMessage, ServerResponse } from "node:http";
+import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server } from "node:https";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { type Service, startService } from "../server/api.ts";
+import { WarmPool } from "../server/pool.ts";
 import type { Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { KubernetesRunner, objectName, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
@@ -42,11 +43,11 @@ afterEach(async () => {
   await removeTempDirs();
 });
 
-/** The service with the given runner and one tenant, acme, with its key. */
+/** The service with the given runner and one tenant, acme, with its key. It keeps the task folders, which the tests look in. */
 async function service(runner: Runner): Promise<Service> {
   const base = await tempDir("jig-runners-");
   const started = await startService(
-    { port: 0, database: join(base, "jig.db"), dataDir: join(base, "data"), gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
+    { port: 0, internal: { port: 0 }, database: join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
     { secret: SECRET, runner },
   );
   services.push(started);
@@ -92,13 +93,15 @@ const alive = (pid: number) => {
 };
 
 describe("the Docker runner", () => {
-  async function docker(config: Partial<ConstructorParameters<typeof DockerRunner>[0]> = {}) {
+  /** The service on the Docker runner, with the fake docker's state files (`files`) there before it starts. */
+  async function docker(config: Partial<ConstructorParameters<typeof DockerRunner>[0]> = {}, files: Record<string, string> = {}) {
     const base = await tempDir("jig-docker-");
     const state = join(base, "state");
     await mkdir(state);
+    for (const [name, text] of Object.entries(files)) await writeFile(join(state, name), text);
     const runner = new DockerRunner({ dataDir: join(base, "data"), docker: [process.execPath, FAKE_DOCKER, state], image: "jig-worker:test", network: "jig-tasks", gatewayBaseUrl: "http://gateway:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config });
     const api = await service(runner);
-    return { api, state, dir: (id: string) => runner.dir(id), container: async (id: string) => JSON.parse(await readFile(join(state, `jig-${id}.json`), "utf8")) };
+    return { api, state, runner, dir: (id: string) => runner.dir(id), container: async (id: string) => JSON.parse(await readFile(join(state, `jig-${id}.json`), "utf8")) };
   }
 
   it("runs jig in a container with limits, no capabilities and the gateway's network, with the task's token and no real key", async () => {
@@ -149,6 +152,16 @@ describe("the Docker runner", () => {
     if (process.getuid?.() === 0) assert.equal((await stat(join(dir(id), "work"))).uid, 10001);
   });
 
+  it("runs a task with approvals in its mode, asking at the internal listener as the containers reach it", async () => {
+    const { api, container } = await docker({ internalBaseUrl: "http://api:8082/" });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "exit 0", approvals: true, mode: "ask", timeLimit: 600 })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    const { args, image } = await container(id);
+    const command = args.slice(args.indexOf(image) + 2);
+    assert.deepEqual(command.slice(0, 7), ["--no-sandbox", "--mode", "ask", "--approve-via", "http://api:8082/internal/approvals", "--approval-timeout", "600"]);
+    assert.ok(!command.includes("--yes"));
+  });
+
   it("cancels with docker kill, which ends everything in the container, and stops a run past its time limit", async () => {
     const { api, state, dir } = await docker({ graceSeconds: 0 });
     const record = (id: string) => until(async () => JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
@@ -187,6 +200,117 @@ describe("the Docker runner", () => {
     assert.ok(signals.slice(first).every((signal) => signal === "KILL"));
     const { pid, child } = JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8"));
     await until(() => !alive(pid) && !alive(child), "the container's processes to be gone");
+  });
+
+  /** The containers the fake docker ran, as it recorded them, by name. */
+  const runs = async (state: string) => {
+    const names = (await readdir(state)).filter((name) => /^jig-.*\.json$/.test(name)).sort();
+    return new Map(await Promise.all(names.map(async (name) => [name.slice(0, -".json".length), JSON.parse(await readFile(join(state, name), "utf8"))] as const)));
+  };
+  const kills = async (state: string) => (await readFile(join(state, "kills.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const pidOf = async (state: string, name: string) => Number(await readFile(join(state, `${name}.pid`), "utf8"));
+
+  it("gives a task to a warm worker, whose jig starts without a docker run, well before a container could start", async () => {
+    Object.assign(process.env, REAL);
+    // A container takes 4 seconds to exist (its image being pulled, say): the warm one did so before the task came.
+    const { api, state, runner, dir } = await docker({ pool: { size: 1 }, runtime: "runsc", cpus: 2, memory: "3g" }, { delay: "4000" });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [[name, warm]] = [...(await runs(state))];
+    assert.match(name, /^jig-pool_[0-9a-f]{24}$/);
+
+    const posted = Date.now();
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "the task, in the claim's answer", model: "claude-haiku-4-5", timeLimit: 600, workspace: { files: { "app.py": "print(1)\n" } } })).body.id;
+    await until(async () => (await api.store.events(id)).length > 0, "the task's first event");
+    const waited = Date.now() - posted;
+    assert.ok(waited < 2000, `its jig started ${waited} ms after it was posted`);
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
+    assert.equal(runner.pool!.stats().hits, 1);
+
+    // No docker run for the task: it ran in the warm container, with its folder at /task.
+    assert.ok(!(await runs(state)).has(`jig-${id}`));
+    assert.deepEqual(values(warm.args, "--mount"), [`type=bind,source=${dir(id)},target=/task`]);
+    // With the isolation a cold container gets, the ticket by name in its environment, and no key.
+    const { args, image, program } = warm;
+    for (const flag of ["--rm", "--init", "--read-only"]) assert.ok(args.includes(flag), flag);
+    assert.deepEqual([values(args, "--cpus"), values(args, "--memory"), values(args, "--memory-swap"), values(args, "--pids-limit")], [["2"], ["3g"], ["3g"], ["512"]]);
+    assert.deepEqual([values(args, "--cap-drop"), values(args, "--security-opt"), values(args, "--runtime"), values(args, "--network"), values(args, "--user")], [["ALL"], ["no-new-privileges"], ["runsc"], ["jig-tasks"], ["10001:10001"]]);
+    assert.deepEqual(values(args, "--tmpfs"), ["/tmp:rw,nosuid,nodev,size=512m"]);
+    assert.deepEqual(values(args, "--env"), ["HOME=/task/home", "JIG_HOME=/task/home/.jig", "NO_COLOR=1", "JIG_POOL_TICKET"]);
+    assert.deepEqual([image, program, ...args.slice(args.indexOf(image) + 2)], ["jig-worker:test", "node", "/opt/jig/server/worker.ts", "--pool", api.internalUrl]);
+    assert.match(warm.env.JIG_POOL_TICKET, /^[\w-]{43}$/, "32 random bytes");
+    for (const value of [...Object.values(REAL), SECRET]) assert.ok(!JSON.stringify(warm).includes(value), "no real key nor the gateway's secret reaches docker");
+
+    // Its jig got the task, the workspace and the task's token, and not the ticket.
+    const jig = JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8"));
+    assert.equal(jig.task, "the task, in the claim's answer");
+    assert.equal(jig.env.JIG_POOL_TICKET, undefined);
+    const payload = payloadOf(jig.env.ANTHROPIC_API_KEY);
+    assert.deepEqual([payload.tenant, payload.task, payload.budgetUsd], ["acme", id, 2.5]);
+    assert.deepEqual(jig.args.slice(0, 4), ["--no-sandbox", "--yes", "--model", "claude-haiku-4-5"]);
+    assert.equal(await readFile(join(dir(id), "work", "app.py"), "utf8"), "print(1)\n");
+    const written = (await readFile(join(dir(id), "events.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), written);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 2 });
+
+    // The ticket was spent at the claim.
+    const again = await fetch(`${api.internalUrl}/internal/pool/claim`, { method: "POST", headers: { authorization: `Bearer ${warm.env.JIG_POOL_TICKET}` } });
+    assert.equal(again.status, 401);
+    // Another worker was started in its place.
+    await until(async () => (await runs(state)).size === 2, "a worker in its place");
+  });
+
+  it("starts a task cold when no warm worker waits, and fills the pool behind it", async () => {
+    const { api, state, runner } = await docker({ pool: { size: 1 } }, { delay: "1000" });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    assert.ok((await runs(state)).has(`jig-${id}`), "its own docker run");
+    await until(() => runner.pool!.stats().idle === 1, "the warm worker started meanwhile");
+    assert.deepEqual([runner.pool!.stats().hits, runner.pool!.stats().misses], [0, 1]);
+  });
+
+  it("cancels a task on a warm worker with docker kill, which ends everything in its container", async () => {
+    const { api, state, runner, dir } = await docker({ pool: { size: 1 } });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [name] = [...(await runs(state)).keys()];
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    const record = await until(async () => JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
+    const worker = await pidOf(state, name);
+    assert.ok(alive(worker) && alive(record.pid) && alive(record.child));
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+    assert.deepEqual((await kills(state)).filter((kill) => kill.name === name), [{ signal: "TERM", name }]);
+    await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
+  });
+
+  it("replaces a worker idle past maxIdleSeconds", async () => {
+    const { state, runner } = await docker({ pool: { size: 1, maxIdleSeconds: 1 } });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [first] = [...(await runs(state)).keys()];
+    const pid = await pidOf(state, first);
+    // Its claim is answered 410, and docker kill sent, a second after it started; another takes its place.
+    await until(async () => (await runs(state)).size >= 2, "a worker in its place");
+    await until(() => !alive(pid), "the first worker to be gone");
+    assert.ok((await kills(state)).some((kill) => kill.name === first && kill.signal === "TERM"));
+    await until(() => runner.pool!.stats().idle === 1, "the new one waiting");
+  });
+
+  it("stops the idle workers as the service stops, and starts no more", async () => {
+    const { api, state, runner } = await docker({ pool: { size: 2 } });
+    await until(() => runner.pool!.stats().idle === 2, "two warm workers");
+    const idle = [...(await runs(state)).keys()];
+    const pids = await Promise.all(idle.map((name) => pidOf(state, name)));
+    services.splice(services.indexOf(api), 1);
+    await api.close();
+    // Their folders are gone by then: a process that exits once the service has closed leaves none behind.
+    assert.deepEqual(await readdir(join(runner.dir("none"), "..")), []);
+    // Told so in the answer to their claims, and sent docker kill.
+    await until(() => !pids.some(alive), "the idle workers to be gone");
+    await until(async () => (await kills(state)).length === 2, "the kills");
+    assert.deepEqual((await kills(state)).map((kill) => kill.name).sort(), idle);
+    assert.equal(runner.pool!.stats().idle, 0);
+    await new Promise((done) => setTimeout(done, 200));
+    assert.deepEqual([...(await runs(state)).keys()], idle);
   });
 
   it("leaves out an event too long to read, without holding it, and the run goes on, counted, until stopped", async () => {
@@ -264,14 +388,22 @@ interface Pod {
   script: Script;
   status: object;
   logs: ServerResponse[];
+  /** A warm worker's: settles once its claim is answered, the script then its task's. */
+  claimed?: Promise<void>;
 }
 
-/** A Kubernetes API server, over TLS, with the few routes the runner uses and pods that do as scripted. */
+/**
+ * A Kubernetes API server, over TLS, with the few routes the runner uses and pods that do as scripted. A
+ * warm worker's pod (its command has --pool <url>) claims its task there with the ticket in its Secret, as
+ * server/worker.ts does, and then does as the task's script says; refused, it exits.
+ */
 class FakeCluster {
   url = "";
   token = "the service account's token";
   namespace = "jig";
-  requests: { method: string; path: string; auth?: string; body?: any }[] = [];
+  requests: { method: string; path: string; auth?: string; type?: string; body?: any }[] = [];
+  /** The warm workers' claims: how each was answered. */
+  claims: { job: string; status?: number; answer?: any }[] = [];
   jobs = new Map<string, any>();
   secrets = new Map<string, any>();
   pods = new Map<string, Pod>();
@@ -293,7 +425,7 @@ class FakeCluster {
     for await (const chunk of req) text += chunk;
     const url = new URL(req.url!, "https://cluster");
     const body = text ? JSON.parse(text) : undefined;
-    this.requests.push({ method: req.method!, path: url.pathname + url.search, auth: req.headers.authorization, body });
+    this.requests.push({ method: req.method!, path: url.pathname + url.search, auth: req.headers.authorization, type: req.headers["content-type"], body });
     const reply = (status: number, value: object) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
     const missing = () => reply(404, { kind: "Status", message: "not found", code: 404 });
     if (req.headers.authorization !== `Bearer ${this.token}`) return reply(401, { kind: "Status", message: "Unauthorized", code: 401 });
@@ -310,12 +442,21 @@ class FakeCluster {
     }
     if (req.method === "POST" && url.pathname === `/api/v1${ns}secrets`) {
       this.secrets.set(body.metadata.name, body);
+      // A warm worker's pod starts, and claims, before anyone looks for it.
+      const job = this.jobs.get(body.metadata.name);
+      if (job?.spec.template.spec.containers[0].command.includes("--pool")) this.pod(job);
       return reply(201, body);
     }
     if ((match = new RegExp(`^/apis/batch/v1${ns}jobs/([\\w-]+)$`).exec(url.pathname))) {
       const job = this.jobs.get(match[1]);
       if (!job) return missing();
       if (req.method === "GET") return reply(200, job);
+      if (req.method === "PATCH") {
+        if (req.headers["content-type"] !== "application/merge-patch+json") return reply(415, { kind: "Status", message: "a merge patch, here", code: 415 });
+        Object.assign(job.metadata.labels, body.metadata?.labels);
+        Object.assign(job.spec, body.spec);
+        return reply(200, job);
+      }
       if (req.method === "DELETE") {
         this.jobs.delete(match[1]);
         for (const [name, pod] of this.pods) {
@@ -336,6 +477,7 @@ class FakeCluster {
       if (!pod) return missing();
       if (!match[2]) return reply(200, { metadata: { name: pod.name }, status: pod.status });
       assert.equal(url.searchParams.get("follow"), "true");
+      await pod.claimed;
       res.writeHead(200, { "content-type": "text/plain" });
       for (const line of pod.script.lines ?? []) res.write(`${line}\n`);
       if (pod.script.hold) return void pod.logs.push(res);
@@ -350,9 +492,12 @@ class FakeCluster {
     const name = `${job.metadata.name}-x7k2p`;
     const secret = this.secrets.get(job.metadata.name);
     if (!this.pods.has(name) && secret) {
-      const script = this.script(JSON.parse(secret.stringData["task.json"]).prompt);
+      const command: string[] = job.spec.template.spec.containers[0].command;
+      const pool = command.indexOf("--pool");
+      const script = pool === -1 ? this.script(JSON.parse(secret.stringData["task.json"]).prompt) : {};
       const pod: Pod = { name, job: job.metadata.name, script, logs: [], status: { phase: "Running", containerStatuses: [{ state: { running: {} } }] } };
       this.pods.set(name, pod);
+      if (pool !== -1) pod.claimed = this.claim(pod, command[pool + 1], secret.stringData.ticket);
       // A pod that never starts, which the Job's deadline ends.
       if (script.pending) {
         pod.status = { phase: "Pending", containerStatuses: [{ state: { waiting: script.pending } }] };
@@ -362,10 +507,21 @@ class FakeCluster {
     return this.pods.get(name);
   }
 
+  /** A warm worker's claim, with the ticket its Secret gave it. */
+  private async claim(pod: Pod, url: string, ticket: string): Promise<void> {
+    const res = await fetch(`${url}/internal/pool/claim`, { method: "POST", headers: { authorization: `Bearer ${ticket}` } }).catch(() => undefined);
+    const answer = res?.status === 200 ? await res.json() : undefined;
+    await res?.body?.cancel().catch(() => {});
+    this.claims.push({ job: pod.job, status: res?.status, answer });
+    if (answer) pod.script = this.script(answer.prompt);
+    else this.end(pod);
+  }
+
   private end(pod: Pod): void {
     const { exitCode = 0, reason, jobReason } = pod.script;
     pod.status = { phase: exitCode ? "Failed" : "Succeeded", containerStatuses: [{ state: { terminated: { exitCode, reason: reason ?? (exitCode ? "Error" : "Completed") } } }] };
     const job = this.jobs.get(pod.job);
+    if (!job) return;
     job.status = { conditions: [{ type: exitCode ? "Failed" : "Complete", status: "True", ...((jobReason ?? exitCode) ? { reason: jobReason ?? "BackoffLimitExceeded" } : {}) }] };
   }
 }
@@ -391,7 +547,7 @@ describe("the Kubernetes runner", () => {
     const tokenFile = join(base, "token");
     await writeFile(tokenFile, `${cluster.token}\n`);
     const runner = new KubernetesRunner({ apiUrl: cluster.url, tokenFile, caFile: join(FIXTURES, "k8s-api.crt"), namespace: "jig", image: "registry.example.com/jig-worker:1", gatewayBaseUrl: "http://jig-gateway.jig.svc:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config });
-    return { cluster, tokenFile, api: await service(runner) };
+    return { cluster, tokenFile, runner, api: await service(runner) };
   }
 
   it("sends a Job with the limits, the deadline, the ttl, the runtime class and a locked-down pod, the token in a Secret it owns", async () => {
@@ -446,6 +602,15 @@ describe("the Kubernetes runner", () => {
     // The events from the pod's log, jig's other output and the worker's line left out; the stats from that line.
     assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
     assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("passes a task with approvals the flags that ask at the internal listener's Service", async () => {
+    const { cluster, api } = await kubernetes({ internalBaseUrl: "http://jig-api-internal.jig.svc:8082" });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x", approvals: true, model: "claude-haiku-4-5", timeLimit: 600 })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    const [container] = cluster.jobs.get(objectName(id)).spec.template.spec.containers;
+    assert.deepEqual(container.command.slice(3, 12), ["jig", "--no-sandbox", "--mode", "edits", "--approve-via", "http://jig-api-internal.jig.svc:8082/internal/approvals", "--approval-timeout", "600", "--model"]);
   });
 
   it("maps how the pod and the Job ended, and the end event, to the task's status", async () => {
@@ -504,6 +669,90 @@ describe("the Kubernetes runner", () => {
     assert.deepEqual(deletes.map(({ path, auth, body }) => [path, auth, body]), [[`/apis/batch/v1/namespaces/jig/jobs/${objectName(id)}?propagationPolicy=Background`, "Bearer the renewed token", { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Background" }]]);
     assert.equal(cluster.jobs.size, 0);
   });
+
+  it("gives a task to a warm worker's Job, its deadline moved to the task's, with no Job made for the task", async () => {
+    Object.assign(process.env, REAL);
+    const { cluster, runner, api } = await kubernetes({ pool: { size: 1, maxIdleSeconds: 300 }, runtimeClassName: "gvisor" });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [[name, warm]] = [...cluster.jobs];
+    assert.match(name, /^jig-pool-[0-9a-f]{16}$/);
+    // A task's pod in all but its command, its ticket for the token, and no input mounted.
+    assert.equal(warm.spec.activeDeadlineSeconds, 360, "the most it may wait, and a minute");
+    assert.deepEqual(warm.spec.template.metadata.labels, { ...ROLE_LABELS, "jig.dev/pool": name.slice("jig-".length) });
+    const pod = warm.spec.template.spec;
+    assert.deepEqual([pod.runtimeClassName, pod.serviceAccountName, pod.automountServiceAccountToken, pod.enableServiceLinks], ["gvisor", "jig-task", false, false]);
+    assert.deepEqual(pod.securityContext, { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: "RuntimeDefault" } });
+    const [container] = pod.containers;
+    assert.deepEqual(container.securityContext, { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: { drop: ["ALL"] } });
+    assert.deepEqual(container.command, ["node", "/opt/jig/server/worker.ts", "--pool", api.internalUrl]);
+    assert.deepEqual(container.env.at(-1), { name: "JIG_POOL_TICKET", valueFrom: { secretKeyRef: { name, key: "ticket" } } });
+    assert.deepEqual(container.volumeMounts.map((mount: { name: string }) => mount.name), ["task", "tmp"]);
+    const secret = cluster.secrets.get(name);
+    assert.deepEqual(secret.metadata.ownerReferences, [{ apiVersion: "batch/v1", kind: "Job", name, uid: warm.metadata.uid }]);
+    assert.deepEqual(Object.keys(secret.stringData), ["ticket"]);
+    assert.match(secret.stringData.ticket, /^[\w-]{43}$/);
+
+    const lines = logOf(0, "end_turn");
+    cluster.script = () => ({ lines });
+    const before = cluster.requests.length;
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "the task, in the claim's answer", model: "claude-haiku-4-5", timeLimit: 600, workspace: { files: { "app.py": "print(1)\n" } } })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
+    assert.equal(runner.pool!.stats().hits, 1);
+    // No Job of its own: the warm one's deadline is the task's time limit and the grace, from now, and it has the task's labels.
+    const since = cluster.requests.slice(before);
+    const made = since.filter((request) => request.method === "POST" && request.path.endsWith("/jobs")).map((request) => request.body.metadata.name);
+    assert.ok(made.every((job) => /^jig-pool-/.test(job)) && !cluster.jobs.has(objectName(id)), `Jobs made: ${made}`);
+    const [patch, ...more] = since.filter((request) => request.method === "PATCH");
+    assert.equal(more.length, 0);
+    assert.deepEqual([patch.path, patch.type], [`/apis/batch/v1/namespaces/jig/jobs/${name}`, "application/merge-patch+json"]);
+    assert.deepEqual(patch.body.metadata, { labels: { [TASK_LABEL]: id, "jig.dev/tenant": "acme" } });
+    assert.ok(patch.body.spec.activeDeadlineSeconds >= 605 && patch.body.spec.activeDeadlineSeconds <= 610, String(patch.body.spec.activeDeadlineSeconds));
+
+    // The claim's answer: what a cold task's Secret and command line hold.
+    const [claim] = cluster.claims;
+    assert.equal(claim.status, 200);
+    const { env, ...rest } = claim.answer;
+    assert.deepEqual(rest, {
+      prompt: "the task, in the claim's answer",
+      workspace: { files: { "app.py": "print(1)\n" } },
+      gitProtocols: ["https"],
+      work: "/task/work",
+      stats: "/task/stats.json",
+      command: ["jig", "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--base-url", "http://jig-gateway.jig.svc:8081/anthropic", "--max-steps", "50", "--time-limit", "600", "--events", "-", "--stats", "/task/stats.json", "-C", "/task/work", "-"],
+      report: true,
+    });
+    const payload = payloadOf(env.ANTHROPIC_API_KEY);
+    assert.deepEqual([payload.tenant, payload.task, payload.budgetUsd], ["acme", id, 2.5]);
+    const sent = JSON.stringify(cluster.requests);
+    for (const value of [...Object.values(REAL), SECRET]) assert.ok(!sent.includes(value), "no real key nor the gateway's secret reaches the cluster");
+    // The events from the warm pod's log.
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("cancels a task on a warm worker by deleting its Job, and deletes the idle ones' as the service stops", async () => {
+    const { cluster, runner, api } = await kubernetes({ pool: { size: 1 } });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [name] = [...cluster.jobs.keys()];
+    cluster.script = () => ({ lines: logOf(undefined, undefined), hold: true });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    await until(async () => (await api.store.events(id)).length === 3, "the pod's events");
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+    const deletes = () => cluster.requests.filter((request) => request.method === "DELETE").map((request) => request.path);
+    assert.deepEqual(deletes(), [`/apis/batch/v1/namespaces/jig/jobs/${name}?propagationPolicy=Background`]);
+
+    await until(() => runner.pool!.stats().idle === 1, "the worker in its place");
+    const [idle] = [...cluster.jobs.keys()];
+    services.splice(services.indexOf(api), 1);
+    await api.close();
+    assert.deepEqual(deletes().at(-1), `/apis/batch/v1/namespaces/jig/jobs/${idle}?propagationPolicy=Background`);
+    assert.equal(cluster.jobs.size, 0);
+    // Its claim was answered as it was stopped.
+    await until(() => cluster.claims.length === 2, "the idle worker's claim answered");
+    assert.deepEqual(cluster.claims.map((claim) => claim.status), [200, 410]);
+  });
 });
 
 describe("the worker a task's pod runs", () => {
@@ -536,6 +785,139 @@ describe("the worker a task's pod runs", () => {
     assert.equal(stdout, "");
     assert.match(stderr, /leads out of the workspace/);
     assert.equal(existsSync(join(dir, "escape")), false);
+  });
+
+  /** A warm worker, its claim answered by `answer` (status and body), with the ticket in its environment. */
+  async function warmWorker(answer: (req: IncomingMessage) => [number, object]) {
+    const claims: { method?: string; url?: string; auth?: string }[] = [];
+    const server = createHttpServer((req, res) => {
+      claims.push({ method: req.method, url: req.url, auth: req.headers.authorization });
+      const [status, body] = answer(req);
+      res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    const child = spawn(process.execPath, [WORKER, "--pool", `http://127.0.0.1:${(server.address() as AddressInfo).port}/`], { env: { PATH: process.env.PATH, JIG_POOL_TICKET: "the ticket" }, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    const code = await new Promise<number | null>((done) => child.on("close", done));
+    return { code, stdout, stderr, claims };
+  }
+
+  it("as a warm worker, claims its task with its ticket, and runs jig with the task's token and not the ticket", async () => {
+    const dir = await tempDir("jig-worker-");
+    const work = join(dir, "work");
+    const stats = join(dir, "stats.json");
+    const command = [process.execPath, FAKE_JIG, "--events", "-", "--stats", stats, "-C", work, "-"];
+    const { code, stdout, claims } = await warmWorker(() => [200, { prompt: "exit 3", workspace: { files: { "app.py": "print(1)\n" } }, gitProtocols: ["https"], work, stats, command, env: { ANTHROPIC_API_KEY: "the task's token" }, report: true }]);
+    assert.deepEqual(claims, [{ method: "POST", url: "/internal/pool/claim", auth: "Bearer the ticket" }]);
+    assert.equal(code, 3);
+    assert.deepEqual(JSON.parse(stdout.trim().split("\n").at(-1)!), { jigWorker: 1, exitCode: 3, stats: { stop: "max_tokens", steps: 2 } });
+    assert.equal(await readFile(join(work, "app.py"), "utf8"), "print(1)\n");
+    const jig = JSON.parse(await readFile(join(work, ".fake-jig.json"), "utf8"));
+    assert.equal(jig.task, "exit 3");
+    assert.equal(jig.env.ANTHROPIC_API_KEY, "the task's token");
+    assert.equal(jig.env.JIG_POOL_TICKET, undefined);
+  });
+
+  it("as a warm worker, exits with no task when its claim is refused", async () => {
+    for (const status of [401, 410]) {
+      const { code, stdout, stderr } = await warmWorker(() => [status, { error: "no" }]);
+      assert.equal(code, 0);
+      assert.equal(stdout, "");
+      assert.match(stderr, new RegExp(`its claim was refused \\(${status}\\)`));
+    }
+  });
+});
+
+describe("the warm pool", () => {
+  /** A pool whose workers are records the test claims with and ends, its claims served on a listener. */
+  async function pool(config: ConstructorParameters<typeof WarmPool>[0]) {
+    const workers: { ticket: string; stopped: boolean; exit: () => void }[] = [];
+    const warm = new WarmPool<number>(config, async (ticket) => {
+      let exit!: () => void;
+      const exited = new Promise<void>((done) => (exit = done));
+      const worker = { ticket, stopped: false, exit };
+      workers.push(worker);
+      // Stopped, it exits when the test says: a container takes a moment to go.
+      return { slot: workers.length, exited, stop: () => void (worker.stopped = true) };
+    });
+    const server = createHttpServer((req, res) => void warm.claim(req, res));
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/internal/pool/claim`;
+    const claim = (ticket?: string, init: RequestInit = {}) => fetch(url, { method: "POST", headers: ticket ? { authorization: `Bearer ${ticket}` } : {}, ...init });
+    return { warm, workers, claim };
+  }
+
+  it("spends a ticket at its first claim, gives the worker one task, and starts another in its place", async () => {
+    const { warm, workers, claim } = await pool({ size: 1 });
+    assert.equal(workers.length, 0, "not before it is opened");
+    warm.open();
+    await until(() => workers.length === 1, "a worker");
+    assert.equal((await claim()).status, 401);
+    assert.equal((await claim("not a ticket")).status, 401);
+    assert.equal((await claim(workers[0].ticket, { method: "GET" })).status, 405);
+    const held = claim(workers[0].ticket);
+    await until(() => warm.stats().idle === 1, "the claim held");
+    assert.equal((await claim(workers[0].ticket)).status, 401, "a second use");
+    const taken = warm.take("task_1")!;
+    assert.equal(taken.slot, 1);
+    assert.equal(workers.length, 2, "another in its place");
+    assert.ok(taken.answer({ prompt: "the task" }));
+    const answer = await held;
+    assert.deepEqual([answer.status, await answer.json()], [200, { prompt: "the task" }]);
+    // The next isn't waiting yet: the task starts cold.
+    assert.equal(warm.take("task_2"), undefined);
+    assert.deepEqual(warm.stats(), { size: 1, idle: 0, starting: 1, hits: 1, misses: 1 });
+    // A worker whose claim goes away is stopped, and can't be given a task.
+    const gone = new AbortController();
+    void claim(workers[1].ticket, { signal: gone.signal }).catch(() => {});
+    await until(() => warm.stats().idle === 1, "the second claim held");
+    gone.abort();
+    await until(() => workers[1].stopped, "the second worker stopped");
+    assert.equal(warm.take("task_3"), undefined);
+    workers[1].exit();
+    await until(() => workers.length === 3, "a third in its place");
+    const closing = warm.close();
+    assert.ok(workers[2].stopped);
+    workers[2].exit();
+    await closing;
+  });
+
+  it("stops a worker idle past maxIdleSeconds, another in its place, and refuses its ticket as expired", async () => {
+    const { warm, workers, claim } = await pool({ size: 1, maxIdleSeconds: 0.3 });
+    warm.open();
+    const held = claim(workers[0].ticket);
+    // Told so in the answer to its claim, stopped, and another started in its place.
+    assert.equal((await held).status, 410);
+    assert.ok(workers[0].stopped);
+    assert.equal(workers.length, 2);
+    // One that never claimed is stopped too: its ticket has expired until it is gone, then is as unknown as any.
+    await until(() => workers[1].stopped, "the second worker stopped");
+    assert.equal(workers.length, 3);
+    assert.equal((await claim(workers[1].ticket)).status, 410);
+    workers[1].exit();
+    await until(async () => (await claim(workers[1].ticket)).status === 401, "the second worker gone");
+    const closing = warm.close();
+    for (const worker of workers) worker.exit();
+    await closing;
+  });
+
+  it("starts a worker again only after a pause when one exits before it claims", async () => {
+    const { warm, workers } = await pool({ size: 1 });
+    warm.open();
+    // Its image can't run, say: starting another at once would only loop.
+    workers[0].exit();
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(workers.length, 1);
+    await until(() => workers.length === 2, "a worker after the pause");
+    const closing = warm.close();
+    assert.ok(workers[1].stopped);
+    workers[1].exit();
+    await closing;
   });
 });
 
@@ -630,12 +1012,13 @@ describe("the deploy files", () => {
     for (const text of ["a: &anchor 1", "a: b # a comment", "a:\n\tb: 1", "a: 1\na: 2", "a: 1\n b: 2", "a: >\n  folded"]) assert.throws(() => parseYaml(text), text);
   });
 
-  it("keep the task pods to the gateway and DNS, and give the service only what the runner needs", async () => {
+  it("keep the task pods to the gateway, the internal listener and DNS, and give the service only what the runner needs", async () => {
     const all = await manifests();
     for (const doc of all) assert.ok(doc.apiVersion && doc.kind && doc.metadata.name, JSON.stringify(doc).slice(0, 100));
     for (const doc of all.filter((doc) => !["Namespace", "RuntimeClass"].includes(doc.kind))) assert.equal(doc.metadata.namespace, "jig", `${doc.kind} ${doc.metadata.name}`);
 
-    // The NetworkPolicy selects the pods the runner labels, and lets them reach only the gateway's pods, on its port, and DNS.
+    // The NetworkPolicy selects the pods the runner labels, and lets them reach only the gateway's pods, on
+    // its port, the service's pods on the internal listener's port, and DNS.
     const policy = find(all, "NetworkPolicy", "jig-task").spec;
     assert.deepEqual(policy.podSelector.matchLabels, ROLE_LABELS);
     assert.deepEqual(policy.policyTypes, ["Ingress", "Egress"]);
@@ -643,13 +1026,22 @@ describe("the deploy files", () => {
     const gateway = find(all, "Deployment", "jig-gateway").spec.template;
     assert.deepEqual(policy.egress[0].to, [{ podSelector: { matchLabels: gateway.metadata.labels } }]);
     assert.deepEqual(policy.egress[0].ports, [{ protocol: "TCP", port: gateway.spec.containers[0].ports[0].containerPort }]);
-    assert.deepEqual(policy.egress[1].ports.map((port: { port: number }) => port.port), [53, 53]);
-    assert.equal(policy.egress.length, 2);
+    const service = find(all, "Deployment", "jig-api").spec.template;
+    const { internal, internalBaseUrl } = JSON.parse(find(all, "ConfigMap", "jig-config").data["service.json"]);
+    assert.deepEqual(policy.egress[1].to, [{ podSelector: { matchLabels: service.metadata.labels } }]);
+    assert.deepEqual(policy.egress[1].ports, [{ protocol: "TCP", port: internal.port }]);
+    assert.deepEqual(policy.egress[2].ports.map((port: { port: number }) => port.port), [53, 53]);
+    assert.equal(policy.egress.length, 3);
     assert.deepEqual(find(all, "Service", "jig-gateway").spec.selector, gateway.metadata.labels);
+    // The internal listener has a Service of its own, which the config tells the tasks; the tenants' has only its port.
+    assert.ok(service.spec.containers[0].ports.some((port: { containerPort: number }) => port.containerPort === internal.port));
+    assert.deepEqual(find(all, "Service", "jig-api-internal").spec, { selector: service.metadata.labels, ports: [{ port: internal.port, targetPort: internal.port }] });
+    assert.equal(internalBaseUrl, `http://jig-api-internal.jig.svc:${internal.port}`);
+    assert.deepEqual(find(all, "Service", "jig-api").spec.ports.map((port: { port: number }) => port.port), [8080]);
 
     // The service's account may run Jobs, follow their pods and make their Secrets, and no more.
     const rules = find(all, "Role", "jig-api").rules.map((rule: any) => [rule.apiGroups, rule.resources, rule.verbs]);
-    assert.deepEqual(rules, [[["batch"], ["jobs"], ["create", "get", "delete"]], [[""], ["pods"], ["get", "list"]], [[""], ["pods/log"], ["get"]], [[""], ["secrets"], ["create"]]]);
+    assert.deepEqual(rules, [[["batch"], ["jobs"], ["create", "get", "patch", "delete"]], [[""], ["pods"], ["get", "list"]], [[""], ["pods/log"], ["get"]], [[""], ["secrets"], ["create"]]]);
     assert.deepEqual(find(all, "RoleBinding", "jig-api").subjects, [{ kind: "ServiceAccount", name: "jig-api", namespace: "jig" }]);
     assert.equal(find(all, "Deployment", "jig-api").spec.template.spec.serviceAccountName, "jig-api");
     assert.equal(find(all, "ServiceAccount", "jig-task").automountServiceAccountToken, false);
@@ -662,16 +1054,34 @@ describe("the deploy files", () => {
     assert.equal(config.gatewayBaseUrl, `http://jig-gateway.jig.svc:${find(all, "Service", "jig-gateway").spec.ports[0].port}/anthropic`);
     // Secrets are referenced, never included.
     assert.ok(!all.some((doc) => doc.kind === "Secret"));
+
+    // Two replicas of the service, sharing the database the jig-database Secret names.
+    const api = find(all, "Deployment", "jig-api").spec;
+    assert.equal(api.replicas, 2);
+    assert.equal(config.database, undefined);
+    const env = api.template.spec.containers[0].env.find((variable: { name: string }) => variable.name === "JIG_DATABASE_URL");
+    assert.deepEqual(env.valueFrom, { secretKeyRef: { name: "jig-database", key: "url" } });
+    // Each replica's warm workers claim at its own pod's address, on the internal listener's port.
+    const variables = api.template.spec.containers[0].env;
+    const own = variables.findIndex((variable: { name: string }) => variable.name === "POD_IP");
+    assert.deepEqual(variables[own].valueFrom, { fieldRef: { fieldPath: "status.podIP" } });
+    const pool = variables.findIndex((variable: { name: string }) => variable.name === "JIG_POOL_BASE_URL");
+    assert.ok(own < pool, "defined before it refers to it");
+    assert.equal(variables[pool].value, `http://$(POD_IP):${internal.port}`);
+    assert.ok(!all.some((doc) => doc.kind === "PersistentVolumeClaim"), "the replicas share no disk");
   });
 
   it("put the gateway on the tasks' internal network on one machine, and the worker image runs jig as the runners' user", async () => {
     const [compose] = parseYaml(await readFile(join(DEPLOY, "docker-compose.yml"), "utf8")) as any[];
     assert.deepEqual(compose.networks.tasks, { name: "jig-tasks", internal: true });
     assert.deepEqual(compose.services.gateway.networks, ["default", "tasks"]);
-    assert.equal(compose.services.api.networks, undefined, "the service needn't reach the tasks");
+    // The service is on it too, where the tasks reach its internal listener.
+    assert.deepEqual(compose.services.api.networks, ["default", "tasks"]);
     assert.ok(compose.services.api.volumes.includes("/var/run/docker.sock:/var/run/docker.sock"));
     const config = JSON.parse(await readFile(join(DEPLOY, "service.docker.json"), "utf8"));
     assert.deepEqual([config.runner, config.docker.network, new URL(config.gatewayBaseUrl).hostname], ["docker", "jig-tasks", "gateway"]);
+    assert.equal(config.internalBaseUrl, `http://api:${config.internal.port}`);
+    assert.equal(config.internal.host, "0.0.0.0");
     // The data's folder is at the same path for the daemon as for the service.
     assert.ok(compose.services.api.volumes.includes(`${config.dataDir}:${config.dataDir}`));
 

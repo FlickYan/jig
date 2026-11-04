@@ -1,16 +1,20 @@
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { type IncomingMessage, request as httpRequest } from "node:http";
+import { type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
-import type { WorkerInput } from "../worker.ts";
+import type { PoolAnswer, WorkerInput } from "../worker.ts";
 import { Lines, parseEvent } from "./local.ts";
 
 // Runs each task as a Kubernetes Job of its own, through the API server with the service account's
 // token. The Job's one pod runs server/worker.ts in the worker image, which makes the workspace and starts
 // jig with `--events -`, so the events come in the pod's log, which this follows: a pod's files are on its
 // node, out of the service's reach, while its log is the API server's to give. The prompt, the workspace
-// and the task's gateway token go in a Secret the Job owns, so they are deleted with it.
+// and the task's gateway token go in a Secret the Job owns, so they are deleted with it. With a pool, Jobs
+// are started ahead of tasks, and a task is given to one whose worker waits (pool.ts): the worker gets the
+// task in the answer to its claim, and its pod's log is followed as a task's own.
 
 export interface KubernetesRunnerConfig {
   /** The API server (default: in the cluster, https://kubernetes.default.svc). */
@@ -40,6 +44,10 @@ export interface KubernetesRunnerConfig {
   gatewaySecret: string;
   graceSeconds: number;
   gitProtocols?: string[];
+  /** The service's internal listener as the pods reach it (its Service): where tasks ask for approvals. */
+  internalBaseUrl?: string;
+  /** Workers started ahead of tasks (pool.ts): none unless `size` is set. */
+  pool?: PoolConfig;
   /** How often the Job and its pod are looked at, in milliseconds (default: 1000). */
   pollMs?: number;
 }
@@ -48,12 +56,22 @@ const ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
 const RESOURCES = { requests: { cpu: "250m", memory: "1Gi", "ephemeral-storage": "1Gi" }, limits: { cpu: "1", memory: "2Gi", "ephemeral-storage": "4Gi" } };
 /** The label the runner finds a task's pod by, and the one the deploy files' NetworkPolicy selects. */
 export const TASK_LABEL = "jig.dev/task";
+/** The label a warm worker's Job and pod are found by, until a task is given to it. */
+export const POOL_LABEL = "jig.dev/pool";
 export const ROLE_LABELS = { "app.kubernetes.io/name": "jig", "app.kubernetes.io/component": "task" };
 // Where the pod keeps the task's input and folder, and how long it waits for the API server past the
 // deadline the Job itself keeps, should the Job controller not stop it.
 const INPUT = "/task-input";
 const TASK = "/task";
 const SLACK_MS = 60_000;
+
+/** A warm worker's Job: where it is, when it was made, and the selector its pod is found by. */
+interface Slot {
+  ns: string;
+  jobPath: string;
+  created: number;
+  selector: string;
+}
 
 /** A Kubernetes object, as much of it as the runner reads. */
 interface Resource {
@@ -68,38 +86,135 @@ interface Resource {
 }
 
 export class KubernetesRunner implements Runner {
+  /** The workers started ahead of tasks, if the config asks for any. */
+  readonly pool?: WarmPool<Slot>;
   private config: KubernetesRunnerConfig;
   private ca: Promise<Buffer> | undefined;
   private ns: Promise<string> | undefined;
+  /** Where the warm workers claim their tasks. */
+  private poolUrl = "";
 
   constructor(config: KubernetesRunnerConfig) {
     this.config = config;
+    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket));
+  }
+
+  warm(internalBaseUrl: string): void {
+    this.poolUrl = this.config.pool?.baseUrl ?? internalBaseUrl;
+    this.pool?.open();
+  }
+
+  async claim(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.pool) return void res.writeHead(404, { "content-type": "application/json" }).end(`${JSON.stringify({ error: "This service keeps no warm workers" })}\n`);
+    return this.pool.claim(req, res);
+  }
+
+  async close(): Promise<void> {
+    await this.pool?.close();
   }
 
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
-    const { graceSeconds, pollMs = 1000 } = this.config;
+    const warm = this.pool?.take(task.id);
+    const handle = warm && (await this.startWarm(warm, task, tenant));
+    if (handle) return handle;
+    const { graceSeconds } = this.config;
     const ns = await this.namespace();
     const name = objectName(task.id);
     const jobPath = `/apis/batch/v1/namespaces/${ns}/jobs/${name}`;
-    const job = await this.call<Resource>("POST", `/apis/batch/v1/namespaces/${ns}/jobs`, this.job(task, tenant, name));
+    const command = [...this.worker(), `${INPUT}/task.json`, ...this.jigCommand(task, tenant)];
+    const env = [{ name: keyVariable(task.spec.model), valueFrom: { secretKeyRef: { name, key: "token" } } }];
+    const labels = { [TASK_LABEL]: task.id, "jig.dev/tenant": tenant.id };
+    const job = await this.call<Resource>("POST", `/apis/batch/v1/namespaces/${ns}/jobs`, this.job(name, labels, command, env, task.spec.timeLimit + graceSeconds, true));
     const input: WorkerInput = { prompt: task.spec.prompt, workspace: task.spec.workspace, gitProtocols: this.config.gitProtocols ?? ["https"], work: `${TASK}/work`, stats: `${TASK}/stats.json` };
+    // Made after the Job, whose uid it needs to be deleted with it; the pod waits for it to mount.
+    await this.secret(ns, name, job, { [TASK_LABEL]: task.id }, { token: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds), "task.json": JSON.stringify(input) });
+    return this.followed(ns, jobPath, `${TASK_LABEL}=${task.id}`, task);
+  }
+
+  /**
+   * Runs the task on a warm worker: the Job's deadline moved to the task's time limit and the grace from
+   * now, and the task, what a cold start puts in its Secret and command line, in the answer to its claim.
+   * Undefined if the worker can't take it (it went away, or its Job couldn't be changed), and the task
+   * starts cold.
+   */
+  private async startWarm(warm: Warm<Slot>, task: Task, tenant: Tenant): Promise<RunHandle | undefined> {
+    const { graceSeconds } = this.config;
+    const { ns, jobPath, created, selector } = warm.slot;
+    // activeDeadlineSeconds counts from the Job's start, which is after `created`.
+    const deadline = Math.ceil((Date.now() - created) / 1000) + task.spec.timeLimit + graceSeconds;
+    const labels = { [TASK_LABEL]: task.id, "jig.dev/tenant": tenant.id };
+    try {
+      await this.call("PATCH", jobPath, { metadata: { labels }, spec: { activeDeadlineSeconds: deadline } }, [], "application/merge-patch+json");
+    } catch (err) {
+      console.error(`jig service: couldn't give ${task.id} to a warm worker:`, err instanceof Error ? err.message : err);
+      warm.stop();
+      return undefined;
+    }
+    const answer: PoolAnswer = {
+      prompt: task.spec.prompt,
+      workspace: task.spec.workspace,
+      gitProtocols: this.config.gitProtocols ?? ["https"],
+      work: `${TASK}/work`,
+      stats: `${TASK}/stats.json`,
+      command: this.jigCommand(task, tenant),
+      env: { [keyVariable(task.spec.model)]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) },
+      report: true,
+    };
+    if (!warm.answer(answer)) return undefined;
+    return this.followed(ns, jobPath, selector, task);
+  }
+
+  /**
+   * A warm worker: a Job like a task's, its pod's labels and limits the same, that runs the worker with
+   * --pool, its ticket in a Secret the Job owns. Its deadline is the most it may wait and a minute, until a
+   * task is given to it.
+   */
+  private async launchWarm(ticket: string): Promise<Started<Slot>> {
+    const ns = await this.namespace();
+    const id = `pool-${randomBytes(8).toString("hex")}`;
+    const name = objectName(id);
+    const jobPath = `/apis/batch/v1/namespaces/${ns}/jobs/${name}`;
+    const labels = { [POOL_LABEL]: id };
+    const env = [{ name: "JIG_POOL_TICKET", valueFrom: { secretKeyRef: { name, key: "ticket" } } }];
+    const created = Date.now();
+    const job = await this.call<Resource>("POST", `/apis/batch/v1/namespaces/${ns}/jobs`, this.job(name, labels, [...this.worker(), "--pool", this.poolUrl], env, (this.config.pool?.maxIdleSeconds ?? 600) + SLACK_MS / 1000, false));
+    await this.secret(ns, name, job, labels, { ticket });
+    // The pool hears of a worker that goes from its claim, so this one is gone once its Job is deleted.
+    let gone!: () => void;
+    const exited = new Promise<void>((done) => (gone = done));
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      void this.remove(jobPath)
+        .catch((err: unknown) => console.error(`jig service: couldn't delete the warm worker's Job ${name}:`, err instanceof Error ? err.message : err))
+        .finally(gone);
+    };
+    return { slot: { ns, jobPath, created, selector: `${POOL_LABEL}=${id}` }, exited, stop };
+  }
+
+  /** Makes the Secret the Job `name` owns, so it is deleted with it; the Job is deleted if it can't be made. */
+  private async secret(ns: string, name: string, job: Resource, labels: Record<string, string>, stringData: Record<string, string>): Promise<void> {
     const secret = {
       apiVersion: "v1",
       kind: "Secret",
-      metadata: { name, labels: { [TASK_LABEL]: task.id }, ownerReferences: [{ apiVersion: "batch/v1", kind: "Job", name, uid: job.metadata?.uid }] },
+      metadata: { name, labels, ownerReferences: [{ apiVersion: "batch/v1", kind: "Job", name, uid: job.metadata?.uid }] },
       type: "Opaque",
-      stringData: { token: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds), "task.json": JSON.stringify(input) },
+      stringData,
     };
-    // Made after the Job, whose uid it needs to be deleted with it; the pod waits for it to mount.
     await this.call("POST", `/api/v1/namespaces/${ns}/secrets`, secret).catch(async (err: unknown) => {
-      await this.remove(jobPath).catch(() => {});
+      await this.remove(`/apis/batch/v1/namespaces/${ns}/jobs/${name}`).catch(() => {});
       throw err;
     });
+  }
 
+  /** The run of the Job's pod (the one `selector` finds), followed to its end; a cancel deletes the Job. */
+  private followed(ns: string, jobPath: string, selector: string, task: Task): RunHandle {
+    const { graceSeconds, pollMs = 1000 } = this.config;
     const events = new Channel<JigEvent>();
     let cancelled = false;
     const backstop = Date.now() + (task.spec.timeLimit + graceSeconds) * 1000 + SLACK_MS;
-    const exit = this.follow(ns, jobPath, task.id, events, pollMs, backstop).finally(() => events.close());
+    const exit = this.follow(ns, jobPath, selector, events, pollMs, backstop).finally(() => events.close());
     const cancel = () => {
       if (cancelled) return;
       cancelled = true;
@@ -108,21 +223,33 @@ export class KubernetesRunner implements Runner {
     return { events: events.drain(), wait: () => exit, cancel };
   }
 
-  /** The Job for a task: one pod, run once, ended at the time limit and the grace, kept for the ttl. */
-  private job(task: Task, tenant: Tenant, name: string): object {
-    const { image, worker = ["node", "/opt/jig/server/worker.ts"], jig = ["jig"], user = 10001 } = this.config;
-    const labels = { ...ROLE_LABELS, [TASK_LABEL]: task.id, "jig.dev/tenant": tenant.id };
-    const command = [...worker, `${INPUT}/task.json`, ...jig, "--no-sandbox", ...jigArgs(task, { cwd: `${TASK}/work`, events: "-", stats: `${TASK}/stats.json`, baseUrl: this.config.gatewayBaseUrl })];
+  private worker(): string[] {
+    return this.config.worker ?? ["node", "/opt/jig/server/worker.ts"];
+  }
+
+  /** jig's command line in the pod, its events to stdout, into the pod's log. */
+  private jigCommand(task: Task, tenant: Tenant): string[] {
+    const { jig = ["jig"] } = this.config;
+    return [...jig, "--no-sandbox", ...jigArgs(task, tenant, { cwd: `${TASK}/work`, events: "-", stats: `${TASK}/stats.json`, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })];
+  }
+
+  /**
+   * A Job: one pod, run once, ended at `deadline` seconds, kept for the ttl, locked down as every task's
+   * pod is. `input` mounts the task's input from the Secret named as the Job.
+   */
+  private job(name: string, labels: Record<string, string>, command: string[], env: object[], deadline: number, input: boolean): object {
+    const { image, user = 10001 } = this.config;
+    const all = { ...ROLE_LABELS, ...labels };
     return {
       apiVersion: "batch/v1",
       kind: "Job",
-      metadata: { name, labels },
+      metadata: { name, labels: all },
       spec: {
         backoffLimit: 0,
-        activeDeadlineSeconds: task.spec.timeLimit + this.config.graceSeconds,
+        activeDeadlineSeconds: deadline,
         ttlSecondsAfterFinished: this.config.ttlSecondsAfterFinished ?? 600,
         template: {
-          metadata: { labels },
+          metadata: { labels: all },
           spec: {
             restartPolicy: "Never",
             ...(this.config.runtimeClassName && { runtimeClassName: this.config.runtimeClassName }),
@@ -137,23 +264,18 @@ export class KubernetesRunner implements Runner {
                 image,
                 command,
                 workingDir: TASK,
-                env: [
-                  { name: "HOME", value: `${TASK}/home` },
-                  { name: "JIG_HOME", value: `${TASK}/home/.jig` },
-                  { name: "NO_COLOR", value: "1" },
-                  { name: keyVariable(task.spec.model), valueFrom: { secretKeyRef: { name, key: "token" } } },
-                ],
+                env: [{ name: "HOME", value: `${TASK}/home` }, { name: "JIG_HOME", value: `${TASK}/home/.jig` }, { name: "NO_COLOR", value: "1" }, ...env],
                 resources: this.config.resources ?? RESOURCES,
                 securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, runAsNonRoot: true, capabilities: { drop: ["ALL"] } },
                 volumeMounts: [
-                  { name: "input", mountPath: INPUT, readOnly: true },
+                  ...(input ? [{ name: "input", mountPath: INPUT, readOnly: true }] : []),
                   { name: "task", mountPath: TASK },
                   { name: "tmp", mountPath: "/tmp" },
                 ],
               },
             ],
             volumes: [
-              { name: "input", secret: { secretName: name, items: [{ key: "task.json", path: "task.json" }] } },
+              ...(input ? [{ name: "input", secret: { secretName: name, items: [{ key: "task.json", path: "task.json" }] } }] : []),
               { name: "task", emptyDir: {} },
               { name: "tmp", emptyDir: {} },
             ],
@@ -168,7 +290,7 @@ export class KubernetesRunner implements Runner {
    * the start, the ones already passed left out, should the stream break), then reads how it ended from
    * the pod and the Job.
    */
-  private async follow(ns: string, jobPath: string, id: string, events: Channel<JigEvent>, pollMs: number, backstop: number): Promise<RunExit> {
+  private async follow(ns: string, jobPath: string, selector: string, events: Channel<JigEvent>, pollMs: number, backstop: number): Promise<RunExit> {
     let seq = 0;
     let said: string | undefined;
     let worker: { exitCode?: number; stats?: unknown } = {};
@@ -180,7 +302,7 @@ export class KubernetesRunner implements Runner {
     for (;;) {
       try {
         const job = await this.get(jobPath);
-        pod = (await this.get(`/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent(`${TASK_LABEL}=${id}`)}`))?.items?.[0] ?? pod;
+        pod = (await this.get(`/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent(selector)}`))?.items?.[0] ?? pod;
         const container = pod?.status?.containerStatuses?.[0]?.state;
         if (!job) return { exitCode: container?.terminated?.exitCode ?? worker.exitCode ?? null, timedOut: false, stats: worker.stats, message: "its Job was deleted" };
         if (!logged && (container?.running || container?.terminated)) {
@@ -250,8 +372,8 @@ export class KubernetesRunner implements Runner {
   }
 
   /** A request's answer as JSON; undefined for the statuses in `missing`, an error for any other but 2xx. */
-  private async call<T>(method: string, path: string, body?: object, missing: number[] = []): Promise<T> {
-    const res = await this.send(method, path, body);
+  private async call<T>(method: string, path: string, body?: object, missing: number[] = [], type = "application/json"): Promise<T> {
+    const res = await this.send(method, path, body, 30_000, type);
     let text = "";
     for await (const chunk of res) text += chunk;
     const status = res.statusCode ?? 0;
@@ -265,7 +387,7 @@ export class KubernetesRunner implements Runner {
   }
 
   /** A request's response; one that takes over `timeoutMs` to answer, or is idle that long, fails. */
-  private async send(method: string, path: string, body?: object, timeoutMs = 30_000): Promise<IncomingMessage> {
+  private async send(method: string, path: string, body?: object, timeoutMs = 30_000, type = "application/json"): Promise<IncomingMessage> {
     const url = new URL(`${(this.config.apiUrl ?? "https://kubernetes.default.svc").replace(/\/$/, "")}${path}`);
     const token = (await readFile(this.config.tokenFile ?? `${ACCOUNT}/token`, "utf8")).trim();
     const https = url.protocol === "https:";
@@ -274,7 +396,7 @@ export class KubernetesRunner implements Runner {
     const data = body && JSON.stringify(body);
     return new Promise((done, fail) => {
       // A length, as Node sends a DELETE's body without one otherwise, which the server can't tell from the next request.
-      const headers = { authorization: `Bearer ${token}`, accept: "application/json", ...(data && { "content-type": "application/json", "content-length": Buffer.byteLength(data) }) };
+      const headers = { authorization: `Bearer ${token}`, accept: "application/json", ...(data && { "content-type": type, "content-length": Buffer.byteLength(data) }) };
       const req = (https ? httpsRequest : httpRequest)(url, { method, headers, ca }, done);
       req.on("error", fail);
       if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error(`no answer in ${timeoutMs / 1000} seconds`)));

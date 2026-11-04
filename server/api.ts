@@ -5,15 +5,18 @@ import type { AddressInfo } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { type Runner, workspaceProblem } from "./runner.ts";
 import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
 import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
 import { Scheduler, type Update } from "./scheduler.ts";
-import { FINISHED, openStore, STATUSES, type Store, type Limits, type Task, type TaskSpec, type TaskStatus, type Tenant } from "./store.ts";
+import { type Approval, type Decision, FINISHED, openStore, STATUSES, type Store, type Limits, type Task, type TaskSpec, type TaskStatus, type Tenant } from "./store.ts";
 
-// The task service's HTTP API (docs/server.md): tenants create tasks, follow their events and cancel them,
-// each with its own API key, and sees only its own tasks. `node server/api.ts --config <file>` runs it.
+// The task service's HTTP API (docs/server.md): tenants create tasks, follow their events, answer the
+// approvals they ask for and cancel them, each with its own API key, and sees only its own tasks. A second
+// listener, which only tasks reach, is where their jig waits for those answers (approvals.ts).
+// `node server/api.ts --config <file>` runs it.
 
 export interface TenantConfig {
   id: string;
@@ -24,16 +27,25 @@ export interface TenantConfig {
   timeLimit?: number;
   budgetUsd?: number | null;
   maxQueued?: number;
+  /** Seconds a task with approvals waits for an answer before it takes a deny. */
+  approvalTimeout?: number;
+  /** Where each approval its tasks ask for is POSTed, signed with the secret in the variable webhookSecretEnv names. */
+  approvalWebhook?: string;
+  webhookSecretEnv?: string;
 }
 
 export interface Config {
   host?: string;
   port?: number;
-  /** The SQLite file. */
+  /** The listener only tasks reach, where their jig waits for approvals' answers (default 127.0.0.1:8082). */
+  internal?: { host?: string; port?: number };
+  /** The internal listener's address as the tasks reach it (default: http://<internal host>:<port>). */
+  internalBaseUrl?: string;
+  /** The SQLite file, or a Postgres URL (postgres://...), which replicas of the service share. */
   database: string;
   /** Where each task's folder goes. */
   dataDir: string;
-  /** Tasks that may run at once, across tenants. */
+  /** Tasks that may run at once, across tenants (and across replicas sharing the database). */
   concurrency?: number;
   /** The model a task gets if it names none. */
   model?: string;
@@ -47,18 +59,28 @@ export interface Config {
   runner?: "local" | "docker" | "kubernetes";
   docker?: Omit<DockerRunnerConfig, Shared>;
   kubernetes?: Omit<KubernetesRunnerConfig, Shared>;
+  /** This replica's name in the database, unique among those running (default: host, process id and a random part). */
+  replicaId?: string;
+  /** How long a replica's hold on a running task lasts unless renewed, in seconds. */
+  leaseSeconds?: number;
+  /** The most events of a task's that are stored. */
+  maxEvents?: number;
+  /** Keep each task's folder after it ends. */
+  keepTaskDirs?: boolean;
   tenants: TenantConfig[];
 }
 
 /** What every runner takes from the config's top level. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols";
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl";
 
-const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000 };
+const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600 };
 const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 
 export interface Service {
   url: string;
+  /** The internal listener's address, as this replica listens on it. */
+  internalUrl: string;
   server: Server;
   store: Store;
   scheduler: Scheduler;
@@ -66,48 +88,93 @@ export interface Service {
 }
 
 /**
- * Opens the store, puts the config's tenants in it and shuts out those it no longer lists, ends what a
- * crash left running, and listens. The runner is the local one unless one is given (a test's).
+ * Checks the config, opens the store, puts the config's tenants in it and shuts out those it no longer
+ * lists, ends the tasks of replicas that are gone, and listens, on the internal listener too. The runner is
+ * the local one unless one is given (a test's); `webhookRetryMs` is the pause before a webhook's first retry.
  */
-export async function startService(config: Config, { secret, runner }: { secret: string; runner?: Runner }): Promise<Service> {
-  const store = openStore(config.database);
-  for (const tenant of config.tenants) {
-    const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
-    await store.putTenant({ id: tenant.id, limits }, tenant.keys.map((key) => key.toLowerCase()));
-  }
-  // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
-  const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
-  if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
-  runner ??= runnerFor(config, secret);
-  const scheduler = new Scheduler(store, runner, config.concurrency ?? 4);
-  const recovered = await scheduler.recover();
-  if (recovered.length) console.error(`jig service: ${recovered.length} task(s) left running by the last run of the service marked as errors`);
-  const server = createServer((req, res) => {
-    handle(req, res, { store, scheduler, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 }).catch((err) => {
+export async function startService(config: Config, { secret, runner, webhookRetryMs }: { secret: string; runner?: Runner; webhookRetryMs?: number }): Promise<Service> {
+  checkConfig(config);
+  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
+  const store = await openStore(config.database);
+  const answers = new Answers(store);
+  const handler = (serve: (req: IncomingMessage, res: ServerResponse) => Promise<void>) => (req: IncomingMessage, res: ServerResponse) =>
+    void serve(req, res).catch((err) => {
       if (!res.headersSent) reply(res, 500, { error: "Internal error" });
       else res.end();
       console.error(err);
     });
-  });
-  await new Promise<void>((done) => server.listen(config.port ?? 8080, config.host ?? "127.0.0.1", done));
-  void scheduler.poke();
-  const { address, port } = server.address() as AddressInfo;
-  return {
-    url: `http://${address.includes(":") ? `[${address}]` : address}:${port}`,
-    server,
-    store,
-    scheduler,
-    async close() {
-      server.closeAllConnections();
-      await new Promise((done) => server.close(done));
-      await scheduler.close();
-      await store.close();
-    },
+  // A warm worker's claim is its runner's to answer (pool.ts); the rest are approvals.
+  const internal = createServer(
+    handler((req, res) => (runner?.claim && req.url?.split("?")[0] === "/internal/pool/claim" ? runner.claim(req, res) : handleInternal(req, res, { store, answers, secret }))),
+  );
+  let scheduler: Scheduler;
+  let internalUrl: string;
+  try {
+    for (const tenant of config.tenants) {
+      const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
+      await store.putTenant({ id: tenant.id, limits }, tenant.keys.map((key) => key.toLowerCase()));
+    }
+    // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
+    const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
+    if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
+    // Before any task starts, as their jig asks for approvals there.
+    internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
+    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl);
+    runner.warm?.(config.internalBaseUrl ?? internalUrl);
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval: (task, approval) => webhooks.send(task, approval) });
+    const expired = await scheduler.start();
+    if (expired.length) console.error(`jig service: ${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
+  } catch (err) {
+    await runner?.close?.();
+    if (internal.listening) await new Promise((done) => internal.close(done));
+    await store.close();
+    throw err;
+  }
+  const context = { store, scheduler, answers, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 };
+  const server = createServer(handler((req, res) => handle(req, res, context)));
+  const close = async () => {
+    webhooks.close();
+    // The idle workers first, their claims answered while the internal listener is still up.
+    await runner!.close?.();
+    for (const listener of [server, internal]) listener.closeAllConnections();
+    await Promise.all([server, internal].map((listener) => new Promise((done) => listener.close(done))));
+    await answers.close();
+    await scheduler.close();
+    await store.close();
   };
+  let url: string;
+  try {
+    url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
+  } catch (err) {
+    // Its port is taken, say: what has started stops.
+    await close();
+    throw err;
+  }
+  return { url, internalUrl, server, store, scheduler, close };
 }
 
-function runnerFor(config: Config, secret: string): Runner {
-  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols };
+/** Listens, and gives the address it listens on as a URL. */
+async function listen(server: Server, port: number, host: string): Promise<string> {
+  await new Promise<void>((done, fail) => server.once("error", fail).listen(port, host, () => (server.off("error", fail), done())));
+  const { address, port: bound } = server.address() as AddressInfo;
+  return `http://${address.includes(":") ? `[${address}]` : address}:${bound}`;
+}
+
+/** The tenants' approval webhooks, each with its secret from the environment. */
+function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
+  const hooks = new Map<string, Webhook>();
+  for (const { id, approvalWebhook, webhookSecretEnv } of tenants) {
+    if (!approvalWebhook || !webhookSecretEnv) continue;
+    const secret = process.env[webhookSecretEnv];
+    if (!secret) throw new Error(`Set ${webhookSecretEnv}, the secret tenant ${id}'s approval webhook is signed with.`);
+    hooks.set(id, { url: approvalWebhook, secret });
+  }
+  return hooks;
+}
+
+function runnerFor(config: Config, secret: string, internalBaseUrl: string): Runner {
+  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") return new LocalRunner({ ...shared, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
@@ -117,9 +184,89 @@ function runnerFor(config: Config, secret: string): Runner {
   throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
 }
 
+/** Throws with what is wrong if the config isn't one the service can run with. */
+export function checkConfig(config: Config): void {
+  const problem = configProblem(config);
+  if (problem) throw new Error(`The config's ${problem}`);
+}
+
+function configProblem(config: Config): string | undefined {
+  if (!isObject(config)) return "top level must be a JSON object";
+  const fields = config as unknown as Record<string, unknown>;
+  const text = (name: string, value: unknown, required: boolean) =>
+    value === undefined ? (required ? `${name} is missing` : undefined) : typeof value === "string" && value ? undefined : `${name} must be a string that isn't empty`;
+  const whole = (name: string, value: unknown, least: number, most = Number.MAX_SAFE_INTEGER) =>
+    value === undefined || (Number.isInteger(value) && (value as number) >= least && (value as number) <= most) ? undefined : `${name} must be a whole number from ${least}${most < Number.MAX_SAFE_INTEGER ? ` to ${most}` : " up"}, not ${JSON.stringify(value)}`;
+  const positive = (name: string, value: unknown, zero = false) =>
+    value === undefined || (typeof value === "number" && Number.isFinite(value) && (zero ? value >= 0 : value > 0)) ? undefined : `${name} must be a number over ${zero ? "or at " : ""}0, not ${JSON.stringify(value)}`;
+  const strings = (name: string, value: unknown) =>
+    value === undefined || (Array.isArray(value) && value.length && value.every((item) => typeof item === "string" && item)) ? undefined : `${name} must be a list of strings`;
+  const http = (name: string, value: unknown) =>
+    value === undefined || (typeof value === "string" && /^https?:\/\//i.test(value) && URL.canParse(value)) ? undefined : `${name} must be an http or https URL, not ${JSON.stringify(value)}`;
+  const poolProblem = (block: string, pool: unknown) =>
+    pool === undefined ? undefined
+    : !isObject(pool) ? `${block}.pool must be an object, {size, maxIdleSeconds}`
+    : (whole(`${block}.pool.size`, pool.size, 0) ?? positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ?? http(`${block}.pool.baseUrl`, pool.baseUrl));
+  const problem =
+    text("database", config.database, true) ??
+    text("dataDir", config.dataDir, true) ??
+    text("gatewayBaseUrl", config.gatewayBaseUrl, true) ??
+    http("gatewayBaseUrl", config.gatewayBaseUrl) ??
+    text("host", config.host, false) ??
+    whole("port", config.port, 0, 65535) ??
+    (config.internal === undefined || isObject(config.internal) ? undefined : "internal must be an object, {host, port}") ??
+    text("internal.host", config.internal?.host, false) ??
+    whole("internal.port", config.internal?.port, 0, 65535) ??
+    http("internalBaseUrl", config.internalBaseUrl) ??
+    whole("concurrency", config.concurrency, 1) ??
+    text("model", config.model, false) ??
+    positive("graceSeconds", config.graceSeconds, true) ??
+    strings("jig", config.jig) ??
+    strings("gitProtocols", config.gitProtocols) ??
+    whole("maxBodyBytes", config.maxBodyBytes, 1) ??
+    positive("heartbeatSeconds", config.heartbeatSeconds) ??
+    text("replicaId", config.replicaId, false) ??
+    positive("leaseSeconds", config.leaseSeconds) ??
+    whole("maxEvents", config.maxEvents, 1) ??
+    poolProblem("docker", config.docker?.pool) ??
+    poolProblem("kubernetes", config.kubernetes?.pool) ??
+    (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
+    (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
+  if (problem) return problem;
+  const tenants = new Set<string>();
+  /** Which tenant each key opens: one key may open only one. */
+  const owners = new Map<string, string>();
+  for (const [i, tenant] of config.tenants.entries()) {
+    const at = `tenants[${i}]`;
+    if (!isObject(tenant)) return `${at} must be an object`;
+    const problem =
+      text(`${at}.id`, tenant.id, true) ??
+      (tenants.has(tenant.id) ? `${at}.id ${JSON.stringify(tenant.id)} is another tenant's too` : undefined) ??
+      (Array.isArray(tenant.keys) ? undefined : `${at}.keys must be a list of the SHA-256 hashes of its API keys, in hex`) ??
+      whole(`${at}.concurrency`, tenant.concurrency, 0) ??
+      whole(`${at}.maxSteps`, tenant.maxSteps, 1) ??
+      whole(`${at}.timeLimit`, tenant.timeLimit, 1) ??
+      (tenant.budgetUsd === null ? undefined : positive(`${at}.budgetUsd`, tenant.budgetUsd)) ??
+      whole(`${at}.maxQueued`, tenant.maxQueued, 0) ??
+      whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1) ??
+      http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
+      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined);
+    if (problem) return problem;
+    tenants.add(tenant.id);
+    for (const [j, key] of tenant.keys.entries()) {
+      if (typeof key !== "string" || !/^[0-9a-f]{64}$/i.test(key)) return `${at}.keys[${j}] must be a key's SHA-256 hash, 64 hex digits (printf %s "$KEY" | sha256sum)`;
+      const owner = owners.get(key.toLowerCase());
+      if (owner !== undefined) return `${at}.keys[${j}] is ${owner === tenant.id ? "there twice" : `tenant ${owner}'s key too: a key opens one tenant`}`;
+      owners.set(key.toLowerCase(), tenant.id);
+    }
+  }
+  return undefined;
+}
+
 interface Context {
   store: Store;
   scheduler: Scheduler;
+  answers: Answers;
   model: string;
   maxBody: number;
   heartbeatMs: number;
@@ -137,15 +284,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (req.method !== "GET") return reply(res, 405, { error: "Use GET or POST" });
     const status = url.searchParams.get("status") ?? undefined;
     if (status !== undefined && !STATUSES.includes(status as TaskStatus)) return reply(res, 400, { error: `status must be one of: ${STATUSES.join(", ")}` });
-    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined });
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, false)) });
+    const before = url.searchParams.get("before") ?? undefined;
+    if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
+    const limit = Number(url.searchParams.get("limit") ?? 100);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
+    // The prompts can be long: a list leaves them out unless asked.
+    const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
+    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
+    const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
+    // A full page may have more after it: the next is read with before=<next>.
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
-  const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events)?$/.exec(url.pathname);
+  const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
   // Another tenant's task is as missing as one that never was.
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
-  const [, , action] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, true)) : reply(res, 405, { error: "Use GET" });
+  const [, , action, approval] = match;
+  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]))) : reply(res, 405, { error: "Use GET" });
+  if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
+  if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
     if (req.method !== "POST") return reply(res, 405, { error: "Use POST" });
     if (FINISHED.has(task.status)) return reply(res, 409, { error: `The task has already ended: ${task.status}`, id: task.id, status: task.status });
@@ -180,6 +337,39 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   reply(res, 201, { id: task.id, status: task.status });
 }
 
+/**
+ * A tenant's answer to an approval, {decision, always?}: 200 with the approval, 404 for one its task's jig
+ * hasn't asked for (or not yet), 409 for one answered already or a task that has ended. The jig waiting for
+ * it, maybe through another replica, hears it at once.
+ */
+async function answer(req: IncomingMessage, res: ServerResponse, task: Task, id: string, { store, answers, maxBody }: Context): Promise<void> {
+  if (req.method !== "POST") return reply(res, 405, { error: "Use POST" });
+  const body = await readBody(req, maxBody);
+  if (body === undefined) {
+    res.setHeader("connection", "close");
+    return reply(res, 413, { error: `The body is over ${maxBody} bytes` });
+  }
+  let input: unknown;
+  try {
+    input = JSON.parse(body);
+  } catch {
+    return reply(res, 400, { error: "The body isn't JSON" });
+  }
+  if (!isObject(input)) return reply(res, 400, { error: "The body must be a JSON object" });
+  const unknown = Object.keys(input).find((key) => !["decision", "always"].includes(key));
+  if (unknown) return reply(res, 400, { error: `Unknown field: ${unknown}` });
+  const { decision, always = false } = input;
+  if (decision !== "allow" && decision !== "deny") return reply(res, 400, { error: "decision must be allow or deny" });
+  if (typeof always !== "boolean") return reply(res, 400, { error: "always must be true or false" });
+  const asked = await store.approval(task.id, id);
+  if (!asked) return reply(res, 404, { error: "No such approval" });
+  if (FINISHED.has(task.status)) return reply(res, 409, { error: `The task has already ended: ${task.status}`, approval: asked });
+  const answered: Approval | undefined = asked.decision ? undefined : await store.decideApproval(task.id, id, { decision: decision as Decision, always, by: "api" });
+  if (!answered) return reply(res, 409, { error: "The approval has been answered already", approval: (await store.approval(task.id, id)) ?? asked });
+  answers.answered(task.id, id);
+  reply(res, 200, answered);
+}
+
 /** The request's body, or undefined once it is over `max` bytes (the rest isn't read). */
 async function readBody(req: IncomingMessage, max: number): Promise<string | undefined> {
   if (Number(req.headers["content-length"]) > max) return undefined;
@@ -196,16 +386,23 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
 /** A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. */
 export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
-  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model"].includes(key));
+  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode"].includes(key));
   if (unknown) return `Unknown field: ${unknown}`;
-  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel } = input;
+  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel, approvals = false, mode } = input;
   if (typeof prompt !== "string" || !prompt.trim()) return "prompt must be a string that isn't empty";
   if (prompt.length > MAX_PROMPT) return `prompt must be at most ${MAX_PROMPT} characters`;
+  // Postgres text can't hold one, and jig has no use for it: refused on every store alike.
+  if (prompt.includes("\0")) return "prompt must not hold a NUL character (\\u0000)";
   if (!Number.isInteger(maxSteps) || (maxSteps as number) < 1 || (maxSteps as number) > tenant.limits.maxSteps) return `maxSteps must be a whole number from 1 to ${tenant.limits.maxSteps}`;
   if (!Number.isInteger(timeLimit) || (timeLimit as number) < 1 || (timeLimit as number) > tenant.limits.timeLimit) return `timeLimit must be a whole number of seconds from 1 to ${tenant.limits.timeLimit}`;
   // The gateway serves the Anthropic API, which jig uses for Claude and DeepSeek models.
   if (typeof model !== "string" || !/^(claude|deepseek)[\w.:-]{0,100}$/.test(model)) return "model must be a Claude or DeepSeek model's id";
-  if (workspace === undefined) return { prompt, maxSteps: maxSteps as number, timeLimit: timeLimit as number, model };
+  if (typeof approvals !== "boolean") return "approvals must be true or false";
+  // Without approvals the run asks nothing (--yes), so a mode would mean nothing.
+  if (mode !== undefined && !approvals) return "mode goes with approvals: true";
+  if (mode !== undefined && !APPROVAL_MODES.includes(mode as never)) return `mode must be one of: ${APPROVAL_MODES.join(", ")}`;
+  const asks = approvals ? { approvals, mode: (mode ?? "edits") as TaskSpec["mode"] } : {};
+  if (workspace === undefined) return { prompt, maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
   if (!isObject(workspace)) return "workspace must be an object";
   const extra = Object.keys(workspace).find((key) => !["files", "git", "ref"].includes(key));
   if (extra) return `Unknown field: workspace.${extra}`;
@@ -223,17 +420,21 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): 
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
   if (ref !== undefined && (git === undefined || typeof ref !== "string" || !/^[\w./-]{1,200}$/.test(ref) || ref.startsWith("-"))) return "workspace.ref must be a branch or tag of workspace.git";
-  return { prompt, workspace: { files, git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model };
+  return { prompt, workspace: { files, git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** A task as the API shows it; the list leaves out the stats. */
-function view(task: Task, full: boolean) {
+/**
+ * A task as the API shows it, with how many of its approvals wait for an answer (none, once it has ended);
+ * the list leaves out the stats, and the prompt unless asked.
+ */
+function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>) {
   const { spec, tenant, stats, ...rest } = task;
-  return { ...rest, prompt: spec.prompt, model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...(full && { stats }) };
+  const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
+  return { ...rest, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {
@@ -244,7 +445,9 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
 /**
  * The task's events after `after` as server-sent events (each one's id its seq): those stored, then the
  * live ones, then `event: done` with the status it ended in, and the stream ends. A client that reconnects
- * with Last-Event-ID gets only what came after.
+ * with Last-Event-ID gets only what came after. The task may run on this replica, whose scheduler passes on
+ * its events as they are stored, or on another, whose events and end the store announces; while it can't
+ * (SQLite, or a lost connection to Postgres), the store is read again every second.
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs }: Context): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
@@ -261,26 +464,40 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     cleanup();
     res.end(`event: done\ndata: ${JSON.stringify({ status })}\n\n`);
   };
-  // Followed before the stored events are read, so none falls between the two; held until those are sent.
-  let held: Update[] | undefined = [];
-  const follow = (update: Update) => {
-    if (held) held.push(update);
-    else if ("event" in update) send(update.event.seq, update.event);
-    else end(update.done);
+  // Sends what is stored after the last event sent, and ends the stream if the task has ended. The status
+  // is read first: once a task has ended, all its events are stored. One read at a time, in order.
+  let reading = Promise.resolve();
+  const pull = () => {
+    reading = reading
+      .then(async () => {
+        if (ended || res.destroyed) return;
+        const { status } = (await store.task(task.id))!;
+        for (const { seq, event } of await store.events(task.id, last)) send(seq, event);
+        if (FINISHED.has(status)) end(status);
+      })
+      .catch((err: unknown) => console.error(`jig service: couldn't read ${task.id}'s events:`, err));
   };
+  // The next event as it comes goes at once; one after a gap, or the end, sends what is stored first.
+  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 ? send(update.event.seq, update.event) : pull());
+  const changed = (id: string, seq?: unknown) => id === task.id && !(typeof seq === "number" && seq <= last) && pull();
   scheduler.updates.on(task.id, follow);
+  store.changes.on("event", changed);
+  store.changes.on("done", changed);
+  store.changes.on("resync", pull);
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), heartbeatMs);
+  const poll = setInterval(() => store.live || pull(), 1000);
   const cleanup = () => {
     scheduler.updates.off(task.id, follow);
+    store.changes.off("event", changed);
+    store.changes.off("done", changed);
+    store.changes.off("resync", pull);
     clearInterval(heartbeat);
+    clearInterval(poll);
   };
   res.on("close", cleanup);
-  for (const { seq, event } of await store.events(task.id, after)) send(seq, event);
-  const now = (await store.task(task.id))!;
-  const updates = held;
-  held = undefined;
-  for (const update of updates) follow(update);
-  if (FINISHED.has(now.status)) end(now.status);
+  // Followed before the stored events are read, so none falls between the two.
+  pull();
+  await reading;
 }
 
 async function main(): Promise<void> {
@@ -289,9 +506,15 @@ async function main(): Promise<void> {
   const secret = process.env.JIG_GATEWAY_SECRET;
   if (!secret) throw new Error("Set JIG_GATEWAY_SECRET, the secret the gateway checks tasks' tokens with.");
   const config: Config = JSON.parse(readFileSync(values.config, "utf8"));
+  // A Postgres URL holds a password, which belongs in a secret rather than the config.
+  if (process.env.JIG_DATABASE_URL) config.database = process.env.JIG_DATABASE_URL;
+  // Replicas share the config, but each one's warm workers claim at its own address (its pod's, say).
+  const pool = config.runner === "docker" ? config.docker?.pool : config.runner === "kubernetes" ? config.kubernetes?.pool : undefined;
+  if (isObject(pool) && process.env.JIG_POOL_BASE_URL) pool.baseUrl = process.env.JIG_POOL_BASE_URL;
+  checkConfig(config);
   // Paths in the config are relative to it.
   const base = dirname(resolve(values.config));
-  config.database = config.database === ":memory:" ? config.database : resolve(base, config.database);
+  if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
   config.dataDir = resolve(base, config.dataDir);
   const service = await startService(config, { secret });
   console.error(`jig service listening on ${service.url}`);

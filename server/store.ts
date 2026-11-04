@@ -1,10 +1,13 @@
 import { randomUUID } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-// The task service's state: tenants and their API keys, tasks, and each task's events. The interface is
-// small and async so that a Postgres store can replace this one; this one is SQLite, through node:sqlite.
+// The task service's state: tenants and their API keys, tasks, each task's events and the approvals its jig
+// asked for. Two stores keep to
+// one interface: SQLite, through node:sqlite, here, for one replica; and Postgres (store-pg.ts), which
+// several replicas share.
 
 export type TaskStatus = "queued" | "running" | "succeeded" | "failed" | "stopped" | "cancelled" | "error";
 export const STATUSES: TaskStatus[] = ["queued", "running", "succeeded", "failed", "stopped", "cancelled", "error"];
@@ -21,6 +24,8 @@ export interface Limits {
   budgetUsd: number | null;
   /** Tasks of the tenant's that may wait in the queue at once; the service's default when missing. */
   maxQueued?: number;
+  /** Seconds a task with approvals waits for an answer before its jig takes it as a deny (default 600). */
+  approvalTimeout?: number;
 }
 
 export interface Tenant {
@@ -35,12 +40,18 @@ export interface Workspace {
   ref?: string;
 }
 
+/** jig's --mode values a task with approvals may run in: auto never asks. */
+export type ApprovalMode = "plan" | "ask" | "edits";
+
 export interface TaskSpec {
   prompt: string;
   workspace?: Workspace;
   maxSteps: number;
   timeLimit: number;
   model: string;
+  /** Ask before the tool calls `mode` doesn't allow, through the API, rather than run with --yes. */
+  approvals?: boolean;
+  mode?: ApprovalMode;
 }
 
 export interface Usage {
@@ -78,6 +89,59 @@ export interface Outcome {
   cost: number | null;
 }
 
+export type Decision = "allow" | "deny";
+
+/** What a task's jig asked before a tool call: its approval_request event. */
+export interface ApprovalRequest {
+  /** ap_<n>, unique within the run. */
+  id: string;
+  step: number | null;
+  tool: string;
+  description: string;
+}
+
+/** How an approval was answered: by the tenant, through the API, or by jig's own timeout. */
+export interface Answer {
+  decision: Decision;
+  always: boolean;
+  by: "api" | "timeout";
+}
+
+/** The answer jig is given at the internal listener: {decision, always}. */
+export interface Given {
+  decision: Decision;
+  always: boolean;
+}
+
+/** An approval, with its answer once it has one. */
+export interface Approval extends ApprovalRequest {
+  requestedAt: string;
+  decision?: Decision;
+  always?: boolean;
+  by?: Answer["by"];
+  decidedAt?: string;
+}
+
+/** A claim's terms: who runs the task, for how long its lease holds, and the caps it must stay within. */
+export interface ClaimTerms {
+  /** The replica that will run it. */
+  owner: string;
+  /** How long the lease holds unless renewed, in milliseconds. */
+  leaseMs: number;
+  /** The most tasks that may run at once in all, across the replicas sharing the store. */
+  concurrency: number;
+  /** The most of the tenant's that may. */
+  tenantConcurrency: number;
+}
+
+/**
+ * What the replicas sharing a store did, as this one hears it: "event" (task, seq) when an event is stored,
+ * "done" (task, status) when a task ends, "cancel" (task) when a cancel is asked for, "approval" (task, id)
+ * when an approval is answered, and "resync" () when some may have been missed (the connection that hears
+ * them came back).
+ */
+export type Changes = EventEmitter;
+
 export interface Store {
   /** Adds the tenant, or updates its limits; its API keys (SHA-256 hashes, in hex) become these. */
   putTenant(tenant: Tenant, keyHashes: string[]): Promise<void>;
@@ -90,27 +154,65 @@ export interface Store {
   retireTenants(keep: string[]): Promise<number>;
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
   task(id: string): Promise<Task | undefined>;
-  /** A tenant's tasks, newest first, at most `limit`. */
-  tasks(tenant: string, options?: { status?: TaskStatus; limit?: number }): Promise<Task[]>;
-  /** Every tenant's tasks in a status, oldest first: the queue, or what a crash left running. */
+  /**
+   * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
+   * without their prompts (an empty string in their place) unless `prompts`.
+   */
+  tasks(tenant: string, options?: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean }): Promise<Task[]>;
+  /** Every tenant's tasks in a status, oldest first. */
   inStatus(status: TaskStatus): Promise<Task[]>;
   /** The tenants with tasks queued, by id. */
   queuedTenants(): Promise<string[]>;
-  /** A tenant's oldest queued task: the next of its to run. */
-  nextQueued(tenant: string): Promise<Task | undefined>;
   /** How many of a tenant's tasks are queued. */
   queuedCount(tenant: string): Promise<number>;
-  /** Moves a queued task to running; false if it was no longer queued. */
-  claim(id: string): Promise<boolean>;
+  /**
+   * Moves the tenant's oldest queued task to running, leased to `terms.owner`, unless as many tasks as
+   * `terms.concurrency` run already ("full"), or as many of the tenant's as its own ("tenant full"); the
+   * running ones are counted in the store, so replicas sharing it keep to the caps together. Undefined if
+   * nothing of the tenant's is queued.
+   */
+  claim(tenant: string, terms: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined>;
+  /** Extends the owner's leases on these running tasks; those it still holds, and whether a cancel was asked for. */
+  renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]>;
+  /** Ends, as errors, the running tasks whose lease ran out: their replica is gone. Their ids. */
+  expire(error: string): Promise<string[]>;
+  /** Asks the replica running the task to cancel it; false if it isn't running. */
+  requestCancel(id: string): Promise<boolean>;
   /** Moves a queued task to cancelled; false if it was no longer queued. */
   cancelQueued(id: string): Promise<boolean>;
-  /** Ends a running task. */
-  finish(id: string, outcome: Outcome): Promise<void>;
+  /** Ends a running task, if the owner still holds it. */
+  finish(id: string, owner: string, outcome: Outcome): Promise<void>;
   /** Keeps one of a task's events; one with a seq already kept is ignored. */
   addEvent(task: string, seq: number, event: object): Promise<void>;
   /** A task's events after seq `after`, in order. */
   events(task: string, after?: number): Promise<{ seq: number; event: object }[]>;
+  /** Keeps an approval a task's jig asked for; undefined if the task has one with its id already. */
+  addApproval(task: string, request: ApprovalRequest): Promise<Approval | undefined>;
+  approval(task: string, id: string): Promise<Approval | undefined>;
+  /** A task's approvals, in the order they were asked for. */
+  approvals(task: string): Promise<Approval[]>;
+  /** Answers an approval that has no answer yet: the approval, or undefined if there is no such one. */
+  decideApproval(task: string, id: string, answer: Answer): Promise<Approval | undefined>;
+  /**
+   * Keeps jig's own record of an approval's answer (its approval event), in place of any other: a timeout,
+   * or an answer by the API that is the one the API gave. False if it isn't kept.
+   */
+  recordApproval(task: string, id: string, answer: Answer): Promise<boolean>;
+  /** The answer jig is given: the API's, or a deny once jig's timeout is recorded; undefined while there is none. */
+  given(task: string, id: string): Promise<Given | undefined>;
+  /** How many of each task's approvals have no answer yet; a task with none is left out. */
+  pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
+  /** What other replicas did, as it happens; a store that can't hear it never emits. */
+  readonly changes: Changes;
+  /** Whether changes are heard as they happen now: if not, whoever waits on them must look again itself. */
+  readonly live: boolean;
   close(): Promise<void>;
+}
+
+/** Opens the store: Postgres for a postgres:// URL, else SQLite at the path (":memory:" for one in memory). */
+export async function openStore(database: string): Promise<Store> {
+  if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database);
+  return new SqliteStore(database);
 }
 
 // Each entry moves the schema one version on (PRAGMA user_version counts them). Never edit one that has
@@ -125,17 +227,31 @@ const MIGRATIONS = [
    CREATE INDEX tasks_by_status ON tasks (status);
    CREATE INDEX tasks_by_tenant ON tasks (tenant, status);
    CREATE TABLE events (task TEXT NOT NULL REFERENCES tasks (id), seq INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY (task, seq));`,
+  // Leases: the replica running a task, until when, and whether another asked it to cancel.
+  `ALTER TABLE tasks ADD COLUMN owner TEXT;
+   ALTER TABLE tasks ADD COLUMN lease_until TEXT;
+   ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;`,
+  // The approvals a task's jig asked for, and their answers: the API's (api_*), which only an answer
+  // through the API sets and jig is given, and the record (decision to decided_at), which jig's own
+  // approval event replaces.
+  `CREATE TABLE approvals (
+     task TEXT NOT NULL REFERENCES tasks (id), id TEXT NOT NULL, step INTEGER, tool TEXT NOT NULL, description TEXT NOT NULL,
+     requested_at TEXT NOT NULL, api_decision TEXT, api_always INTEGER, api_at TEXT,
+     decision TEXT, always INTEGER, decided_by TEXT, decided_at TEXT, PRIMARY KEY (task, id));`,
 ];
 
 type Row = Record<string, unknown>;
 
-/** Opens (or creates) the SQLite store at `path` (":memory:" for one that lasts as long as the process). */
-export function openStore(path: string): Store {
-  return new SqliteStore(path);
-}
+/** A task's columns but its prompt, which a list leaves out. */
+export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost";
 
+// One replica's store, or several processes' on one machine: SQLite has no notifications, so changes
+// made by another process are found by looking again, and claims take its write lock.
 class SqliteStore implements Store {
   private db: DatabaseSync;
+  // Each stream and each wait for an approval's answer listens.
+  readonly changes: Changes = new EventEmitter().setMaxListeners(0);
+  readonly live = false;
 
   constructor(path: string) {
     try {
@@ -202,7 +318,7 @@ class SqliteStore implements Store {
   }
 
   async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
-    const id = `task_${randomUUID().replaceAll("-", "")}`;
+    const id = newTaskId();
     const { prompt, ...rest } = spec;
     this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), new Date().toISOString());
     return (await this.task(id))!;
@@ -213,10 +329,10 @@ class SqliteStore implements Store {
     return row && toTask(row);
   }
 
-  async tasks(tenant: string, { status, limit = 100 }: { status?: TaskStatus; limit?: number } = {}): Promise<Task[]> {
-    const rows = status
-      ? this.db.prepare("SELECT * FROM tasks WHERE tenant = ? AND status = ? ORDER BY rowid DESC LIMIT ?").all(tenant, status, limit)
-      : this.db.prepare("SELECT * FROM tasks WHERE tenant = ? ORDER BY rowid DESC LIMIT ?").all(tenant, limit);
+  async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
+    const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
+    const params = [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit];
+    const rows = this.db.prepare(`SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`).all(...params);
     return (rows as Row[]).map(toTask);
   }
 
@@ -224,25 +340,56 @@ class SqliteStore implements Store {
     return (this.db.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY rowid").all(status) as Row[]).map(toTask);
   }
 
-  // These three go through the (tenant, status) index, so the scheduler's look at the queue costs the same
-  // with ten tasks queued or a million, and reads no prompt but those of the tasks it starts.
+  // These go through the (tenant, status) index, so the scheduler's look at the queue costs the same with
+  // ten tasks queued or a million, and reads no prompt but those of the tasks it starts.
   async queuedTenants(): Promise<string[]> {
     const rows = this.db.prepare("SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.tenant = tenants.id AND status = 'queued') ORDER BY id").all() as Row[];
     return rows.map((row) => String(row.id));
-  }
-
-  async nextQueued(tenant: string): Promise<Task | undefined> {
-    const row = this.db.prepare("SELECT * FROM tasks WHERE tenant = ? AND status = 'queued' ORDER BY rowid LIMIT 1").get(tenant) as Row | undefined;
-    return row && toTask(row);
   }
 
   async queuedCount(tenant: string): Promise<number> {
     return Number((this.db.prepare("SELECT count(*) AS n FROM tasks WHERE tenant = ? AND status = 'queued'").get(tenant) as Row).n);
   }
 
-  async claim(id: string): Promise<boolean> {
-    const { changes } = this.db.prepare("UPDATE tasks SET status = 'running', started = ? WHERE id = ? AND status = 'queued'").run(new Date().toISOString(), id);
-    return changes === 1;
+  async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {
+    // IMMEDIATE takes the write lock first, so another process can't count the same free slot meanwhile.
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const counts = this.db.prepare("SELECT count(*) AS total, count(*) FILTER (WHERE tenant = ?) AS mine FROM tasks WHERE status = 'running'").get(tenant) as Row;
+      let result: Task | "full" | "tenant full" | undefined;
+      if (Number(counts.total) >= concurrency) result = "full";
+      else if (Number(counts.mine) >= tenantConcurrency) result = "tenant full";
+      else {
+        const now = Date.now();
+        const row = this.db
+          .prepare("UPDATE tasks SET status = 'running', started = ?, owner = ?, lease_until = ?, cancel_requested = 0 WHERE id = (SELECT id FROM tasks WHERE tenant = ? AND status = 'queued' ORDER BY rowid LIMIT 1) RETURNING *")
+          .get(new Date(now).toISOString(), owner, new Date(now + leaseMs).toISOString(), tenant) as Row | undefined;
+        result = row && toTask(row);
+      }
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  async renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]> {
+    const rows = this.db
+      .prepare("UPDATE tasks SET lease_until = ? WHERE id IN (SELECT value FROM json_each(?)) AND owner = ? AND status = 'running' RETURNING id, cancel_requested")
+      .all(new Date(Date.now() + leaseMs).toISOString(), JSON.stringify(ids), owner) as Row[];
+    return rows.map((row) => ({ id: String(row.id), cancel: Boolean(row.cancel_requested) }));
+  }
+
+  async expire(error: string): Promise<string[]> {
+    const now = new Date().toISOString();
+    // A task left running by a version of the service without leases has none: it is as gone.
+    const rows = this.db.prepare("UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING id").all(error, now, now) as Row[];
+    return rows.map((row) => String(row.id));
+  }
+
+  async requestCancel(id: string): Promise<boolean> {
+    return this.db.prepare("UPDATE tasks SET cancel_requested = 1 WHERE id = ? AND status = 'running'").run(id).changes === 1;
   }
 
   async cancelQueued(id: string): Promise<boolean> {
@@ -250,10 +397,10 @@ class SqliteStore implements Store {
     return changes === 1;
   }
 
-  async finish(id: string, outcome: Outcome): Promise<void> {
+  async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
     this.db
-      .prepare("UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running'")
-      .run(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id);
+      .prepare("UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ?")
+      .run(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner);
   }
 
   async addEvent(task: string, seq: number, event: object): Promise<void> {
@@ -265,31 +412,115 @@ class SqliteStore implements Store {
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
   }
 
+  async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
+    const row = this.db
+      .prepare("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING *")
+      .get(task, id, step, tool, description, new Date().toISOString()) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async approval(task: string, id: string): Promise<Approval | undefined> {
+    const row = this.db.prepare("SELECT * FROM approvals WHERE task = ? AND id = ?").get(task, id) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async approvals(task: string): Promise<Approval[]> {
+    return (this.db.prepare("SELECT * FROM approvals WHERE task = ? ORDER BY rowid").all(task) as Row[]).map(toApproval);
+  }
+
+  async decideApproval(task: string, id: string, { decision, always, by }: Answer): Promise<Approval | undefined> {
+    const row = this.db
+      .prepare(
+        "UPDATE approvals SET api_decision = ?1, api_always = ?2, api_at = ?4, decision = ?1, always = ?2, decided_by = ?3, decided_at = ?4 WHERE task = ?5 AND id = ?6 AND decision IS NULL RETURNING *",
+      )
+      .get(decision, Number(always), by, new Date().toISOString(), task, id) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<boolean> {
+    // A timeout is decided now. An answer by the API is kept only as the API gave it (always may be
+    // dropped, as jig drops it from a deny), and with the time it was given.
+    const { changes } =
+      by === "timeout"
+        ? this.db.prepare("UPDATE approvals SET decision = 'deny', always = 0, decided_by = 'timeout', decided_at = ? WHERE task = ? AND id = ?").run(new Date().toISOString(), task, id)
+        : this.db
+            .prepare("UPDATE approvals SET decision = ?1, always = ?2, decided_by = 'api', decided_at = api_at WHERE task = ?3 AND id = ?4 AND api_decision = ?1 AND (?2 = 0 OR api_always = 1)")
+            .run(decision, Number(always), task, id);
+    return Number(changes) > 0;
+  }
+
+  async given(task: string, id: string): Promise<Given | undefined> {
+    return toGiven(this.db.prepare("SELECT api_decision, api_always, decided_by FROM approvals WHERE task = ? AND id = ?").get(task, id) as Row | undefined);
+  }
+
+  async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
+    const rows = this.db.prepare("SELECT task, count(*) AS n FROM approvals WHERE task IN (SELECT value FROM json_each(?)) AND decision IS NULL GROUP BY task").all(JSON.stringify(tasks)) as Row[];
+    return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
   async close(): Promise<void> {
     this.db.close();
   }
 }
 
-function json(value: unknown): string | null {
+export function newTaskId(): string {
+  return `task_${randomUUID().replaceAll("-", "")}`;
+}
+
+/** A value for a JSON column, as text. */
+export function json(value: unknown): string | null {
   return value === null || value === undefined ? null : JSON.stringify(value);
 }
 
+/** A JSON column's value: text from SQLite, already decoded from Postgres. */
 function parsed(value: unknown): unknown {
-  return value === null || value === undefined ? null : JSON.parse(String(value));
+  return value === null || value === undefined ? null : typeof value === "string" ? JSON.parse(value) : value;
 }
 
-function toTask(row: Row): Task {
+/** A time column's value as an ISO string: SQLite keeps them so, Postgres gives Dates. */
+function time(value: unknown): string | null {
+  return value === null || value === undefined ? null : value instanceof Date ? value.toISOString() : String(value);
+}
+
+/** An approval from its row, in either store, with only the fields it has. */
+export function toApproval(row: Row): Approval {
+  return {
+    id: String(row.id),
+    step: row.step === null ? null : Number(row.step),
+    tool: String(row.tool),
+    description: String(row.description),
+    requestedAt: time(row.requested_at)!,
+    ...(row.decision !== null && {
+      decision: row.decision as Decision,
+      always: Boolean(row.always),
+      by: row.decided_by as Answer["by"],
+      decidedAt: time(row.decided_at)!,
+    }),
+  };
+}
+
+/** The answer jig is given, from an approval's row in either store (see Store.given). */
+export function toGiven(row: Row | undefined): Given | undefined {
+  if (!row) return undefined;
+  if (row.api_decision !== null) return { decision: row.api_decision as Decision, always: Boolean(row.api_always) };
+  // jig's timeout stands for a deny, whatever its event said.
+  if (row.decided_by === "timeout") return { decision: "deny", always: false };
+  return undefined;
+}
+
+/** A task from its row, in either store. */
+export function toTask(row: Row): Task {
   return {
     id: String(row.id),
     tenant: String(row.tenant),
-    spec: { prompt: String(row.prompt), ...JSON.parse(String(row.spec)) },
+    spec: { prompt: String(row.prompt), ...(parsed(row.spec) as Omit<TaskSpec, "prompt">) },
     status: row.status as TaskStatus,
     exitCode: row.exit_code === null ? null : Number(row.exit_code),
     stop: row.stop as string | null,
     error: row.error as string | null,
-    created: String(row.created),
-    started: row.started as string | null,
-    ended: row.ended as string | null,
+    created: time(row.created)!,
+    started: time(row.started),
+    ended: time(row.ended),
     stats: parsed(row.stats),
     usage: parsed(row.usage) as Usage | null,
     cost: row.cost === null ? null : Number(row.cost),

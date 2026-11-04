@@ -1,5 +1,7 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { mkdir, readFile } from "node:fs/promises";
+import { type IncomingMessage, request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { constants } from "node:os";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,6 +13,11 @@ import { prepareWorkspace, readStats } from "./runners/local.ts";
 // workspace in, so this does both: it makes the workspace as the local runner does, starts jig with the
 // prompt on stdin, and once jig has exited prints one line of its own after jig's events, {"jigWorker": 1,
 // "exitCode", "stats"}, and exits as jig did.
+//
+// A warm worker (pool.ts), started ahead of its task, is `node server/worker.ts --pool <internal listener>`
+// with its ticket in JIG_POOL_TICKET: it claims a task there, and the answer holds the task, jig's
+// arguments and the task's token, which it runs the same way. It exits after that one task, or with none
+// if its claim is refused (401 or 410: its ticket was spent, or has expired).
 
 /** What the runner puts in the task's Secret as task.json. */
 export interface WorkerInput {
@@ -22,23 +29,69 @@ export interface WorkerInput {
   stats: string;
 }
 
+/** The answer to a warm worker's claim: the task, and how its jig starts. */
+export interface PoolAnswer extends WorkerInput {
+  /** jig and its arguments. */
+  command: string[];
+  /** What jig's environment has beyond the worker's: the task's token, as its API key. */
+  env: Record<string, string>;
+  /** Print the worker's line after jig's events, as the Kubernetes runner reads it from the pod's log. */
+  report?: boolean;
+}
+
+let child: ChildProcess | undefined;
+
 async function main(): Promise<void> {
-  const [input, program, ...args] = process.argv.slice(2);
-  if (!program) throw new Error("Usage: node server/worker.ts <task.json> <jig> [arguments]");
-  const task: WorkerInput = JSON.parse(await readFile(input, "utf8"));
+  // As the pod's first process this one ignores signals it has no handler for: the kubelet's SIGTERM is
+  // passed on to jig, which stops its commands and ends the run; before jig starts, it ends the worker.
+  for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => (child ? child.kill(signal) : process.exit(128 + constants.signals[signal])));
+  const [first, ...rest] = process.argv.slice(2);
+  if (first === "--pool") {
+    const answer = await claim(rest[0]);
+    if (!answer) return;
+    const [program, ...args] = answer.command;
+    return run(answer, program, args, answer.env, answer.report ?? false);
+  }
+  const [program, ...args] = rest;
+  if (!first || !program) throw new Error("Usage: node server/worker.ts <task.json> <jig> [arguments], or --pool <internal listener>");
+  return run(JSON.parse(await readFile(first, "utf8")), program, args, {}, true);
+}
+
+/** The task a warm worker is given, waited for as long as it takes; undefined if its claim is refused. */
+async function claim(baseUrl: string | undefined): Promise<PoolAnswer | undefined> {
+  const ticket = process.env.JIG_POOL_TICKET;
+  // Spent once it is used, but jig and its commands get an environment without it all the same.
+  delete process.env.JIG_POOL_TICKET;
+  if (!baseUrl || !ticket) throw new Error("A warm worker needs --pool <the internal listener>, and its ticket in JIG_POOL_TICKET");
+  const url = new URL(`${baseUrl.replace(/\/+$/, "")}/internal/pool/claim`);
+  // node:http, which has no timeout of its own: the answer comes when a task does.
+  const res = await new Promise<IncomingMessage>((done, fail) => {
+    const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, { method: "POST", headers: { authorization: `Bearer ${ticket}`, "content-length": 0 } }, done);
+    req.on("error", fail);
+    req.end();
+  });
+  let text = "";
+  for await (const chunk of res) text += chunk;
+  if (res.statusCode === 401 || res.statusCode === 410) {
+    console.error(`jig worker: no task for it: its claim was refused (${res.statusCode})`);
+    return undefined;
+  }
+  if (res.statusCode !== 200) throw new Error(`The claim failed: ${res.statusCode} ${text.slice(0, 200)}`);
+  return JSON.parse(text);
+}
+
+/** Makes the workspace and runs jig in it, the prompt on stdin, then exits as jig did. */
+async function run(task: WorkerInput, program: string, args: string[], env: Record<string, string>, report: boolean): Promise<void> {
   await mkdir(task.work, { recursive: true });
   await prepareWorkspace(task.work, task.workspace, task.gitProtocols);
-
-  const child = spawn(program, args, { cwd: task.work, stdio: ["pipe", "inherit", "inherit"] });
+  child = spawn(program, args, { cwd: task.work, env: { ...process.env, ...env }, stdio: ["pipe", "inherit", "inherit"] });
   child.stdin!.on("error", () => {});
   child.stdin!.end(task.prompt);
-  // As the pod's first process this one ignores signals it has no handler for: the kubelet's SIGTERM is
-  // passed on to jig, which stops its commands and ends the run.
-  for (const signal of ["SIGTERM", "SIGINT"] as const) process.on(signal, () => child.kill(signal));
   const exitCode = await new Promise<number>((done, fail) => {
-    child.on("error", (err) => fail(new Error(`jig didn't start: ${err.message}`)));
-    child.on("exit", (code, signal) => done(code ?? 128 + (signal ? constants.signals[signal] : 0)));
+    child!.on("error", (err) => fail(new Error(`jig didn't start: ${err.message}`)));
+    child!.on("exit", (code, signal) => done(code ?? 128 + (signal ? constants.signals[signal] : 0)));
   });
+  if (!report) process.exit(exitCode);
   const line = `${JSON.stringify({ jigWorker: 1, exitCode, stats: await readStats(task.stats) })}\n`;
   process.stdout.write(line, () => process.exit(exitCode));
 }

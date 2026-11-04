@@ -1,24 +1,13 @@
-# The task service: one replica, as its SQLite store takes one writer, on a volume that outlives the pod.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: jig-data
-  namespace: jig
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 10Gi
----
+# The task service: two replicas sharing one Postgres database, whose URL (with its password) comes from
+# the jig-database Secret, yours to make:
+#   kubectl -n jig create secret generic jig-database --from-literal=url='postgres://jig:...@postgres.example.com:5432/jig?sslmode=require'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: jig-api
   namespace: jig
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: jig
@@ -43,12 +32,27 @@ spec:
           command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
           ports:
             - containerPort: 8080
+            # The internal listener, where the task pods ask for approvals.
+            - containerPort: 8082
           env:
             - name: JIG_GATEWAY_SECRET
               valueFrom:
                 secretKeyRef:
                   name: jig-secrets
                   key: gateway-secret
+            - name: JIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: jig-database
+                  key: url
+            # A warm worker claims its task from the replica that started it, at this pod's own address
+            # rather than the Service in front of both (docs/server.md, Warm pools).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: JIG_POOL_BASE_URL
+              value: "http://$(POD_IP):8082"
           readinessProbe:
             httpGet:
               path: /healthz
@@ -70,9 +74,9 @@ spec:
         - name: config
           configMap:
             name: jig-config
+        # The Kubernetes runner keeps nothing of a task's here: the state is in the database.
         - name: data
-          persistentVolumeClaim:
-            claimName: jig-data
+          emptyDir: {}
         - name: tmp
           emptyDir: {}
 ---
@@ -88,3 +92,18 @@ spec:
   ports:
     - port: 8080
       targetPort: 8080
+---
+# The internal listener, a Service of its own: the task pods may reach it (networkpolicy.yaml), not the
+# tenants' API. Any replica answers, as they hear each other's answers through the database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-api-internal
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: api
+  ports:
+    - port: 8082
+      targetPort: 8082
