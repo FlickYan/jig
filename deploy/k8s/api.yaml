@@ -45,6 +45,14 @@ spec:
                 secretKeyRef:
                   name: jig-database
                   key: url
+            # A warm worker claims its task from the replica that started it, at this pod's own address
+            # rather than the Service in front of both (docs/server.md, Warm pools).
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: JIG_POOL_BASE_URL
+              value: "http://$(POD_IP):8082"
           readinessProbe:
             httpGet:
               path: /healthz

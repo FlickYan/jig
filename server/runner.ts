@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { isAbsolute } from "node:path";
 import type { Task, TaskStatus, Tenant } from "./store.ts";
 
@@ -37,6 +38,12 @@ export interface Runner {
   start(task: Task, tenant: Tenant): Promise<RunHandle>;
   /** Removes what a task's run left on this machine (its folder), once the run has ended. */
   removeFiles?(id: string): Promise<void>;
+  /** Starts the workers it keeps warm (pool.ts), which claim their tasks at the internal listener, as they reach it. */
+  warm?(internalBaseUrl: string): void;
+  /** Answers a warm worker's claim, POST /internal/pool/claim on the internal listener. */
+  claim?(req: IncomingMessage, res: ServerResponse): Promise<void>;
+  /** Stops the workers it keeps warm, and settles once they are gone: the service is shutting down. */
+  close?(): Promise<void>;
 }
 
 /** A gateway token's payload (the token contract). */

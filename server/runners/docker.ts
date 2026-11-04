@@ -1,15 +1,20 @@
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { closeSync, openSync } from "node:fs";
 import { lchown, mkdir, readdir, rm } from "node:fs/promises";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import { type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
 import { jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
+import type { PoolAnswer } from "../worker.ts";
 import { lastLine, prepareWorkspace, readStats, TERM_MS, tail } from "./local.ts";
 
 // Runs each task's jig in a container of its own, through the docker CLI: `docker run --rm` with limits on
 // CPU, memory and processes, a read-only root, no capabilities, and a network that reaches only the
 // gateway. The task's folder is made here as the local runner makes it and bound into the container at
-// /task; the events file jig writes there is read from this side.
+// /task; the events file jig writes there is read from this side. With a pool, containers are started
+// ahead of tasks, each with a folder of its own, and a task is given to one that waits (pool.ts).
 
 export interface DockerRunnerConfig {
   /** Where the task folders go. The daemon binds them by this path, so it must be the same on its machine. */
@@ -37,6 +42,10 @@ export interface DockerRunnerConfig {
   gitProtocols?: string[];
   /** The service's internal listener as the containers reach it, on the network: where tasks ask for approvals. */
   internalBaseUrl?: string;
+  /** Workers started ahead of tasks (pool.ts): none unless `size` is set. */
+  pool?: PoolConfig;
+  /** How a warm worker starts in the image (default: node /opt/jig/server/worker.ts). */
+  worker?: string[];
   pollMs?: number;
 }
 
@@ -46,41 +55,129 @@ const PASSED = ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"
 const RETRY_MS = 1_000;
 
 export class DockerRunner implements Runner {
+  /** The workers started ahead of tasks, if the config asks for any. */
+  readonly pool?: WarmPool<Slot>;
   private config: DockerRunnerConfig;
+  /** The folders of tasks run on a warm worker: its slot's, not one named for the task. */
+  private folders = new Map<string, string>();
+  /** Where the warm workers claim their tasks. */
+  private poolUrl = "";
 
   constructor(config: DockerRunnerConfig) {
     this.config = config;
+    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket));
   }
 
   /** The task's folder. */
   dir(id: string): string {
-    return join(this.config.dataDir, "tasks", id);
+    return this.folders.get(id) ?? join(this.config.dataDir, "tasks", id);
   }
 
   async removeFiles(id: string): Promise<void> {
     await rm(this.dir(id), { recursive: true, force: true });
+    this.folders.delete(id);
+  }
+
+  warm(internalBaseUrl: string): void {
+    this.poolUrl = this.config.pool?.baseUrl ?? internalBaseUrl;
+    this.pool?.open();
+  }
+
+  async claim(req: IncomingMessage, res: ServerResponse): Promise<void> {
+    if (!this.pool) return void res.writeHead(404, { "content-type": "application/json" }).end(`${JSON.stringify({ error: "This service keeps no warm workers" })}\n`);
+    return this.pool.claim(req, res);
+  }
+
+  async close(): Promise<void> {
+    await this.pool?.close();
   }
 
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
-    const { docker = ["docker"], jig = ["jig"], user = "10001:10001", graceSeconds, pollMs = 100 } = this.config;
+    const warm = this.pool?.take(task.id);
+    const handle = warm && (await this.startWarm(warm, task, tenant));
+    if (handle) return handle;
+    const { jig = ["jig"], graceSeconds } = this.config;
     const dir = this.dir(task.id);
-    await rm(dir, { recursive: true, force: true });
-    await mkdir(join(dir, "work"), { recursive: true });
-    await mkdir(join(dir, "home"));
+    await this.makeFolder(dir);
     await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"]);
-    // A service running as root (as one holding the docker socket may) makes the folder root's, which jig,
-    // not root in the container, couldn't write.
-    const [uid, gid] = user.split(":").map(Number);
-    if (process.getuid?.() === 0 && Number.isInteger(uid) && Number.isInteger(gid)) await chownTree(dir, uid, gid);
+    await this.chown(dir);
 
     // The token goes by name only (-e NAME), its value in the CLI's environment, out of the process list.
     const key = keyVariable(task.spec.model);
-    const env: NodeJS.ProcessEnv = { [key]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) };
-    for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
     const name = `jig-${task.id}`;
     const args = [
-      "run", "--rm", "--interactive", "--init", "--name", name, "--label", `jig.task=${task.id}`, "--label", `jig.tenant=${tenant.id}`,
-      "--user", user,
+      ...this.runArgs(name, dir, ["--interactive", "--label", `jig.task=${task.id}`, "--label", `jig.tenant=${tenant.id}`], key),
+      // The container is the boundary: bubblewrap would need Docker's seccomp filter and /proc masks loosened.
+      ...jig, "--no-sandbox", ...this.jigArgs(task, tenant),
+    ];
+    const container = this.launch(name, args, { [key]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) }, join(dir, "output.log"), task.spec.prompt);
+    return this.handle(container, dir, task);
+  }
+
+  /**
+   * Runs the task on a warm worker: its workspace made in the slot's folder, which the container has bound
+   * since it started, and the rest, what a cold start passes to docker run, in the answer to its claim.
+   * Undefined if the worker went away meanwhile, and the task starts cold.
+   */
+  private async startWarm(warm: Warm<Slot>, task: Task, tenant: Tenant): Promise<RunHandle | undefined> {
+    const { jig = ["jig"], graceSeconds } = this.config;
+    const { dir, container } = warm.slot;
+    try {
+      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"]);
+      await this.chown(dir);
+    } catch (err) {
+      warm.stop();
+      throw err;
+    }
+    const answer: PoolAnswer = {
+      prompt: task.spec.prompt,
+      gitProtocols: this.config.gitProtocols ?? ["https"],
+      work: "/task/work",
+      stats: "/task/stats.json",
+      command: [...jig, "--no-sandbox", ...this.jigArgs(task, tenant)],
+      env: { [keyVariable(task.spec.model)]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) },
+    };
+    if (!warm.answer(answer)) return undefined;
+    warm.slot.assigned = true;
+    this.folders.set(task.id, dir);
+    return this.handle(container, dir, task);
+  }
+
+  /** A warm worker: a container with its own slot's folder at /task, as a task's, that claims a task with its ticket. */
+  private async launchWarm(ticket: string): Promise<Started<Slot>> {
+    const { worker = ["node", "/opt/jig/server/worker.ts"] } = this.config;
+    const id = `pool_${randomBytes(12).toString("hex")}`;
+    const dir = join(this.config.dataDir, "tasks", id);
+    await this.makeFolder(dir);
+    await this.chown(dir);
+    const name = `jig-${id}`;
+    const args = [...this.runArgs(name, dir, ["--label", `jig.pool=${id}`], "JIG_POOL_TICKET"), ...worker, "--pool", this.poolUrl];
+    const container = this.launch(name, args, { JIG_POOL_TICKET: ticket }, join(dir, "output.log"));
+    const slot: Slot = { dir, container, assigned: false };
+    // A worker that never got a task leaves its folder; one that did, the task's.
+    void container.exit.then(async () => {
+      if (!slot.assigned) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    });
+    return { slot, exited: container.exit, stop: container.stop };
+  }
+
+  private async makeFolder(dir: string): Promise<void> {
+    await rm(dir, { recursive: true, force: true });
+    await mkdir(join(dir, "work"), { recursive: true });
+    await mkdir(join(dir, "home"));
+  }
+
+  /** A service running as root (as one holding the docker socket may) makes the folder root's, which jig, not root in the container, couldn't write. */
+  private async chown(dir: string): Promise<void> {
+    const [uid, gid] = (this.config.user ?? "10001:10001").split(":").map(Number);
+    if (process.getuid?.() === 0 && Number.isInteger(uid) && Number.isInteger(gid)) await chownTree(dir, uid, gid);
+  }
+
+  /** docker run's arguments up to the image: the limits and isolation every container gets, cold or warm. */
+  private runArgs(name: string, dir: string, extra: string[], key: string): string[] {
+    return [
+      "run", "--rm", "--init", "--name", name, ...extra,
+      "--user", this.config.user ?? "10001:10001",
       "--cpus", String(this.config.cpus ?? 1), "--memory", this.config.memory ?? "2g", "--memory-swap", this.config.memory ?? "2g", "--pids-limit", String(this.config.pidsLimit ?? 512),
       "--read-only", "--tmpfs", `/tmp:rw,nosuid,nodev,size=${this.config.tmpSize ?? "512m"}`, "--mount", `type=bind,source=${dir},target=/task`, "--workdir", "/task/work",
       "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -88,16 +185,26 @@ export class DockerRunner implements Runner {
       "--network", this.config.network,
       "--env", "HOME=/task/home", "--env", "JIG_HOME=/task/home/.jig", "--env", "NO_COLOR=1", "--env", key,
       this.config.image,
-      // The container is the boundary: bubblewrap would need Docker's seccomp filter and /proc masks loosened.
-      ...jig, "--no-sandbox", ...jigArgs(task, tenant, { cwd: "/task/work", events: "/task/events.jsonl", stats: "/task/stats.json", baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl }),
     ];
-    const log = join(dir, "output.log");
+  }
+
+  private jigArgs(task: Task, tenant: Tenant): string[] {
+    return jigArgs(task, tenant, { cwd: "/task/work", events: "/task/events.jsonl", stats: "/task/stats.json", baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl });
+  }
+
+  /** Starts docker run, `secrets` in the CLI's environment only, its output to `log`, and `stdin` to the container. */
+  private launch(name: string, args: string[], secrets: Record<string, string>, log: string, stdin?: string): Container {
+    const { docker = ["docker"] } = this.config;
+    const env: NodeJS.ProcessEnv = { ...secrets };
+    for (const variable of PASSED) if (process.env[variable] !== undefined) env[variable] = process.env[variable];
     const out = openSync(log, "w");
     const [program, ...first] = docker;
-    const child = spawn(program, [...first, ...args], { env, stdio: ["pipe", out, out] });
+    const child = spawn(program, [...first, ...args], { env, stdio: [stdin === undefined ? "ignore" : "pipe", out, out] });
     closeSync(out);
-    child.stdin!.on("error", () => {});
-    child.stdin!.end(task.spec.prompt);
+    if (stdin !== undefined) {
+      child.stdin!.on("error", () => {});
+      child.stdin!.end(stdin);
+    }
 
     /** Whether the signal reached the container. */
     const kill = (signal: string) =>
@@ -107,7 +214,6 @@ export class DockerRunner implements Runner {
         killer.on("exit", (code) => done(code === 0));
       });
     let exited = false;
-    let timedOut = false;
     let stopping = false;
     let timer: NodeJS.Timeout | undefined;
     let wake: (() => void) | undefined;
@@ -127,31 +233,47 @@ export class DockerRunner implements Runner {
         }
       })();
     };
-    const deadline = setTimeout(() => ((timedOut = true), stop()), (task.spec.timeLimit + graceSeconds) * 1000);
-    const stats = join(dir, "stats.json");
-    const exit = new Promise<RunExit>((done) => {
-      child.on("error", (err) => {
+    const exit = new Promise<{ code: number | null; message?: string }>((done) => {
+      const end = (result: { code: number | null; message?: string }) => {
         exited = true;
-        clearTimeout(deadline);
         clearTimeout(timer);
         wake?.();
-        done({ exitCode: null, timedOut, message: `docker didn't start: ${err.message}` });
-      });
+        done(result);
+      };
+      child.on("error", (err) => end({ code: null, message: `docker didn't start: ${err.message}` }));
       // docker run exits with the container's code, or 125 to 127 when it couldn't run it.
-      child.on("exit", (code) => {
-        exited = true;
-        clearTimeout(deadline);
-        clearTimeout(timer);
-        wake?.();
-        done({ exitCode: code, timedOut });
-      });
-    }).then(async (result) => ({
-      ...result,
-      stats: await readStats(stats),
-      message: result.message ?? (result.exitCode === 0 ? undefined : await lastLine(log)),
-    }));
-    return { events: tail(join(dir, "events.jsonl"), () => exited, pollMs), wait: () => exit, cancel: stop };
+      child.on("exit", (code) => end({ code }));
+    });
+    return { exit, exited: () => exited, stop };
   }
+
+  /** A task's run in the container, from now: its events read from the folder, and stopped at its time limit and the grace. */
+  private handle(container: Container, dir: string, task: Task): RunHandle {
+    const { graceSeconds, pollMs = 100 } = this.config;
+    let timedOut = false;
+    const deadline = setTimeout(() => ((timedOut = true), container.stop()), (task.spec.timeLimit + graceSeconds) * 1000);
+    const exit = container.exit.then(async ({ code, message }): Promise<RunExit> => {
+      clearTimeout(deadline);
+      return { exitCode: code, timedOut, stats: await readStats(join(dir, "stats.json")), message: message ?? (code === 0 ? undefined : await lastLine(join(dir, "output.log"))) };
+    });
+    return { events: tail(join(dir, "events.jsonl"), container.exited, pollMs), wait: () => exit, cancel: container.stop };
+  }
+}
+
+/** A docker run of the runner's. */
+interface Container {
+  /** docker run's exit code (null if it didn't start, with why). */
+  exit: Promise<{ code: number | null; message?: string }>;
+  exited(): boolean;
+  /** TERM, sent until it reaches the container, then KILL 5 seconds later until it has exited. */
+  stop(): void;
+}
+
+/** A warm worker's container and folder; `assigned` once a task is given to it. */
+interface Slot {
+  dir: string;
+  container: Container;
+  assigned: boolean;
 }
 
 async function chownTree(path: string, uid: number, gid: number): Promise<void> {

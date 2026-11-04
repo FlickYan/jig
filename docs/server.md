@@ -294,6 +294,46 @@ and Secret with it.
 cluster's network plugin enforces NetworkPolicy. A git workspace is cloned in the pod, so it needs its git
 host allowed as well (the file has an example rule).
 
+### Warm pools
+
+A Docker or Kubernetes task waits for its container or pod to be made, scheduled and started, its image
+pulled, before jig's first model call: seconds, or minutes under load. With a pool, each replica keeps
+workers started ahead of tasks (`server/pool.ts`), and a task that finds one waiting starts at once:
+
+```json
+"docker": { "image": "jig-worker", "network": "jig-tasks", "pool": { "size": 4, "maxIdleSeconds": 600 } }
+```
+
+`size` (0, no pool, by default) is how many idle workers the replica keeps; `pool` goes in the
+`kubernetes` block the same way. A worker is a container (`docker.worker`, `node
+/opt/jig/server/worker.ts` by default, with `--pool <internalBaseUrl>`) or a Job made as a task's is, the
+same image, user, limits, network and runtime, with a ticket of its own in `JIG_POOL_TICKET`: 32 random
+bytes, which the replica keeps only as their hash, with their expiry. The worker long-polls `POST
+/internal/pool/claim` on the internal listener with the ticket as its Bearer, which spends it: a second
+use is 401, and an expired ticket 410. When the scheduler starts a task and a worker waits, the task is
+given to it in the answer to its claim, with what a cold start would have given it: the prompt, the
+workspace, the task's gateway token and jig's arguments. On Docker the service makes the workspace in the
+worker's own folder, bound at `/task` since the container started, and reads the events file there; on
+Kubernetes the worker makes it, and the events come in the pod's log, its Job given the task's deadline
+(from now) and labels with a merge patch (the Role in `deploy/k8s/rbac.yaml` allows `patch` on Jobs).
+With none waiting the task starts cold, as before, and the pool is filled behind it. A miss is logged,
+with the pool's idle workers, hits and misses so far.
+
+A worker runs one task and exits: none is used again, so no tenant's files, memory or processes meet
+another's, and what tenants share is what cold tasks share, the image and the node. The worker takes the
+ticket out of its environment before it starts jig; spent, it opens nothing anyway. A worker idle for
+`maxIdleSeconds` is told so (410) and stopped, and another started in its place; one that exits before it
+claims is started again after a pause that doubles, up to a minute, so an image that can't run doesn't
+loop; on Kubernetes, where only its claim says a worker is up, one that never claims is found at its
+`maxIdleSeconds`. A service that stops stops its idle workers. A replica that crashes leaves them waiting
+on a connection that breaks, and they exit (an idle Job's own deadline is `maxIdleSeconds` and a minute).
+
+A worker claims from the replica that started it, which alone holds its ticket. `pool.baseUrl` is that
+replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on
+Kubernetes that is a Service in front of every replica, so each replica takes its pod's own address from
+`JIG_POOL_BASE_URL`, which `deploy/k8s/api.yaml` sets (`http://$(POD_IP):8082`) and which takes the
+config's place.
+
 ## Events
 
 `jig --events <file|->`, in a task given on the command line or stdin, writes the task's events as JSON

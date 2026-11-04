@@ -103,7 +103,10 @@ export async function startService(config: Config, { secret, runner, webhookRetr
       else res.end();
       console.error(err);
     });
-  const internal = createServer(handler((req, res) => handleInternal(req, res, { store, answers, secret })));
+  // A warm worker's claim is its runner's to answer (pool.ts); the rest are approvals.
+  const internal = createServer(
+    handler((req, res) => (runner?.claim && req.url?.split("?")[0] === "/internal/pool/claim" ? runner.claim(req, res) : handleInternal(req, res, { store, answers, secret }))),
+  );
   let scheduler: Scheduler;
   let internalUrl: string;
   try {
@@ -117,11 +120,13 @@ export async function startService(config: Config, { secret, runner, webhookRetr
     // Before any task starts, as their jig asks for approvals there.
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl);
+    runner.warm?.(config.internalBaseUrl ?? internalUrl);
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
     scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval: (task, approval) => webhooks.send(task, approval) });
     const expired = await scheduler.start();
     if (expired.length) console.error(`jig service: ${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
+    await runner?.close?.();
     if (internal.listening) await new Promise((done) => internal.close(done));
     await store.close();
     throw err;
@@ -130,6 +135,8 @@ export async function startService(config: Config, { secret, runner, webhookRetr
   const server = createServer(handler((req, res) => handle(req, res, context)));
   const close = async () => {
     webhooks.close();
+    // The idle workers first, their claims answered while the internal listener is still up.
+    await runner!.close?.();
     for (const listener of [server, internal]) listener.closeAllConnections();
     await Promise.all([server, internal].map((listener) => new Promise((done) => listener.close(done))));
     await answers.close();
@@ -196,6 +203,10 @@ function configProblem(config: Config): string | undefined {
     value === undefined || (Array.isArray(value) && value.length && value.every((item) => typeof item === "string" && item)) ? undefined : `${name} must be a list of strings`;
   const http = (name: string, value: unknown) =>
     value === undefined || (typeof value === "string" && /^https?:\/\//i.test(value) && URL.canParse(value)) ? undefined : `${name} must be an http or https URL, not ${JSON.stringify(value)}`;
+  const poolProblem = (block: string, pool: unknown) =>
+    pool === undefined ? undefined
+    : !isObject(pool) ? `${block}.pool must be an object, {size, maxIdleSeconds}`
+    : (whole(`${block}.pool.size`, pool.size, 0) ?? positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ?? http(`${block}.pool.baseUrl`, pool.baseUrl));
   const problem =
     text("database", config.database, true) ??
     text("dataDir", config.dataDir, true) ??
@@ -217,6 +228,8 @@ function configProblem(config: Config): string | undefined {
     text("replicaId", config.replicaId, false) ??
     positive("leaseSeconds", config.leaseSeconds) ??
     whole("maxEvents", config.maxEvents, 1) ??
+    poolProblem("docker", config.docker?.pool) ??
+    poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
     (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
   if (problem) return problem;
@@ -495,6 +508,9 @@ async function main(): Promise<void> {
   const config: Config = JSON.parse(readFileSync(values.config, "utf8"));
   // A Postgres URL holds a password, which belongs in a secret rather than the config.
   if (process.env.JIG_DATABASE_URL) config.database = process.env.JIG_DATABASE_URL;
+  // Replicas share the config, but each one's warm workers claim at its own address (its pod's, say).
+  const pool = config.runner === "docker" ? config.docker?.pool : config.runner === "kubernetes" ? config.kubernetes?.pool : undefined;
+  if (isObject(pool) && process.env.JIG_POOL_BASE_URL) pool.baseUrl = process.env.JIG_POOL_BASE_URL;
   checkConfig(config);
   // Paths in the config are relative to it.
   const base = dirname(resolve(values.config));

@@ -653,6 +653,10 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
+    assert.equal(problem({ docker: { image: "w", network: "n", pool: 4 } }), "The config's docker.pool must be an object, {size, maxIdleSeconds}");
+    assert.equal(problem({ kubernetes: { image: "w", pool: { size: -1 } } }), "The config's kubernetes.pool.size must be a whole number from 0 up, not -1");
+    assert.equal(problem({ kubernetes: { image: "w", pool: { size: 1, maxIdleSeconds: 0 } } }), "The config's kubernetes.pool.maxIdleSeconds must be a number over 0, not 0");
     const key = sha256(KEYS.acme);
     assert.equal(problem({ tenants: [{ id: "acme", keys: [key] }, { id: "acme", keys: [] }] }), 'The config\'s tenants[1].id "acme" is another tenant\'s too');
     assert.equal(problem({ tenants: [{ id: "acme", keys: [key] }, { id: "globex", keys: [key.toUpperCase()] }] }), "The config's tenants[1].keys[0] is tenant acme's key too: a key opens one tenant");
