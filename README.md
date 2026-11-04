@@ -621,6 +621,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
+| [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits, usage and budgets |
 
 **When does the loop stop?** When a reply has no tool calls (the model's signal that it is done). With
 `--check` in a one-shot run (`jig --check "task"`), the first time that happens jig asks the model to check
