@@ -1002,7 +1002,7 @@ function approveVia(values: Values, model: string, api: Api, apiKey?: string) {
   } catch {}
   if (protocol !== "http:" && protocol !== "https:") throw new Error("--approve-via must be an http or https address, like http://127.0.0.1:8082/internal/approvals");
   const timeout = given === undefined ? 600 : Number(given);
-  if (!(timeout > 0 && timeout * 1000 < 2 ** 31)) throw new Error("--approval-timeout must be a positive number of seconds, under 24 days");
+  if (!(timeout > 0 && Math.ceil(timeout * 1000) < 2 ** 31)) throw new Error("--approval-timeout must be a positive number of seconds, under 24 days");
   const key = apiKey ?? apiKeyFor(model, api);
   if (!key) throw new Error("--approve-via sends the API key jig uses for the model to the service, and there is none: set DEEPSEEK_API_KEY (DeepSeek models), ANTHROPIC_API_KEY (Claude models) or OPENAI_API_KEY (others).");
   return httpApprover(url, key, timeout);

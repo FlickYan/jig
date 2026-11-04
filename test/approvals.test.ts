@@ -140,10 +140,11 @@ describe("--approve-via", () => {
 
   it("denies a call nobody answered by --approval-timeout, a key the service refuses included", async () => {
     // The service knows only the task's token, so every poll with this key gets a 401, and jig keeps trying.
+    // A timeout that isn't a whole number of milliseconds is rounded up, not an error.
     const api = await running(["touch made"]);
     const approvals = await fakeApprovals(() => ({ status: 401 }));
     try {
-      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "1.5", "--events", file, "Make the file."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "1.5001", "--events", file, "Make the file."], { api, cwd: project });
       assert.equal(code, 0, output);
       assert.equal(existsSync(join(project, "made")), false);
       assert.ok(approvals.polls.length >= 2, `${approvals.polls.length} polls`);
@@ -199,6 +200,8 @@ describe("--approve-via", () => {
         [["--approval-timeout", "60", "Do it."], /--approval-timeout is for --approve-via/],
         [["--approve-via", "ftp://example.com/approvals", "Do it."], /--approve-via must be an http or https address/],
         [["--approve-via", url, "--approval-timeout", "0", "Do it."], /--approval-timeout must be a positive number of seconds/],
+        // Just under 2 ** 31 ms, but not once rounded up to a whole millisecond, where a timer would fire at once.
+        [["--approve-via", url, "--approval-timeout", "2147483.6475", "Do it."], /--approval-timeout must be a positive number of seconds/],
         [["--approve-via", url, "Do it."], /--approve-via sends the API key/, { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" }],
       ];
       for (const [given, refusal, env] of refusals) {

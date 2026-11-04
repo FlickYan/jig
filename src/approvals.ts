@@ -23,7 +23,8 @@ export type Answer = Approval & { by?: "api" | "timeout" };
 export function httpApprover(url: string, key: string, timeout: number) {
   const base = url.replace(/\/+$/, "");
   return async ({ id }: ApprovalRequest, signal: AbortSignal): Promise<Answer> => {
-    const waiting = AbortSignal.any([signal, AbortSignal.timeout(timeout * 1000)]);
+    // In whole milliseconds: AbortSignal.timeout throws on a fraction of one, as 1.0001 seconds would give.
+    const waiting = AbortSignal.any([signal, AbortSignal.timeout(Math.ceil(timeout * 1000))]);
     let retry = FIRST_RETRY_MS;
     while (!waiting.aborted) {
       try {
