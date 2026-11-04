@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, connect } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
@@ -124,6 +124,17 @@ async function* frames(res: Response): AsyncGenerator<{ id?: string; event?: str
   }
 }
 
+/** Sends `head` (and `body`) on a socket of its own, as written: a request target fetch() wouldn't send. */
+async function raw(base: string, head: string, body = ""): Promise<{ status: number; text: string }> {
+  const { hostname, port } = new URL(base);
+  const socket = connect(Number(port), hostname);
+  // Written, not ended: a client that half-closes its socket has gone away, as far as the router knows.
+  socket.write(`${head}\r\nhost: ${hostname}:${port}\r\nconnection: close\r\ncontent-length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+  let text = "";
+  for await (const chunk of socket) text += chunk;
+  return { status: Number(/^HTTP\/1\.1 (\d+)/.exec(text)?.[1]), text };
+}
+
 /** A stand-in for a region's service: its /healthz says it is `name`, and `serve` answers the rest. */
 async function fakeRegion(name: string, serve: (req: IncomingMessage, res: ServerResponse) => void): Promise<string> {
   const server = createServer((req, res) => {
@@ -159,6 +170,8 @@ describe("a service in a region", () => {
         error: "this is region eu; post to region us's service or through the router",
       });
       assert.deepEqual((await call(eu.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: 5 })).body, { error: "region must be a region's name" });
+      // Both end before the service closes, which would otherwise pull their store and folders from under them.
+      for (const id of [created.body.id, named.body.id]) await statusOf(eu.url, KEYS.acme, id, "succeeded");
     });
   }
 
@@ -171,6 +184,7 @@ describe("a service in a region", () => {
     const refused = await call(plain.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: "eu" });
     assert.equal(refused.status, 400);
     assert.equal(refused.body.error, "this is a service with no region; post to region eu's service or through the router");
+    await statusOf(plain.url, KEYS.acme, body.id, "succeeded");
     assert.throws(() => checkConfig({ region: "EU-1" } as unknown as Config), /The config's region must be 1 to 16 lowercase letters and digits, not "EU-1"/);
   });
 });
@@ -188,7 +202,8 @@ describe("the router", () => {
     assert.equal(home.headers.get("x-request-id"), "req-1.a");
     assert.ok(await eu.store.task(home.body.id));
     assert.equal(await us.store.task(home.body.id), undefined);
-    assert.match((await call(front.url, KEYS.initech, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id, /^task_us_/);
+    const initech = (await call(front.url, KEYS.initech, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    assert.match(initech, /^task_us_/);
 
     const named = await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: "us" }, { "x-request-id": "not a valid id!" });
     assert.equal(named.status, 201);
@@ -213,6 +228,9 @@ describe("the router", () => {
       assert.ok(refused.headers.get("x-request-id"));
     }
     assert.deepEqual((await call(front.url, undefined, "GET", "/healthz")).body, { ok: true, regions: { eu: true, us: true } });
+    await statusOf(front.url, KEYS.acme, home.body.id, "succeeded");
+    await statusOf(front.url, KEYS.initech, initech, "succeeded");
+    await statusOf(front.url, KEYS.acme, named.body.id, "succeeded");
   });
 
   it("routes a task's view, its live events and its cancel by the region in its id, and lists a region's tasks", async () => {
@@ -235,6 +253,7 @@ describe("the router", () => {
     await writeFile(join(us.base, "data", "tasks", waiting, "work", "go"), "");
     for await (const frame of stream) seen.push(frame.event ?? JSON.parse(frame.data).type);
     assert.deepEqual(seen, ["start", "tool_call", "tool_result", "step", "text", "step", "end", "done"]);
+    await statusOf(front.url, KEYS.acme, waiting, "succeeded");
 
     // A cancel goes to the region the task is in.
     const hanging = (await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
@@ -275,6 +294,7 @@ describe("the router", () => {
     assert.equal(moved.status, 201);
     assert.match(moved.body.id, /^task_us_/);
     assert.equal(moved.headers.get("x-jig-region"), "us");
+    await statusOf(front.url, KEYS.acme, moved.body.id, "succeeded");
     // Not for a tenant without failover, nor a task that names the region that is down, nor a task there.
     for (const [key, body] of [[KEYS.globex, { prompt: "exit 0" }], [KEYS.acme, { prompt: "exit 0", region: "eu" }]] as const) {
       const refused = await call(front.url, key, "POST", "/v1/tasks", body);
@@ -296,8 +316,10 @@ describe("the router", () => {
     await region("eu", { base: eu.base, port: Number(new URL(eu.url).port) });
     await until(async () => (await call(front.url, undefined, "GET", "/healthz")).body.regions.eu, "eu to be up again");
     assert.equal((await call(front.url, KEYS.acme, "GET", `/v1/tasks/${done}`)).body.status, "succeeded");
-    assert.match((await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id, /^task_eu_/);
+    const back = (await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    assert.match(back, /^task_eu_/);
     assert.ok(lines.includes("jig router: region eu is up again (region=eu)"));
+    await statusOf(front.url, KEYS.globex, back, "succeeded");
   });
 
   it("counts a region that answers as another as down", async () => {
@@ -376,6 +398,40 @@ describe("the router", () => {
     assert.equal(JSON.parse(first.value!.data).type, "start");
     client.abort();
     await until(() => closed, "the region's request to close");
+  });
+
+  it("sends a request whose target names another host to the region all the same, with its key", async () => {
+    const asked: string[] = [];
+    const elsewhere: string[] = [];
+    const eu = await fakeRegion("eu", (req, res) => {
+      asked.push(`${req.method} ${req.url} ${req.headers.authorization}`);
+      res.writeHead(req.method === "POST" ? 201 : 200, { "content-type": "application/json" }).end(JSON.stringify({ from: "eu" }));
+    });
+    const evil = await fakeRegion("evil", (req, res) => {
+      elsewhere.push(`${req.method} ${req.url}`);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ from: "evil" }));
+    });
+    const front = await router({ eu, us: await fakeRegion("us", () => {}) });
+    const host = new URL(evil).host;
+    const id = `task_eu_${"b".repeat(32)}`;
+    const auth = `authorization: Bearer ${KEYS.globex}`;
+    // Scheme-relative targets and absolute-form ones go to the region the path names; a path that
+    // parses to //host/... goes to the region's own service, under its own path.
+    for (const [target, method, path] of [
+      [`///${host}/v1/tasks/${id}?x=1`, "GET", `/v1/tasks/${id}?x=1`],
+      [`http://${host}/v1/tasks/${id}`, "GET", `/v1/tasks/${id}`],
+      [`http://${host}/v1/tasks`, "POST", "/v1/tasks"],
+      [`///${host}/v1/tasks`, "POST", "/v1/tasks"],
+      [`/.//${host}/v1/usage`, "GET", `/${host}/v1/usage`],
+    ]) {
+      asked.length = 0;
+      const answer = await raw(front.url, `${method} ${target} HTTP/1.1\r\n${auth}`, method === "POST" ? JSON.stringify({ prompt: "exit 0" }) : "");
+      assert.equal(answer.status, method === "POST" ? 201 : 200, target);
+      assert.match(answer.text, /x-jig-region: eu/i);
+      assert.match(answer.text, /\{"from":"eu"\}/);
+      assert.deepEqual(asked, [`${method} ${path} Bearer ${KEYS.globex}`], target);
+    }
+    assert.deepEqual(elsewhere, []);
   });
 
   it("serves its metrics and health on a listener of their own", async () => {

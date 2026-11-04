@@ -231,9 +231,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
   const forward = (x: Exchange, region: Region, path: string, body?: Buffer): Promise<void> =>
     new Promise((done) => {
       const headers = Object.fromEntries(Object.entries(x.req.headers).filter(([name]) => !HOP_BY_HOP.has(name) && !(body && name === "content-length")));
-      const base = withSlash(region.url);
-      const request = base.protocol === "https:" ? httpsRequest : httpRequest;
-      const upstream = request(new URL(path.replace(/^\//, ""), base), {
+      const request = region.url.protocol === "https:" ? httpsRequest : httpRequest;
+      const upstream = request(under(region.url, path), {
         method: x.req.method,
         headers: { ...headers, "x-request-id": x.id, ...(body && { "content-length": String(body.length) }) },
       });
@@ -270,7 +269,7 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
         const region = regions.get(name)!;
         if (!region.up) return { name, status: 503, body: undefined };
         try {
-          const res = await fetch(new URL(`${path.replace(/^\//, "")}${query.size ? `?${query}` : ""}`, withSlash(region.url)), {
+          const res = await fetch(under(region.url, `${path}${query.size ? `?${query}` : ""}`), {
             headers: { authorization: x.req.headers.authorization ?? "", "x-request-id": x.id },
             signal: AbortSignal.timeout(30_000),
           });
@@ -294,6 +293,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
 
   const handle = async (x: Exchange): Promise<void> => {
     const { req } = x;
+    // Requests go on with this parsed path and query, never req.url: a target in absolute form
+    // (http://host/v1/...) or one that starts with // names a host of the client's choosing.
     const url = new URL(req.url ?? "/", "http://router");
     if (url.pathname === "/healthz") return reply(x, 200, { ok: true, regions: standing() });
     const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
@@ -319,7 +320,7 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
         if (typeof named !== "string" || !allowed(named)) return reply(x, 403, { error: `Tenant ${tenant.id} may not use region ${JSON.stringify(named)}: it may use ${tenant.allowed.join(", ")}`, region: named });
         const region = regions.get(named)!;
         if (!region.up) return down(x, named, "try again once it is back, or name another region");
-        return forward(x, region, req.url!, body);
+        return forward(x, region, url.pathname + url.search, body);
       }
       let region = regions.get(tenant.home)!;
       if (!region.up) {
@@ -329,7 +330,7 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
         x.log.info(`a new task goes to region ${other.name}: its home, ${region.name}, is down`, { region: other.name });
         region = other;
       }
-      return forward(x, region, req.url!, body);
+      return forward(x, region, url.pathname + url.search, body);
     }
 
     const task = /^\/v1\/tasks\/([^/]+)(\/[^/]+)?/.exec(url.pathname);
@@ -340,7 +341,7 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       if (name === undefined || !regions.has(name) || !allowed(name)) return reply(x, 404, { error: "No such task" });
       const region = regions.get(name)!;
       if (!region.up) return down(x, name, "its tasks can't be read or changed until it is back (task data stays in its region)");
-      return forward(x, region, req.url!);
+      return forward(x, region, url.pathname + url.search);
     }
 
     // The tenant's list, and its usage, are each region's own: ?region= picks one (the home by default).
@@ -441,6 +442,14 @@ async function readBody(req: IncomingMessage, max: number): Promise<Buffer | und
 /** The URL as a base that paths join onto, keeping its own path (https://eu.example.com/jig/ + v1/tasks). */
 function withSlash(url: URL): URL {
   return new URL(url.href.endsWith("/") ? url.href : `${url.href}/`);
+}
+
+/**
+ * The path and query on the region's URL, under its own path. Joined as text, never resolved as a URL: a
+ * path like //host/... or https:host/... would otherwise name another host, and take the tenant's key there.
+ */
+function under(region: URL, path: string): URL {
+  return new URL(withSlash(region).href + path.replace(/^\/+/, ""));
 }
 
 async function listen(server: Server, port: number, host: string): Promise<string> {
