@@ -35,6 +35,8 @@ export interface DockerRunnerConfig {
   gatewaySecret: string;
   graceSeconds: number;
   gitProtocols?: string[];
+  /** The service's internal listener as the containers reach it, on the network: where tasks ask for approvals. */
+  internalBaseUrl?: string;
   pollMs?: number;
 }
 
@@ -87,7 +89,7 @@ export class DockerRunner implements Runner {
       "--env", "HOME=/task/home", "--env", "JIG_HOME=/task/home/.jig", "--env", "NO_COLOR=1", "--env", key,
       this.config.image,
       // The container is the boundary: bubblewrap would need Docker's seccomp filter and /proc masks loosened.
-      ...jig, "--no-sandbox", ...jigArgs(task, { cwd: "/task/work", events: "/task/events.jsonl", stats: "/task/stats.json", baseUrl: this.config.gatewayBaseUrl }),
+      ...jig, "--no-sandbox", ...jigArgs(task, tenant, { cwd: "/task/work", events: "/task/events.jsonl", stats: "/task/stats.json", baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl }),
     ];
     const log = join(dir, "output.log");
     const out = openSync(log, "w");

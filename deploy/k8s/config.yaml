@@ -17,6 +17,8 @@ data:
       "concurrency": 50,
       "model": "deepseek-flash",
       "gatewayBaseUrl": "http://jig-gateway.jig.svc:8081/anthropic",
+      "internal": { "host": "0.0.0.0", "port": 8082 },
+      "internalBaseUrl": "http://jig-api-internal.jig.svc:8082",
       "runner": "kubernetes",
       "kubernetes": { "image": "registry.example.com/jig-worker:0.1.0", "ttlSecondsAfterFinished": 600 },
       "tenants": []

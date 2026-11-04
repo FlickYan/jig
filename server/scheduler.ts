@@ -1,14 +1,15 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
+import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
-import type { Outcome, Store, Task, TaskStatus, Tenant, Usage } from "./store.ts";
+import type { Approval, Outcome, Store, Task, TaskStatus, Tenant, Usage } from "./store.ts";
 
 // Starts queued tasks as slots free up: never more than `concurrency` at once, nor more of a tenant's than
 // its own limit, and round-robin across the tenants with work queued, so one that queues a thousand tasks
 // doesn't hold back another's one. The caps are counted in the store, so replicas of the service sharing
 // one keep to them together; the round-robin is each replica's own. A run's events go to the store, then
-// to whoever follows the task.
+// to whoever follows the task; an approval it asks for is kept as its event is.
 //
 // A running task is leased to the replica that runs it, which renews the lease while the run goes on: a
 // task whose lease ran out has lost its replica (it crashed, or lost the database), and any replica ends it
@@ -28,6 +29,8 @@ export interface SchedulerOptions {
   maxEvents?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
+  /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
+  onApproval?: (task: Task, approval: Approval) => void;
 }
 
 interface Run {
@@ -66,8 +69,9 @@ export class Scheduler {
   private leaseMs: number;
   private maxEvents: number;
   private keepTaskDirs: boolean;
+  private onApproval?: (task: Task, approval: Approval) => void;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, onApproval }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -75,6 +79,7 @@ export class Scheduler {
     this.leaseMs = leaseMs;
     this.maxEvents = maxEvents;
     this.keepTaskDirs = keepTaskDirs;
+    this.onApproval = onApproval;
     store.changes.on("cancel", this.cancelled);
   }
 
@@ -253,9 +258,17 @@ export class Scheduler {
           dropping = true;
           kept = { v: 1, seq: event.seq, ts: event.ts, type: "notice", text: `The run's events past ${this.maxEvents} aren't kept: the service drops them, but for the end.` };
         }
+        // The approval first, so it can be answered by whoever sees its event; one past the cap isn't kept,
+        // and jig's wait for it ends at its timeout, as a deny.
+        const request = approvalRequest(kept);
+        const approval = request && (await this.store.addApproval(task.id, request));
         await this.store.addEvent(task.id, kept.seq, kept);
         stored++;
+        // jig's own word on how it was answered is the record.
+        const answered = approvalAnswer(kept);
+        if (answered) await this.store.recordApproval(task.id, answered.id, answered.answer);
         this.updates.emit(task.id, { event: kept } satisfies Update);
+        if (approval) this.onApproval?.(task, approval);
       }
       exit = await run.handle.wait();
     } catch (err) {

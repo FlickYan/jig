@@ -55,6 +55,7 @@ async function service(config: Partial<Config> = {}, base?: string): Promise<Ser
   const started = await startService(
     {
       port: 0,
+      internal: { port: 0 },
       database: config.database ?? (await database(base)),
       dataDir,
       keepTaskDirs: true,

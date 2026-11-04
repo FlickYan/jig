@@ -6,9 +6,11 @@
   "concurrency": 8,
   "model": "deepseek-flash",
   "gatewayBaseUrl": "http://gateway:8081/anthropic",
+  "internal": { "host": "0.0.0.0", "port": 8082 },
+  "internalBaseUrl": "http://api:8082",
   "runner": "docker",
   "docker": { "image": "jig-worker", "network": "jig-tasks", "cpus": 1, "memory": "2g", "pidsLimit": 512 },
   "tenants": [
-    { "id": "example", "keys": ["<sha256 of the tenant's API key, in hex>"], "concurrency": 2, "timeLimit": 1800, "budgetUsd": 5 }
+    { "id": "example", "keys": ["<sha256 of the tenant's API key, in hex>"], "concurrency": 2, "timeLimit": 1800, "budgetUsd": 5, "approvalTimeout": 600 }
   ]
 }

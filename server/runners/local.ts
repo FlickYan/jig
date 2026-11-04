@@ -22,6 +22,8 @@ export interface LocalRunnerConfig {
   graceSeconds: number;
   /** The protocols a git workspace may be cloned over (default: https only). */
   gitProtocols?: string[];
+  /** The service's internal listener, where a task with approvals asks for them. */
+  internalBaseUrl?: string;
   /** How often the events file is read, in milliseconds. */
   pollMs?: number;
 }
@@ -68,7 +70,7 @@ export class LocalRunner implements Runner {
     const out = openSync(log, "w");
     const [program, ...first] = this.config.jig;
     // A process group of its own, so a cancel or the time limit reaches what jig started too.
-    const child = spawn(program, [...first, ...jigArgs(task, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl })], { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
+    const child = spawn(program, [...first, ...jigArgs(task, tenant, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })], { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
     closeSync(out);
     child.stdin!.on("error", () => {}); // a jig that exits before reading its task
     child.stdin!.end(task.spec.prompt);

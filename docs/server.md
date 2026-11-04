@@ -148,6 +148,49 @@ its tasks end as `error` once their leases run out, and the others go on. SQLite
 on one machine too, with no announcements: streams read it every second, and a cancel is found as leases
 are renewed.
 
+### Approvals
+
+A task posted with `"approvals": true` asks before the tool calls its `mode` doesn't allow (`plan`, `ask`
+or `edits`, the default: jig's `--mode` values but `auto`), and a person answers through the API while it
+waits; one without runs with `--yes`, as before. Its jig gets `--mode <mode> --approve-via
+<internalBaseUrl>/internal/approvals --approval-timeout <the tenant's approvalTimeout>` in `--yes`'s place,
+and where it would ask at a terminal it writes an `approval_request` event and waits for the answer. The
+approval exists once that event is stored.
+
+```bash
+curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"prompt": "...", "approvals": true, "mode": "ask"}'
+# {"approvals": [{"id": "ap_1", "step", "tool", "description", "requestedAt", and once answered "decision", "always", "by", "decidedAt"}]}
+curl -s localhost:8080/v1/tasks/$ID/approvals -H "Authorization: Bearer $KEY"
+curl -s localhost:8080/v1/tasks/$ID/approvals/ap_1 -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"decision": "allow", "always": true}'
+```
+
+An answer is 200 with the approval, 404 for one the task hasn't asked for (or not yet), and 409 for one
+answered already or a task that has ended. `allow` runs the call, and with `always` is the terminal's
+"always" answer; `deny` is the terminal's no, and the model reads that the user declined. A task's view
+has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer (0 once it has ended).
+With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
+runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
+`timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
+it times out as a deny.
+
+jig waits on a second listener, `internal` (`{"host", "port"}`, 127.0.0.1:8082 by default), which serves
+only `GET /internal/approvals/<id>?wait=<seconds>` and `GET /healthz`. Its Bearer is the task's gateway
+token, checked as the gateway checks it, so a task gets only its own approvals' answers; the request is
+held until the answer comes, for 30 seconds at most, then gets 200 `{"decision", "always"}`, or 204 while
+there is none. `internalBaseUrl` is where the tasks reach it (`http://<internal host>:<port>` by default):
+`http://api:8082` on the Docker network, the `jig-api-internal` Service on Kubernetes. Any replica can
+hold the request: an answer given through another is announced on Postgres (`NOTIFY jig_approvals`), and
+found within a second on SQLite. Replicas on one machine each need a port of their own for it, as for the
+API.
+
+A tenant with `approvalWebhook` (a URL) and `webhookSecretEnv` (the variable that holds its secret, which
+must be set) is told of each approval as it is stored: a POST of `{"task": <id>, "approval": {...}}`,
+signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
+2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
+it.
+
 ### The local runner
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
@@ -204,9 +247,11 @@ sent again each second until it reaches the container (one whose image is still 
 exist yet), then `docker kill` 5 seconds later, again each second until the run ends; a container a
 crashed service left runs until jig's own `--time-limit`.
 
-The network must reach only the gateway: an internal network (`docker network create --internal
-jig-tasks`) with the gateway attached to it too (`docker network connect jig-tasks <gateway>`), so the
-tasks reach it by its name there (`"gatewayBaseUrl": "http://gateway:8081/anthropic"`) and nothing else.
+The network must reach only the gateway and the service's internal listener: an internal network (`docker
+network create --internal jig-tasks`) with the gateway and the service attached to it too (`docker network
+connect jig-tasks <gateway>`, and the same for the service), so the tasks reach them by their names there (`"gatewayBaseUrl":
+"http://gateway:8081/anthropic"`, `"internalBaseUrl": "http://api:8082"`) and nothing else. The tenants' API
+is on that network too, but takes only tenants' keys, which no task holds.
 The daemon binds the task folders by their path on its own machine, so a service in a container must have
 `dataDir` at the same path as on the host. A service running as root gives each task folder to
 `docker.user` (10001:10001, the image's `jig` user); one that doesn't must run as that user. The task
@@ -241,7 +286,8 @@ says so, and a pod that never started (its image couldn't be pulled, say) an `er
 reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
 and Secret with it.
 
-`deploy/k8s/networkpolicy.yaml` lets the task pods reach only the gateway and the cluster's DNS, where the
+`deploy/k8s/networkpolicy.yaml` lets the task pods reach only the gateway, the service's internal listener
+(`jig-api-internal`, on its own port) and the cluster's DNS, where the
 cluster's network plugin enforces NetworkPolicy. A git workspace is cloned in the pod, so it needs its git
 host allowed as well (the file has an example rule).
 

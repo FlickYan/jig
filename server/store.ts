@@ -4,7 +4,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
-// The task service's state: tenants and their API keys, tasks, and each task's events. Two stores keep to
+// The task service's state: tenants and their API keys, tasks, each task's events and the approvals its jig
+// asked for. Two stores keep to
 // one interface: SQLite, through node:sqlite, here, for one replica; and Postgres (store-pg.ts), which
 // several replicas share.
 
@@ -23,6 +24,8 @@ export interface Limits {
   budgetUsd: number | null;
   /** Tasks of the tenant's that may wait in the queue at once; the service's default when missing. */
   maxQueued?: number;
+  /** Seconds a task with approvals waits for an answer before its jig takes it as a deny (default 600). */
+  approvalTimeout?: number;
 }
 
 export interface Tenant {
@@ -37,12 +40,18 @@ export interface Workspace {
   ref?: string;
 }
 
+/** jig's --mode values a task with approvals may run in: auto never asks. */
+export type ApprovalMode = "plan" | "ask" | "edits";
+
 export interface TaskSpec {
   prompt: string;
   workspace?: Workspace;
   maxSteps: number;
   timeLimit: number;
   model: string;
+  /** Ask before the tool calls `mode` doesn't allow, through the API, rather than run with --yes. */
+  approvals?: boolean;
+  mode?: ApprovalMode;
 }
 
 export interface Usage {
@@ -80,6 +89,33 @@ export interface Outcome {
   cost: number | null;
 }
 
+export type Decision = "allow" | "deny";
+
+/** What a task's jig asked before a tool call: its approval_request event. */
+export interface ApprovalRequest {
+  /** ap_<n>, unique within the run. */
+  id: string;
+  step: number | null;
+  tool: string;
+  description: string;
+}
+
+/** How an approval was answered: by the tenant, through the API, or by jig's own timeout. */
+export interface Answer {
+  decision: Decision;
+  always: boolean;
+  by: "api" | "timeout";
+}
+
+/** An approval, with its answer once it has one. */
+export interface Approval extends ApprovalRequest {
+  requestedAt: string;
+  decision?: Decision;
+  always?: boolean;
+  by?: Answer["by"];
+  decidedAt?: string;
+}
+
 /** A claim's terms: who runs the task, for how long its lease holds, and the caps it must stay within. */
 export interface ClaimTerms {
   /** The replica that will run it. */
@@ -94,8 +130,9 @@ export interface ClaimTerms {
 
 /**
  * What the replicas sharing a store did, as this one hears it: "event" (task, seq) when an event is stored,
- * "done" (task, status) when a task ends, "cancel" (task) when a cancel is asked for, and "resync" () when
- * some may have been missed (the connection that hears them came back).
+ * "done" (task, status) when a task ends, "cancel" (task) when a cancel is asked for, "approval" (task, id)
+ * when an approval is answered, and "resync" () when some may have been missed (the connection that hears
+ * them came back).
  */
 export type Changes = EventEmitter;
 
@@ -143,6 +180,17 @@ export interface Store {
   addEvent(task: string, seq: number, event: object): Promise<void>;
   /** A task's events after seq `after`, in order. */
   events(task: string, after?: number): Promise<{ seq: number; event: object }[]>;
+  /** Keeps an approval a task's jig asked for; undefined if the task has one with its id already. */
+  addApproval(task: string, request: ApprovalRequest): Promise<Approval | undefined>;
+  approval(task: string, id: string): Promise<Approval | undefined>;
+  /** A task's approvals, in the order they were asked for. */
+  approvals(task: string): Promise<Approval[]>;
+  /** Answers an approval that has no answer yet: the approval, or undefined if there is no such one. */
+  decideApproval(task: string, id: string, answer: Answer): Promise<Approval | undefined>;
+  /** Keeps jig's own record of an approval's answer (its approval event), in place of any other. */
+  recordApproval(task: string, id: string, answer: Answer): Promise<void>;
+  /** How many of each task's approvals have no answer yet; a task with none is left out. */
+  pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
   /** What other replicas did, as it happens; a store that can't hear it never emits. */
   readonly changes: Changes;
   /** Whether changes are heard as they happen now: if not, whoever waits on them must look again itself. */
@@ -172,6 +220,10 @@ const MIGRATIONS = [
   `ALTER TABLE tasks ADD COLUMN owner TEXT;
    ALTER TABLE tasks ADD COLUMN lease_until TEXT;
    ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;`,
+  // The approvals a task's jig asked for, and their answers.
+  `CREATE TABLE approvals (
+     task TEXT NOT NULL REFERENCES tasks (id), id TEXT NOT NULL, step INTEGER, tool TEXT NOT NULL, description TEXT NOT NULL,
+     requested_at TEXT NOT NULL, decision TEXT, always INTEGER, decided_by TEXT, decided_at TEXT, PRIMARY KEY (task, id));`,
 ];
 
 type Row = Record<string, unknown>;
@@ -183,7 +235,8 @@ export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, c
 // made by another process are found by looking again, and claims take its write lock.
 class SqliteStore implements Store {
   private db: DatabaseSync;
-  readonly changes: Changes = new EventEmitter();
+  // Each stream and each wait for an approval's answer listens.
+  readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   readonly live = false;
 
   constructor(path: string) {
@@ -345,6 +398,41 @@ class SqliteStore implements Store {
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
   }
 
+  async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
+    const row = this.db
+      .prepare("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING *")
+      .get(task, id, step, tool, description, new Date().toISOString()) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async approval(task: string, id: string): Promise<Approval | undefined> {
+    const row = this.db.prepare("SELECT * FROM approvals WHERE task = ? AND id = ?").get(task, id) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async approvals(task: string): Promise<Approval[]> {
+    return (this.db.prepare("SELECT * FROM approvals WHERE task = ? ORDER BY rowid").all(task) as Row[]).map(toApproval);
+  }
+
+  async decideApproval(task: string, id: string, { decision, always, by }: Answer): Promise<Approval | undefined> {
+    const row = this.db
+      .prepare("UPDATE approvals SET decision = ?, always = ?, decided_by = ?, decided_at = ? WHERE task = ? AND id = ? AND decision IS NULL RETURNING *")
+      .get(decision, Number(always), by, new Date().toISOString(), task, id) as Row | undefined;
+    return row && toApproval(row);
+  }
+
+  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<void> {
+    // jig confirming the API's answer leaves the time it was given; a timeout is decided now.
+    this.db
+      .prepare("UPDATE approvals SET decision = ?, always = ?, decided_by = ?, decided_at = CASE WHEN decided_at IS NOT NULL AND ? = 'api' THEN decided_at ELSE ? END WHERE task = ? AND id = ?")
+      .run(decision, Number(always), by, by, new Date().toISOString(), task, id);
+  }
+
+  async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
+    const rows = this.db.prepare("SELECT task, count(*) AS n FROM approvals WHERE task IN (SELECT value FROM json_each(?)) AND decision IS NULL GROUP BY task").all(JSON.stringify(tasks)) as Row[];
+    return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
   async close(): Promise<void> {
     this.db.close();
   }
@@ -367,6 +455,23 @@ function parsed(value: unknown): unknown {
 /** A time column's value as an ISO string: SQLite keeps them so, Postgres gives Dates. */
 function time(value: unknown): string | null {
   return value === null || value === undefined ? null : value instanceof Date ? value.toISOString() : String(value);
+}
+
+/** An approval from its row, in either store, with only the fields it has. */
+export function toApproval(row: Row): Approval {
+  return {
+    id: String(row.id),
+    step: row.step === null ? null : Number(row.step),
+    tool: String(row.tool),
+    description: String(row.description),
+    requestedAt: time(row.requested_at)!,
+    ...(row.decision !== null && {
+      decision: row.decision as Decision,
+      always: Boolean(row.always),
+      by: row.decided_by as Answer["by"],
+      decidedAt: time(row.decided_at)!,
+    }),
+  };
 }
 
 /** A task from its row, in either store. */

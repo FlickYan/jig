@@ -48,6 +48,7 @@ async function shared(config: Partial<Config> = {}): Promise<Omit<Config, "dataD
   const base = await tempDir("jig-replicas-");
   return {
     port: 0,
+    internal: { port: 0 },
     database: backend === "SQLite" ? join(base, "jig.db") : await postgresDatabase(),
     gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
     jig: [process.execPath, FAKE_JIG],

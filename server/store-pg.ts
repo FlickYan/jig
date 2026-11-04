@@ -1,14 +1,33 @@
 import { EventEmitter } from "node:events";
 import { type Listener, Pool, type Row } from "./pg.ts";
-import { type ClaimTerms, type Changes, json, newTaskId, type Outcome, type Store, TASK_COLUMNS, type Task, type TaskSpec, type TaskStatus, type Tenant, toTask } from "./store.ts";
+import {
+  type Answer,
+  type Approval,
+  type ApprovalRequest,
+  type ClaimTerms,
+  type Changes,
+  json,
+  newTaskId,
+  type Outcome,
+  type Store,
+  TASK_COLUMNS,
+  type Task,
+  type TaskSpec,
+  type TaskStatus,
+  type Tenant,
+  toApproval,
+  toTask,
+} from "./store.ts";
 
 // The task service's state in Postgres (pg.ts), which several replicas of the service share. Claims count
 // the running tasks under a lock the database holds for the transaction, so two replicas can't both take
 // the last slot. Every change another replica may wait on is announced with NOTIFY in the statement that
-// makes it: an event stored or a task ended on jig_events, a cancel asked for on jig_cancel.
+// makes it: an event stored or a task ended on jig_events, a cancel asked for on jig_cancel, an approval
+// answered on jig_approvals.
 
 const EVENTS = "jig_events";
 const CANCELS = "jig_cancel";
+const APPROVALS = "jig_approvals";
 // pg_advisory_xact_lock's keys: claims, and migrations (so two replicas starting at once don't both run them).
 const CLAIM_LOCK = 7_366_000_001;
 const MIGRATE_LOCK = 7_366_000_002;
@@ -28,6 +47,10 @@ const MIGRATIONS = [
    CREATE INDEX tasks_queue ON tasks (tenant, status, n);
    CREATE INDEX tasks_by_status ON tasks (status);
    CREATE TABLE events (task text NOT NULL REFERENCES tasks (id), seq integer NOT NULL, json text NOT NULL, PRIMARY KEY (task, seq));`,
+  // The approvals a task's jig asked for, and their answers.
+  `CREATE TABLE approvals (
+     n bigserial UNIQUE, task text NOT NULL REFERENCES tasks (id), id text NOT NULL, step integer, tool text NOT NULL, description text NOT NULL,
+     requested_at timestamptz NOT NULL, decision text, always boolean, decided_by text, decided_at timestamptz, PRIMARY KEY (task, id));`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -43,7 +66,7 @@ export class PostgresStore implements Store {
     this.pool = pool;
     this.listener = listener;
     listener.on("notification", (channel: string, payload: string) => {
-      let message: { task?: unknown; seq?: unknown; done?: unknown };
+      let message: { task?: unknown; seq?: unknown; done?: unknown; id?: unknown };
       try {
         message = JSON.parse(payload);
       } catch {
@@ -53,6 +76,7 @@ export class PostgresStore implements Store {
       if (channel === EVENTS && typeof message.seq === "number") this.changes.emit("event", message.task, message.seq);
       else if (channel === EVENTS && typeof message.done === "string") this.changes.emit("done", message.task, message.done);
       else if (channel === CANCELS) this.changes.emit("cancel", message.task);
+      else if (channel === APPROVALS && typeof message.id === "string") this.changes.emit("approval", message.task, message.id);
     });
     // What was announced while it was away is missed: whoever waits looks again.
     listener.on("connected", () => this.changes.emit("resync"));
@@ -64,7 +88,7 @@ export class PostgresStore implements Store {
     try {
       pool = new Pool(url);
       await migrate(pool);
-      const listener = pool.listen([EVENTS, CANCELS]);
+      const listener = pool.listen([EVENTS, CANCELS, APPROVALS]);
       await listener.ready;
       return new PostgresStore(pool, listener);
     } catch (err) {
@@ -210,6 +234,47 @@ export class PostgresStore implements Store {
   async events(task: string, after = 0): Promise<{ seq: number; event: object }[]> {
     const { rows } = await this.pool.query("SELECT seq, json FROM events WHERE task = $1 AND seq > $2 ORDER BY seq", [task, after]);
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
+  }
+
+  async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
+    const [row] = (
+      await this.pool.query("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT DO NOTHING RETURNING *", [task, id, step, tool, description])
+    ).rows;
+    return row && toApproval(row);
+  }
+
+  async approval(task: string, id: string): Promise<Approval | undefined> {
+    const [row] = (await this.pool.query("SELECT * FROM approvals WHERE task = $1 AND id = $2", [task, id])).rows;
+    return row && toApproval(row);
+  }
+
+  async approvals(task: string): Promise<Approval[]> {
+    return (await this.pool.query("SELECT * FROM approvals WHERE task = $1 ORDER BY n", [task])).rows.map(toApproval);
+  }
+
+  async decideApproval(task: string, id: string, { decision, always, by }: Answer): Promise<Approval | undefined> {
+    // Announced, so a replica whose jig is waiting for it hears it at once.
+    const [row] = (
+      await this.pool.query(
+        `WITH decided AS (UPDATE approvals SET decision = $3, always = $4, decided_by = $5, decided_at = now() WHERE task = $1 AND id = $2 AND decision IS NULL RETURNING *)
+         SELECT *, pg_notify('${APPROVALS}', json_build_object('task', task, 'id', id)::text) FROM decided`,
+        [task, id, decision, always, by],
+      )
+    ).rows;
+    return row && toApproval(row);
+  }
+
+  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<void> {
+    // jig confirming the API's answer leaves the time it was given; a timeout is decided now.
+    await this.pool.query(
+      "UPDATE approvals SET decision = $3, always = $4, decided_by = $5, decided_at = CASE WHEN decided_at IS NOT NULL AND $5 = 'api' THEN decided_at ELSE now() END WHERE task = $1 AND id = $2",
+      [task, id, decision, always, by],
+    );
+  }
+
+  async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
+    const { rows } = await this.pool.query(`SELECT task, count(*) AS n FROM approvals WHERE task IN (${IDS}) AND decision IS NULL GROUP BY task`, [json(tasks)]);
+    return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
   }
 
   async close(): Promise<void> {

@@ -40,6 +40,8 @@ export interface KubernetesRunnerConfig {
   gatewaySecret: string;
   graceSeconds: number;
   gitProtocols?: string[];
+  /** The service's internal listener as the pods reach it (its Service): where tasks ask for approvals. */
+  internalBaseUrl?: string;
   /** How often the Job and its pod are looked at, in milliseconds (default: 1000). */
   pollMs?: number;
 }
@@ -112,7 +114,7 @@ export class KubernetesRunner implements Runner {
   private job(task: Task, tenant: Tenant, name: string): object {
     const { image, worker = ["node", "/opt/jig/server/worker.ts"], jig = ["jig"], user = 10001 } = this.config;
     const labels = { ...ROLE_LABELS, [TASK_LABEL]: task.id, "jig.dev/tenant": tenant.id };
-    const command = [...worker, `${INPUT}/task.json`, ...jig, "--no-sandbox", ...jigArgs(task, { cwd: `${TASK}/work`, events: "-", stats: `${TASK}/stats.json`, baseUrl: this.config.gatewayBaseUrl })];
+    const command = [...worker, `${INPUT}/task.json`, ...jig, "--no-sandbox", ...jigArgs(task, tenant, { cwd: `${TASK}/work`, events: "-", stats: `${TASK}/stats.json`, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })];
     return {
       apiVersion: "batch/v1",
       kind: "Job",

@@ -37,6 +37,11 @@ services:
       - /var/lib/jig:/var/lib/jig
     depends_on:
       - gateway
+    # On tasks too, where the tasks reach its internal listener as api:8082, to ask for approvals. Its
+    # tenants' API is there as well, but takes only tenants' keys, which no task holds.
+    networks:
+      - default
+      - tasks
 networks:
   # Internal: no way out but to the gateway.
   tasks:

@@ -68,10 +68,18 @@ export function keyVariable(model: string): string {
   return model.startsWith("deepseek") ? "DEEPSEEK_API_KEY" : "ANTHROPIC_API_KEY";
 }
 
-/** jig's arguments for a task, its prompt to come on stdin (`-`), which keeps it out of the process list. */
-export function jigArgs(task: Task, paths: { cwd: string; events: string; stats: string; baseUrl: string }): string[] {
-  const { model, maxSteps, timeLimit } = task.spec;
-  return ["--yes", "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, "-C", paths.cwd, "-"];
+/**
+ * jig's arguments for a task, its prompt to come on stdin (`-`), which keeps it out of the process list. A
+ * task with approvals runs in its mode and asks at the service's internal listener (`internalBaseUrl`)
+ * before the tool calls that mode doesn't allow; any other runs with --yes.
+ */
+export function jigArgs(task: Task, tenant: Tenant, paths: { cwd: string; events: string; stats: string; baseUrl: string; internalBaseUrl?: string }): string[] {
+  const { model, maxSteps, timeLimit, approvals, mode = "edits" } = task.spec;
+  if (approvals && !paths.internalBaseUrl) throw new Error("A task with approvals needs the service's internalBaseUrl, where its jig asks for them");
+  const asks = approvals
+    ? ["--mode", mode, "--approve-via", `${paths.internalBaseUrl!.replace(/\/+$/, "")}/internal/approvals`, "--approval-timeout", String(tenant.limits.approvalTimeout ?? 600)]
+    : ["--yes"];
+  return [...asks, "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, "-C", paths.cwd, "-"];
 }
 
 /** Why a workspace file's path can't be written, or undefined if it lies inside the workspace. */

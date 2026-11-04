@@ -66,6 +66,7 @@ async function stack(replies: Block[][]): Promise<{ service: Service; gateway: G
   const service = await startService(
     {
       port: 0,
+      internal: { port: 0 },
       database: join(base, "jig.db"),
       dataDir,
       model: MODEL,

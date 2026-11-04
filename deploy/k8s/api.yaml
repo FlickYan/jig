@@ -32,6 +32,8 @@ spec:
           command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
           ports:
             - containerPort: 8080
+            # The internal listener, where the task pods ask for approvals.
+            - containerPort: 8082
           env:
             - name: JIG_GATEWAY_SECRET
               valueFrom:
@@ -82,3 +84,18 @@ spec:
   ports:
     - port: 8080
       targetPort: 8080
+---
+# The internal listener, a Service of its own: the task pods may reach it (networkpolicy.yaml), not the
+# tenants' API. Any replica answers, as they hear each other's answers through the database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-api-internal
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: api
+  ports:
+    - port: 8082
+      targetPort: 8082

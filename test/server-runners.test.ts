@@ -46,7 +46,7 @@ afterEach(async () => {
 async function service(runner: Runner): Promise<Service> {
   const base = await tempDir("jig-runners-");
   const started = await startService(
-    { port: 0, database: join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
+    { port: 0, internal: { port: 0 }, database: join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
     { secret: SECRET, runner },
   );
   services.push(started);
@@ -147,6 +147,16 @@ describe("the Docker runner", () => {
     assert.equal(await readFile(join(dir(id), "work", "app.py"), "utf8"), "print(1)\n");
     // A service running as root gives the folder to the container's user.
     if (process.getuid?.() === 0) assert.equal((await stat(join(dir(id), "work"))).uid, 10001);
+  });
+
+  it("runs a task with approvals in its mode, asking at the internal listener as the containers reach it", async () => {
+    const { api, container } = await docker({ internalBaseUrl: "http://api:8082/" });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "exit 0", approvals: true, mode: "ask", timeLimit: 600 })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    const { args, image } = await container(id);
+    const command = args.slice(args.indexOf(image) + 2);
+    assert.deepEqual(command.slice(0, 7), ["--no-sandbox", "--mode", "ask", "--approve-via", "http://api:8082/internal/approvals", "--approval-timeout", "600"]);
+    assert.ok(!command.includes("--yes"));
   });
 
   it("cancels with docker kill, which ends everything in the container, and stops a run past its time limit", async () => {
@@ -448,6 +458,15 @@ describe("the Kubernetes runner", () => {
     assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
   });
 
+  it("passes a task with approvals the flags that ask at the internal listener's Service", async () => {
+    const { cluster, api } = await kubernetes({ internalBaseUrl: "http://jig-api-internal.jig.svc:8082" });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x", approvals: true, model: "claude-haiku-4-5", timeLimit: 600 })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    const [container] = cluster.jobs.get(objectName(id)).spec.template.spec.containers;
+    assert.deepEqual(container.command.slice(3, 12), ["jig", "--no-sandbox", "--mode", "edits", "--approve-via", "http://jig-api-internal.jig.svc:8082/internal/approvals", "--approval-timeout", "600", "--model"]);
+  });
+
   it("maps how the pod and the Job ended, and the end event, to the task's status", async () => {
     const { cluster, api } = await kubernetes();
     const scripts: Record<string, Script> = {
@@ -630,12 +649,13 @@ describe("the deploy files", () => {
     for (const text of ["a: &anchor 1", "a: b # a comment", "a:\n\tb: 1", "a: 1\na: 2", "a: 1\n b: 2", "a: >\n  folded"]) assert.throws(() => parseYaml(text), text);
   });
 
-  it("keep the task pods to the gateway and DNS, and give the service only what the runner needs", async () => {
+  it("keep the task pods to the gateway, the internal listener and DNS, and give the service only what the runner needs", async () => {
     const all = await manifests();
     for (const doc of all) assert.ok(doc.apiVersion && doc.kind && doc.metadata.name, JSON.stringify(doc).slice(0, 100));
     for (const doc of all.filter((doc) => !["Namespace", "RuntimeClass"].includes(doc.kind))) assert.equal(doc.metadata.namespace, "jig", `${doc.kind} ${doc.metadata.name}`);
 
-    // The NetworkPolicy selects the pods the runner labels, and lets them reach only the gateway's pods, on its port, and DNS.
+    // The NetworkPolicy selects the pods the runner labels, and lets them reach only the gateway's pods, on
+    // its port, the service's pods on the internal listener's port, and DNS.
     const policy = find(all, "NetworkPolicy", "jig-task").spec;
     assert.deepEqual(policy.podSelector.matchLabels, ROLE_LABELS);
     assert.deepEqual(policy.policyTypes, ["Ingress", "Egress"]);
@@ -643,9 +663,18 @@ describe("the deploy files", () => {
     const gateway = find(all, "Deployment", "jig-gateway").spec.template;
     assert.deepEqual(policy.egress[0].to, [{ podSelector: { matchLabels: gateway.metadata.labels } }]);
     assert.deepEqual(policy.egress[0].ports, [{ protocol: "TCP", port: gateway.spec.containers[0].ports[0].containerPort }]);
-    assert.deepEqual(policy.egress[1].ports.map((port: { port: number }) => port.port), [53, 53]);
-    assert.equal(policy.egress.length, 2);
+    const service = find(all, "Deployment", "jig-api").spec.template;
+    const { internal, internalBaseUrl } = JSON.parse(find(all, "ConfigMap", "jig-config").data["service.json"]);
+    assert.deepEqual(policy.egress[1].to, [{ podSelector: { matchLabels: service.metadata.labels } }]);
+    assert.deepEqual(policy.egress[1].ports, [{ protocol: "TCP", port: internal.port }]);
+    assert.deepEqual(policy.egress[2].ports.map((port: { port: number }) => port.port), [53, 53]);
+    assert.equal(policy.egress.length, 3);
     assert.deepEqual(find(all, "Service", "jig-gateway").spec.selector, gateway.metadata.labels);
+    // The internal listener has a Service of its own, which the config tells the tasks; the tenants' has only its port.
+    assert.ok(service.spec.containers[0].ports.some((port: { containerPort: number }) => port.containerPort === internal.port));
+    assert.deepEqual(find(all, "Service", "jig-api-internal").spec, { selector: service.metadata.labels, ports: [{ port: internal.port, targetPort: internal.port }] });
+    assert.equal(internalBaseUrl, `http://jig-api-internal.jig.svc:${internal.port}`);
+    assert.deepEqual(find(all, "Service", "jig-api").spec.ports.map((port: { port: number }) => port.port), [8080]);
 
     // The service's account may run Jobs, follow their pods and make their Secrets, and no more.
     const rules = find(all, "Role", "jig-api").rules.map((rule: any) => [rule.apiGroups, rule.resources, rule.verbs]);
@@ -676,10 +705,13 @@ describe("the deploy files", () => {
     const [compose] = parseYaml(await readFile(join(DEPLOY, "docker-compose.yml"), "utf8")) as any[];
     assert.deepEqual(compose.networks.tasks, { name: "jig-tasks", internal: true });
     assert.deepEqual(compose.services.gateway.networks, ["default", "tasks"]);
-    assert.equal(compose.services.api.networks, undefined, "the service needn't reach the tasks");
+    // The service is on it too, where the tasks reach its internal listener.
+    assert.deepEqual(compose.services.api.networks, ["default", "tasks"]);
     assert.ok(compose.services.api.volumes.includes("/var/run/docker.sock:/var/run/docker.sock"));
     const config = JSON.parse(await readFile(join(DEPLOY, "service.docker.json"), "utf8"));
     assert.deepEqual([config.runner, config.docker.network, new URL(config.gatewayBaseUrl).hostname], ["docker", "jig-tasks", "gateway"]);
+    assert.equal(config.internalBaseUrl, `http://api:${config.internal.port}`);
+    assert.equal(config.internal.host, "0.0.0.0");
     // The data's folder is at the same path for the daemon as for the service.
     assert.ok(compose.services.api.volumes.includes(`${config.dataDir}:${config.dataDir}`));
 
