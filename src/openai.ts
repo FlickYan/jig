@@ -7,6 +7,7 @@ import type {
   ChatCompletionMessageParam,
 } from "openai/resources/chat/completions";
 import type { ReasoningEffort } from "openai/resources/shared";
+import { context } from "./context.ts";
 import { estimateTokens } from "./conversation.ts";
 import type { ModelTurn } from "./model.ts";
 import type { Tool } from "./tools/index.ts";
@@ -31,8 +32,9 @@ export interface ChatOptions {
 /** A reply that ended before it was finished: the stream stopped without saying why it was done. */
 export class ReplyBrokeOff extends Error {}
 
-/** Whether the user has heard that the server sends no token counts: once is enough, not at every reply. */
-let toldEstimated = false;
+/** The runs whose user has heard that the server sends no token counts: once a run is enough, not at every
+ * reply, and each of a library's tasks in one process is told on its own. */
+const toldEstimated = new WeakSet<object>();
 
 /**
  * The conversation as chat messages. Thinking goes back as `reasoning_content`, which DeepSeek requires on
@@ -183,8 +185,8 @@ export async function chatTurn(
   const cached = usage?.prompt_tokens_details?.cached_tokens ?? (usage as { prompt_cache_hit_tokens?: number } | null)?.prompt_cache_hit_tokens ?? 0;
   // A server that ignores include_usage sends no counts. Zero tokens would make the conversation look empty,
   // so it would never be compacted: the counts are estimated from the text instead, and the user told once.
-  if (!usage && !toldEstimated) {
-    toldEstimated = true;
+  if (!usage && !toldEstimated.has(context())) {
+    toldEstimated.add(context());
     ui.notice("The API reports no token usage, so jig estimates it from the length of the text.");
   }
   const stop = finish === "length" ? "max_tokens" : finish === "content_filter" ? "refusal" : calls.length ? "tool_use" : "end_turn";

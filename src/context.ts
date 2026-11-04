@@ -18,6 +18,8 @@ export interface Context {
 }
 
 const store = new AsyncLocalStorage<Context>();
+/** The process's own, outside any run: the same object each time, so what is kept per run works there too. */
+const outside: Context = {};
 
 /** Runs `work` with `context` as its own, and what it starts, however long that runs. */
 export function withContext<T>(context: Context, work: () => T): T {
@@ -26,5 +28,5 @@ export function withContext<T>(context: Context, work: () => T): T {
 
 /** The context of the run this is called for; outside one, nothing, so the process's own holds. */
 export function context(): Context {
-  return store.getStore() ?? {};
+  return store.getStore() ?? outside;
 }

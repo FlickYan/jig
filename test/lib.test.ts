@@ -261,4 +261,30 @@ describe("runTask", () => {
       api.close();
     }
   });
+
+  it("tells each task once that the API reports no token usage, not only the first in the process", async () => {
+    // An OpenAI-compatible server that ignores include_usage, as some local ones do: each reply has no counts.
+    const chunk = (choice: object) => `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 0, model: "m", choices: [{ index: 0, ...choice }] })}\n\n`;
+    const http = createServer((req, res) => {
+      req.resume().on("end", () => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(chunk({ delta: { content: "Done." }, finish_reason: null }) + chunk({ delta: {}, finish_reason: "stop" }) + "data: [DONE]\n\n");
+      });
+    });
+    await new Promise<void>((done) => http.listen(0, "127.0.0.1", done));
+    try {
+      const baseUrl = `http://127.0.0.1:${(http.address() as AddressInfo).port}/v1`;
+      const api = { url: baseUrl } as FakeApi;
+      for (const run of [1, 2]) {
+        const { events, options } = await setUp(api, { model: "some-local-model", baseUrl, maxSteps: 3 });
+        const result = await runTask(options);
+        assert.equal(result.stop, "end_turn", `run ${run}: ${result.error}`);
+        const told = ofType(events, "notice").map((event) => event.text);
+        assert.deepEqual(told, ["The API reports no token usage, so jig estimates it from the length of the text."], `run ${run}`);
+      }
+    } finally {
+      http.closeAllConnections();
+      await new Promise((done) => http.close(done));
+    }
+  });
 });
