@@ -39,10 +39,12 @@ JIG_GATEWAY_SECRET=$(cat gateway-secret) node server/api.ts --config service.jso
 }
 ```
 
-Paths are relative to the config file. `host` defaults to 127.0.0.1, `concurrency` (tasks at once, across
-tenants) to 4; a tenant's `concurrency` to 2, `maxSteps` to 50, `timeLimit` to 1800 seconds and `budgetUsd`
-(the most one task may spend, which the gateway holds it to) to none. The config holds only the SHA-256 of
-each key: `printf %s "$KEY" | sha256sum` gives it. Also: `graceSeconds` (30), `jig` (the program and first
+Paths are relative to the config file, and the database's folder is made if it isn't there. `host` defaults
+to 127.0.0.1, `concurrency` (tasks at once, across tenants) to 4; a tenant's `concurrency` to 2, `maxSteps`
+to 50, `timeLimit` to 1800 seconds, `budgetUsd` (the most one task may spend, which the gateway holds it to)
+to none and `maxQueued` (its tasks that may wait at once) to 1000. The config holds only the SHA-256 of
+each key: `printf %s "$KEY" | sha256sum` gives it. A tenant taken out of the config is shut out at the next
+start: its keys stop working, and its queued tasks are cancelled. Also: `graceSeconds` (30), `jig` (the program and first
 arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols` (`["https"]`),
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15).
 
@@ -73,7 +75,7 @@ curl -sN localhost:8080/v1/tasks/$ID/events -H "Authorization: Bearer $KEY" -H '
 A request is refused with 400 and the reason when a field is unknown or out of bounds, the model isn't a
 Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file's path is absolute, goes
 through `..` or names a folder, or the workspace has both files and a repository; with 413 when the body is
-over `maxBodyBytes`. A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running
+over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued. A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running
 one (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it.
 
@@ -95,7 +97,8 @@ come from that event too.
 The scheduler starts queued tasks while fewer than `concurrency` run in all and fewer than the tenant's own
 `concurrency` of its, taking the tenants with work queued in turn, from the one after the last to get a
 slot: a tenant that queues a thousand tasks takes one slot at a time like the others, and doesn't hold back
-another's one. A task is claimed in the store (`queued` to `running`) before it starts, so it never runs
+another's one. It reads only the next task of the tenant whose turn it is, never the whole queue, so a
+long queue doesn't slow the service. A task is claimed in the store (`queued` to `running`) before it starts, so it never runs
 twice. When the service starts, tasks the last run of it left `running` (it crashed, or was killed) are
 marked `error`, not run again, since their workspace is half changed; what was still queued runs. A
 SIGTERM or Ctrl+C kills the runs and marks them `error` the same way. A local run a crashed service started

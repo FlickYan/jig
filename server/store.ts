@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 // The task service's state: tenants and their API keys, tasks, and each task's events. The interface is
@@ -17,6 +19,8 @@ export interface Limits {
   timeLimit: number;
   /** The most one task may spend, in USD, which the gateway holds it to; null: no limit. */
   budgetUsd: number | null;
+  /** Tasks of the tenant's that may wait in the queue at once; the service's default when missing. */
+  maxQueued?: number;
 }
 
 export interface Tenant {
@@ -79,12 +83,23 @@ export interface Store {
   putTenant(tenant: Tenant, keyHashes: string[]): Promise<void>;
   tenant(id: string): Promise<Tenant | undefined>;
   tenantByKey(keyHash: string): Promise<Tenant | undefined>;
+  /**
+   * Shuts out the tenants not in `keep`: removes their API keys and cancels their queued tasks. How many
+   * tasks it cancelled.
+   */
+  retireTenants(keep: string[]): Promise<number>;
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
   task(id: string): Promise<Task | undefined>;
   /** A tenant's tasks, newest first, at most `limit`. */
   tasks(tenant: string, options?: { status?: TaskStatus; limit?: number }): Promise<Task[]>;
   /** Every tenant's tasks in a status, oldest first: the queue, or what a crash left running. */
   inStatus(status: TaskStatus): Promise<Task[]>;
+  /** The tenants with tasks queued, by id. */
+  queuedTenants(): Promise<string[]>;
+  /** A tenant's oldest queued task: the next of its to run. */
+  nextQueued(tenant: string): Promise<Task | undefined>;
+  /** How many of a tenant's tasks are queued. */
+  queuedCount(tenant: string): Promise<number>;
   /** Moves a queued task to running; false if it was no longer queued. */
   claim(id: string): Promise<boolean>;
   /** Moves a queued task to cancelled; false if it was no longer queued. */
@@ -123,7 +138,13 @@ class SqliteStore implements Store {
   private db: DatabaseSync;
 
   constructor(path: string) {
-    this.db = new DatabaseSync(path);
+    try {
+      // A fresh checkout has no folder for the file yet.
+      if (path !== ":memory:" && path !== "") mkdirSync(dirname(path), { recursive: true });
+      this.db = new DatabaseSync(path);
+    } catch (err) {
+      throw new Error(`Couldn't open the database ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
     // WAL lets readers go on while a run's events are written; the timeout rides out another process's write.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
     const version = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
@@ -164,6 +185,22 @@ class SqliteStore implements Store {
     return row && this.tenant(String(row.tenant));
   }
 
+  async retireTenants(keep: string[]): Promise<number> {
+    const kept = JSON.stringify(keep);
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM api_keys WHERE tenant NOT IN (SELECT value FROM json_each(?))").run(kept);
+      const { changes } = this.db
+        .prepare("UPDATE tasks SET status = 'cancelled', ended = ?, error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (SELECT value FROM json_each(?))")
+        .run(new Date().toISOString(), kept);
+      this.db.exec("COMMIT");
+      return Number(changes);
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
   async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
     const id = `task_${randomUUID().replaceAll("-", "")}`;
     const { prompt, ...rest } = spec;
@@ -185,6 +222,22 @@ class SqliteStore implements Store {
 
   async inStatus(status: TaskStatus): Promise<Task[]> {
     return (this.db.prepare("SELECT * FROM tasks WHERE status = ? ORDER BY rowid").all(status) as Row[]).map(toTask);
+  }
+
+  // These three go through the (tenant, status) index, so the scheduler's look at the queue costs the same
+  // with ten tasks queued or a million, and reads no prompt but those of the tasks it starts.
+  async queuedTenants(): Promise<string[]> {
+    const rows = this.db.prepare("SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.tenant = tenants.id AND status = 'queued') ORDER BY id").all() as Row[];
+    return rows.map((row) => String(row.id));
+  }
+
+  async nextQueued(tenant: string): Promise<Task | undefined> {
+    const row = this.db.prepare("SELECT * FROM tasks WHERE tenant = ? AND status = 'queued' ORDER BY rowid LIMIT 1").get(tenant) as Row | undefined;
+    return row && toTask(row);
+  }
+
+  async queuedCount(tenant: string): Promise<number> {
+    return Number((this.db.prepare("SELECT count(*) AS n FROM tasks WHERE tenant = ? AND status = 'queued'").get(tenant) as Row).n);
   }
 
   async claim(id: string): Promise<boolean> {

@@ -308,6 +308,43 @@ describe("the task service's API", () => {
     assert.ok(task.ended);
     await statusOf(api, queued.id, "succeeded");
   });
+
+  it("shuts out a tenant taken out of the config: its key stops working and its queued tasks never run", async () => {
+    const base = await tempDir("jig-service-");
+    // globex may run none at once, so its task is still queued when the service stops.
+    const first = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] }, base);
+    const id = (await call(first, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    services.splice(services.indexOf(first), 1);
+    await first.close();
+
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] }, base);
+    assert.equal((await call(api, KEYS.globex, "GET", "/v1/tasks")).status, 401);
+    assert.equal((await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 401);
+    const task = (await api.store.task(id))!;
+    assert.deepEqual([task.status, task.error], ["cancelled", "its tenant was removed from the config"]);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks")).status, 200);
+    await api.scheduler.settled();
+    assert.equal(existsSync(work(api, id)), false);
+  });
+
+  it("refuses a task past the tenant's queue limit", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, maxQueued: 2 }] });
+    for (let i = 0; i < 2; i++) assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    const { status, body } = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.equal(status, 429);
+    assert.match(body.error, /2 tasks queued/);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued")).body.tasks.length, 2);
+  });
+
+  it("makes the database's folder, and names the database when it can't open it", async () => {
+    const base = await tempDir("jig-service-");
+    const api = await service({ database: join(base, "not", "made", "jig.db") }, base);
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    assert.ok(existsSync(join(base, "not", "made", "jig.db")));
+    await writeFile(join(base, "a-file"), "");
+    const path = join(base, "a-file", "jig.db");
+    assert.throws(() => openStore(path), (err: Error) => err.message.startsWith(`Couldn't open the database ${path}: `));
+  });
 });
 
 /** A runner whose runs end when the test says, recording how many run at once. */
@@ -364,6 +401,41 @@ describe("the scheduler", () => {
     assert.equal((await store.inStatus("succeeded")).length, 50);
     // c's five didn't wait for a's thirty.
     assert.ok(runner.started.lastIndexOf("c") < runner.started.lastIndexOf("a"));
+    await store.close();
+  });
+
+  it("reads only the tasks it starts, however many are queued", async () => {
+    const store = openStore(":memory:");
+    for (const id of ["a", "b"]) await store.putTenant({ id, limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    for (let i = 0; i < 5000; i++) await store.createTask("a", { prompt: "x".repeat(1000), maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    await store.createTask("b", { prompt: "b0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // Counts the tasks the store hands the scheduler.
+    let read = 0;
+    const counted = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (typeof value !== "function") return value;
+        return async (...args: unknown[]) => {
+          const result = await value.apply(target, args);
+          read += Array.isArray(result) ? result.filter((item) => typeof item === "object" && item && "spec" in item).length : result && typeof result === "object" && "spec" in result ? 1 : 0;
+          return result;
+        };
+      },
+    });
+    const runner = new FakeRunner();
+    const scheduler = new Scheduler(counted, runner, 4);
+    await scheduler.poke();
+    assert.deepEqual([runner.started, read], [["a", "b"], 2]);
+    // a is at its limit and b's queue is empty: another poke starts nothing and reads nothing.
+    read = 0;
+    await scheduler.poke();
+    assert.deepEqual([runner.started.length, read], [2, 0]);
+    // Each run that ends lets one more of a's start, read alone.
+    runner.active.values().next().value!.end();
+    await scheduler.settled();
+    assert.equal(read, 1);
+    for (const run of runner.active.values()) run.end();
+    await scheduler.close();
     await store.close();
   });
 });

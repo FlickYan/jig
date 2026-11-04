@@ -21,6 +21,7 @@ export interface TenantConfig {
   maxSteps?: number;
   timeLimit?: number;
   budgetUsd?: number | null;
+  maxQueued?: number;
 }
 
 export interface Config {
@@ -43,7 +44,7 @@ export interface Config {
   tenants: TenantConfig[];
 }
 
-const DEFAULT_LIMITS: Limits = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null };
+const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000 };
 const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 
@@ -56,8 +57,8 @@ export interface Service {
 }
 
 /**
- * Opens the store, puts the config's tenants in it, ends what a crash left running, and listens. The
- * runner is the local one unless one is given (a test's).
+ * Opens the store, puts the config's tenants in it and shuts out those it no longer lists, ends what a
+ * crash left running, and listens. The runner is the local one unless one is given (a test's).
  */
 export async function startService(config: Config, { secret, runner }: { secret: string; runner?: Runner }): Promise<Service> {
   const store = openStore(config.database);
@@ -65,6 +66,9 @@ export async function startService(config: Config, { secret, runner }: { secret:
     const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
     await store.putTenant({ id: tenant.id, limits }, tenant.keys.map((key) => key.toLowerCase()));
   }
+  // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
+  const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
+  if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
   runner ??= new LocalRunner({
     dataDir: config.dataDir,
     jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")],
@@ -155,6 +159,9 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   }
   const spec = taskSpec(input, tenant, context.model);
   if (typeof spec === "string") return reply(res, 400, { error: spec });
+  // A queue without an end would fill the disk, and a tenant's waits only grow.
+  const most = tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued;
+  if ((await context.store.queuedCount(tenant.id)) >= most) return reply(res, 429, { error: `The tenant has ${most} tasks queued, the most it may: wait for some to start` });
   const task = await context.store.createTask(tenant.id, spec);
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });

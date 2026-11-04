@@ -104,26 +104,32 @@ export class Scheduler {
     return [...this.runs.values()].filter((run) => tenant === undefined || run.tenant === tenant).length;
   }
 
+  // It reads the tenants with work queued and then, a slot at a time, the next task of the tenant whose
+  // turn it is, never the whole queue: a poke must stay cheap however much one tenant has queued, since
+  // the store's calls hold up the whole service while they run.
   private async fill(): Promise<void> {
     if (this.runs.size >= this.concurrency) return;
-    const queues = new Map<string, Task[]>();
-    for (const task of await this.store.inStatus("queued")) queues.set(task.tenant, [...(queues.get(task.tenant) ?? []), task]);
     // The tenants in order, from the one after the last to get a slot.
-    const ids = [...queues.keys()].sort();
+    const ids = await this.store.queuedTenants();
     const order = [...ids.filter((id) => id > this.lastTenant), ...ids.filter((id) => id <= this.lastTenant)];
     const tenants = new Map<string, Tenant | undefined>();
     for (const id of order) tenants.set(id, await this.store.tenant(id));
+    /** Tenants whose queue has run dry. */
+    const empty = new Set<string>();
     for (let progress = true; progress && this.runs.size < this.concurrency && !this.closed; ) {
       progress = false;
       for (const id of order) {
         if (this.runs.size >= this.concurrency || this.closed) break;
         const tenant = tenants.get(id);
-        const queue = queues.get(id)!;
-        if (!tenant || !queue.length || this.running(id) >= tenant.limits.concurrency) continue;
-        const task = queue.shift()!;
-        if (!(await this.store.claim(task.id))) continue; // cancelled meanwhile
-        this.lastTenant = id;
+        if (!tenant || empty.has(id) || this.running(id) >= tenant.limits.concurrency) continue;
+        const task = await this.store.nextQueued(id);
+        if (!task) {
+          empty.add(id);
+          continue;
+        }
         progress = true;
+        if (!(await this.store.claim(task.id))) continue; // cancelled meanwhile: its next one gets the turn
+        this.lastTenant = id;
         const run: Run = { tenant: id };
         this.runs.set(task.id, run);
         run.done = this.run(task, tenant, run);
