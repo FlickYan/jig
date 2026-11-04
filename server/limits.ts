@@ -28,9 +28,10 @@ export interface LimiterOptions {
 
 /**
  * A request let through, which must release its slot when its reply is over; or turned away, with `error`
- * when the state couldn't be reached rather than a limit being reached.
+ * when the state couldn't be reached rather than a limit being reached, and with `limit` when it waited
+ * its longest: a rate's bucket had no room, or too many requests were in flight.
  */
-export type Admission = { release(): void } | { retryAfter: number; error?: Error };
+export type Admission = { release(): void } | { retryAfter: number; error?: Error; limit?: "rate" | "concurrency" };
 
 /** With shared state, how often the waiting requests try again when no release has been heard of. */
 const POLL_MS = 250;
@@ -66,11 +67,6 @@ export class Limiter {
     state.onRelease(() => this.queued && void this.pump());
   }
 
-  /** Requests in flight from this gateway. */
-  get inFlight(): number {
-    return this.flying;
-  }
-
   /** Requests waiting for their turn here. */
   get queued(): number {
     return [...this.queues.values()].reduce((sum, queue) => sum + queue.length, 0);
@@ -85,12 +81,13 @@ export class Limiter {
         this.order.push(tenant);
       }
       this.queues.get(tenant)!.push(waiter);
-      const leave = (retryAfter: number) => {
-        if (this.remove(waiter)) resolve({ retryAfter });
+      const leave = (retryAfter: number, limit?: "rate" | "concurrency") => {
+        if (this.remove(waiter)) resolve({ retryAfter, limit });
       };
       waiter.timer = setTimeout(() => {
+        // A bucket says when it has room; a slot comes back whenever a reply ends.
         const wait = this.waits.get(tenant) ?? Infinity;
-        leave(Math.max(1, Math.ceil((Number.isFinite(wait) ? wait : 1000) / 1000)));
+        leave(Math.max(1, Math.ceil((Number.isFinite(wait) ? wait : 1000) / 1000)), Number.isFinite(wait) ? "rate" : "concurrency");
       }, this.options.maxWaitMs);
       signal?.addEventListener("abort", () => leave(1), { once: true });
       void this.pump();

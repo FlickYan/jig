@@ -6,13 +6,15 @@
 // upstream byte for byte (prompt caching depends on it) and the reply comes back as it arrives; only the
 // credentials change, and the model where an upstream calls it by another id. With several upstreams, a
 // request goes on to the next one when an upstream fails it before its reply starts, and an upstream that
-// keeps failing is passed over for a while (Breaker). docs/server.md describes the routes and the config.
+// keeps failing is passed over for a while (Breaker). Its metrics are served on a listener of their own,
+// and each reply carries an x-request-id, which its log lines carry too. docs/server.md describes the
+// routes and the config.
 //
 //   node server/gateway.ts --config gateway.json
 
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { createServer, type IncomingHttpHeaders, type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, request as httpRequest, type Server, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { AddressInfo } from "node:net";
 import { fileURLToPath } from "node:url";
@@ -20,7 +22,8 @@ import { parseArgs } from "node:util";
 import type { Usage } from "../src/agent.ts";
 import { costOf, PRICES } from "../src/prices.ts";
 import { type Admission, type Limits, Limiter } from "./limits.ts";
-import { createLog } from "./log.ts";
+import { createLog, logFormat, logLevel } from "./log.ts";
+import { Registry } from "./metrics.ts";
 import { parseRedisUrl } from "./redis.ts";
 import { MemoryState, RedisState, SharedState, type Spent, type State, StateError } from "./state.ts";
 import { type TokenPayload, verifyToken } from "./token.ts";
@@ -35,6 +38,8 @@ export interface UpstreamConfig {
 export interface GatewayConfig {
   /** Where to listen (default: 127.0.0.1, port 8787). */
   listen?: { host?: string; port?: number };
+  /** A listener of its own for GET /metrics and GET /healthz (host default: 127.0.0.1); none without it. */
+  metrics?: { host?: string; port: number };
   /** One provider: the same as `upstreams` with one, named "default", with no `models`. */
   upstream?: UpstreamConfig;
   /** The providers, in the order a request tries them; give this or `upstream`, not both. */
@@ -79,13 +84,25 @@ export interface GatewayConfig {
 
 export interface Gateway {
   url: string;
+  /** The metrics listener's, with `metrics` in the config. */
+  metricsUrl?: string;
   close(): Promise<void>;
 }
 
-// Not forwarded either way: they describe one connection, not the request. The credentials and the
+// Not forwarded either way: they describe one connection, not the request; and x-request-id is the
+// gateway's own, which neither jig's nor the provider's takes the place of. The credentials and the
 // encoding are the gateway's own to set.
-const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"]);
+const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length", "x-request-id"]);
 const SET_HERE = new Set(["x-api-key", "authorization", "accept-encoding"]);
+
+/** A request id a client may give in x-request-id; any other gets a new one. */
+const REQUEST_ID = /^[\w.-]{1,128}$/;
+
+/** The request's id: the client's, if it gave one that will do, or a new one. */
+function requestId(req: IncomingMessage): string {
+  const given = req.headers["x-request-id"];
+  return typeof given === "string" && REQUEST_ID.test(given) ? given : randomUUID();
+}
 
 /** A long conversation is a few megabytes; this is far past any the API takes. */
 const MAX_BODY_BYTES = 64 * 1024 * 1024;
@@ -227,6 +244,11 @@ export class Breaker {
     return "probe";
   }
 
+  /** Open or half-open: passing the upstream over, or letting only a probe through. */
+  get open(): boolean {
+    return this.openUntil > 0;
+  }
+
   /** Milliseconds until an open circuit lets a probe through. */
   wait(now = Date.now()): number {
     return Math.max(0, this.openUntil - now);
@@ -302,6 +324,9 @@ export function withModel(body: Buffer, model: string): Buffer {
 
 const NO_USAGE: Usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
 
+/** Each kind of token as jig_gateway_tokens_total names it. */
+const TOKEN_KINDS: Record<keyof Usage, string> = { input: "input", output: "output", cacheRead: "cache_read", cacheWrite: "cache_write" };
+
 /** The Messages API's usage object as jig counts it; fields it leaves out are left out. */
 function usageFrom(usage: unknown): Partial<Usage> {
   const u = (usage ?? {}) as Record<string, unknown>;
@@ -364,42 +389,6 @@ class UsageReader {
   }
 }
 
-/** Counters and gauges, written in Prometheus's text format. */
-class Metrics {
-  private readonly values = new Map<string, Map<string, number>>();
-  private readonly help: Record<string, [type: string, text: string]> = {
-    jig_gateway_requests_total: ["counter", "Messages API requests with a valid token, by tenant."],
-    jig_gateway_rate_limited_total: ["counter", "Requests answered with 429, the gateway's own and the provider's, by tenant."],
-    jig_gateway_budget_exceeded_total: ["counter", "Requests answered with 402 because the task's budget was spent, by tenant."],
-    jig_gateway_upstream_errors_total: ["counter", "Provider replies with status 5xx, 401 or 403, and requests that could not reach it or had no reply in time."],
-    jig_gateway_upstream_failures_total: ["counter", "Requests an upstream failed, which went on to the next one or, with none left, back to jig, by upstream."],
-    jig_gateway_tokens_total: ["counter", "Tokens the provider counted, by tenant and kind."],
-    jig_gateway_cost_usd_total: ["counter", "What the priced replies cost, in USD, by tenant."],
-    jig_gateway_state_errors_total: ["counter", "Reads and writes of the shared state (Redis) that failed."],
-    jig_gateway_in_flight: ["gauge", "Requests sent upstream whose reply is not over."],
-    jig_gateway_queued: ["gauge", "Requests waiting for their turn."],
-  };
-
-  add(name: string, labels: Record<string, string>, by = 1): void {
-    const key = Object.entries(labels)
-      .map(([label, value]) => `${label}="${value.replace(/[\\"]/g, "\\$&").replace(/\n/g, "\\n")}"`)
-      .join(",");
-    const series = this.values.get(name) ?? new Map<string, number>();
-    series.set(key, (series.get(key) ?? 0) + by);
-    this.values.set(name, series);
-  }
-
-  text(gauges: Record<string, number>): string {
-    const lines: string[] = [];
-    for (const [name, [type, help]] of Object.entries(this.help)) {
-      lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`);
-      if (name in gauges) lines.push(`${name} ${gauges[name]}`);
-      for (const [labels, value] of this.values.get(name) ?? []) lines.push(`${name}${labels ? `{${labels}}` : ""} ${value}`);
-    }
-    return `${lines.join("\n")}\n`;
-  }
-}
-
 /** The config's mistakes, said before the gateway starts rather than at its first request. */
 function check(config: GatewayConfig, env: NodeJS.ProcessEnv): void {
   if (!env.JIG_GATEWAY_SECRET) throw new Error("Set JIG_GATEWAY_SECRET, the secret the task service signs tokens with.");
@@ -422,6 +411,11 @@ function check(config: GatewayConfig, env: NodeJS.ProcessEnv): void {
     if (!Array.isArray(names) || !names.length) throw new Error(`${where}.keyEnv must name at least one environment variable holding a key.`);
     const missing = names.filter((name) => !env[name]);
     if (missing.length) throw new Error(`No key in ${missing.join(", ")}.`);
+  }
+  if (config.metrics !== undefined) {
+    const { port, host } = config.metrics ?? {};
+    if (!(Number.isInteger(port) && port >= 0 && port <= 65535)) throw new Error("metrics.port must be a port number, 0 to 65535.");
+    if (host !== undefined && typeof host !== "string") throw new Error("metrics.host must be a host name or address.");
   }
   for (const field of ["firstByteMs", "failures", "openMs"] as const) {
     const value = config.failover?.[field];
@@ -453,6 +447,8 @@ interface Upstream {
  */
 interface Failure {
   upstream: string;
+  /** Why, for jig_gateway_failovers_total: connect, timeout, status_<code>, or keys. */
+  reason: string;
   why: string;
   status?: number;
   headers?: IncomingHttpHeaders;
@@ -474,11 +470,27 @@ async function errorBody(reply: IncomingMessage): Promise<Buffer | undefined> {
   return Buffer.concat(chunks);
 }
 
+/** One model call, as its access line and the metrics tell it. */
+interface Call {
+  request: string;
+  /** When it came, by performance.now(). */
+  started: number;
+  /** "none" until its token is checked, and for a token that fails. */
+  tenant: string;
+  task?: string;
+  /** The upstream whose reply went back; "none" when none answered. */
+  upstream: string;
+  /** The provider's id of that reply (its request-id header), to find it in the provider's logs. */
+  upstreamRequest?: string;
+  usage?: Usage;
+  cost?: number;
+}
+
 /** Starts a gateway with `config`, its secret and keys read from `env`. */
 export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv = process.env): Promise<Gateway> {
   check(config, env);
   const secret = env.JIG_GATEWAY_SECRET!;
-  const log = createLog("gateway");
+  const log = createLog("gateway", { format: logFormat(env), level: logLevel(env) });
   const keyId = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
   const { firstByteMs = 60_000, failures = 5, openMs = 30_000 } = config.failover ?? {};
   const upstreams: Upstream[] = (config.upstreams ?? [{ ...config.upstream!, name: "default" }]).map(({ name, baseUrl, keyEnv, models }) => ({
@@ -488,16 +500,47 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     models,
     breaker: new Breaker(failures, openMs),
   }));
-  const metrics = new Metrics();
-  metrics.add("jig_gateway_state_errors_total", {}, 0);
+  // This replica's metrics. A label never holds a key, a token, a prompt or a task: tenants, upstreams and
+  // statuses are few, tasks are without end.
+  const registry = new Registry();
+  const metrics = {
+    requests: registry.counter("jig_gateway_requests_total", "Model calls by their final status and the upstream whose reply went back (none when none answered).", ["tenant", "upstream", "status"]),
+    seconds: registry.histogram("jig_gateway_request_seconds", "From a model call's arrival to its reply's end.", ["upstream"]),
+    firstByte: registry.histogram("jig_gateway_first_byte_seconds", "From a model call's arrival to the headers of the provider's reply that it passed back.", ["upstream"]),
+    queue: registry.histogram("jig_gateway_queue_seconds", "How long a model call waited for a slot under the limits.", ["tenant"]),
+    inflight: registry.gauge("jig_gateway_inflight", "Model calls let through whose reply is not over.", ["tenant"]),
+    waiting: registry.gauge("jig_gateway_waiting", "Model calls waiting for a slot on this replica."),
+    tokens: registry.counter("jig_gateway_tokens_total", "Tokens the provider counted, by kind: input, output, cache_read, cache_write.", ["tenant", "kind"]),
+    cost: registry.counter("jig_gateway_cost_usd_total", "What the priced replies cost, in USD.", ["tenant"]),
+    failovers: registry.counter("jig_gateway_failovers_total", "Model calls an upstream failed, by the upstream tried next (none when none was left) and why: connect, timeout, status_<code> or keys.", ["from", "to", "reason"]),
+    open: registry.gauge("jig_gateway_upstream_open", "1 while an upstream's circuit is open or half-open.", ["upstream"]),
+    keys: registry.gauge("jig_gateway_keys", "Each upstream's keys: ok, resting (rate-limited) or refused.", ["upstream", "state"]),
+    refused: registry.counter("jig_gateway_refused_total", "Model calls the gateway turned away itself: auth, budget, rate, concurrency or quota.", ["tenant", "reason"]),
+    stateErrors: registry.counter("jig_gateway_state_errors_total", "Reads and writes of the shared state (Redis) that failed."),
+  };
+  metrics.stateErrors.inc({}, 0);
   const state: State = config.state
     ? new SharedState(new RedisState(config.state.redis, { prefix: config.state.prefix, leaseMs: config.state.leaseMs }), {
         onStateError: config.state.onStateError ?? "closed",
-        onError: () => metrics.add("jig_gateway_state_errors_total", {}),
+        onError: () => metrics.stateErrors.inc(),
+        // Its lines, that Redis went away or came back, go out as the gateway's others do.
+        log: (line) => log.warn(line.replace(/^jig gateway: /, "")),
       })
     : new MemoryState();
   const { maxWaitMs = 30_000, tenantDefaults, tenants, ...global } = config.limits ?? {};
   const limiter = new Limiter({ global, tenantDefaults, tenants, maxWaitMs }, state);
+  // Gauges are read as a scrape asks for them. The keys' standing is what the replicas share, read afresh.
+  metrics.waiting.onCollect(() => metrics.waiting.set({}, limiter.queued));
+  metrics.open.onCollect(() => upstreams.forEach(({ name, breaker }) => metrics.open.set({ upstream: name }, breaker.open ? 1 : 0)));
+  metrics.keys.onCollect(async () => {
+    for (const { name, pool } of upstreams) {
+      await pool.refresh(state);
+      const now = Date.now();
+      const counts = { ok: 0, resting: 0, refused: 0 };
+      for (const key of pool.keys) counts[key.bad ? "refused" : key.coolUntil > now ? "resting" : "ok"]++;
+      for (const [standing, n] of Object.entries(counts)) metrics.keys.set({ upstream: name, state: standing }, n);
+    }
+  });
   const admin = config.adminTokenEnv ? env[config.adminTokenEnv] : undefined;
 
   const isAdmin = (given: string): boolean => {
@@ -510,11 +553,13 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
    * Counts a reply's usage toward its task and tenant, and the upstream that gave it, priced by the model
    * the reply names, or the one the upstream was asked for, or else the one jig asked for.
    */
-  const meter = async (token: TokenPayload, requested: string | undefined, provided: string | undefined, reader: UsageReader, upstream: string): Promise<void> => {
+  const meter = async (call: Call, token: TokenPayload, requested: string | undefined, provided: string | undefined, reader: UsageReader, upstream: string): Promise<void> => {
     const model = [reader.model, provided].find((id) => id && PRICES[id]) ?? requested;
     const cost = model ? costOf(model, reader.usage) : undefined;
-    for (const [kind, n] of Object.entries(reader.usage)) if (n) metrics.add("jig_gateway_tokens_total", { tenant: token.tenant, kind }, n);
-    if (cost) metrics.add("jig_gateway_cost_usd_total", { tenant: token.tenant }, cost);
+    for (const [kind, n] of Object.entries(reader.usage)) if (n) metrics.tokens.inc({ tenant: token.tenant, kind: TOKEN_KINDS[kind as keyof Usage] }, n);
+    if (cost) metrics.cost.inc({ tenant: token.tenant }, cost);
+    call.usage = reader.usage;
+    call.cost = cost;
     // Without Redis ("closed"), what the reply cost goes uncounted: it is counted as a state error and said.
     await state.spend(token, reader.usage, cost, upstream).catch(() => {});
   };
@@ -540,8 +585,9 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
    */
   const attempt = async (upstream: Upstream, path: string, headers: IncomingHttpHeaders, body: Buffer, signal: AbortSignal): Promise<IncomingMessage | Failure> => {
     const { name, base, pool } = upstream;
-    const failure = (status: number, type: string, message: string, headers: Record<string, string> = {}): Failure => ({
+    const failure = (reason: string, status: number, type: string, message: string, headers: Record<string, string> = {}): Failure => ({
       upstream: name,
+      reason,
       why: message,
       status,
       headers: { "content-type": "application/json", ...headers },
@@ -553,8 +599,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       const key = pool.take(tried);
       if (!key) {
         const retryAfter = pool.retryAfter();
-        if (retryAfter === undefined) return { ...failure(502, "api_error", "The gateway's provider keys were all refused; an operator must replace them."), keys: true };
-        return { ...failure(429, "rate_limit_error", "Every provider key is rate-limited; try again later.", { "retry-after": String(retryAfter) }), keys: true };
+        if (retryAfter === undefined) return { ...failure("keys", 502, "api_error", "The gateway's provider keys were all refused; an operator must replace them."), keys: true };
+        return { ...failure("keys", 429, "rate_limit_error", "Every provider key is rate-limited; try again later.", { "retry-after": String(retryAfter) }), keys: true };
       }
       tried.add(key);
       // The reply's headers, and a failed reply's body, must come in time.
@@ -565,14 +611,13 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         try {
           reply = await send(base, path, headers, body, key, AbortSignal.any([signal, slow.signal]));
         } catch (err) {
-          if (signal.aborted) return { upstream: name, why: "jig went away" };
-          metrics.add("jig_gateway_upstream_errors_total", { status: slow.signal.aborted ? "timeout" : "unreachable" });
-          const why = slow.signal.aborted ? `no reply from ${base.host} within ${firstByteMs} ms` : `could not reach ${base.host}: ${(err as Error).message}`;
-          return { upstream: name, why };
+          // Never counted: forward sees that jig went away first.
+          if (signal.aborted) return { upstream: name, reason: "connect", why: "jig went away" };
+          if (slow.signal.aborted) return { upstream: name, reason: "timeout", why: `no reply from ${base.host} within ${firstByteMs} ms` };
+          return { upstream: name, reason: "connect", why: `could not reach ${base.host}: ${(err as Error).message}` };
         }
         const status = reply.statusCode ?? 502;
         const refused = status === 401 || status === 403;
-        if (refused || status >= 500) metrics.add("jig_gateway_upstream_errors_total", { status: String(status) });
         if (refused) pool.mark(state, key, "bad");
         if (status === 429) pool.mark(state, key, Date.now() + retryAfterMs(reply.headers["retry-after"]));
         if ((refused || status === 429) && pool.take(tried, true)) {
@@ -581,16 +626,18 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         }
         if (refused) {
           reply.resume();
-          return { ...failure(502, "api_error", `The provider refused the gateway's key (${status}); an operator must replace it.`), keys: true };
+          return { ...failure("keys", 502, "api_error", `The provider refused the gateway's key (${status}); an operator must replace it.`), keys: true };
         }
         if (!FAILOVER_STATUSES.has(status)) return reply;
         const keys = status === 429;
+        const reason = `status_${status}`;
         try {
           const failed = await errorBody(reply);
-          if (!failed) return { ...failure(status, "api_error", `${status} from ${base.host}, with a body too large to pass on.`), keys };
-          return { upstream: name, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed, keys };
+          if (!failed) return { ...failure(reason, status, "api_error", `${status} from ${base.host}, with a body too large to pass on.`), keys };
+          return { upstream: name, reason, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed, keys };
         } catch (err) {
-          return { upstream: name, why: slow.signal.aborted ? `no reply from ${base.host} within ${firstByteMs} ms` : `${status} from ${base.host}, ${(err as Error).message}` };
+          if (slow.signal.aborted) return { upstream: name, reason: "timeout", why: `no reply from ${base.host} within ${firstByteMs} ms` };
+          return { upstream: name, reason, why: `${status} from ${base.host}, ${(err as Error).message}` };
         }
       } finally {
         clearTimeout(timer);
@@ -606,13 +653,16 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
    * it came (a rate limit with its retry-after, which jig's SDK waits: no storm of retries from here), or
    * 503 when none answered.
    */
-  const forward = async (req: IncomingMessage, res: ServerResponse, token: TokenPayload, body: Buffer, model: string | undefined, serving: Upstream[], signal: AbortSignal): Promise<void> => {
+  const forward = async (req: IncomingMessage, res: ServerResponse, call: Call, token: TokenPayload, body: Buffer, model: string | undefined, serving: Upstream[], signal: AbortSignal): Promise<void> => {
     const url = new URL(req.url ?? "/", "http://gateway");
     const path = url.pathname.replace(/^\/anthropic/, "") + url.search;
     const headers = Object.fromEntries(Object.entries(req.headers).filter(([name]) => !HOP_BY_HOP.has(name) && !SET_HERE.has(name)));
+    const { request } = call;
     let last: Failure | undefined;
     const why: string[] = [];
     let opensIn = Infinity;
+    // An upstream's failure is counted once the next one is tried, or none is left.
+    let failedOver: { from: string; reason: string } | undefined;
     for (const upstream of serving) {
       const { name, breaker } = upstream;
       const taken = breaker.take();
@@ -621,6 +671,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         why.push(`${name}: passed over while its circuit is open`);
         continue;
       }
+      if (failedOver) metrics.failovers.inc({ ...failedOver, to: name });
+      failedOver = undefined;
       const provided = model === undefined ? undefined : upstream.models?.[model];
       let settled = false;
       try {
@@ -631,21 +683,24 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         }
         settled = true;
         if ("why" in outcome) {
-          metrics.add("jig_gateway_upstream_failures_total", { upstream: name });
+          failedOver = { from: name, reason: outcome.reason };
           if (outcome.keys) breaker.abandoned(taken);
-          else if (breaker.failed(taken)) log.warn(`upstream ${name} is passed over for ${openMs} ms`, { upstream: name, why: outcome.why });
+          else if (breaker.failed(taken)) log.warn(`upstream ${name} is passed over for ${openMs} ms`, { upstream: name, why: outcome.why, request });
           if (outcome.status) last = outcome;
           why.push(`${name}: ${outcome.why}`);
           continue;
         }
-        if (breaker.succeeded()) log.info(`upstream ${name} answers again`, { upstream: name });
-        return await pass(res, outcome, token, model, provided, name);
+        if (breaker.succeeded()) log.info(`upstream ${name} answers again`, { upstream: name, request });
+        return await pass(res, outcome, call, token, model, provided, name);
       } finally {
         if (!settled) breaker.abandoned(taken);
       }
     }
+    if (failedOver) metrics.failovers.inc({ ...failedOver, to: "none" });
     if (last) {
-      if (last.status === 429) metrics.add("jig_gateway_rate_limited_total", { tenant: token.tenant });
+      call.upstream = last.upstream;
+      const id = last.headers?.["request-id"];
+      if (typeof id === "string") call.upstreamRequest = id;
       res.writeHead(last.status!, { ...Object.fromEntries(Object.entries(last.headers ?? {}).filter(([name]) => !HOP_BY_HOP.has(name))), "x-jig-upstream": last.upstream });
       return void res.end(last.body);
     }
@@ -654,15 +709,19 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   };
 
   /** Passes `reply` back to jig as it comes, counting its usage on the way. */
-  const pass = async (res: ServerResponse, reply: IncomingMessage, token: TokenPayload, model: string | undefined, provided: string | undefined, upstream: string): Promise<void> => {
+  const pass = async (res: ServerResponse, reply: IncomingMessage, call: Call, token: TokenPayload, model: string | undefined, provided: string | undefined, upstream: string): Promise<void> => {
     const status = reply.statusCode ?? 502;
+    call.upstream = upstream;
+    const id = reply.headers["request-id"];
+    if (typeof id === "string") call.upstreamRequest = id;
+    metrics.firstByte.observe({ upstream }, (performance.now() - call.started) / 1000);
     const reader = new UsageReader(/event-stream/.test(String(reply.headers["content-type"])));
     res.writeHead(status, { ...Object.fromEntries(Object.entries(reply.headers).filter(([name]) => !HOP_BY_HOP.has(name))), "x-jig-upstream": upstream });
     res.flushHeaders();
     reply.on("data", (chunk: Buffer) => reader.add(chunk));
     // Counted however the reply ends: tokens the provider sent before jig went away were spent too.
     let counted: Promise<void> | undefined;
-    const count = () => (counted ??= (reader.end(), status === 200 ? meter(token, model, provided, reader, upstream) : Promise.resolve()));
+    const count = () => (counted ??= (reader.end(), status === 200 ? meter(call, token, model, provided, reader, upstream) : Promise.resolve()));
     // jig's reply ends once it is counted, so the task's next request, through any replica, sees it.
     reply.once("end", () => void count().finally(() => res.end()));
     reply.once("close", () => {
@@ -675,10 +734,15 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     if (!res.closed) await new Promise((done) => res.once("close", done));
   };
 
-  const messages = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const messages = async (req: IncomingMessage, res: ServerResponse, call: Call): Promise<void> => {
     const token = verifyToken(secret, credential(req.headers));
-    if (token instanceof Error) return fail(res, 401, "authentication_error", `Not a valid gateway token: ${token.message}.`);
-    metrics.add("jig_gateway_requests_total", { tenant: token.tenant });
+    if (token instanceof Error) {
+      // Whose it claims to be is not known, and a label of it would let anyone make series without end.
+      metrics.refused.inc({ tenant: "none", reason: "auth" });
+      return fail(res, 401, "authentication_error", `Not a valid gateway token: ${token.message}.`);
+    }
+    call.tenant = token.tenant;
+    call.task = token.task;
     const chunks: Buffer[] = [];
     let size = 0;
     for await (const chunk of req as AsyncIterable<Buffer>) {
@@ -700,7 +764,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       // Nothing spent yet is $0, so a budget of 0 refuses the first request too.
       const spentUsd = (await state.spent(token.tenant, token.task))?.costUsd ?? 0;
       if (spentUsd >= token.budgetUsd) {
-        metrics.add("jig_gateway_budget_exceeded_total", { tenant: token.tenant });
+        metrics.refused.inc({ tenant: token.tenant, reason: "budget" });
         return fail(res, 402, "billing_error", `This task has spent its budget: $${spentUsd.toFixed(4)} of $${token.budgetUsd}.`);
       }
       // A budget the gateway can't price toward would not hold.
@@ -710,17 +774,21 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     }
     const client = new AbortController();
     res.once("close", () => res.writableFinished || client.abort()); // jig went away: so does the request
+    const queued = performance.now();
     const admission: Admission = await limiter.acquire(token.tenant, client.signal);
+    if (!client.signal.aborted) metrics.queue.observe({ tenant: token.tenant }, (performance.now() - queued) / 1000);
     if ("retryAfter" in admission) {
       if (client.signal.aborted) return;
       if (admission.error) throw admission.error;
-      metrics.add("jig_gateway_rate_limited_total", { tenant: token.tenant });
+      if (admission.limit) metrics.refused.inc({ tenant: token.tenant, reason: admission.limit });
       return fail(res, 429, "rate_limit_error", "This tenant's requests are over its limits; try again later.", { "retry-after": String(admission.retryAfter) });
     }
+    metrics.inflight.inc({ tenant: token.tenant });
     try {
-      await forward(req, res, token, body, model, serving, client.signal);
+      await forward(req, res, call, token, body, model, serving, client.signal);
     } finally {
       admission.release();
+      metrics.inflight.dec({ tenant: token.tenant });
     }
   };
 
@@ -752,35 +820,73 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     res.end(JSON.stringify({ task, ...found }));
   };
 
-  const route = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  /** Counts a model call once its reply is over, however it ended, and writes its access line. */
+  const record = (call: Call, res: ServerResponse): void => {
+    // 499, as nginx has it, when jig went away before any reply.
+    const status = res.headersSent ? res.statusCode : 499;
+    const seconds = (performance.now() - call.started) / 1000;
+    const { request, tenant, task, upstream, usage, cost, upstreamRequest } = call;
+    metrics.requests.inc({ tenant, upstream, status });
+    metrics.seconds.observe({ upstream }, seconds);
+    const ms = Math.round(seconds * 1000);
+    log.debug("model call", { request, tenant, task, upstream, status, ms, input: usage?.input, output: usage?.output, cost, upstream_request: upstreamRequest });
+  };
+
+  const route = async (req: IncomingMessage, res: ServerResponse, request: string): Promise<void> => {
     const url = new URL(req.url ?? "/", "http://gateway");
     const { pathname } = url;
     const route = `${req.method} ${pathname}`;
-    if (route === "POST /anthropic/v1/messages") return messages(req, res);
-    if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
-    if (route === "GET /metrics") {
-      const gauges = { jig_gateway_in_flight: limiter.inFlight, jig_gateway_queued: limiter.queued };
-      return void res.writeHead(200, { "content-type": "text/plain; version=0.0.4" }).end(metrics.text(gauges));
+    if (route === "POST /anthropic/v1/messages") {
+      const call: Call = { request, started: performance.now(), tenant: "none", upstream: "none" };
+      res.once("close", () => record(call, res));
+      return messages(req, res, call);
     }
+    if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
     if (req.method === "GET" && pathname.startsWith("/usage/")) return usage(req, res, url);
     fail(res, 404, "not_found_error", `The gateway has no ${route}.`);
   };
 
   const server = createServer((req, res) => {
-    route(req, res).catch((err) => {
+    const request = requestId(req);
+    res.setHeader("x-request-id", request);
+    route(req, res, request).catch((err) => {
       if (err instanceof StateError) return fail(res, 503, "api_error", `${err.message}; try again shortly.`, { "retry-after": "1" });
+      log.error("a request failed", { request, err });
       fail(res, 500, "api_error", `The gateway failed: ${(err as Error).message}`);
     });
   });
+  // The metrics on a listener of their own, never the port the tasks reach, as they need no token.
+  const scrape = config.metrics && createServer((req, res) => {
+    res.setHeader("x-request-id", requestId(req));
+    const route = `${req.method} ${new URL(req.url ?? "/", "http://gateway").pathname}`;
+    if (route === "GET /metrics") return void registry.serve(res).catch((err) => fail(res, 500, "api_error", `The metrics failed: ${(err as Error).message}`));
+    if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
+    fail(res, 404, "not_found_error", `The gateway's metrics listener has no ${route}.`);
+  });
+  const listen = async (server: Server, host: string, port: number): Promise<string> => {
+    await new Promise<void>((done, failed) => server.once("error", failed).listen(port, host, done));
+    const address = server.address() as AddressInfo;
+    return `http://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`;
+  };
   const { host = "127.0.0.1", port = 8787 } = config.listen ?? {};
-  await new Promise<void>((done, failed) => server.once("error", failed).listen(port, host, done));
-  const address = server.address() as AddressInfo;
+  const url = await listen(server, host, port);
+  let metricsUrl: string | undefined;
+  if (scrape) {
+    try {
+      metricsUrl = await listen(scrape, config.metrics!.host ?? "127.0.0.1", config.metrics!.port);
+    } catch (err) {
+      server.close();
+      state.close();
+      throw err;
+    }
+  }
   return {
-    url: `http://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${address.port}`,
+    url,
+    metricsUrl,
     async close() {
       limiter.close();
-      server.closeAllConnections();
-      await new Promise((done) => server.close(done));
+      for (const listener of [server, scrape]) listener?.closeAllConnections();
+      await Promise.all([server, scrape].map((listener) => listener && new Promise((done) => listener.close(done))));
       // The requests just broken off give their slots back before the state goes.
       await limiter.settle(2000);
       state.close();
@@ -794,14 +900,15 @@ async function main(): Promise<void> {
     console.log("Usage: node server/gateway.ts --config <file>\n\nThe model gateway; docs/server.md describes the config.");
     process.exit(values.help ? 0 : 1);
   }
+  const log = createLog("gateway");
   let gateway: Gateway;
   try {
     gateway = await startGateway(JSON.parse(readFileSync(values.config, "utf8")));
   } catch (err) {
-    console.error(`jig gateway: ${(err as Error).message}`);
+    log.error("could not start", { err });
     process.exit(1);
   }
-  console.log(`jig gateway listening on ${gateway.url}`);
+  log.info(`listening on ${gateway.url}`, { metrics: gateway.metricsUrl });
   for (const signal of ["SIGINT", "SIGTERM"] as const) process.once(signal, () => gateway.close().then(() => process.exit(0)));
 }
 

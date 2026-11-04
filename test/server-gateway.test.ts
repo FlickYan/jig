@@ -68,7 +68,7 @@ function streamed(res: ServerResponse): void {
 
 async function gateway(upstream: string, config: Partial<GatewayConfig> = {}, env: NodeJS.ProcessEnv = {}): Promise<Gateway> {
   const gw = await startGateway(
-    { listen: { port: 0 }, upstream: { baseUrl: upstream, keyEnv: ["POOL_KEY_1"] }, ...config },
+    { listen: { port: 0 }, metrics: { port: 0 }, upstream: { baseUrl: upstream, keyEnv: ["POOL_KEY_1"] }, ...config },
     { JIG_GATEWAY_SECRET: SECRET, ...KEYS, ...env },
   );
   closing.push(() => gw.close());
@@ -89,8 +89,9 @@ async function until(condition: () => boolean | Promise<boolean>, what: string):
   }
 }
 
+/** A series' value on the gateway's metrics listener. */
 async function metric(gw: Gateway, series: string): Promise<number | undefined> {
-  const text = await (await fetch(`${gw.url}/metrics`)).text();
+  const text = await (await fetch(`${gw.metricsUrl}/metrics`)).text();
   const line = text.split("\n").find((line) => line.startsWith(`${series} `));
   return line === undefined ? undefined : Number(line.slice(series.length + 1));
 }
@@ -207,9 +208,9 @@ describe("the gateway", () => {
     const provider = await fakeProvider((_, res) => (hold ? held.push(res) : streamed(res)));
     const gw = await gateway(provider.url, { limits: { concurrent: 1 } });
     const flood = Array.from({ length: 6 }, (_, i) => ask(gw, token({ tenant: "flood", task: "f" }), `flood-${i}`));
-    await until(async () => provider.seen.length === 1 && (await metric(gw, "jig_gateway_queued")) === 5, "the flood to queue up");
+    await until(async () => provider.seen.length === 1 && (await metric(gw, "jig_gateway_waiting")) === 5, "the flood to queue up");
     const other = ask(gw, token({ tenant: "other", task: "o" }), "other");
-    await until(async () => (await metric(gw, "jig_gateway_queued")) === 6, "the other tenant's request to queue");
+    await until(async () => (await metric(gw, "jig_gateway_waiting")) === 6, "the other tenant's request to queue");
     hold = false;
     held.forEach((res) => streamed(res));
     const responses = await Promise.all([...flood, other]);
@@ -246,7 +247,7 @@ describe("the gateway", () => {
     provider.seen.length = 0;
     for (let i = 0; i < 3; i++) assert.equal((await ask(revoked, token())).status, 200);
     assert.deepEqual(provider.seen.map((s) => s.headers["x-api-key"]), ["revoked", "pool-key-2", "pool-key-2", "pool-key-2"]);
-    assert.equal(await metric(revoked, 'jig_gateway_upstream_errors_total{status="401"}'), 1);
+    assert.equal(await metric(revoked, 'jig_gateway_keys{upstream="default",state="refused"}'), 1);
   });
 
   it("counts the usage of streamed and whole replies, by task and tenant", async () => {
@@ -279,8 +280,8 @@ describe("the gateway", () => {
     assert.equal((await read("t1?tenant=acme", token({ tenant: "rival" }))).status, 403);
     assert.equal((await read("%E0", credential)).status, 400);
     assert.equal(await metric(gw, 'jig_gateway_tokens_total{tenant="acme",kind="output"}'), 25);
-    assert.equal(await metric(gw, 'jig_gateway_requests_total{tenant="acme"}'), 2);
-    assert.equal(await metric(gw, "jig_gateway_in_flight"), 0);
+    assert.equal(await metric(gw, 'jig_gateway_requests_total{tenant="acme",upstream="default",status="200"}'), 2);
+    assert.equal(await metric(gw, 'jig_gateway_inflight{tenant="acme"}'), 0);
   });
 
   it("breaks off its reply when the provider's does, counting what came before", async () => {
@@ -298,7 +299,7 @@ describe("the gateway", () => {
     const hung = new Promise<string>((done) => (timer = setTimeout(() => done("hung"), 3000)));
     const outcome = await Promise.race([response.text().then(() => "ended", () => "broke off"), hung]).finally(() => clearTimeout(timer));
     assert.equal(outcome, "broke off");
-    await until(async () => (await metric(gw, "jig_gateway_in_flight")) === 0, "the request to give back its slot");
+    await until(async () => (await metric(gw, 'jig_gateway_inflight{tenant="acme"}')) === 0, "the request to give back its slot");
     const spent = await (await fetch(`${gw.url}/usage/dropped`, { headers: { "x-api-key": token({ task: "dropped" }) } })).json();
     assert.deepEqual([spent.requests, spent.usage.input, spent.usage.output], [1, 10, 1]);
   });
@@ -372,7 +373,7 @@ describe("the gateway with several upstreams", () => {
   /** A gateway with these upstreams, in this order, each with the key POOL_KEY_1. */
   async function failover(upstreams: { name: string; url: string; models?: Record<string, string> }[], config: Partial<GatewayConfig> = {}): Promise<Gateway> {
     const listed = upstreams.map(({ name, url, models }) => ({ name, baseUrl: url, keyEnv: ["POOL_KEY_1"], models }));
-    const gw = await startGateway({ listen: { port: 0 }, upstreams: listed, ...config }, { JIG_GATEWAY_SECRET: SECRET, ...KEYS });
+    const gw = await startGateway({ listen: { port: 0 }, metrics: { port: 0 }, upstreams: listed, ...config }, { JIG_GATEWAY_SECRET: SECRET, ...KEYS });
     closing.push(() => gw.close());
     return gw;
   }
@@ -391,6 +392,7 @@ describe("the gateway with several upstreams", () => {
       slow: await fakeProvider(() => {}), // never answers
       refusing: await fakeProvider((_, res) => void res.writeHead(401).end()),
     };
+    const reasons: Record<string, string> = { overloaded: "status_529", failing: "status_500", unreachable: "connect", slow: "timeout", refusing: "keys" };
     for (const [what, first] of Object.entries(firsts)) {
       const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { firstByteMs: 300 } });
       const credential = token({ task: what });
@@ -399,7 +401,7 @@ describe("the gateway with several upstreams", () => {
       assert.equal(await response.text(), messagesReply([{ text: "Done." }]));
       const spent = await (await fetch(`${gw.url}/usage/${what}`, { headers: { "x-api-key": credential } })).json();
       assert.deepEqual([spent.requests, spent.upstreams], [1, { second: 1 }], what);
-      assert.equal(await metric(gw, 'jig_gateway_upstream_failures_total{upstream="first"}'), 1, what);
+      assert.equal(await metric(gw, `jig_gateway_failovers_total{from="first",to="second",reason="${reasons[what]}"}`), 1, what);
       if (what !== "unreachable") assert.equal(first.seen.length, 1, `${what}: the first upstream was asked`);
     }
     // Each went to the second as it came.
@@ -483,7 +485,7 @@ describe("the gateway with several upstreams", () => {
     await probed.text();
     // Closed: the first takes requests again.
     assert.deepEqual([await via("g"), await via("h")], ["first", "first"]);
-    assert.equal(await metric(gw, 'jig_gateway_upstream_failures_total{upstream="first"}'), 3);
+    assert.equal(await metric(gw, 'jig_gateway_failovers_total{from="first",to="second",reason="status_529"}'), 3);
 
     // With every upstream's circuit open, nothing is sent, and jig is told when to try again.
     const lone = await fakeProvider((_, res) => overloaded(res));
@@ -592,6 +594,152 @@ describe("the gateway with several upstreams", () => {
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: { x: 1 as unknown as string } }] }), /models must map/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, keyEnv: ["NOWHERE"] }] }), /No key in NOWHERE/);
     await assert.rejects(start({ upstream: one, failover: { failures: 0 } }), /failover.failures/);
+  });
+});
+
+describe("the gateway's metrics and logs", () => {
+  const overloaded = (res: ServerResponse) => void res.writeHead(529, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}');
+
+  it("serves its metrics on a listener of its own, which serves nothing else, and none without one", async () => {
+    const provider = await fakeProvider();
+    const plain = await gateway(provider.url, { metrics: undefined });
+    assert.equal(plain.metricsUrl, undefined);
+    assert.equal((await fetch(`${plain.url}/metrics`)).status, 404);
+    const gw = await gateway(provider.url);
+    assert.equal((await fetch(`${gw.url}/metrics`)).status, 404, "never on the public port");
+    assert.notEqual(new URL(gw.metricsUrl!).port, new URL(gw.url).port);
+    assert.equal(await (await fetch(`${gw.metricsUrl}/healthz`)).text(), "ok\n");
+    const scrape = await fetch(`${gw.metricsUrl}/metrics`);
+    assert.match(scrape.headers.get("content-type")!, /^text\/plain; version=0\.0\.4/);
+    assert.match(await scrape.text(), /# TYPE jig_gateway_refused_total counter/);
+    for (const [method, path] of [["POST", "/metrics"], ["GET", "/usage/t1"], ["POST", "/anthropic/v1/messages"]]) {
+      const response = await fetch(`${gw.metricsUrl}${path}`, { method, headers: { "x-api-key": token() }, body: method === "POST" ? body() : undefined });
+      assert.equal(response.status, 404, `${method} ${path}`);
+    }
+    assert.equal(provider.seen.length, 0);
+    await assert.rejects(gateway(provider.url, { metrics: { port: -1 } }), /metrics.port/);
+  });
+
+  it("counts calls by status and upstream, their tokens, cost, refusals and failovers", async () => {
+    const first = await fakeProvider((_, res) => overloaded(res));
+    const second = await fakeProvider();
+    const upstreams = [{ name: "first", baseUrl: first.url, keyEnv: ["POOL_KEY_1"] }, { name: "second", baseUrl: second.url, keyEnv: ["POOL_KEY_1", "POOL_KEY_2"] }];
+    const gw = await gateway("", { upstream: undefined, upstreams, failover: { failures: 1, openMs: 60_000 } });
+    // The first fails over to the second, and its circuit opens: the next goes to the second alone.
+    for (const task of ["a", "b"]) {
+      const response = await ask(gw, token({ task }));
+      assert.deepEqual([response.status, response.headers.get("x-jig-upstream")], [200, "second"]);
+      await response.text();
+    }
+    assert.equal(first.seen.length, 1);
+    assert.equal((await ask(gw, "not-a-token")).status, 401);
+    assert.equal((await ask(gw, token({ task: "broke", budgetUsd: 0 }))).status, 402);
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const expected: [string, number][] = [
+      ['jig_gateway_requests_total{tenant="acme",upstream="second",status="200"}', 2],
+      ['jig_gateway_requests_total{tenant="none",upstream="none",status="401"}', 1],
+      ['jig_gateway_requests_total{tenant="acme",upstream="none",status="402"}', 1],
+      ['jig_gateway_refused_total{tenant="none",reason="auth"}', 1],
+      ['jig_gateway_refused_total{tenant="acme",reason="budget"}', 1],
+      ['jig_gateway_failovers_total{from="first",to="second",reason="status_529"}', 1],
+      ['jig_gateway_tokens_total{tenant="acme",kind="input"}', 20],
+      ['jig_gateway_tokens_total{tenant="acme",kind="output"}', 10],
+      ['jig_gateway_cost_usd_total{tenant="acme"}', 2 * costOf(MODEL, usage)!],
+      ['jig_gateway_request_seconds_count{upstream="second"}', 2],
+      ['jig_gateway_request_seconds_count{upstream="none"}', 2],
+      ['jig_gateway_first_byte_seconds_count{upstream="second"}', 2],
+      ['jig_gateway_queue_seconds_count{tenant="acme"}', 2],
+      ['jig_gateway_inflight{tenant="acme"}', 0],
+      ["jig_gateway_waiting", 0],
+      ['jig_gateway_upstream_open{upstream="first"}', 1],
+      ['jig_gateway_upstream_open{upstream="second"}', 0],
+      ['jig_gateway_keys{upstream="first",state="ok"}', 1],
+      ['jig_gateway_keys{upstream="second",state="ok"}', 2],
+      ["jig_gateway_state_errors_total", 0],
+    ];
+    await until(async () => (await metric(gw, 'jig_gateway_request_seconds_count{upstream="none"}')) === 2, "every call to be counted");
+    for (const [series, value] of expected) assert.equal(await metric(gw, series), value, series);
+    const text = await (await fetch(`${gw.metricsUrl}/metrics`)).text();
+    assert.match(text, /# TYPE jig_gateway_request_seconds histogram/);
+    assert.ok(!/pool-key|jgt1\.|"broke"/.test(text), "no key, token or task in a label");
+
+    // Over the tenant's requests in flight, and over its rate: refused, each for what it is.
+    const held: ServerResponse[] = [];
+    let hold = true;
+    const holding = await fakeProvider((_, res) => (hold ? void held.push(res) : streamed(res)));
+    const limited = await gateway(holding.url, { limits: { maxWaitMs: 200, tenants: { one: { concurrent: 1 }, slow: { requestsPerMinute: 1 } } } });
+    const busy = ask(limited, token({ tenant: "one" }));
+    await until(() => held.length === 1, "the first request to be held");
+    assert.equal((await ask(limited, token({ tenant: "one" }))).status, 429);
+    assert.equal(await metric(limited, 'jig_gateway_inflight{tenant="one"}'), 1);
+    hold = false;
+    held.forEach((res) => streamed(res));
+    await (await busy).text();
+    assert.equal((await ask(limited, token({ tenant: "slow" }))).status, 200);
+    assert.equal((await ask(limited, token({ tenant: "slow" }))).status, 429);
+    assert.equal(await metric(limited, 'jig_gateway_refused_total{tenant="one",reason="concurrency"}'), 1);
+    assert.equal(await metric(limited, 'jig_gateway_refused_total{tenant="slow",reason="rate"}'), 1);
+  });
+
+  it("answers with the client's x-request-id or a new one, which the provider never sees", async () => {
+    const provider = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_provider", "x-request-id": "the-providers" });
+      res.end(messagesReply([{ text: "Done." }]));
+    });
+    const gw = await gateway(provider.url);
+    const traced = await ask(gw, token(), "hi", { "x-request-id": "trace-1.a_B" });
+    assert.equal(traced.headers.get("x-request-id"), "trace-1.a_B");
+    assert.equal(traced.headers.get("request-id"), "req_provider", "the provider's own id comes back too");
+    await traced.text();
+    const made = await ask(gw, token(), "hi", { "x-request-id": "not an id!" });
+    const id = made.headers.get("x-request-id")!;
+    assert.match(id, /^[\w.-]{1,128}$/);
+    await made.text();
+    assert.equal(provider.seen.length, 2);
+    assert.ok(provider.seen.every((seen) => seen.headers["x-request-id"] === undefined), "not sent upstream");
+    // On every reply: a refusal, another route, and the metrics listener's.
+    const refused = await ask(gw, "nope");
+    assert.match(refused.headers.get("x-request-id")!, /^[\w.-]{1,128}$/);
+    assert.notEqual(refused.headers.get("x-request-id"), id);
+    const elsewhere = [await fetch(`${gw.url}/nowhere`, { headers: { "x-request-id": "r2" } }), await fetch(`${gw.metricsUrl}/metrics`, { headers: { "x-request-id": "r3" } })];
+    assert.deepEqual(elsewhere.map((r) => r.headers.get("x-request-id")), ["r2", "r3"]);
+    await Promise.all([refused, ...elsewhere].map((r) => r.arrayBuffer()));
+  });
+
+  it("writes JSON log lines, a model call's at debug with its request id and the provider's", async () => {
+    const provider = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_upstream_1" });
+      res.end(messagesReply([{ text: "Done." }]));
+    });
+    const dir = await tempDir("jig-gateway-");
+    const config = join(dir, "gateway.json");
+    await writeFile(config, JSON.stringify({ listen: { port: 0 }, metrics: { port: 0 }, upstream: { baseUrl: provider.url, keyEnv: ["POOL_KEY_1"] } }));
+    const env = { PATH: process.env.PATH, JIG_GATEWAY_SECRET: SECRET, ...KEYS, JIG_LOG_FORMAT: "json", JIG_LOG_LEVEL: "debug" };
+    const child = spawn(process.execPath, [join(ROOT, "server", "gateway.ts"), "--config", config], { env });
+    closing.push(() => child.kill());
+    const exited = new Promise<number | null>((done) => child.on("exit", done));
+    let stderr = "";
+    child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+    const lines = () => stderr.split("\n").filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    await until(() => lines().some((line) => /^listening on/.test(line.msg)), "the gateway to start");
+    const started = lines().find((line) => /^listening on/.test(line.msg));
+    assert.deepEqual([started.level, started.component], ["info", "gateway"]);
+    assert.match(started.metrics, /^http:\/\/127\.0\.0\.1:\d+$/);
+    assert.equal((await fetch(`${started.metrics}/metrics`)).status, 200);
+    const url = started.msg.slice("listening on ".length);
+    const response = await fetch(`${url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token({ task: "t7" }), "x-request-id": "trace-7" }, body: body() });
+    await response.text();
+    await until(() => lines().some((line) => line.request === "trace-7"), "the call's line");
+    const call = lines().find((line) => line.request === "trace-7");
+    const cost = costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 });
+    assert.deepEqual(
+      { ...call, ts: undefined, ms: undefined },
+      { ts: undefined, level: "debug", component: "gateway", msg: "model call", request: "trace-7", tenant: "acme", task: "t7", upstream: "default", status: 200, ms: undefined, input: 10, output: 5, cost, upstream_request: "req_upstream_1" },
+    );
+    assert.ok(call.ms >= 0);
+    assert.ok(stderr.split("\n").filter(Boolean).every((line) => line.startsWith("{")), `only JSON lines: ${stderr}`);
+    child.kill("SIGTERM");
+    assert.equal(await exited, 0);
   });
 });
 

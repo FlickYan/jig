@@ -388,6 +388,7 @@ ANTHROPIC_API_KEY=<the task's token> jig --model claude-opus-5-5 --base-url http
 ```json
 {
   "listen": { "host": "127.0.0.1", "port": 8081 },
+  "metrics": { "port": 9091 },
   "upstream": { "baseUrl": "https://api.anthropic.com", "keyEnv": ["ANTHROPIC_KEY_1", "ANTHROPIC_KEY_2"] },
   "limits": {
     "concurrent": 64,
@@ -415,13 +416,9 @@ constant time, and answers 401 to anything else, expired tokens included, withou
 The body goes byte for byte, since prompt caching depends on it, and the headers as they came, but for the
 credentials and `accept-encoding`: the gateway asks for the reply uncompressed, so it can read the usage in
 it. A streamed reply comes back event by event as the provider sends it; if the provider breaks it off,
-the gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`.
-`GET /metrics` is Prometheus's text format: `jig_gateway_requests_total`, `jig_gateway_rate_limited_total`
-and `jig_gateway_budget_exceeded_total` by tenant, `jig_gateway_upstream_errors_total` by status,
-`jig_gateway_tokens_total` by tenant and kind, `jig_gateway_cost_usd_total`,
-`jig_gateway_state_errors_total`, `jig_gateway_upstream_failures_total` by upstream, and the gauges
-`jig_gateway_in_flight` and `jig_gateway_queued`, all of them this replica's own. Neither of those two GETs
-asks for a token, so keep the gateway's address inside the cluster. `GET /usage/<task>` gives what a task
+the gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`, without a token,
+so keep the gateway's address inside the cluster; the metrics are on a listener of their own (below).
+`GET /usage/<task>` gives what a task
 spent, `{task, tenant, requests, usage, costUsd, unpriced, upstreams, budgetUsd}` (`upstreams`: the
 replies counted, by the upstream that gave them), to that task's token (its tenant's task of that id), or
 to the admin token (`adminTokenEnv`) with the tenant named, `/usage/<task>?tenant=<tenant>`, since a task id is only unique
@@ -486,6 +483,35 @@ at once, with a `retry-after` for when one may be tried. The gateway says on std
 
 Usage is priced by the model the reply names, or else the provider's id where `src/prices.ts` has a price
 for it, or else the model jig asked for; budgets hold as with one upstream.
+
+**Metrics and logs.** With `"metrics": {"host": "127.0.0.1", "port": 9091}` (`host` defaults to
+127.0.0.1), a second listener answers only `GET /metrics`, in Prometheus's text format, and `GET /healthz`;
+without the block there is none, and the public port never serves metrics. Each replica counts its own:
+
+| metric | labels | what |
+|--------|--------|------|
+| `jig_gateway_requests_total` | `tenant`, `upstream`, `status` | model calls by their final status (499 when jig went away first), and the upstream whose reply went back (`none` when none answered; `tenant` is `none` for a token that fails) |
+| `jig_gateway_request_seconds` | `upstream` | histogram: from a call's arrival to its reply's end |
+| `jig_gateway_first_byte_seconds` | `upstream` | histogram: from a call's arrival to the headers of the provider's reply passed back |
+| `jig_gateway_queue_seconds` | `tenant` | histogram: how long a call waited for a slot under the limits |
+| `jig_gateway_inflight` | `tenant` | gauge: calls let through whose reply is not over |
+| `jig_gateway_waiting` | | gauge: calls waiting for a slot on this replica |
+| `jig_gateway_tokens_total` | `tenant`, `kind` | tokens, `kind` being `input`, `output`, `cache_read` or `cache_write` |
+| `jig_gateway_cost_usd_total` | `tenant` | what the priced replies cost |
+| `jig_gateway_failovers_total` | `from`, `to`, `reason` | calls an upstream failed, `to` the next one tried (`none` with none left), `reason` one of `connect`, `timeout`, `status_<code>` or `keys` |
+| `jig_gateway_upstream_open` | `upstream` | gauge: 1 while its circuit is open or half-open |
+| `jig_gateway_keys` | `upstream`, `state` | gauge: how many keys are `ok`, `resting` or `refused` |
+| `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` (or, to come, `quota`) |
+| `jig_gateway_state_errors_total` | | reads and writes of Redis that failed |
+
+No label holds a key, a token, a prompt or a task. Every reply carries `x-request-id`: the client's, if it
+sent one of 1 to 128 letters, digits, `_`, `.` and `-`, or else a new one. It isn't sent to the provider.
+The gateway logs on stderr, as `jig gateway: ...` lines or, with `JIG_LOG_FORMAT=json`, one JSON object a
+line; `JIG_LOG_LEVEL=debug` adds a line for each model call, with its `request`, `tenant`, `task`,
+`upstream`, `status`, `ms`, `input` and `output` tokens, `cost`, and `upstream_request`, the provider's own
+`request-id` for the reply. A slow or failed call is found by its task or
+request id and followed to the provider; an error the gateway itself meets is logged at `error`, with its
+request id.
 
 **Usage and budgets.** The gateway reads each reply's usage as it passes (a whole reply's `usage`, or a
 stream's `message_start` and `message_delta`), also of a stream jig left halfway, and adds it to the task's
