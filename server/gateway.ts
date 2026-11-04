@@ -201,8 +201,10 @@ function retryAfterMs(header: string | string[] | undefined): number {
 /**
  * An upstream's circuit breaker, this replica's own: `limit` failures in a row open it, and it passes the
  * upstream over for `openMs`; then one request at a time goes as a probe, and the probe's reply closes it
- * or opens it again. Only failures that send a request on count; a reply that goes back to jig, 4xx
- * included, is the upstream answering.
+ * or opens it again. Only failures that send a request on count, and not those of the keys (a rate limit,
+ * or every key resting or refused): a resting key passes the upstream over for its own retry-after, no
+ * longer, and a breaker opened by it would hold for `openMs`. A reply that goes back to jig, 4xx included,
+ * is the upstream answering.
  */
 export class Breaker {
   private failures = 0;
@@ -249,7 +251,7 @@ export class Breaker {
     return true;
   }
 
-  /** The request ended with no word on the upstream (jig went away): another may probe. */
+  /** The request ended with no word on the upstream (jig went away, or its keys failed it): another may probe. */
   abandoned(taken: "closed" | "probe"): void {
     if (taken === "probe") this.probing = false;
   }
@@ -455,6 +457,8 @@ interface Failure {
   status?: number;
   headers?: IncomingHttpHeaders;
   body?: Buffer;
+  /** It was the keys that failed it (a 429, or every key resting or refused), not the upstream: its breaker doesn't count it. */
+  keys?: boolean;
 }
 
 /** A failed reply's body, which is small; undefined past MAX_ERROR_BYTES. */
@@ -549,8 +553,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       const key = pool.take(tried);
       if (!key) {
         const retryAfter = pool.retryAfter();
-        if (retryAfter === undefined) return failure(502, "api_error", "The gateway's provider keys were all refused; an operator must replace them.");
-        return failure(429, "rate_limit_error", "Every provider key is rate-limited; try again later.", { "retry-after": String(retryAfter) });
+        if (retryAfter === undefined) return { ...failure(502, "api_error", "The gateway's provider keys were all refused; an operator must replace them."), keys: true };
+        return { ...failure(429, "rate_limit_error", "Every provider key is rate-limited; try again later.", { "retry-after": String(retryAfter) }), keys: true };
       }
       tried.add(key);
       // The reply's headers, and a failed reply's body, must come in time.
@@ -577,13 +581,14 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         }
         if (refused) {
           reply.resume();
-          return failure(502, "api_error", `The provider refused the gateway's key (${status}); an operator must replace it.`);
+          return { ...failure(502, "api_error", `The provider refused the gateway's key (${status}); an operator must replace it.`), keys: true };
         }
         if (!FAILOVER_STATUSES.has(status)) return reply;
+        const keys = status === 429;
         try {
           const failed = await errorBody(reply);
-          if (!failed) return failure(status, "api_error", `${status} from ${base.host}, with a body too large to pass on.`);
-          return { upstream: name, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed };
+          if (!failed) return { ...failure(status, "api_error", `${status} from ${base.host}, with a body too large to pass on.`), keys };
+          return { upstream: name, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed, keys };
         } catch (err) {
           return { upstream: name, why: slow.signal.aborted ? `no reply from ${base.host} within ${firstByteMs} ms` : `${status} from ${base.host}, ${(err as Error).message}` };
         }
@@ -627,7 +632,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         settled = true;
         if ("why" in outcome) {
           metrics.add("jig_gateway_upstream_failures_total", { upstream: name });
-          if (breaker.failed(taken)) log.warn(`upstream ${name} is passed over for ${openMs} ms`, { upstream: name, why: outcome.why });
+          if (outcome.keys) breaker.abandoned(taken);
+          else if (breaker.failed(taken)) log.warn(`upstream ${name} is passed over for ${openMs} ms`, { upstream: name, why: outcome.why });
           if (outcome.status) last = outcome;
           why.push(`${name}: ${outcome.why}`);
           continue;

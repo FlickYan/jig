@@ -494,6 +494,44 @@ describe("the gateway with several upstreams", () => {
     assert.ok(Number(open.headers.get("retry-after")) >= 1);
   });
 
+  it("leaves the circuit to the keys when the provider rate-limits: a resting key passes it over for its retry-after alone", async () => {
+    let limited = 0;
+    const provider = await fakeProvider((_, res) => {
+      if (limited++) return streamed(res);
+      res.writeHead(429, { "retry-after": "1", "content-type": "application/json" }).end('{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}');
+    });
+    // One upstream, as `upstream`: the provider's 429, then the gateway's own while the key rests, more than `failures` of them.
+    const gw = await gateway(provider.url, { failover: { failures: 2, openMs: 30_000 } });
+    const statuses = [];
+    for (let i = 0; i < 4; i++) {
+      const response = await ask(gw, token());
+      statuses.push([response.status, response.headers.get("retry-after")]);
+      await response.text();
+    }
+    assert.deepEqual(statuses, [[429, "1"], [429, "1"], [429, "1"], [429, "1"]]);
+    assert.equal(provider.seen.length, 1);
+    // A second later the key is back, and so is the provider: no circuit holds it for openMs.
+    await sleep(1100);
+    const back = await ask(gw, token());
+    assert.deepEqual([back.status, back.headers.get("x-jig-upstream")], [200, "default"]);
+    await back.text();
+    assert.equal(provider.seen.length, 2);
+
+    // With several upstreams, the requests go on to the next while the key rests, and back to the first after.
+    limited = 0;
+    const second = await fakeProvider();
+    const both = await failover([{ name: "first", url: provider.url }, { name: "second", url: second.url }], { failover: { failures: 2, openMs: 30_000 } });
+    const via = async () => {
+      const response = await ask(both, token());
+      await response.text();
+      return response.headers.get("x-jig-upstream");
+    };
+    assert.deepEqual([await via(), await via(), await via(), await via()], ["second", "second", "second", "second"]);
+    assert.equal(provider.seen.length, 3);
+    await sleep(1100);
+    assert.equal(await via(), "first");
+  });
+
   it("lets one probe through at a time, and another once the probe's client went away", () => {
     const breaker = new Breaker(1, 100);
     assert.equal(breaker.take(0), "closed");

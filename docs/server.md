@@ -478,8 +478,9 @@ upstream fails, the last failed reply goes back as it came (a 429 with its `retr
 (`overloaded_error`) if none answered.
 
 Each upstream has a circuit breaker, each replica its own: `failures` failures in a row (those that send
-a request on; a 400 that goes back to jig is the upstream answering) open it, and for `openMs` it is
-passed over, no request reaching it. Then one request at a time tries it; its reply closes the circuit,
+a request on, but not a 429 or a pool with every key resting or refused, since a rate-limited key rests
+for its own `retry-after` and no longer; a 400 that goes back to jig is the upstream answering) open it,
+and for `openMs` it is passed over, no request reaching it. Then one request at a time tries it; its reply closes the circuit,
 its failure opens it for another `openMs`. With every upstream for a model open, the gateway answers 503
 at once, with a `retry-after` for when one may be tried. The gateway says on stderr when an upstream is passed over and when it answers again.
 
