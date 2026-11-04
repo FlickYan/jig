@@ -26,6 +26,58 @@ export interface Limits {
   maxQueued?: number;
   /** Seconds a task with approvals waits for an answer before its jig takes it as a deny (default 600). */
   approvalTimeout?: number;
+  /** What the tenant may start in a UTC day, and spend in a UTC day or month: none when missing. */
+  quotas?: Quotas;
+}
+
+export interface Quotas {
+  /** Tasks created in a UTC day, whatever became of them. */
+  tasksPerDay?: number;
+  /** USD spent by the tasks that ended in a UTC day, from the usage ledger. */
+  usdPerDay?: number;
+  usdPerMonth?: number;
+}
+
+/** A cap a new task is refused at: the queue's, or one of the quotas. */
+export type Cap = "maxQueued" | keyof Quotas;
+const CAPS: Cap[] = ["maxQueued", "tasksPerDay", "usdPerDay", "usdPerMonth"];
+
+/** The caps a new task must keep within, checked with its insert (Store.createTask), and the time it is made at. */
+export interface Caps extends Quotas {
+  maxQueued?: number;
+  now: Date;
+}
+
+/** Why a new task was refused: the cap, its limit and what the tenant has used of it. */
+export interface Refusal {
+  quota: Cap;
+  limit: number;
+  used: number;
+}
+
+/** A row of the usage report: the ended tasks of a tenant, day or model (those it is grouped by), summed. */
+export interface UsageRow {
+  tenant?: string;
+  day?: string;
+  model?: string;
+  tasks: number;
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  costUsd: number;
+  seconds: number;
+}
+
+export interface UsageQuery {
+  /** UTC days, YYYY-MM-DD, both included. */
+  from: string;
+  to: string;
+  /** What the rows are by, in this order; the tenant before them with `byTenant`. */
+  group: ("day" | "model")[];
+  byTenant?: boolean;
+  /** Only this tenant's usage. */
+  tenant?: string;
 }
 
 export interface Tenant {
@@ -153,6 +205,12 @@ export interface Store {
    */
   retireTenants(keep: string[]): Promise<number>;
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
+  /**
+   * Adds the task unless the tenant is at one of the caps: the refusal for the first it is at, in the order
+   * maxQueued, tasksPerDay, usdPerDay, usdPerMonth. The count and the insert are one replica's at a time, so
+   * replicas sharing the store can't both admit the tenant's last task of the day.
+   */
+  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
   task(id: string): Promise<Task | undefined>;
   /**
    * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
@@ -180,7 +238,10 @@ export interface Store {
   requestCancel(id: string): Promise<boolean>;
   /** Moves a queued task to cancelled; false if it was no longer queued. */
   cancelQueued(id: string): Promise<boolean>;
-  /** Ends a running task, if the owner still holds it. */
+  /**
+   * Ends a running task, if the owner still holds it. Every way a task ends (this, expire, cancelQueued and
+   * retireTenants) writes its row of the usage ledger in the same transaction, once.
+   */
   finish(id: string, owner: string, outcome: Outcome): Promise<void>;
   /** Keeps one of a task's events; one with a seq already kept is ignored. */
   addEvent(task: string, seq: number, event: object): Promise<void>;
@@ -202,6 +263,8 @@ export interface Store {
   given(task: string, id: string): Promise<Given | undefined>;
   /** How many of each task's approvals have no answer yet; a task with none is left out. */
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
+  /** The usage ledger summed by the query's groups, sorted by them; a group with no ended task is left out. */
+  usage(query: UsageQuery): Promise<UsageRow[]>;
   /** What other replicas did, as it happens; a store that can't hear it never emits. */
   readonly changes: Changes;
   /** Whether changes are heard as they happen now: if not, whoever waits on them must look again itself. */
@@ -238,6 +301,13 @@ const MIGRATIONS = [
      task TEXT NOT NULL REFERENCES tasks (id), id TEXT NOT NULL, step INTEGER, tool TEXT NOT NULL, description TEXT NOT NULL,
      requested_at TEXT NOT NULL, api_decision TEXT, api_always INTEGER, api_at TEXT,
      decision TEXT, always INTEGER, decided_by TEXT, decided_at TEXT, PRIMARY KEY (task, id));`,
+  // The usage ledger: a row per ended task, for quotas and billing, which sum it by tenant and UTC day
+  // rather than read every task. Tasks that ended before it have none.
+  `CREATE TABLE usage (
+     task TEXT PRIMARY KEY REFERENCES tasks (id), tenant TEXT NOT NULL, day TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL,
+     input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, cost_usd REAL NOT NULL, seconds REAL NOT NULL);
+   CREATE INDEX usage_by_tenant ON usage (tenant, day);
+   CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
 ];
 
 type Row = Record<string, unknown>;
@@ -303,25 +373,42 @@ class SqliteStore implements Store {
 
   async retireTenants(keep: string[]): Promise<number> {
     const kept = JSON.stringify(keep);
-    this.db.exec("BEGIN");
-    try {
+    return this.atomically(() => {
       this.db.prepare("DELETE FROM api_keys WHERE tenant NOT IN (SELECT value FROM json_each(?))").run(kept);
-      const { changes } = this.db
-        .prepare("UPDATE tasks SET status = 'cancelled', ended = ?, error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (SELECT value FROM json_each(?))")
-        .run(new Date().toISOString(), kept);
-      this.db.exec("COMMIT");
-      return Number(changes);
-    } catch (err) {
-      this.db.exec("ROLLBACK");
-      throw err;
-    }
+      const ended = this.db
+        .prepare(`UPDATE tasks SET status = 'cancelled', ended = ?, error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (SELECT value FROM json_each(?)) RETURNING ${ENDED}`)
+        .all(new Date().toISOString(), kept) as Row[];
+      this.ledger(ended);
+      return ended.length;
+    });
   }
 
-  async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
+  createTask(tenant: string, spec: TaskSpec): Promise<Task>;
+  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
+    if (caps) return this.admit(tenant, spec, caps);
     const id = newTaskId();
     const { prompt, ...rest } = spec;
     this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), new Date().toISOString());
     return (await this.task(id))!;
+  }
+
+  /**
+   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here waits
+   * (createTask inserts before its first await), so no other statement of this process's runs inside it.
+   */
+  private admit(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal> {
+    return this.atomically(() => {
+      const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
+      const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
+      const refused = refusal(caps, (cap) =>
+        cap === "maxQueued" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'queued'")
+        : cap === "tasksPerDay" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND created >= ? AND created < ?", dayStart.toISOString(), nextDay.toISOString())
+        : cap === "usdPerDay" ? one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?", day)
+        : one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?", isoDay(monthStart), isoDay(nextMonth)),
+      );
+      return refused ? Promise.resolve(refused) : this.createTask(tenant, spec);
+    }, "BEGIN IMMEDIATE");
   }
 
   async task(id: string): Promise<Task | undefined> {
@@ -383,9 +470,12 @@ class SqliteStore implements Store {
 
   async expire(error: string): Promise<string[]> {
     const now = new Date().toISOString();
-    // A task left running by a version of the service without leases has none: it is as gone.
-    const rows = this.db.prepare("UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING id").all(error, now, now) as Row[];
-    return rows.map((row) => String(row.id));
+    return this.atomically(() => {
+      // A task left running by a version of the service without leases has none: it is as gone.
+      const rows = this.db.prepare(`UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING ${ENDED}`).all(error, now, now) as Row[];
+      this.ledger(rows);
+      return rows.map((row) => String(row.id));
+    });
   }
 
   async requestCancel(id: string): Promise<boolean> {
@@ -393,14 +483,53 @@ class SqliteStore implements Store {
   }
 
   async cancelQueued(id: string): Promise<boolean> {
-    const { changes } = this.db.prepare("UPDATE tasks SET status = 'cancelled', ended = ? WHERE id = ? AND status = 'queued'").run(new Date().toISOString(), id);
-    return changes === 1;
+    return this.atomically(() => {
+      const rows = this.db.prepare(`UPDATE tasks SET status = 'cancelled', ended = ? WHERE id = ? AND status = 'queued' RETURNING ${ENDED}`).all(new Date().toISOString(), id) as Row[];
+      this.ledger(rows);
+      return rows.length === 1;
+    });
   }
 
   async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
-    this.db
-      .prepare("UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ?")
-      .run(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner);
+    this.atomically(() => {
+      const rows = this.db
+        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
+        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner) as Row[];
+      this.ledger(rows, spentOf(outcome));
+    });
+  }
+
+  /** The ledger's rows for tasks that just ended (their ENDED columns), each having spent `spent`. */
+  private ledger(rows: Row[], spent: Spent = NOTHING): void {
+    const insert = this.db.prepare(
+      "INSERT OR IGNORE INTO usage (task, tenant, day, model, status, input, output, cache_read, cache_write, cost_usd, seconds) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    );
+    for (const row of rows) {
+      const ended = String(row.ended);
+      const seconds = row.started === null ? 0 : (Date.parse(ended) - Date.parse(String(row.started))) / 1000;
+      const model = String((JSON.parse(String(row.spec)) as Partial<TaskSpec>).model ?? "");
+      insert.run(String(row.id), String(row.tenant), ended.slice(0, 10), model, String(row.status), spent.input, spent.output, spent.cacheRead, spent.cacheWrite, spent.costUsd, seconds);
+    }
+  }
+
+  async usage(query: UsageQuery): Promise<UsageRow[]> {
+    const keys = usageKeys(query);
+    const where = ["day >= ?", "day <= ?", ...(query.tenant !== undefined ? ["tenant = ?"] : [])];
+    const sql = `SELECT ${[...keys, USAGE_SUMS].join(", ")} FROM usage WHERE ${where.join(" AND ")}${keys.length ? ` GROUP BY ${keys.join(", ")}` : ""}`;
+    return usageRows(this.db.prepare(sql).all(query.from, query.to, ...(query.tenant !== undefined ? [query.tenant] : [])) as Row[], keys);
+  }
+
+  /** Runs `body` in a transaction: committed if it returns, rolled back if it throws. It must not wait. */
+  private atomically<T>(body: () => T, begin = "BEGIN"): T {
+    this.db.exec(begin);
+    try {
+      const result = body();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      throw err;
+    }
   }
 
   async addEvent(task: string, seq: number, event: object): Promise<void> {
@@ -461,6 +590,93 @@ class SqliteStore implements Store {
   async close(): Promise<void> {
     this.db.close();
   }
+}
+
+/** The columns of a task that just ended that its row of the ledger needs. */
+export const ENDED = "id, tenant, spec, status, started, ended";
+
+/** What a task spent, as the ledger keeps it. */
+export interface Spent {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  costUsd: number;
+}
+
+const NOTHING: Spent = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+
+/**
+ * What a run's outcome says it spent, from its end event. On Docker and Kubernetes a task's commands can
+ * write that event, so anything but a count or a cost (a negative, a string, a fraction) is taken as 0
+ * rather than let fail the statement that ends the task.
+ */
+export function spentOf(outcome: Outcome): Spent {
+  const count = (value: unknown) => (Number.isSafeInteger(value) && (value as number) >= 0 ? (value as number) : 0);
+  const usage = (outcome.usage ?? {}) as Partial<Record<keyof Usage, unknown>>;
+  const cost = outcome.cost;
+  return {
+    input: count(usage.input),
+    output: count(usage.output),
+    cacheRead: count(usage.cacheRead),
+    cacheWrite: count(usage.cacheWrite),
+    costUsd: typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : 0,
+  };
+}
+
+/** A time's UTC day, YYYY-MM-DD. */
+export function isoDay(time: Date): string {
+  return time.toISOString().slice(0, 10);
+}
+
+/** The UTC day and month `now` is in: the day's name, and when each starts and the next starts. */
+export function periods(now: Date): { day: string; dayStart: Date; nextDay: Date; monthStart: Date; nextMonth: Date } {
+  const [year, month, date] = [now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()];
+  return { day: isoDay(now), dayStart: new Date(Date.UTC(year, month, date)), nextDay: new Date(Date.UTC(year, month, date + 1)), monthStart: new Date(Date.UTC(year, month, 1)), nextMonth: new Date(Date.UTC(year, month + 1, 1)) };
+}
+
+/** USD to the nanodollar: sums of costs like 0.1 + 0.2 don't come out a hair under a limit, or show as 0.30000000000000004. */
+export function roundUsd(usd: number): number {
+  return Math.round(usd * 1e9) / 1e9;
+}
+
+/** The first cap the tenant is at, by `used`, which measures only the caps that are set. */
+export function refusal(caps: Caps, used: (cap: Cap) => number): Refusal | undefined {
+  for (const quota of CAPS) {
+    const limit = caps[quota];
+    if (limit === undefined) continue;
+    const spent = quota.startsWith("usd") ? roundUsd(used(quota)) : used(quota);
+    if (spent >= limit) return { quota, limit, used: spent };
+  }
+  return undefined;
+}
+
+/** The sums of a usage report's rows, in SQL either store runs. */
+export const USAGE_SUMS =
+  "count(*) AS tasks, sum(input) AS input, sum(output) AS output, sum(cache_read) AS cache_read, sum(cache_write) AS cache_write, sum(cost_usd) AS cost_usd, sum(seconds) AS seconds";
+
+/** The columns a usage report groups by: the tenant if asked, then its groups (only these names reach SQL). */
+export function usageKeys({ group, byTenant }: UsageQuery): ("tenant" | "day" | "model")[] {
+  return [...(byTenant ? (["tenant"] as const) : []), ...group.filter((key) => key === "day" || key === "model")];
+}
+
+/** A usage report's rows from either store's, sorted by their keys (as bytes, the same in both). */
+export function usageRows(rows: Row[], keys: ("tenant" | "day" | "model")[]): UsageRow[] {
+  const sorted = rows.map((row) => ({
+    ...Object.fromEntries(keys.map((key) => [key, String(row[key])])),
+    tasks: Number(row.tasks),
+    input: Number(row.input),
+    output: Number(row.output),
+    cacheRead: Number(row.cache_read),
+    cacheWrite: Number(row.cache_write),
+    costUsd: roundUsd(Number(row.cost_usd)),
+    seconds: Math.round(Number(row.seconds) * 1000) / 1000,
+  }));
+  const order = (a: UsageRow, b: UsageRow) => {
+    for (const key of keys) if (a[key] !== b[key]) return a[key]! < b[key]! ? -1 : 1;
+    return 0;
+  };
+  return sorted.sort(order);
 }
 
 export function newTaskId(): string {

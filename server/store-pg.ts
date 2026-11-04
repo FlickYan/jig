@@ -1,15 +1,22 @@
 import { EventEmitter } from "node:events";
-import { type Listener, Pool, type Row } from "./pg.ts";
+import { type Client, type Listener, Pool, type Row } from "./pg.ts";
 import {
   type Answer,
   type Approval,
   type ApprovalRequest,
+  type Caps,
   type ClaimTerms,
   type Changes,
+  ENDED,
   type Given,
+  isoDay,
   json,
   newTaskId,
   type Outcome,
+  periods,
+  type Refusal,
+  refusal,
+  spentOf,
   type Store,
   TASK_COLUMNS,
   type Task,
@@ -19,6 +26,11 @@ import {
   toApproval,
   toGiven,
   toTask,
+  USAGE_SUMS,
+  type UsageQuery,
+  type UsageRow,
+  usageKeys,
+  usageRows,
 } from "./store.ts";
 
 // The task service's state in Postgres (pg.ts), which several replicas of the service share. Claims count
@@ -33,6 +45,8 @@ const APPROVALS = "jig_approvals";
 // pg_advisory_xact_lock's keys: claims, and migrations (so two replicas starting at once don't both run them).
 const CLAIM_LOCK = 7_366_000_001;
 const MIGRATE_LOCK = 7_366_000_002;
+// With a tenant's hashtext, a lock of its own on its new tasks: two 32-bit keys, a key space apart from the above.
+const CREATE_LOCK = 7366;
 
 // Each entry moves the schema one version on (jig_schema counts them). Never edit one that has shipped:
 // add another. JSON is kept as `json`, which holds the text as it came, or as text: jsonb would turn away
@@ -56,11 +70,27 @@ const MIGRATIONS = [
      n bigserial UNIQUE, task text NOT NULL REFERENCES tasks (id), id text NOT NULL, step integer, tool text NOT NULL, description text NOT NULL,
      requested_at timestamptz NOT NULL, api_decision text, api_always boolean, api_at timestamptz,
      decision text, always boolean, decided_by text, decided_at timestamptz, PRIMARY KEY (task, id));`,
+  // The usage ledger: a row per ended task, for quotas and billing, which sum it by tenant and UTC day
+  // rather than read every task. Tasks that ended before it have none.
+  `CREATE TABLE usage (
+     task text PRIMARY KEY REFERENCES tasks (id), tenant text NOT NULL, day text NOT NULL, model text NOT NULL, status text NOT NULL,
+     input bigint NOT NULL, output bigint NOT NULL, cache_read bigint NOT NULL, cache_write bigint NOT NULL, cost_usd double precision NOT NULL, seconds double precision NOT NULL);
+   CREATE INDEX usage_by_tenant ON usage (tenant, day);
+   CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
 const NOTIFY_DONE = `SELECT id, pg_notify('${EVENTS}', json_build_object('task', id, 'done', status)::text) FROM done`;
 const IDS = "SELECT json_array_elements_text($1::json)";
+
+/**
+ * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING ENDED), in the statement that ends
+ * them, so in its transaction; `spent` is the SQL of input, output, cache_read, cache_write and cost_usd.
+ */
+const ledger = (spent = "0, 0, 0, 0, 0") =>
+  `ledger AS (INSERT INTO usage (task, tenant, day, model, status, input, output, cache_read, cache_write, cost_usd, seconds)
+     SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(spec->>'model', ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
+     FROM done ON CONFLICT DO NOTHING)`;
 
 export class PostgresStore implements Store {
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
@@ -130,17 +160,36 @@ export class PostgresStore implements Store {
     return this.pool.transaction(async (db) => {
       await db.query(`DELETE FROM api_keys WHERE tenant NOT IN (${IDS})`, [json(keep)]);
       const { rows } = await db.query(
-        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING id, status) ${NOTIFY_DONE}`,
+        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
         [json(keep)],
       );
       return rows.length;
     });
   }
 
-  async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
+  createTask(tenant: string, spec: TaskSpec): Promise<Task>;
+  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
     const { prompt, ...rest } = spec;
-    const { rows } = await this.pool.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(), tenant, prompt, json(rest)]);
-    return toTask(rows[0]);
+    const insert = async (db: Client) => {
+      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(), tenant, prompt, json(rest)]);
+      return toTask(rows[0]);
+    };
+    if (!caps) return insert(this.pool);
+    return this.pool.transaction(async (db) => {
+      // Held to the transaction's end, so the counts and the insert are one replica's at a time, for this
+      // tenant; each count is a statement of its own, which sees what the last insert committed.
+      await db.query(`SELECT pg_advisory_xact_lock(${CREATE_LOCK}, hashtext($1))`, [tenant]);
+      const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
+      const one = async (sql: string, ...params: unknown[]) => Number(Object.values((await db.query(sql, [tenant, ...params])).rows[0])[0]);
+      const used = {
+        maxQueued: caps.maxQueued === undefined ? 0 : await one("SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'queued'"),
+        tasksPerDay: caps.tasksPerDay === undefined ? 0 : await one("SELECT count(*) FROM tasks WHERE tenant = $1 AND created >= $2 AND created < $3", dayStart, nextDay),
+        usdPerDay: caps.usdPerDay === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day = $2", day),
+        usdPerMonth: caps.usdPerMonth === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day >= $2 AND day < $3", isoDay(monthStart), isoDay(nextMonth)),
+      };
+      return refusal(caps, (cap) => used[cap]) ?? insert(db);
+    });
   }
 
   async task(id: string): Promise<Task | undefined> {
@@ -201,7 +250,7 @@ export class PostgresStore implements Store {
   async expire(error: string): Promise<string[]> {
     // The database's clock, not the replicas', says when a lease ran out.
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now()) RETURNING id, status) ${NOTIFY_DONE}`,
+      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now()) RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
       [error],
     );
     return rows.map((row) => String(row.id));
@@ -216,15 +265,16 @@ export class PostgresStore implements Store {
   }
 
   async cancelQueued(id: string): Promise<boolean> {
-    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING id, status) ${NOTIFY_DONE}`, [id]);
+    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`, [id]);
     return rows.length === 1;
   }
 
   async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
+    const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
     await this.pool.query(
       `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
-       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING id, status) ${NOTIFY_DONE}`,
-      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost],
+       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${ENDED}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
+      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd],
     );
   }
 
@@ -289,6 +339,14 @@ export class PostgresStore implements Store {
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
     const { rows } = await this.pool.query(`SELECT task, count(*) AS n FROM approvals WHERE task IN (${IDS}) AND decision IS NULL GROUP BY task`, [json(tasks)]);
     return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
+  async usage(query: UsageQuery): Promise<UsageRow[]> {
+    const keys = usageKeys(query);
+    const params: unknown[] = [query.from, query.to];
+    const where = ["day >= $1", "day <= $2", ...(query.tenant !== undefined ? [`tenant = $${params.push(query.tenant)}`] : [])];
+    const sql = `SELECT ${[...keys, USAGE_SUMS].join(", ")} FROM usage WHERE ${where.join(" AND ")}${keys.length ? ` GROUP BY ${keys.join(", ")}` : ""}`;
+    return usageRows((await this.pool.query(sql, params)).rows, keys);
   }
 
   async close(): Promise<void> {

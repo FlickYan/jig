@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -11,7 +11,25 @@ import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
 import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
 import { Scheduler, type Update } from "./scheduler.ts";
-import { type Approval, type Decision, FINISHED, openStore, STATUSES, type Store, type Limits, type Task, type TaskSpec, type TaskStatus, type Tenant } from "./store.ts";
+import {
+  type Approval,
+  type Decision,
+  FINISHED,
+  isoDay,
+  openStore,
+  periods,
+  type Quotas,
+  roundUsd,
+  STATUSES,
+  type Store,
+  type Limits,
+  type Task,
+  type TaskSpec,
+  type TaskStatus,
+  type Tenant,
+  type UsageQuery,
+  type UsageRow,
+} from "./store.ts";
 
 // The task service's HTTP API (docs/server.md): tenants create tasks, follow their events, answer the
 // approvals they ask for and cancel them, each with its own API key, and sees only its own tasks. A second
@@ -32,6 +50,8 @@ export interface TenantConfig {
   /** Where each approval its tasks ask for is POSTed, signed with the secret in the variable webhookSecretEnv names. */
   approvalWebhook?: string;
   webhookSecretEnv?: string;
+  /** The most tasks it may create in a UTC day, and USD its tasks may spend in a UTC day or month. */
+  quotas?: Quotas;
 }
 
 export interface Config {
@@ -67,13 +87,15 @@ export interface Config {
   maxEvents?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
+  /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
+  adminKeyEnv?: string;
   tenants: TenantConfig[];
 }
 
 /** What every runner takes from the config's top level. */
 type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl";
 
-const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600 };
+const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
 const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 
@@ -90,10 +112,16 @@ export interface Service {
 /**
  * Checks the config, opens the store, puts the config's tenants in it and shuts out those it no longer
  * lists, ends the tasks of replicas that are gone, and listens, on the internal listener too. The runner is
- * the local one unless one is given (a test's); `webhookRetryMs` is the pause before a webhook's first retry.
+ * the local one unless one is given (a test's); `webhookRetryMs` is the pause before a webhook's first retry;
+ * `now` is the clock the quotas' days and months, and the usage report's default range, are read from.
  */
-export async function startService(config: Config, { secret, runner, webhookRetryMs }: { secret: string; runner?: Runner; webhookRetryMs?: number }): Promise<Service> {
+export async function startService(
+  config: Config,
+  { secret, runner, webhookRetryMs, now = () => new Date() }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date },
+): Promise<Service> {
   checkConfig(config);
+  const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
+  if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
   const store = await openStore(config.database);
   const answers = new Answers(store);
@@ -131,7 +159,16 @@ export async function startService(config: Config, { secret, runner, webhookRetr
     await store.close();
     throw err;
   }
-  const context = { store, scheduler, answers, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 };
+  const context = {
+    store,
+    scheduler,
+    answers,
+    model: config.model ?? "deepseek-flash",
+    maxBody: config.maxBodyBytes ?? 1024 * 1024,
+    heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000,
+    adminKey: adminKey === undefined ? undefined : sha256(adminKey),
+    now,
+  };
   const server = createServer(handler((req, res) => handle(req, res, context)));
   const close = async () => {
     webhooks.close();
@@ -231,6 +268,7 @@ function configProblem(config: Config): string | undefined {
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
+    text("adminKeyEnv", config.adminKeyEnv, false) ??
     (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
   if (problem) return problem;
   const tenants = new Set<string>();
@@ -239,6 +277,7 @@ function configProblem(config: Config): string | undefined {
   for (const [i, tenant] of config.tenants.entries()) {
     const at = `tenants[${i}]`;
     if (!isObject(tenant)) return `${at} must be an object`;
+    const notQuota = isObject(tenant.quotas) ? Object.keys(tenant.quotas).find((key) => !["tasksPerDay", "usdPerDay", "usdPerMonth"].includes(key)) : undefined;
     const problem =
       text(`${at}.id`, tenant.id, true) ??
       (tenants.has(tenant.id) ? `${at}.id ${JSON.stringify(tenant.id)} is another tenant's too` : undefined) ??
@@ -250,7 +289,12 @@ function configProblem(config: Config): string | undefined {
       whole(`${at}.maxQueued`, tenant.maxQueued, 0) ??
       whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
-      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined);
+      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
+      (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
+      (notQuota === undefined ? undefined : `${at}.quotas.${notQuota} isn't a quota: tasksPerDay, usdPerDay or usdPerMonth`) ??
+      whole(`${at}.quotas.tasksPerDay`, tenant.quotas?.tasksPerDay, 1) ??
+      positive(`${at}.quotas.usdPerDay`, tenant.quotas?.usdPerDay) ??
+      positive(`${at}.quotas.usdPerMonth`, tenant.quotas?.usdPerMonth);
     if (problem) return problem;
     tenants.add(tenant.id);
     for (const [j, key] of tenant.keys.entries()) {
@@ -270,14 +314,22 @@ interface Context {
   model: string;
   maxBody: number;
   heartbeatMs: number;
+  /** The SHA-256 of the admin key, when there is one. */
+  adminKey?: Buffer;
+  now: () => Date;
 }
+
+const sha256 = (text: string) => createHash("sha256").update(text).digest();
 
 async function handle(req: IncomingMessage, res: ServerResponse, context: Context): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
   if (url.pathname === "/healthz") return reply(res, 200, { ok: true });
   const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
+  if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) return admin(req, res, url, key, context);
   const tenant = key && (await context.store.tenantByKey(createHash("sha256").update(key).digest("hex")));
   if (!tenant) return reply(res, 401, { error: "A tenant's API key is needed: Authorization: Bearer <key>" }, { "www-authenticate": "Bearer" });
+
+  if (url.pathname === "/v1/usage") return req.method === "GET" ? usage(res, url, context, { tenant: tenant.id }) : reply(res, 405, { error: "Use GET" });
 
   if (url.pathname === "/v1/tasks") {
     if (req.method === "POST") return createTask(req, res, tenant, context);
@@ -329,12 +381,85 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   }
   const spec = taskSpec(input, tenant, context.model);
   if (typeof spec === "string") return reply(res, 400, { error: spec });
-  // A queue without an end would fill the disk, and a tenant's waits only grow.
-  const most = tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued;
-  if ((await context.store.queuedCount(tenant.id)) >= most) return reply(res, 429, { error: `The tenant has ${most} tasks queued, the most it may: wait for some to start` });
-  const task = await context.store.createTask(tenant.id, spec);
+  // A queue without an end would fill the disk, and a tenant's waits only grow. The caps are counted with
+  // the insert, so replicas sharing the store keep to them together.
+  const now = context.now();
+  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now });
+  if ("quota" in task) {
+    const { quota, limit, used } = task;
+    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start` });
+    const { nextDay, nextMonth } = periods(now);
+    const resets = quota === "usdPerMonth" ? nextMonth : nextDay;
+    const what = quota === "tasksPerDay" ? `created ${used} tasks today (UTC), the most it may` : `spent $${used} ${quota === "usdPerDay" ? "today (UTC)" : "this month (UTC)"}, against a quota of $${limit}`;
+    const retryAfter = String(Math.max(1, Math.ceil((resets.getTime() - now.getTime()) / 1000)));
+    return reply(res, 429, { error: `The tenant has ${what}: its ${quota} quota resets at ${resets.toISOString()}`, quota, limit, used, resetsAt: resets.toISOString() }, { "retry-after": retryAfter });
+  }
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });
+}
+
+/** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */
+async function admin(req: IncomingMessage, res: ServerResponse, url: URL, key: string | undefined, context: Context): Promise<void> {
+  if (!context.adminKey || url.pathname !== "/admin/usage") return reply(res, 404, { error: "Not found" });
+  // Compared as hashes, which are the same length, in constant time.
+  if (!key || !timingSafeEqual(sha256(key), context.adminKey)) return reply(res, 401, { error: "The admin key is needed: Authorization: Bearer <key>" }, { "www-authenticate": "Bearer" });
+  if (req.method !== "GET") return reply(res, 405, { error: "Use GET" });
+  const tenant = url.searchParams.get("tenant");
+  if (tenant !== null && !tenant) return reply(res, 400, { error: "tenant must be a tenant's id" });
+  return usage(res, url, context, { byTenant: true, ...(tenant !== null && { tenant }) }, ["tenant"]);
+}
+
+const DAY = /^(\d{4})-(\d\d)-(\d\d)$/;
+const MAX_DAYS = 366;
+
+/**
+ * The usage report, ?from=YYYY-MM-DD&to=YYYY-MM-DD&group=day|model|day,model&format=json|csv: the ledger's
+ * rows summed by UTC day and/or model over those days (both included; this month to today by default), at
+ * most 366 of them, with their total; or the rows alone as CSV.
+ */
+async function usage(res: ServerResponse, url: URL, { store, now }: Context, scope: Pick<UsageQuery, "tenant" | "byTenant">, allowed: string[] = []): Promise<void> {
+  const params = url.searchParams;
+  const unknown = [...params.keys()].find((name) => !["from", "to", "group", "format", ...allowed].includes(name));
+  if (unknown) return reply(res, 400, { error: `Unknown parameter: ${unknown}` });
+  const today = now();
+  const from = params.get("from") ?? isoDay(periods(today).monthStart);
+  const to = params.get("to") ?? isoDay(today);
+  for (const [name, day] of [["from", from], ["to", to]]) {
+    const [, year, month, date] = DAY.exec(day) ?? [];
+    // A day that doesn't exist (2026-02-30) comes back another from Date.
+    if (!year || isoDay(new Date(Date.UTC(Number(year), Number(month) - 1, Number(date)))) !== day || Number(year) < 1000) return reply(res, 400, { error: `${name} must be a day, YYYY-MM-DD` });
+  }
+  const days = (Date.parse(to) - Date.parse(from)) / 86_400_000 + 1;
+  if (days < 1) return reply(res, 400, { error: "from must be no later than to" });
+  if (days > MAX_DAYS) return reply(res, 400, { error: `The range may be at most ${MAX_DAYS} days` });
+  const group = params.get("group") ?? "day";
+  if (!["day", "model", "day,model"].includes(group)) return reply(res, 400, { error: "group must be day, model or day,model" });
+  const format = params.get("format") ?? "json";
+  if (format !== "json" && format !== "csv") return reply(res, 400, { error: "format must be json or csv" });
+  const rows = await store.usage({ from, to, group: group.split(",") as UsageQuery["group"], ...scope });
+  if (format === "csv") return csv(res, rows, [...(scope.byTenant ? ["tenant"] : []), ...group.split(",")]);
+  reply(res, 200, { from, to, rows, total: totalOf(rows) });
+}
+
+const SUMMED = ["tasks", "input", "output", "cacheRead", "cacheWrite", "costUsd", "seconds"] as const;
+
+/** The rows summed: every one of them, whatever they are grouped by. */
+function totalOf(rows: UsageRow[]): Omit<UsageRow, "tenant" | "day" | "model"> {
+  const total = Object.fromEntries(SUMMED.map((name) => [name, rows.reduce((sum, row) => sum + row[name], 0)])) as Omit<UsageRow, "tenant" | "day" | "model">;
+  // As the rows are: to the nanodollar, and the millisecond.
+  return { ...total, costUsd: roundUsd(total.costUsd), seconds: Math.round(total.seconds * 1000) / 1000 };
+}
+
+/** The rows as CSV (RFC 4180): a header line, then a line each. */
+function csv(res: ServerResponse, rows: UsageRow[], keys: string[]): void {
+  const columns = [...keys, ...SUMMED];
+  const field = (value: unknown) => {
+    const text = String(value ?? "");
+    return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  };
+  const lines = [columns.join(","), ...rows.map((row) => columns.map((column) => field(row[column as keyof UsageRow])).join(","))];
+  res.writeHead(200, { "content-type": "text/csv; charset=utf-8" });
+  res.end(`${lines.join("\r\n")}\r\n`);
 }
 
 /**

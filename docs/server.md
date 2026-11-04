@@ -88,7 +88,8 @@ A request is refused with 400 and the reason when a field is unknown or out of b
 Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file's path is absolute, goes
 through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
 character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
-over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued. A cancel answers 200 for
+over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
+quotas (below). A cancel answers 200 for
 a queued task (it is cancelled at once), 202 for a running one (its jig and everything it started are
 killed, and the task ends `cancelled`) and 409 for one that has ended. A stream sends a comment every
 `heartbeatSeconds`, so proxies don't close it.
@@ -193,6 +194,50 @@ must be set) is told of each approval as it is stored: a POST of `{"task": <id>,
 signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
 2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
 it.
+
+### Quotas and usage
+
+A tenant's `quotas` cap what it may start in a UTC day, and what its tasks may spend in a UTC day or month:
+
+```json
+{ "id": "acme", "keys": ["..."], "quotas": { "tasksPerDay": 500, "usdPerDay": 50, "usdPerMonth": 1000 } }
+```
+
+Each is no limit when left out. `tasksPerDay` counts the tasks the tenant created that day, whatever became
+of them; `usdPerDay` and `usdPerMonth` add up the cost of its tasks that ended that day or month, from the
+usage ledger (below). A task posted at one of them is refused with 429, `{"error", "quota", "limit",
+"used", "resetsAt"}`, `resetsAt` being the start of the next UTC day (of the next month, for
+`usdPerMonth`), and `retry-after` the seconds until then. They are counted with the task's insert, under a
+lock of the tenant's (Postgres's, or SQLite's write lock), so replicas can't both let in a tenant's last
+task of the day; `maxQueued` is counted the same way. The USD quotas count only tasks that have ended, so
+the tasks running when one is reached can take the tenant past it by what they spend: the service only
+refuses new tasks, and spending is held as it happens by the gateway, which sees every model call (each
+task's `budgetUsd`, and its own limits, below).
+
+Each task that ends, however it ends (a cancel before it started, or a replica lost, too), writes a row of
+the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, `task`, `day` (the UTC day it
+ended, `YYYY-MM-DD`), `model`, `status`, `input`, `output`, `cache_read`, `cache_write`, `cost_usd` and
+`seconds` (from its start to its end; 0 if it never started). The tokens and cost are those of jig's `end`
+event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, and on
+Docker and Kubernetes a task's commands can write that event, so for what a tenant must pay the gateway's
+counts are the record. Tasks that ended before the ledger came have no row.
+
+```bash
+# The tenant's own usage, by UTC day, model or both (day,model), over from..to (both included; this month
+# to today by default, 366 days at most):
+# {"from", "to", "rows": [{"day", "model", "tasks", "input", "output", "cacheRead", "cacheWrite", "costUsd", "seconds"}], "total": {...}}
+curl -s 'localhost:8080/v1/usage?from=2026-11-01&to=2026-11-30&group=day,model' -H "Authorization: Bearer $KEY"
+# The same rows as CSV, with a header line.
+curl -s 'localhost:8080/v1/usage?group=model&format=csv' -H "Authorization: Bearer $KEY"
+# Every tenant's, each row with its tenant, or one tenant's, to the admin key.
+curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&format=csv' -H "Authorization: Bearer $JIG_ADMIN_KEY"
+curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
+```
+
+Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
+that isn't one is a 400. `/admin/usage` is there only with `adminKeyEnv` in the config, the environment
+variable that holds the admin key (which must be set); without it every `/admin` route is a 404. To bill a
+month, take the admin's CSV of it by model once it is over, or read the `usage` table, by `(tenant, day)`.
 
 ### The local runner
 
