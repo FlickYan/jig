@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // The model gateway: jig's tasks call the Messages API through it with a token of their own (token.ts),
 // and it calls the provider with a real key from its pool, so a sandbox never holds one. Each tenant's
-// requests are held to its limits (limits.ts), and what each task and tenant spent is counted from the
-// replies, in this process or, for several replicas acting as one, in Redis (state.ts). The body goes
-// upstream byte for byte (prompt caching depends on it) and the reply comes back as it arrives; only the
-// credentials change, and the model where an upstream calls it by another id. With several upstreams, a
-// request goes on to the next one when an upstream fails it before its reply starts, and an upstream that
-// keeps failing is passed over for a while (Breaker). Its metrics are served on a listener of their own,
-// and each reply carries an x-request-id, which its log lines carry too. docs/server.md describes the
-// routes and the config.
+// requests are held to its limits (limits.ts) and its daily and monthly quotas, and what each task and
+// tenant spent is counted from the replies, in this process or, for several replicas acting as one, in
+// Redis (state.ts). The body goes upstream byte for byte (prompt caching depends on it) and the reply
+// comes back as it arrives; only the credentials change, and the model where an upstream calls it by
+// another id. With several upstreams, a request goes on to the next one when an upstream fails it before
+// its reply starts, and an upstream that keeps failing is passed over for a while (Breaker). Its metrics
+// are served on a listener of their own, and each reply carries an x-request-id, which its log lines carry
+// too. docs/server.md describes the routes and the config.
 //
 //   node server/gateway.ts --config gateway.json
 
@@ -25,7 +25,7 @@ import { type Admission, type Limits, Limiter } from "./limits.ts";
 import { createLog, logFormat, logLevel } from "./log.ts";
 import { Registry } from "./metrics.ts";
 import { parseRedisUrl } from "./redis.ts";
-import { MemoryState, RedisState, SharedState, type Spent, type State, StateError } from "./state.ts";
+import { MemoryState, RedisState, SharedState, type Spent, type State, StateError, utcDay } from "./state.ts";
 import { type TokenPayload, verifyToken } from "./token.ts";
 
 export interface UpstreamConfig {
@@ -58,9 +58,10 @@ export interface GatewayConfig {
     /** How long an open circuit passes the upstream over before one request tries it, in milliseconds (default: 30 seconds). */
     openMs?: number;
   };
-  limits?: Limits & {
+  limits?: Omit<Limits, "dailyUsd" | "monthlyUsd"> & {
     /** How long a request over a limit waits for its turn, in milliseconds (default: 30 seconds). */
     maxWaitMs?: number;
+    /** For a tenant `tenants` doesn't name. The quotas (dailyUsd, monthlyUsd) are a tenant's own: here or there, not above. */
     tenantDefaults?: Limits;
     tenants?: Record<string, Limits>;
   };
@@ -102,6 +103,17 @@ const REQUEST_ID = /^[\w.-]{1,128}$/;
 function requestId(req: IncomingMessage): string {
   const given = req.headers["x-request-id"];
   return typeof given === "string" && REQUEST_ID.test(given) ? given : randomUUID();
+}
+
+/** The longest range of days GET /usage reads at once: a year's, a leap year's included. */
+const MAX_USAGE_DAYS = 366;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The start of a UTC day given as YYYY-MM-DD, in milliseconds; undefined for anything else, 2026-02-30 included. */
+function dayStart(day: string): number | undefined {
+  const ms = /^\d{4}-\d{2}-\d{2}$/.test(day) ? Date.parse(day) : NaN;
+  return Number.isNaN(ms) || utcDay(ms) !== day ? undefined : ms;
 }
 
 /** A long conversation is a few megabytes; this is far past any the API takes. */
@@ -417,6 +429,15 @@ function check(config: GatewayConfig, env: NodeJS.ProcessEnv): void {
     if (!(Number.isInteger(port) && port >= 0 && port <= 65535)) throw new Error("metrics.port must be a port number, 0 to 65535.");
     if (host !== undefined && typeof host !== "string") throw new Error("metrics.host must be a host name or address.");
   }
+  // Quotas are each tenant's own: at the top of `limits` they would hold for nobody.
+  for (const field of ["dailyUsd", "monthlyUsd"] as const) {
+    if ((config.limits as Limits | undefined)?.[field] !== undefined) throw new Error(`limits.${field} is a tenant's quota: set it in limits.tenantDefaults or limits.tenants.`);
+    const owners = { tenantDefaults: config.limits?.tenantDefaults, ...Object.fromEntries(Object.entries(config.limits?.tenants ?? {}).map(([id, own]) => [`tenants.${id}`, own])) };
+    for (const [name, own] of Object.entries(owners)) {
+      const value = own?.[field];
+      if (value !== undefined && !(typeof value === "number" && value > 0)) throw new Error(`limits.${name}.${field} must be a number of USD above 0.`);
+    }
+  }
   for (const field of ["firstByteMs", "failures", "openMs"] as const) {
     const value = config.failover?.[field];
     if (value !== undefined && !(typeof value === "number" && value > 0)) throw new Error(`failover.${field} must be a number above 0.`);
@@ -486,8 +507,11 @@ interface Call {
   cost?: number;
 }
 
-/** Starts a gateway with `config`, its secret and keys read from `env`. */
-export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv = process.env): Promise<Gateway> {
+/**
+ * Starts a gateway with `config`, its secret and keys read from `env`. `now` is the time a tenant's days
+ * and months are counted by, Date.now but in tests.
+ */
+export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv = process.env, { now = Date.now }: { now?: () => number } = {}): Promise<Gateway> {
   check(config, env);
   const secret = env.JIG_GATEWAY_SECRET!;
   const log = createLog("gateway", { format: logFormat(env), level: logLevel(env) });
@@ -520,13 +544,14 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   };
   metrics.stateErrors.inc({}, 0);
   const state: State = config.state
-    ? new SharedState(new RedisState(config.state.redis, { prefix: config.state.prefix, leaseMs: config.state.leaseMs }), {
+    ? new SharedState(new RedisState(config.state.redis, { prefix: config.state.prefix, leaseMs: config.state.leaseMs, now }), {
         onStateError: config.state.onStateError ?? "closed",
+        now,
         onError: () => metrics.stateErrors.inc(),
         // Its lines, that Redis went away or came back, go out as the gateway's others do.
         log: (line) => log.warn(line.replace(/^jig gateway: /, "")),
       })
-    : new MemoryState();
+    : new MemoryState({ now });
   const { maxWaitMs = 30_000, tenantDefaults, tenants, ...global } = config.limits ?? {};
   const limiter = new Limiter({ global, tenantDefaults, tenants, maxWaitMs }, state);
   // Gauges are read as a scrape asks for them. The keys' standing is what the replicas share, read afresh.
@@ -562,6 +587,26 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     call.cost = cost;
     // Without Redis ("closed"), what the reply cost goes uncounted: it is counted as a state error and said.
     await state.spend(token, reader.usage, cost, upstream).catch(() => {});
+  };
+
+  /**
+   * The quota `tenant` has spent, of `dailyUsd` and `monthlyUsd`, with the seconds until it resets, at 00:00
+   * UTC of the next day or month; the month's when both are, as it resets last. Undefined while neither is.
+   */
+  const spentQuota = async (tenant: string, dailyUsd: number | undefined, monthlyUsd: number | undefined) => {
+    const time = now();
+    const day = utcDay(time);
+    const [year, month, date] = day.split("-").map(Number);
+    const quotas = [
+      { which: "monthly", quotaUsd: monthlyUsd, read: () => state.spentIn(tenant, day.slice(0, 7)), resets: Date.UTC(year, month, 1), when: "this month" },
+      { which: "daily", quotaUsd: dailyUsd, read: () => state.spentOn(tenant, day), resets: Date.UTC(year, month - 1, date + 1), when: "today" },
+    ];
+    for (const { which, quotaUsd, read, resets, when } of quotas) {
+      if (quotaUsd === undefined) continue;
+      const spentUsd = (await read())?.costUsd ?? 0;
+      if (spentUsd >= quotaUsd) return { which, quotaUsd, spentUsd, when, resets, retryAfter: Math.max(1, Math.ceil((resets - time) / 1000)) };
+    }
+    return undefined;
   };
 
   /** One request to the provider at `base` with `key`; resolves with its reply's status and headers. */
@@ -772,6 +817,22 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         return fail(res, 400, "invalid_request_error", `A task with a budget can only use a model with a price (${Object.keys(PRICES).join(", ")}).`);
       }
     }
+    // The tenant's quotas, before its request waits for a slot. Replies still going are counted when they
+    // end, so a tenant can go past a quota by what they cost.
+    const { dailyUsd, monthlyUsd } = limiter.tenantLimits(token.tenant);
+    if (dailyUsd !== undefined || monthlyUsd !== undefined) {
+      const spent = await spentQuota(token.tenant, dailyUsd, monthlyUsd);
+      if (spent) {
+        metrics.refused.inc({ tenant: token.tenant, reason: "quota" });
+        const { which, spentUsd, quotaUsd, when, resets, retryAfter } = spent;
+        const message = `This tenant has spent its ${which} quota: $${spentUsd.toFixed(4)} of $${quotaUsd} ${when} (UTC). It resets at ${new Date(resets).toISOString().replace(".000Z", "Z")}.`;
+        return fail(res, 402, "billing_error", message, { "retry-after": String(retryAfter) });
+      }
+      // As with a budget, a quota holds only where the gateway can price the reply.
+      if (!model || !PRICES[model]) {
+        return fail(res, 400, "invalid_request_error", `A tenant with a quota can only use a model with a price (${Object.keys(PRICES).join(", ")}).`);
+      }
+    }
     const client = new AbortController();
     res.once("close", () => res.writableFinished || client.abort()); // jig went away: so does the request
     const queued = performance.now();
@@ -820,6 +881,38 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     res.end(JSON.stringify({ task, ...found }));
   };
 
+  /**
+   * A tenant's spending by UTC day, for billing, to the admin token: /usage?tenant=<id>&from=<day>&to=<day>,
+   * both days in, a year's at most. Days with nothing spent are left out.
+   */
+  const usageByDay = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> => {
+    const given = credential(req.headers);
+    if (!isAdmin(given)) {
+      if (verifyToken(secret, given) instanceof Error) return fail(res, 401, "authentication_error", "A tenant's usage takes the admin token.");
+      return fail(res, 403, "permission_error", "A task's token reads only its own usage, at /usage/<task>.");
+    }
+    const [tenant, from, to] = ["tenant", "from", "to"].map((name) => url.searchParams.get(name) ?? "");
+    if (!tenant) return fail(res, 400, "invalid_request_error", "Name the tenant: /usage?tenant=<tenant>&from=YYYY-MM-DD&to=YYYY-MM-DD.");
+    const [start, end] = [dayStart(from), dayStart(to)];
+    if (start === undefined || end === undefined) return fail(res, 400, "invalid_request_error", "from and to must be days, as YYYY-MM-DD.");
+    const count = (end - start) / DAY_MS + 1;
+    if (count < 1) return fail(res, 400, "invalid_request_error", "from must not be after to.");
+    if (count > MAX_USAGE_DAYS) return fail(res, 400, "invalid_request_error", `A range is ${MAX_USAGE_DAYS} days at most.`);
+    const days = Array.from({ length: count }, (_, i) => utcDay(start + i * DAY_MS));
+    const spent = await Promise.all(days.map((day) => state.spentOn(tenant, day)));
+    const total = { requests: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costUsd: 0 };
+    const listed = days.flatMap((day, i) => {
+      const found = spent[i];
+      if (!found) return [];
+      const { requests, usage, costUsd } = found;
+      const counts = { requests, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, costUsd };
+      for (const field of Object.keys(total) as (keyof typeof total)[]) total[field] += counts[field];
+      return [{ day, ...counts }];
+    });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ tenant, from, to, days: listed, total }));
+  };
+
   /** Counts a model call once its reply is over, however it ended, and writes its access line. */
   const record = (call: Call, res: ServerResponse): void => {
     // 499, as nginx has it, when jig went away before any reply.
@@ -842,6 +935,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       return messages(req, res, call);
     }
     if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
+    if (route === "GET /usage") return usageByDay(req, res, url);
     if (req.method === "GET" && pathname.startsWith("/usage/")) return usage(req, res, url);
     fail(res, 404, "not_found_error", `The gateway has no ${route}.`);
   };

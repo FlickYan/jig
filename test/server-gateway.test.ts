@@ -66,10 +66,11 @@ function streamed(res: ServerResponse): void {
   res.end(messagesReply([{ text: "Done." }]));
 }
 
-async function gateway(upstream: string, config: Partial<GatewayConfig> = {}, env: NodeJS.ProcessEnv = {}): Promise<Gateway> {
+async function gateway(upstream: string, config: Partial<GatewayConfig> = {}, env: NodeJS.ProcessEnv = {}, now?: () => number): Promise<Gateway> {
   const gw = await startGateway(
     { listen: { port: 0 }, metrics: { port: 0 }, upstream: { baseUrl: upstream, keyEnv: ["POOL_KEY_1"] }, ...config },
     { JIG_GATEWAY_SECRET: SECRET, ...KEYS, ...env },
+    { now },
   );
   closing.push(() => gw.close());
   return gw;
@@ -87,6 +88,21 @@ async function until(condition: () => boolean | Promise<boolean>, what: string):
   for (const start = Date.now(); !(await condition()); await new Promise((done) => setTimeout(done, 10))) {
     if (Date.now() - start > 5000) throw new Error(`timed out waiting for ${what}`);
   }
+}
+
+/** A clock the test moves, for the days and months a gateway counts spending by. */
+function clock(start: number): { now: () => number; set(ms: number): void } {
+  let time = start;
+  return { now: () => time, set: (ms) => void (time = ms) };
+}
+
+const HOUR_MS = 60 * 60 * 1000;
+
+/** A request's status and its retry-after, its body read so the reply is over. */
+async function outcome(response: Promise<Response>): Promise<[number, string | null]> {
+  const answered = await response;
+  await answered.arrayBuffer();
+  return [answered.status, answered.headers.get("retry-after")];
 }
 
 /** A series' value on the gateway's metrics listener. */
@@ -327,6 +343,95 @@ describe("the gateway", () => {
     assert.equal(provider.seen.length, 4);
   });
 
+  it("refuses a tenant past its daily or monthly quota with 402 until the day or month is over", async () => {
+    const provider = await fakeProvider();
+    // Each reply costs $0.00007: two spend a quota of $0.0001, three one of $0.0002.
+    const time = clock(Date.UTC(2026, 10, 29, 12));
+    const tenants = { daily: { dailyUsd: 0.0001 }, monthly: { monthlyUsd: 0.0002 }, both: { dailyUsd: 0.0001, monthlyUsd: 0.0001 } };
+    const gw = await gateway(provider.url, { limits: { tenants } }, {}, time.now);
+    const as = (tenant: string) => ask(gw, token({ tenant }));
+    assert.deepEqual([await outcome(as("daily")), await outcome(as("daily"))], [[200, null], [200, null]]);
+    const over = await as("daily");
+    assert.equal(over.status, 402);
+    const { error } = await over.json();
+    assert.equal(error.type, "billing_error");
+    assert.equal(error.message, "This tenant has spent its daily quota: $0.0001 of $0.0001 today (UTC). It resets at 2026-11-30T00:00:00Z.");
+    assert.equal(over.headers.get("retry-after"), String(12 * 60 * 60));
+    assert.equal(provider.seen.length, 2);
+    // A tenant without quotas goes on as before; the next day, the daily one does too.
+    assert.deepEqual(await outcome(as("acme")), [200, null]);
+    time.set(Date.UTC(2026, 10, 30, 0, 0, 1));
+    assert.deepEqual(await outcome(as("daily")), [200, null]);
+
+    // A month's quota is spent across its days, and holds until the next month.
+    time.set(Date.UTC(2026, 10, 29, 12));
+    assert.deepEqual(await outcome(as("monthly")), [200, null]);
+    time.set(Date.UTC(2026, 10, 30, 18));
+    assert.deepEqual([await outcome(as("monthly")), await outcome(as("monthly"))], [[200, null], [200, null]]);
+    const month = await as("monthly");
+    assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(6 * 60 * 60)]);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month \(UTC\)\. It resets at 2026-12-01T00:00:00Z\./);
+    time.set(Date.UTC(2026, 11, 1));
+    assert.deepEqual(await outcome(as("monthly")), [200, null]);
+    // With both spent, the month's is the one to wait for.
+    time.set(Date.UTC(2026, 11, 31, 23));
+    assert.deepEqual([await outcome(as("both")), await outcome(as("both"))], [[200, null], [200, null]]);
+    const both = await as("both");
+    assert.deepEqual([both.status, both.headers.get("retry-after")], [402, String(60 * 60)]);
+    assert.match((await both.json()).error.message, /monthly quota.* 2027-01-01T00:00:00Z/);
+
+    assert.equal(await metric(gw, 'jig_gateway_refused_total{tenant="daily",reason="quota"}'), 1);
+    assert.equal(await metric(gw, 'jig_gateway_refused_total{tenant="monthly",reason="quota"}'), 1);
+    assert.equal(await metric(gw, 'jig_gateway_requests_total{tenant="daily",upstream="none",status="402"}'), 1);
+    // As with a budget, a quota needs a price to count against.
+    const unpriced = await fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token({ tenant: "daily" }) }, body: body("hi", "claude-haiku-4-5") });
+    assert.equal(unpriced.status, 400);
+    assert.equal(provider.seen.length, 10);
+  });
+
+  it("says what is wrong with a quota before it starts", async () => {
+    const start = (limits: GatewayConfig["limits"]) => gateway("http://127.0.0.1:9", { limits });
+    await assert.rejects(start({ dailyUsd: 5 } as GatewayConfig["limits"]), /limits.dailyUsd is a tenant's quota/);
+    await assert.rejects(start({ tenantDefaults: { monthlyUsd: 0 } }), /limits.tenantDefaults.monthlyUsd must be a number of USD above 0/);
+    await assert.rejects(start({ tenants: { acme: { dailyUsd: "5" as unknown as number } } }), /limits.tenants.acme.dailyUsd/);
+  });
+
+  it("reads a tenant's spending by UTC day to the admin token, for billing", async () => {
+    const provider = await fakeProvider();
+    const time = clock(Date.UTC(2026, 10, 29, 23));
+    const gw = await gateway(provider.url, { adminTokenEnv: "ADMIN_TOKEN" }, { ADMIN_TOKEN: "admin-secret" }, time.now);
+    await outcome(ask(gw, token()));
+    time.set(Date.UTC(2026, 10, 30, 1));
+    await outcome(ask(gw, token({ task: "t2" })));
+    await outcome(ask(gw, token({ task: "t3" })));
+    await outcome(ask(gw, token({ tenant: "rival" })));
+    const read = (query: string, credential = "admin-secret") => fetch(`${gw.url}/usage?${query}`, { headers: { authorization: `Bearer ${credential}` } });
+    const cost = costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 })!;
+    const day = (day: string, n: number) => ({ day, requests: n, input: 10 * n, output: 5 * n, cacheRead: 0, cacheWrite: 0, costUsd: n * cost });
+    const days = await (await read("tenant=acme&from=2026-11-01&to=2026-12-31")).json();
+    // Days with nothing spent are left out.
+    assert.deepEqual({ ...days, total: { ...days.total, costUsd: undefined } }, {
+      tenant: "acme",
+      from: "2026-11-01",
+      to: "2026-12-31",
+      days: [day("2026-11-29", 1), day("2026-11-30", 2)],
+      total: { requests: 3, input: 30, output: 15, cacheRead: 0, cacheWrite: 0, costUsd: undefined },
+    });
+    assert.ok(Math.abs(days.total.costUsd - 3 * cost) < 1e-12);
+    assert.deepEqual((await (await read("tenant=acme&from=2026-11-30&to=2026-11-30")).json()).days, [day("2026-11-30", 2)]);
+    assert.deepEqual((await (await read("tenant=rival&from=2026-11-30&to=2026-11-30")).json()).total.requests, 1);
+    // A leap year's 366 days are a range; 367 aren't.
+    assert.deepEqual((await (await read("tenant=acme&from=2024-01-01&to=2024-12-31")).json()).days, []);
+    for (const query of ["tenant=acme&from=2024-01-01&to=2025-01-01", "from=2026-11-01&to=2026-11-30", "tenant=acme&from=2026-02-30&to=2026-03-01", "tenant=acme&from=2026-11-1&to=2026-11-30", "tenant=acme&to=2026-11-30", "tenant=acme&from=2026-11-30&to=2026-11-29"]) {
+      const response = await read(query);
+      assert.deepEqual([response.status, (await response.json()).error.type], [400, "invalid_request_error"], query);
+    }
+    // Only to the admin token: a task's token reads its own task's, at /usage/<task>, as before.
+    assert.equal((await read("tenant=acme&from=2026-11-01&to=2026-11-30", token())).status, 403);
+    assert.equal((await read("tenant=acme&from=2026-11-01&to=2026-11-30", "wrong")).status, 401);
+    assert.equal((await (await fetch(`${gw.url}/usage/t1`, { headers: { "x-api-key": token() } })).json()).requests, 1);
+  });
+
   it("carries a task of jig's own, its token as the API key", async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "write_file", input: { path: "done.txt", content: "done\n" } }] : [{ text: "Done." }]));
     closing.push(() => api.close());
@@ -340,6 +445,19 @@ describe("the gateway", () => {
     const spent = await (await fetch(`${gw.url}/usage/jig-run`, { headers: { "x-api-key": credential } })).json();
     assert.deepEqual([spent.requests, spent.usage.input, spent.usage.output, spent.unpriced], [2, 20, 10, 2]);
     assert.equal(api.requests.length, 2);
+  });
+
+  it("ends a jig run whose tenant spends its quota, which jig's SDK doesn't retry", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "write_file", input: { path: "done.txt", content: "done\n" } }] : [{ text: "Done." }]));
+    closing.push(() => api.close());
+    // The first reply spends more than the day's quota, so the run's second request is refused.
+    const gw = await gateway(api.url, { limits: { tenantDefaults: { dailyUsd: 0.00001 } } });
+    const cwd = await tempDir("jig-gateway-");
+    const args = ["--no-sandbox", "--yes", "--model", MODEL, "--base-url", `${gw.url}/anthropic`, "Write done.txt."];
+    const { code, output } = await runJig(args, { api, cwd, env: { ANTHROPIC_API_KEY: token({ task: "quota-run" }) } });
+    assert.equal(code, 1, output);
+    assert.match(output, /daily quota/);
+    assert.equal(api.requests.length, 1);
   });
 
   it("starts from a config file, and says what is missing from one", async () => {
@@ -790,9 +908,15 @@ describe("the gateway's state in memory", () => {
     state.prune(now + 60_000);
     assert.equal(await state.spent("acme", "old"), undefined);
     assert.equal((await state.spent("acme", "live"))?.requests, 1);
-    // The day's total stays for billing; the bucket, full again a minute later, and the slot given back, go.
+    // The day's and the month's totals stay for billing; the bucket, full again a minute later, and the slot given back, go.
     assert.equal((await state.spentOn("acme", utcDay(now)))?.requests, 2);
-    assert.equal(state.size, 2);
+    assert.equal((await state.spentIn("acme", utcDay(now).slice(0, 7)))?.requests, 2);
+    assert.equal(state.size, 3);
+    // A day goes after 35 days, a month after 400.
+    state.prune(now + 36 * 86_400_000);
+    assert.deepEqual([await state.spentOn("acme", utcDay(now)), (await state.spentIn("acme", utcDay(now).slice(0, 7)))?.requests], [undefined, 2]);
+    state.prune(now + 401 * 86_400_000);
+    assert.equal(state.size, 0);
   });
 });
 
@@ -812,6 +936,18 @@ describe("the gateway without its Redis", () => {
     assert.deepEqual([(await ask(open, token({ budgetUsd: 1 }))).status, (await ask(open, token())).status], [200, 429]);
     assert.equal((await (await fetch(`${open.url}/usage/t1`, { headers: { "x-api-key": token() } })).json()).requests, 1);
     assert.equal(provider.seen.length, 1);
+  });
+
+  it("holds a tenant to its quota by this replica's own counts when 'open'", async () => {
+    const provider = await fakeProvider();
+    const redis = `redis://127.0.0.1:${await deadPort()}/1`;
+    const gw = await gateway(provider.url, { state: { redis, onStateError: "open" }, limits: { tenantDefaults: { dailyUsd: 0.0001 } } });
+    assert.deepEqual([await outcome(ask(gw, token())), await outcome(ask(gw, token()))], [[200, null], [200, null]]);
+    assert.equal((await ask(gw, token())).status, 402);
+    assert.equal(provider.seen.length, 2);
+    // Closed, a quota that can't be read refuses the request.
+    const closed = await gateway(provider.url, { state: { redis }, limits: { tenantDefaults: { dailyUsd: 1 } } });
+    assert.equal((await ask(closed, token())).status, 503);
   });
 
   it("says what is wrong with its state's config before it starts", async () => {
@@ -991,6 +1127,48 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     provider.seen.length = 0;
     for (let i = 0; i < 2; i++) assert.equal((await ask(gw, token())).status, 200);
     assert.deepEqual(provider.seen.map((s) => s.headers["x-api-key"]), ["pool-key-1", "pool-key-2"]);
+  });
+
+  it("holds a tenant to its daily and monthly quotas across gateways, and reads its days back", async () => {
+    const provider = await fakeProvider();
+    const state = { redis: REDIS!, prefix: prefix() };
+    // The last day of this month, at noon, then the first of the next: near enough to now that Redis keeps them.
+    const today = new Date();
+    const last = Date.UTC(today.getUTCFullYear(), today.getUTCMonth() + 1, 0, 12);
+    const time = clock(last - 24 * HOUR_MS);
+    const config = { state, adminTokenEnv: "ADMIN_TOKEN", limits: { tenants: { daily: { dailyUsd: 0.0001 }, monthly: { monthlyUsd: 0.0002 } } } };
+    const [a, b] = [await gateway(provider.url, config, { ADMIN_TOKEN: "admin-secret" }, time.now), await gateway(provider.url, config, { ADMIN_TOKEN: "admin-secret" }, time.now)];
+    const as = (gw: Gateway, tenant: string) => ask(gw, token({ tenant }));
+    // Each reply costs $0.00007: two, one through each, spend the day's $0.0001.
+    assert.deepEqual([await outcome(as(a, "daily")), await outcome(as(b, "daily"))], [[200, null], [200, null]]);
+    const over = await as(a, "daily");
+    assert.deepEqual([over.status, (await over.json()).error.type, over.headers.get("retry-after")], [402, "billing_error", String(12 * 60 * 60)]);
+    assert.equal(await metric(a, 'jig_gateway_refused_total{tenant="daily",reason="quota"}'), 1);
+    assert.deepEqual(await outcome(as(b, "acme")), [200, null]);
+    // The month's $0.0002, over two days and two gateways.
+    assert.deepEqual(await outcome(as(a, "monthly")), [200, null]);
+    time.set(last);
+    assert.deepEqual([await outcome(as(b, "monthly")), await outcome(as(a, "monthly")), await outcome(as(b, "daily"))], [[200, null], [200, null], [200, null]]);
+    const month = await as(a, "monthly");
+    assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(12 * 60 * 60)]);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month/);
+    time.set(last + 12 * HOUR_MS);
+    assert.deepEqual(await outcome(as(b, "monthly")), [200, null]);
+
+    // The month's total is one hash, kept for 400 days; the days are read back through either gateway.
+    const redis = new Redis(REDIS!);
+    closing.push(() => redis.close());
+    const monthKey = `${state.prefix}month:monthly:${utcDay(last).slice(0, 7)}`;
+    assert.equal(await redis.command(["HGET", monthKey, "requests"]), "3");
+    const ttl = Number(await redis.command(["TTL", monthKey]));
+    assert.ok(ttl > 395 * 86_400 && ttl <= 400 * 86_400 + 31 * 86_400, `kept about 400 days: ${ttl} s`);
+    const shared = new RedisState(REDIS!, { prefix: state.prefix });
+    closing.push(() => shared.close());
+    assert.equal((await shared.spentIn("daily", utcDay(last).slice(0, 7)))?.requests, 3);
+    const from = utcDay(last - 24 * HOUR_MS), to = utcDay(last + 12 * HOUR_MS);
+    const read = await (await fetch(`${b.url}/usage?tenant=monthly&from=${from}&to=${to}`, { headers: { authorization: "Bearer admin-secret" } })).json();
+    assert.deepEqual(read.days.map((day: { day: string; requests: number }) => [day.day, day.requests]), [[from, 1], [utcDay(last), 2], [to, 1]]);
+    assert.equal(read.total.requests, 4);
   });
 
   it("answers 503 when Redis goes away mid-run, or goes on alone, and comes back with it", async () => {

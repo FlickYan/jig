@@ -14,6 +14,9 @@ export interface Limits {
   burst?: number;
   /** Requests in flight at once, streaming replies included. Left out: no limit. */
   concurrent?: number;
+  /** A tenant's quotas, in USD: what it may spend in a UTC day, and in a UTC month. Left out: no quota. */
+  dailyUsd?: number;
+  monthlyUsd?: number;
 }
 
 export interface LimiterOptions {
@@ -110,8 +113,13 @@ export class Limiter {
     for (const end = Date.now() + ms; (this.flying || this.releasing.size) && Date.now() < end; ) await new Promise((done) => setTimeout(done, 10));
   }
 
+  /** `tenant`'s own limits and quotas: its entry in `tenants`, or else `tenantDefaults`. */
+  tenantLimits(tenant: string): Limits {
+    return this.options.tenants?.[tenant] ?? this.options.tenantDefaults ?? {};
+  }
+
   private limits(tenant: string): { tenant: Limits; global: Limits } {
-    return { tenant: this.options.tenants?.[tenant] ?? this.options.tenantDefaults ?? {}, global: this.options.global };
+    return { tenant: this.tenantLimits(tenant), global: this.options.global };
   }
 
   /** Takes `waiter` out of its queue; false if it had already left it. */

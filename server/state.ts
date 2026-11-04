@@ -1,15 +1,15 @@
 // What the gateway counts and must agree on: requests in flight and the rate buckets (admission), what
-// each task and tenant spent, and which provider keys are refused or resting. MemoryState keeps it in
-// this process, as one gateway needs; RedisState keeps it in Redis, so several replicas act as one gateway
-// and a restart forgets nothing; SharedState puts RedisState behind the gateway's choice of what to do
-// when Redis can't be reached. docs/server.md describes it.
+// each task spent and each tenant in a day and a month, and which provider keys are refused or resting.
+// MemoryState keeps it in this process, as one gateway needs; RedisState keeps it in Redis, so several
+// replicas act as one gateway and a restart forgets nothing; SharedState puts RedisState behind the
+// gateway's choice of what to do when Redis can't be reached. docs/server.md describes it.
 
 import type { Usage } from "../src/agent.ts";
 import type { Limits } from "./limits.ts";
 import { Redis, type RedisReply, redisScript } from "./redis.ts";
 import type { TokenPayload } from "./token.ts";
 
-/** What a task, or a tenant in a day, spent. */
+/** What a task, or a tenant in a day or a month, spent. */
 export interface Spent {
   tenant: string;
   /** Replies counted. */
@@ -45,14 +45,16 @@ export interface State {
   /** Calls `listener` when another gateway gives back a slot. */
   onRelease(listener: () => void): void;
   /**
-   * Adds a reply's usage to its task's and its tenant's day's totals; `cost` undefined for an unpriced
-   * model, `upstream` the name of the upstream that gave the reply.
+   * Adds a reply's usage to its task's and its tenant's day's and month's totals; `cost` undefined for an
+   * unpriced model, `upstream` the name of the upstream that gave the reply.
    */
   spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void>;
   /** What `tenant`'s task `task` spent; undefined if nothing yet. */
   spent(tenant: string, task: string): Promise<Spent | undefined>;
   /** What `tenant` spent on a UTC day (YYYY-MM-DD), for quotas and billing to read. */
   spentOn(tenant: string, day: string): Promise<Spent | undefined>;
+  /** What `tenant` spent in a UTC month (YYYY-MM), for its monthly quota. */
+  spentIn(tenant: string, month: string): Promise<Spent | undefined>;
   /**
    * The keys' standing, shared with other gateways; undefined when it can't be read. One process needs none
    * beyond its own.
@@ -65,6 +67,8 @@ export interface State {
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** How long a tenant's days are kept: a month's bill can be read from them. */
 const DAYS_KEPT = 35;
+/** How long a tenant's months are kept: a year's, and a little more. */
+const MONTHS_KEPT_DAYS = 400;
 
 const NO_USAGE: Usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
 const USAGE_FIELDS = Object.keys(NO_USAGE) as (keyof Usage)[];
@@ -122,13 +126,20 @@ export class Bucket {
 
 /** The state in this process: one gateway's, or a replica's own while Redis can't be reached. */
 export class MemoryState implements State {
+  /** The time days and months are counted by: Date.now, or a test's clock. */
+  private readonly now: () => number;
   private readonly buckets = new Map<string, Bucket | undefined>();
   private globalBucket?: Bucket;
   private readonly flying = new Map<string, number>();
   private total = 0;
   private readonly tasks = new Map<string, Spent & { until: number }>();
   private readonly days = new Map<string, Spent & { until: number }>();
+  private readonly months = new Map<string, Spent & { until: number }>();
   private readonly sweeper = setInterval(() => this.prune(), 60_000).unref();
+
+  constructor(options: { now?: () => number } = {}) {
+    this.now = options.now ?? Date.now;
+  }
 
   async admit(tenant: string, _id: string, limits: { tenant: Limits; global: Limits }): Promise<number> {
     const now = Date.now();
@@ -161,16 +172,22 @@ export class MemoryState implements State {
   onRelease(): void {}
 
   async spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void> {
-    const now = Date.now();
+    const now = this.now();
     const task = JSON.stringify([token.tenant, token.task]);
     if (!this.tasks.has(task)) this.tasks.set(task, { ...nothingSpent(token.tenant, token.budgetUsd), until: 0 });
-    const day = JSON.stringify([token.tenant, utcDay(now)]);
-    if (!this.days.has(day)) this.days.set(day, { ...nothingSpent(token.tenant, null), until: now + DAYS_KEPT * DAY_MS });
     const spent = this.tasks.get(task)!;
     // Kept a day past the token's end, by when no request of the task can come.
     spent.until = Math.max(spent.until, token.exp * 1000 + DAY_MS);
     addTo(spent, usage, cost, upstream);
-    addTo(this.days.get(day)!, usage, cost, upstream);
+    const day = utcDay(now);
+    for (const [map, when, kept] of [[this.days, day, DAYS_KEPT], [this.months, day.slice(0, 7), MONTHS_KEPT_DAYS]] as const) {
+      const key = JSON.stringify([token.tenant, when]);
+      if (!map.has(key)) map.set(key, { ...nothingSpent(token.tenant, null), until: 0 });
+      const total = map.get(key)!;
+      // Kept from its last reply, as Redis keeps it.
+      total.until = now + kept * DAY_MS;
+      addTo(total, usage, cost, upstream);
+    }
   }
 
   async spent(tenant: string, task: string): Promise<Spent | undefined> {
@@ -181,15 +198,19 @@ export class MemoryState implements State {
     return this.copy(this.days.get(JSON.stringify([tenant, day])));
   }
 
-  /** Forgets tasks a day past their token, old days, and tenants' full buckets, so the maps don't grow forever. */
-  prune(now = Date.now()): void {
-    for (const map of [this.tasks, this.days]) for (const [key, spent] of map) if (spent.until <= now) map.delete(key);
+  async spentIn(tenant: string, month: string): Promise<Spent | undefined> {
+    return this.copy(this.months.get(JSON.stringify([tenant, month])));
+  }
+
+  /** Forgets tasks a day past their token, old days and months, and tenants' full buckets, so the maps don't grow forever. */
+  prune(now = this.now()): void {
+    for (const map of [this.tasks, this.days, this.months]) for (const [key, spent] of map) if (spent.until <= now) map.delete(key);
     for (const [tenant, bucket] of this.buckets) if (!bucket || bucket.full(now)) this.buckets.delete(tenant);
   }
 
   /** How many entries it holds, for the tests to see it pruned. */
   get size(): number {
-    return this.tasks.size + this.days.size + this.buckets.size + this.flying.size;
+    return this.tasks.size + this.days.size + this.months.size + this.buckets.size + this.flying.size;
   }
 
   close(): void {
@@ -257,20 +278,21 @@ end
 return 0`);
 
 /**
- * KEYS: the task's and the tenant's day's hashes. ARGV: input, cacheRead, cacheWrite, output, the cost
- * ('' when unpriced), each key's expiry (Unix seconds), the tenant, the task's budget ('' for none), the
- * upstream that gave the reply ('' for none), counted in the field upstream:<name>.
+ * KEYS: the task's, the tenant's day's and the tenant's month's hashes. ARGV: input, cacheRead,
+ * cacheWrite, output, the cost ('' when unpriced), the tenant, the task's budget ('' for none), the
+ * upstream that gave the reply ('' for none, counted in the field upstream:<name>), then each key's expiry
+ * (Unix seconds).
  */
 const SPEND = redisScript(`local fields = { 'input', 'cacheRead', 'cacheWrite', 'output' }
 for i, key in ipairs(KEYS) do
   redis.call('HINCRBY', key, 'requests', 1)
   for j, field in ipairs(fields) do redis.call('HINCRBY', key, field, ARGV[j]) end
   if ARGV[5] == '' then redis.call('HINCRBY', key, 'unpriced', 1) else redis.call('HINCRBYFLOAT', key, 'costUsd', ARGV[5]) end
-  if ARGV[10] ~= '' then redis.call('HINCRBY', key, 'upstream:' .. ARGV[10], 1) end
-  redis.call('HSET', key, 'tenant', ARGV[8])
-  redis.call('EXPIREAT', key, ARGV[5 + i])
+  if ARGV[8] ~= '' then redis.call('HINCRBY', key, 'upstream:' .. ARGV[8], 1) end
+  redis.call('HSET', key, 'tenant', ARGV[6])
+  redis.call('EXPIREAT', key, ARGV[8 + i])
 end
-redis.call('HSET', KEYS[1], 'budgetUsd', ARGV[9])
+redis.call('HSET', KEYS[1], 'budgetUsd', ARGV[7])
 return 0`);
 
 /** How long a refused key's mark is kept after it was last refused: a key an operator put right is tried again by then. */
@@ -296,6 +318,8 @@ export interface RedisStateOptions {
   leaseMs?: number;
   /** How long a command may wait for Redis (default: 2 seconds). */
   timeoutMs?: number;
+  /** The time days and months are counted by (default: Date.now; tests set their own). */
+  now?: () => number;
 }
 
 /** The state in Redis, shared by every gateway that uses the same URL and prefix. */
@@ -305,8 +329,10 @@ export class RedisState implements State {
   private readonly subscriber: Redis;
   private readonly prefix: string;
   private readonly listeners: (() => void)[] = [];
+  private readonly now: () => number;
 
   constructor(url: string, options: RedisStateOptions = {}) {
+    this.now = options.now ?? Date.now;
     this.prefix = options.prefix ?? "jig:gw:";
     this.leaseMs = options.leaseMs ?? 60_000;
     this.redis = new Redis(url, { timeoutMs: options.timeoutMs });
@@ -342,12 +368,15 @@ export class RedisState implements State {
   }
 
   async spend(token: TokenPayload, usage: Usage, cost: number | undefined, upstream?: string): Promise<void> {
-    const now = Date.now();
+    const now = this.now();
+    const day = utcDay(now);
     // A task's spending is kept a week past its token: its budget holds as long as the token works.
     const taskUntil = token.exp + 7 * 86_400;
     const dayUntil = Math.floor(now / 1000) + DAYS_KEPT * 86_400;
-    const keys = [this.key("spent", token.tenant, token.task), this.key("day", token.tenant, utcDay(now))];
-    const args = [...USAGE_FIELDS.map((field) => usage[field]), cost === undefined ? "" : cost, taskUntil, dayUntil, token.tenant, token.budgetUsd ?? "", upstream ?? ""];
+    const monthUntil = Math.floor(now / 1000) + MONTHS_KEPT_DAYS * 86_400;
+    // The month's total in the same script as the day's, so the two never disagree.
+    const keys = [this.key("spent", token.tenant, token.task), this.key("day", token.tenant, day), this.key("month", token.tenant, day.slice(0, 7))];
+    const args = [...USAGE_FIELDS.map((field) => usage[field]), cost === undefined ? "" : cost, token.tenant, token.budgetUsd ?? "", upstream ?? "", taskUntil, dayUntil, monthUntil];
     await this.redis.eval(SPEND, keys, args);
   }
 
@@ -357,6 +386,10 @@ export class RedisState implements State {
 
   async spentOn(tenant: string, day: string): Promise<Spent | undefined> {
     return this.read(this.key("day", tenant, day), tenant);
+  }
+
+  async spentIn(tenant: string, month: string): Promise<Spent | undefined> {
+    return this.read(this.key("month", tenant, month), tenant);
   }
 
   async keys(ids: string[]): Promise<KeyState[]> {
@@ -413,10 +446,10 @@ export class SharedState implements State {
   private readonly local = new Set<string>();
   private down = false;
 
-  constructor(redis: RedisState, options: { onStateError: "closed" | "open"; onError(err: Error): void; log?(line: string): void }) {
+  constructor(redis: RedisState, options: { onStateError: "closed" | "open"; onError(err: Error): void; log?(line: string): void; now?: () => number }) {
     this.redis = redis;
     this.leaseMs = redis.leaseMs;
-    if (options.onStateError === "open") this.fallback = new MemoryState();
+    if (options.onStateError === "open") this.fallback = new MemoryState({ now: options.now });
     this.onError = options.onError;
     this.log = options.log ?? ((line) => console.error(line));
   }
@@ -476,6 +509,10 @@ export class SharedState implements State {
 
   async spentOn(tenant: string, day: string): Promise<Spent | undefined> {
     return this.either(() => this.redis.spentOn(tenant, day), (fallback) => fallback.spentOn(tenant, day));
+  }
+
+  async spentIn(tenant: string, month: string): Promise<Spent | undefined> {
+    return this.either(() => this.redis.spentIn(tenant, month), (fallback) => fallback.spentIn(tenant, month));
   }
 
   // A key's standing is worth sharing but never worth refusing a request for: without Redis, the gateway

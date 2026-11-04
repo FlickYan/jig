@@ -395,7 +395,7 @@ ANTHROPIC_API_KEY=<the task's token> jig --model claude-opus-5-5 --base-url http
     "requestsPerMinute": 2000,
     "maxWaitMs": 30000,
     "tenantDefaults": { "requestsPerMinute": 60, "concurrent": 8 },
-    "tenants": { "acme": { "requestsPerMinute": 600, "burst": 100, "concurrent": 32 } }
+    "tenants": { "acme": { "requestsPerMinute": 600, "burst": 100, "concurrent": 32, "dailyUsd": 50, "monthlyUsd": 1000 } }
   },
   "adminTokenEnv": "JIG_GATEWAY_ADMIN_TOKEN"
 }
@@ -422,7 +422,11 @@ so keep the gateway's address inside the cluster; the metrics are on a listener 
 spent, `{task, tenant, requests, usage, costUsd, unpriced, upstreams, budgetUsd}` (`upstreams`: the
 replies counted, by the upstream that gave them), to that task's token (its tenant's task of that id), or
 to the admin token (`adminTokenEnv`) with the tenant named, `/usage/<task>?tenant=<tenant>`, since a task id is only unique
-within its tenant.
+within its tenant. `GET /usage?tenant=<id>&from=YYYY-MM-DD&to=YYYY-MM-DD`, to the admin token alone, gives a
+tenant's spending by UTC day, for billing: `{tenant, from, to, days: [{day, requests, input, output,
+cacheRead, cacheWrite, costUsd}], total}`, both days in, the days with nothing spent left out. A range is
+366 days at most, and a day that isn't one (`2026-02-30`), or `from` after `to`, is a 400; days are kept
+35 days (below), so an older one reads as nothing spent.
 
 **Limits.** Each tenant has a rate (`requestsPerMinute`, a token bucket refilled continuously, holding
 `burst` requests, by default a minute's worth) and a number of requests in flight (`concurrent`, a
@@ -432,6 +436,19 @@ gateway sends upstream at once. Any left out is no limit. A request over a limit
 queue that serves the tenants in turn, a request of each, so a tenant with a thousand requests waiting
 delays another tenant's request by one slot at most. After `maxWaitMs` (30 seconds by default) it gets 429
 with `retry-after`, and jig's SDK waits that long and tries again, twice at most.
+
+**Quotas.** `dailyUsd` and `monthlyUsd`, in `tenantDefaults` or a tenant's own entry in `tenants` (not at
+the top of `limits`, and above 0 where given), are the most a tenant may spend in a UTC day and in a UTC
+month, across all its tasks. Before a request waits for its slot, the gateway reads what the tenant has
+spent today and this month; at or past either quota it answers 402 (`billing_error`) at once, the
+provider not called, with a message naming the quota, its amount, what is spent and when it resets
+(00:00 UTC of the next day, or of the next month), and `retry-after` in seconds until then. jig's SDK
+doesn't retry a 402, so the jig run ends with an error, as for a budget. The check is soft by the requests
+already in flight: they finish and are counted when their replies end, so a tenant can go past a quota by
+what they cost. A tenant with a quota may only use a priced model (400 otherwise), as a task with a budget.
+Refusals are counted in `jig_gateway_refused_total` with `reason="quota"`. The task service checks the
+same quotas when a task is posted, so a tenant past one has its new tasks refused before they queue; the
+gateway's check, on every model call, is the hard limit on what a tenant spends.
 
 **Keys.** The pool's keys are used in turn. A key the provider refuses (401 or 403) is not used again
 until a restart (with `state`, below, until its mark in Redis is gone), and one it rate-limits (429)
@@ -501,7 +518,7 @@ without the block there is none, and the public port never serves metrics. Each 
 | `jig_gateway_failovers_total` | `from`, `to`, `reason` | calls an upstream failed, `to` the next one tried (`none` with none left), `reason` one of `connect`, `timeout`, `status_<code>` or `keys` |
 | `jig_gateway_upstream_open` | `upstream` | gauge: 1 while its circuit is open or half-open |
 | `jig_gateway_keys` | `upstream`, `state` | gauge: how many keys are `ok`, `resting` or `refused` |
-| `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` (or, to come, `quota`) |
+| `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` or `quota` |
 | `jig_gateway_state_errors_total` | | reads and writes of Redis that failed |
 
 No label holds a key, a token, a prompt or a task. Every reply carries `x-request-id`: the client's, if it
@@ -521,9 +538,10 @@ tasks, and jig's reply ends only once it is counted. A task whose spending has r
 `budgetUsd` gets 402 (`billing_error`) on its next request, which ends the jig run with an error (a budget
 of 0 refuses the first); requests already in flight finish, so a task can go over by what they cost. A
 task with a budget may only use a priced model: one without a price gets 400, since its spending couldn't
-be counted against the budget. Each tenant's spending by UTC day is kept too, for quotas and billing to
-read. Without `state`, all this is in the gateway's memory: a task is forgotten a day after its token
-expires, a tenant's day after 35 days, and a restart forgets everything.
+be counted against the budget. Each tenant's spending by UTC day and by UTC month is kept too, for quotas
+and billing to read. Without `state`, all this is in the gateway's memory: a task is forgotten a day after
+its token expires, a tenant's day 35 days after its last reply, its month 400 days after, and a restart
+forgets everything.
 
 **Several replicas.** With `state`, the gateway keeps its counts in Redis, so any number of replicas
 behind one Service act as one gateway, and a restart forgets nothing:
@@ -539,7 +557,8 @@ replicas; a request in flight is a lease that its gateway renews every `leaseMs`
 on, so the slots of a replica that died come back within `leaseMs` (60 seconds). The queue that takes the
 tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
 the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
-week after its token expires, a tenant's day for 35 days; a key the provider refused or rate-limited is
+week after its token expires, a tenant's day for 35 days and its month for 400 (a hash each,
+`<prefix>day:<tenant>:<YYYY-MM-DD>` and `<prefix>month:<tenant>:<YYYY-MM>`, added to in the same script); a key the provider refused or rate-limited is
 passed over by every replica (Redis has its SHA-256, never the key), a rate-limited one until its rest is
 over, and a refused one for a day after it was last refused, restarts or not. Each key's mark is its own
 Redis key, `<prefix>key:<id>`, `id` being the first 16 hex digits of the key's SHA-256. To have the
@@ -552,7 +571,7 @@ When Redis can't be reached (a command waits 2 seconds at most), `onStateError` 
 `closed`, the default, answers each request 503 with `retry-after: 1` (jig's SDK tries again), and the
 spending of replies still in flight goes uncounted; `open` goes on with this replica's own limits and
 counts until Redis is back, so for that while each replica holds a tenant to its limits alone, and budgets
-count only what went through it. Either way the gateway says so once on stderr and counts each failure in
+and quotas count only what went through it. Either way the gateway says so once on stderr and counts each failure in
 `jig_gateway_state_errors_total`.
 
 ## Deploying
