@@ -11,7 +11,7 @@ data:
   router.json: |
     {
       "listen": { "host": "0.0.0.0", "port": 8090 },
-      "metrics": { "host": "0.0.0.0", "port": 9090 },
+      "metrics": { "host": "0.0.0.0", "port": 9182 },
       "regions": [
         { "name": "eu", "url": "https://jig-eu.example.com" },
         { "name": "us", "url": "https://jig-us.example.com" }
@@ -36,6 +36,9 @@ spec:
       labels:
         app.kubernetes.io/name: jig
         app.kubernetes.io/component: router
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9182"
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -51,7 +54,8 @@ spec:
           ports:
             - containerPort: 8090
             # GET /metrics and /healthz alone, for Prometheus; not in the Service below.
-            - containerPort: 9090
+            - containerPort: 9182
+              name: metrics
           readinessProbe:
             httpGet:
               path: /healthz
@@ -82,3 +86,29 @@ spec:
   ports:
     - port: 8090
       targetPort: 8090
+---
+# Who reaches the router's pods: the tenants from anywhere (the load balancer in front of it), and the
+# metrics listener only from the monitoring namespace, as for the service and the gateway (networkpolicy.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jig-router
+  namespace: jig
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: router
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8090
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9182

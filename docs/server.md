@@ -687,7 +687,7 @@ another region, by design: that is what keeps a tenant's data where it was put.
 ```json
 {
   "listen": { "host": "0.0.0.0", "port": 8090 },
-  "metrics": { "host": "0.0.0.0", "port": 9090 },
+  "metrics": { "host": "0.0.0.0", "port": 9182 },
   "regions": [{ "name": "eu", "url": "https://jig-eu.example.com" }, { "name": "us", "url": "https://jig-us.example.com" }],
   "tenants": [{ "id": "acme", "keys": ["<sha256 of its key>"], "home": "eu", "allowed": ["eu", "us"], "failover": true }],
   "health": { "intervalMs": 5000, "failures": 2 }
@@ -699,8 +699,9 @@ the key hashes the regions have for it, its `home` region, the regions its tasks
 home alone by default) and `failover` (false). The router maps a request's key to its tenant (401, as a
 service's, for one it doesn't know) and passes the request on, `Authorization` and all, so the region's
 service still checks the key; of what a tenant sends, it reads only a new task's `region` (in a body of
-16 MiB at most). Every answer has `x-jig-region`, the region that gave it, and `x-request-id`, the
-client's if it sent one (`^[\w.-]{1,128}$`) or a new one, which the region is sent too.
+16 MiB at most). Every answer a region gave has `x-jig-region`, that region (the router's own, a 401, 403,
+404, 413, 502 or 503, have none; a 503 for a region that is down names it in its body), and every answer has
+`x-request-id`, the client's if it sent one (`^[\w.-]{1,128}$`) or a new one, which the region is sent too.
 
 - `POST /v1/tasks` goes to the spec's `region` if it names one (403 if the tenant may not use it), else to
   the home. The body goes as it came.
@@ -727,7 +728,8 @@ own (127.0.0.1 by default) serves `GET /metrics` and `GET /healthz` only: `jig_r
 region (empty for the router's own answers, `all` for usage added up), route and status, `jig_router_request_seconds` (to the
 answer's headers) by region and route, `jig_router_region_up` by region, and `jig_router_failovers_total`
 by `from` and `to`. The router keeps nothing between requests, so any number of replicas can run,
-anywhere; `deploy/k8s/router.yaml` runs two.
+anywhere; `deploy/k8s/router.yaml` runs two, its metrics on port 9182 for Prometheus (`deploy/observability/`), with a
+NetworkPolicy that lets only the monitoring namespace reach them.
 
 ## Deploying
 
@@ -738,7 +740,8 @@ anywhere; `deploy/k8s/router.yaml` runs two.
 (`deploy/service.docker.json`), and the gateway, on the internal `jig-tasks` network the tasks join; the
 gateway's config is `deploy/gateway.json` (DeepSeek, its key in `DEEPSEEK_API_KEY`). On Kubernetes,
 `deploy/k8s/` has the namespace, the service's and the gateway's Deployments and Services, the service's
-account with a Role to run Jobs, the tasks' account with none, the NetworkPolicy, a gVisor RuntimeClass and
+account with a Role to run Jobs, the tasks' account with none, the NetworkPolicies (`networkpolicy.yaml`: what
+the tasks may reach, and who may reach the service and the gateway), a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
 are yours to make. The service runs two replicas on that database. The gateway runs two replicas too,
