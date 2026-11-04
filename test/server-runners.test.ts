@@ -12,7 +12,7 @@ import { type Service, startService } from "../server/api.ts";
 import type { Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { KubernetesRunner, objectName, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
-import { lastLine, readStats, tail } from "../server/runners/local.ts";
+import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // The Docker and Kubernetes runners (server/runners/), with a fake docker CLI (fixtures/fake-docker.mjs)
@@ -170,6 +170,63 @@ describe("the Docker runner", () => {
     assert.deepEqual([task.status, task.stop], ["stopped", "time_limit"]);
     assert.deepEqual((await kills()).at(-1), { signal: "TERM", name: `jig-${late}` });
     await until(() => !alive(second.pid) && !alive(second.child), "the container's processes to be gone");
+  });
+
+  it("sends a cancel again until the container exists, and KILL after it while the run goes on", async () => {
+    const { api, state, dir } = await docker();
+    // The container exists 1.5 seconds after docker run starts, and its jig ignores TERM.
+    await writeFile(join(state, "delay"), "1500");
+    await writeFile(join(state, "deaf"), "");
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    await until(() => existsSync(join(state, `jig-${id}.json`)), "docker run");
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+    const signals = (await readFile(join(state, "kills.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line).signal);
+    const first = signals.indexOf("KILL");
+    assert.ok(first >= 2 && signals.slice(0, first).every((signal) => signal === "TERM"), `TERM that missed, sent again: ${signals}`);
+    assert.ok(signals.slice(first).every((signal) => signal === "KILL"));
+    const { pid, child } = JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8"));
+    await until(() => !alive(pid) && !alive(child), "the container's processes to be gone");
+  });
+
+  it("leaves out an event too long to read, without holding it, and the run goes on, counted, until stopped", async () => {
+    // A task's commands can write the events file; a line with no end would fill the service's memory.
+    const { api, state } = await docker();
+    await writeFile(join(state, "flood"), String(MAX_LINE + 1));
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    await until(async () => (await api.store.events(id)).length === 4, "the events after it");
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => (event as { type: string }).type), ["start", "tool_call", "tool_result", "step"]);
+    assert.equal((await call(api, "GET", `/v1/tasks/${id}`)).body.status, "running");
+    assert.equal(api.scheduler.running("acme"), 1);
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+  });
+
+  it("cuts the events file into lines across reads, whatever their characters, and skips one over the limit", async () => {
+    const dir = await tempDir("jig-docker-");
+    const file = join(dir, "events.jsonl");
+    const event = (seq: number, text: string) => `${JSON.stringify({ v: 1, seq, ts: "", type: "text", text })}\n`;
+    // Wider than a read, with characters of two and four bytes across where reads end.
+    const wide = "é😀".repeat(30_000);
+    await writeFile(file, event(1, wide) + event(2, "x".repeat(MAX_LINE)) + "y".repeat(3 * MAX_LINE));
+    let done = false;
+    const seen: unknown[] = [];
+    const reading = (async () => {
+      for await (const { seq, text } of tail(file, () => done, 10)) seen.push([seq, text]);
+    })();
+    await until(() => seen.length === 1, "the first event");
+    // The long line ends later; what follows it is read, and a last line with no newline isn't.
+    await writeFile(file, `\n${event(3, "after")}{"v":1,`, { flag: "a" });
+    await until(() => seen.length === 2, "the event after the long line");
+    done = true;
+    await reading;
+    assert.deepEqual(seen, [[1, wide], [3, "after"]]);
+    // The same cut for a stream of chunks, its last line kept.
+    const lines = new Lines();
+    const bytes = Buffer.from(`a${wide}\n${"z".repeat(MAX_LINE + 1)}\nb\nc`);
+    const out = [];
+    for (let i = 0; i < bytes.length; i += 1000) out.push(...lines.push(bytes.subarray(i, i + 1000)));
+    assert.deepEqual([...out, lines.end()], [`a${wide}`, "b", "c"]);
   });
 
   it("reads the run's files only where they are regular files, not links or pipes a task's commands left", async () => {
@@ -418,6 +475,17 @@ describe("the Kubernetes runner", () => {
     const never = await outcome("never starts");
     assert.deepEqual(never.slice(0, 3), ["error", "error", null]);
     assert.match(never[3], /DeadlineExceeded: .* the pod was ImagePullBackOff: Back-off pulling image/);
+  });
+
+  it("leaves out a line of the pod's log too long to read", async () => {
+    // The task's commands can write the log too, through /proc/1/fd/1.
+    const { cluster, api } = await kubernetes();
+    const lines = logOf(0, "end_turn");
+    const long = JSON.stringify({ v: 1, seq: 2, ts: "", type: "text", text: "x".repeat(MAX_LINE) });
+    cluster.script = () => ({ lines: [lines[0], long, ...lines.slice(1)] });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "flood" })).body.id;
+    assert.equal((await ended(api, id)).status, "succeeded");
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
   });
 
   it("cancels by deleting the Job in the background, with a token read again from its file", async () => {

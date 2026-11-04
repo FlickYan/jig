@@ -3,9 +3,12 @@
 // <state>/<name>.json and runs the container's command as the fake jig, with the paths under the bind
 // mount's target read as its source, in a process group of its own. `kill --signal <s> <name>` records
 // the kill in <state>/kills.jsonl and sends the signal to that group. A flag it doesn't know fails as
-// docker's do, with 125.
+// docker's do, with 125. Files in <state> change what it does: `delay` holds the milliseconds `run` takes
+// before the container exists (its image being pulled), a `deaf` container ignores TERM, as a jig whose
+// commands hold it up might, and `flood` holds the length of an event too long to read (a text of that
+// many x's) that the container's commands write in the events file before jig starts.
 import { spawn } from "node:child_process";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { constants } from "node:os";
 import { join } from "node:path";
 
@@ -31,6 +34,10 @@ if (command === "run") {
   writeFileSync(join(state, `${name}.json`), JSON.stringify({ args: rest, env: process.env, image, program }));
   const mount = Object.fromEntries(values("--mount")[0].split(",").map((part) => part.split("=")));
   const host = (path) => (path === mount.target || path.startsWith(`${mount.target}/`) ? mount.source + path.slice(mount.target.length) : path);
+  const option = (file) => (existsSync(join(state, file)) ? Number(readFileSync(join(state, file), "utf8")) : 0);
+  await new Promise((done) => setTimeout(done, option("delay")));
+  const flood = option("flood");
+  if (flood) appendFileSync(host("/task/events.jsonl"), `${JSON.stringify({ v: 1, seq: 2, ts: "", type: "text", text: "x".repeat(flood) })}\n`);
   const env = { PATH: process.env.PATH };
   for (const entry of values("--env")) {
     const [key, ...value] = entry.split("=");
@@ -50,6 +57,7 @@ if (command === "run") {
     console.error(`Error response from daemon: No such container: ${name}`);
     process.exit(1);
   }
+  if (signal === "TERM" && existsSync(join(state, "deaf"))) process.exit(0);
   try {
     process.kill(-pid, `SIG${signal}`);
   } catch {} // already gone

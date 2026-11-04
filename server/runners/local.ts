@@ -2,7 +2,6 @@ import { execFile, spawn } from "node:child_process";
 import { closeSync, constants, openSync } from "node:fs";
 import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
@@ -125,30 +124,78 @@ export async function prepareWorkspace(work: string, workspace: Workspace | unde
   });
 }
 
+/** The longest line of a run's events that is read, in bytes: jig's are far shorter. */
+export const MAX_LINE = 1024 * 1024;
+
+/**
+ * Cuts bytes into lines, leaving out any line longer than MAX_LINE without holding it: in a container a
+ * task's commands can write the events (or the log) too, and a line with no end would otherwise grow in
+ * the service's memory until it ran out.
+ */
+export class Lines {
+  private parts: Buffer[] = [];
+  private size = 0;
+  /** In a line too long to keep, until its newline. */
+  private skipping = false;
+
+  /** The lines the chunk ends. */
+  push(chunk: Buffer): string[] {
+    const lines: string[] = [];
+    let start = 0;
+    // A newline byte is never part of another character in UTF-8, so the bytes can be cut at it.
+    for (let end; (end = chunk.indexOf(10, start)) !== -1; start = end + 1) {
+      if (!this.skipping && this.size + end - start <= MAX_LINE) lines.push(Buffer.concat([...this.parts, chunk.subarray(start, end)]).toString("utf8"));
+      this.parts = [];
+      this.size = 0;
+      this.skipping = false;
+    }
+    const rest = chunk.subarray(start);
+    if (this.skipping || !rest.length) return lines;
+    if (this.size + rest.length > MAX_LINE) {
+      this.parts = [];
+      this.size = 0;
+      this.skipping = true;
+    } else {
+      // A copy, as the caller may read into the same buffer again.
+      this.parts.push(Buffer.from(rest));
+      this.size += rest.length;
+    }
+    return lines;
+  }
+
+  /** What is left after the last newline, if it isn't too long. */
+  end(): string | undefined {
+    const rest = this.skipping || !this.size ? undefined : Buffer.concat(this.parts).toString("utf8");
+    this.parts = [];
+    this.size = 0;
+    this.skipping = false;
+    return rest;
+  }
+}
+
 /**
  * The events jig appends to `file`, as it writes them, until `finished()` and the last of them is read. A
- * line that isn't an event (or a last one cut short by a crash) is left out.
+ * line that isn't an event, one over MAX_LINE, or a last one cut short by a crash is left out.
  */
 export async function* tail(file: string, finished: () => boolean, pollMs: number): AsyncGenerator<JigEvent> {
-  const decoder = new StringDecoder("utf8");
+  const lines = new Lines();
   const chunk = Buffer.alloc(64 * 1024);
   let offset = 0;
-  let partial = "";
   for (;;) {
     // Looked at before the read, so the read after jig's exit gets all it wrote.
     const last = finished();
     const handle = await openRegular(file);
     if (handle) {
       try {
-        for (let read; (read = (await handle.read(chunk, 0, chunk.length, offset)).bytesRead) > 0; offset += read) partial += decoder.write(chunk.subarray(0, read));
+        // A chunk at a time, its events passed on before the next is read.
+        for (let read; (read = (await handle.read(chunk, 0, chunk.length, offset)).bytesRead) > 0; offset += read) {
+          for (const line of lines.push(chunk.subarray(0, read))) {
+            const event = parseEvent(line);
+            if (event) yield event;
+          }
+        }
       } finally {
         await handle.close();
-      }
-      const lines = partial.split("\n");
-      partial = lines.pop()!;
-      for (const line of lines) {
-        const event = parseEvent(line);
-        if (event) yield event;
       }
     }
     if (last) return;

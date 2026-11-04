@@ -1,11 +1,10 @@
 import { readFile } from "node:fs/promises";
 import { type IncomingMessage, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { StringDecoder } from "node:string_decoder";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
 import type { WorkerInput } from "../worker.ts";
-import { parseEvent } from "./local.ts";
+import { Lines, parseEvent } from "./local.ts";
 
 // Runs each task as a Kubernetes Job of its own, through the API server with the service account's
 // token. The Job's one pod runs server/worker.ts in the worker image, which makes the workspace and starts
@@ -299,18 +298,13 @@ function workerLine(line: string): { exitCode?: number; stats?: unknown } | unde
   }
 }
 
-/** A response's lines, the last one too if it has no newline. */
+/** A response's lines, the last one too if it has no newline; one over MAX_LINE is left out. */
 async function* lines(res: IncomingMessage): AsyncGenerator<string> {
-  const decoder = new StringDecoder("utf8");
-  let partial = "";
-  for await (const chunk of res as AsyncIterable<Buffer>) {
-    partial += decoder.write(chunk);
-    const all = partial.split("\n");
-    partial = all.pop()!;
-    yield* all;
-  }
-  partial += decoder.end();
-  if (partial) yield partial;
+  // The task's commands can write the log too (through /proc/1/fd/1), so no line is held whole.
+  const split = new Lines();
+  for await (const chunk of res as AsyncIterable<Buffer>) yield* split.push(chunk);
+  const last = split.end();
+  if (last) yield last;
 }
 
 /** A queue one side pushes to and the other drains, as an async iterable, until it is closed. */

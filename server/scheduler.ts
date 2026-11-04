@@ -152,6 +152,12 @@ export class Scheduler {
       exit = await run.handle.wait();
     } catch (err) {
       failure = err instanceof Error ? err.message : String(err);
+      // A run whose events couldn't be read or stored may still be going: it is stopped, and keeps its
+      // slot until it has ended, so a failing reader never lets a tenant run more than its limit.
+      if (run.handle) {
+        run.handle.cancel();
+        exit = await run.handle.wait().catch(() => undefined);
+      }
     }
     const recorded = this.record(task.id, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => console.error(`jig service: couldn't store how ${task.id} ended:`, err));
     this.recording.add(recorded);

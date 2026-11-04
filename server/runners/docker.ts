@@ -40,6 +40,8 @@ export interface DockerRunnerConfig {
 
 // The docker CLI needs these of the service's environment to reach its daemon; it gets nothing else of it.
 const PASSED = ["PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY"];
+// How often a kill that missed, or a KILL the run outlived, is sent again.
+const RETRY_MS = 1_000;
 
 export class DockerRunner implements Runner {
   private config: DockerRunnerConfig;
@@ -91,16 +93,33 @@ export class DockerRunner implements Runner {
     child.stdin!.on("error", () => {});
     child.stdin!.end(task.spec.prompt);
 
-    const kill = (signal: string) => {
-      spawn(program, [...first, "kill", "--signal", signal, name], { env, stdio: "ignore" }).on("error", () => {});
-    };
+    /** Whether the signal reached the container. */
+    const kill = (signal: string) =>
+      new Promise<boolean>((done) => {
+        const killer = spawn(program, [...first, "kill", "--signal", signal, name], { env, stdio: "ignore", timeout: TERM_MS });
+        killer.on("error", () => done(false));
+        killer.on("exit", (code) => done(code === 0));
+      });
     let exited = false;
     let timedOut = false;
-    let killer: NodeJS.Timeout | undefined;
+    let stopping = false;
+    let timer: NodeJS.Timeout | undefined;
+    let wake: (() => void) | undefined;
+    // A pause the run's exit cuts short.
+    const pause = (ms: number) => new Promise<void>((done) => (exited ? done() : ((wake = done), (timer = setTimeout(done, ms)))));
+    // The container may not exist yet (its image still being pulled, or a busy daemon), and a kill then
+    // misses: TERM is sent again until one reaches it, and KILL from 5 seconds later until the run ends.
     const stop = () => {
-      if (exited) return;
-      kill("TERM");
-      killer ??= setTimeout(() => kill("KILL"), TERM_MS);
+      if (exited || stopping) return;
+      stopping = true;
+      void (async () => {
+        while (!exited && !(await kill("TERM"))) await pause(RETRY_MS);
+        await pause(TERM_MS);
+        while (!exited) {
+          await kill("KILL");
+          await pause(RETRY_MS);
+        }
+      })();
     };
     const deadline = setTimeout(() => ((timedOut = true), stop()), (task.spec.timeLimit + graceSeconds) * 1000);
     const stats = join(dir, "stats.json");
@@ -108,13 +127,16 @@ export class DockerRunner implements Runner {
       child.on("error", (err) => {
         exited = true;
         clearTimeout(deadline);
+        clearTimeout(timer);
+        wake?.();
         done({ exitCode: null, timedOut, message: `docker didn't start: ${err.message}` });
       });
       // docker run exits with the container's code, or 125 to 127 when it couldn't run it.
       child.on("exit", (code) => {
         exited = true;
         clearTimeout(deadline);
-        clearTimeout(killer);
+        clearTimeout(timer);
+        wake?.();
         done({ exitCode: code, timedOut });
       });
     }).then(async (result) => ({

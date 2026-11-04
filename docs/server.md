@@ -154,9 +154,13 @@ token is passed by name, its value in the docker CLI's environment, which holds 
 the `DOCKER_*` variables of the service's. jig runs with `--no-sandbox` in the container: bubblewrap would
 need Docker's seccomp filter and `/proc` masks loosened, which would weaken the container, the wall that
 matters here. So its commands can write anything in `/task`, the events included: the service reads those
-files only where they are regular files, not links, and the events are the task's own account of itself
-(what it costs is the gateway's to count). A cancel or the time limit is `docker kill --signal TERM`, then
-`docker kill` 5 seconds later; a container a crashed service left runs until jig's own `--time-limit`.
+files only where they are regular files, not links, a chunk at a time, and leaves out any line over 1 MiB
+without holding it, so what a task writes there can make up its own events (what it costs is the
+gateway's to count) but not fill the service's memory. A run whose events can't be read or stored is
+stopped, and keeps its slot until it has ended. A cancel or the time limit is `docker kill --signal TERM`,
+sent again each second until it reaches the container (one whose image is still being pulled doesn't
+exist yet), then `docker kill` 5 seconds later, again each second until the run ends; a container a
+crashed service left runs until jig's own `--time-limit`.
 
 The network must reach only the gateway: an internal network (`docker network create --internal
 jig-tasks`) with the gateway attached to it too (`docker network connect jig-tasks <gateway>`), so the
@@ -188,7 +192,8 @@ A pod's files are on its node, out of the service's reach, so the events come in
 `node server/worker.ts`, which makes the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events
-it has, should the stream break) and takes the exit code from the pod, the stats from that line and a
+it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) and
+takes the exit code from the pod, the stats from that line and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
 says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
 reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod

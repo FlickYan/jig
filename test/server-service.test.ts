@@ -404,6 +404,46 @@ describe("the scheduler", () => {
     await store.close();
   });
 
+  it("stops a run whose events can't be read, and holds its slot until the run has ended", async () => {
+    const store = openStore(":memory:");
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    for (const prompt of ["a0", "a1"]) await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    const started: string[] = [];
+    let cancels = 0;
+    let end!: () => void;
+    const runner: Runner = {
+      async start(task) {
+        started.push(task.spec.prompt);
+        const ended = new Promise<void>((done) => (end = done));
+        return {
+          // As a reader would that ran out of memory on what a task's commands wrote.
+          events: (async function* () {
+            throw new RangeError("Invalid string length");
+          })(),
+          wait: async () => {
+            await ended;
+            return { exitCode: 137, timedOut: false };
+          },
+          cancel: () => void cancels++,
+        };
+      },
+    };
+    const scheduler = new Scheduler(store, runner, 4);
+    await scheduler.poke();
+    while (!cancels) await new Promise((done) => setImmediate(done));
+    await scheduler.settled();
+    // Stopped, but not yet ended: still counted, and a1 waits.
+    assert.deepEqual([started, scheduler.running("a")], [["a0"], 1]);
+    end();
+    await scheduler.settled();
+    const [failed] = await store.inStatus("error");
+    assert.deepEqual([failed.spec.prompt, failed.error], ["a0", "Invalid string length"]);
+    assert.deepEqual(started, ["a0", "a1"]);
+    end();
+    await scheduler.close();
+    await store.close();
+  });
+
   it("reads only the tasks it starts, however many are queued", async () => {
     const store = openStore(":memory:");
     for (const id of ["a", "b"]) await store.putTenant({ id, limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
