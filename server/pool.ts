@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import { createLog } from "./log.ts";
 
 // Warm pools (docs/server.md): workers the Docker and Kubernetes runners start ahead of tasks, so a task
 // doesn't wait for a container or a pod to start. Each is given a one-time ticket (JIG_POOL_TICKET), which
@@ -45,6 +46,8 @@ interface Worker<S> {
   reply?: (status: number, body: object) => void;
   timer?: NodeJS.Timeout;
 }
+
+const log = createLog("service");
 
 // The longest a pool waits before it starts workers again after ones that failed before claiming.
 const MAX_BACKOFF_MS = 60_000;
@@ -108,7 +111,7 @@ export class WarmPool<S> {
     }
     this.misses++;
     const { idle, starting, hits, misses } = this.stats();
-    console.error(`jig service: no warm worker was waiting for ${task}, which starts cold (pool: ${idle} idle, ${starting} starting; ${hits} hits, ${misses} misses)`);
+    log.info(`no warm worker was waiting for the task, which starts cold (pool: ${idle} idle, ${starting} starting; ${hits} hits, ${misses} misses)`, { task });
     return undefined;
   }
 
@@ -168,7 +171,7 @@ export class WarmPool<S> {
         void started.exited.then(() => this.gone(worker));
       },
       (err: unknown) => {
-        console.error("jig service: couldn't start a warm worker:", err instanceof Error ? err.message : err);
+        log.error("couldn't start a warm worker", { err });
         this.gone(worker);
       },
     );

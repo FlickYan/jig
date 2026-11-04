@@ -19,6 +19,7 @@ data:
       "gatewayBaseUrl": "http://jig-gateway.jig.svc:8081/anthropic",
       "internal": { "host": "0.0.0.0", "port": 8082 },
       "internalBaseUrl": "http://jig-api-internal.jig.svc:8082",
+      "metrics": { "host": "0.0.0.0", "port": 9180 },
       "runner": "kubernetes",
       "kubernetes": { "image": "registry.example.com/jig-worker:0.1.0", "ttlSecondsAfterFinished": 600 },
       "tenants": []
@@ -35,6 +36,7 @@ data:
   gateway.json: |
     {
       "listen": { "host": "0.0.0.0", "port": 8081 },
+      "metrics": { "host": "0.0.0.0", "port": 9181 },
       "upstream": { "baseUrl": "https://api.deepseek.com/anthropic", "keyEnv": ["DEEPSEEK_API_KEY"] },
       "limits": { "concurrent": 256, "maxWaitMs": 30000, "tenantDefaults": { "requestsPerMinute": 120, "concurrent": 16 } },
       "state": { "redis": "redis://jig-redis.jig.svc:6379/0" }

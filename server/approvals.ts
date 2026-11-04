@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
+import { createLog } from "./log.ts";
 import type { JigEvent } from "./runner.ts";
 import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task } from "./store.ts";
 import { verifyToken } from "./token.ts";
@@ -149,6 +150,8 @@ export interface Webhook {
   secret: string;
 }
 
+const log = createLog("service");
+
 /** Tries after a first that fails, and how long each may take. */
 const RETRIES = 3;
 const ATTEMPT_MS = 10_000;
@@ -189,7 +192,7 @@ export class Webhooks {
           last = err instanceof Error ? err.message : String(err);
         }
       }
-      console.error(`jig service: the approval webhook of ${task.tenant} failed for ${task.id}'s ${approval.id}, ${RETRIES + 1} times: ${last}`);
+      log.warn(`the approval webhook failed for ${approval.id}, ${RETRIES + 1} times: ${last}`, { tenant: task.tenant, task: task.id });
     })().finally(() => this.pending.delete(stop));
   }
 

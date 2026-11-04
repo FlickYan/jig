@@ -161,7 +161,7 @@ export class KubernetesRunner implements Runner {
       report: true,
     };
     if (!warm.answer(answer)) return undefined;
-    return this.followed(ns, jobPath, selector, task);
+    return { ...this.followed(ns, jobPath, selector, task), warm: true };
   }
 
   /**

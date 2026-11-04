@@ -140,7 +140,7 @@ export class DockerRunner implements Runner {
     if (!warm.answer(answer)) return undefined;
     warm.slot.assigned = true;
     this.folders.set(task.id, dir);
-    return this.handle(container, dir, task);
+    return { ...this.handle(container, dir, task), warm: true };
   }
 
   /** A warm worker: a container with its own slot's folder at /task, as a task's, that claims a task with its ticket. */

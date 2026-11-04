@@ -17,6 +17,10 @@ spec:
       labels:
         app.kubernetes.io/name: jig
         app.kubernetes.io/component: api
+      # Prometheus finds the pods by these (deploy/observability/prometheus.yml): the metrics listener's port.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9180"
     spec:
       serviceAccountName: jig-api
       securityContext:
@@ -34,6 +38,9 @@ spec:
             - containerPort: 8080
             # The internal listener, where the task pods ask for approvals.
             - containerPort: 8082
+            # The metrics listener, which only the monitoring namespace reaches (networkpolicy.yaml).
+            - containerPort: 9180
+              name: metrics
           env:
             - name: JIG_GATEWAY_SECRET
               valueFrom:
