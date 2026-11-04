@@ -2,8 +2,10 @@ import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
+import { createLog, type Log } from "./log.ts";
 import { type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
-import type { Approval, Outcome, Store, Task, TaskStatus, Tenant, Usage } from "./store.ts";
+import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
+import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
 // Starts queued tasks as slots free up: never more than `concurrency` at once, nor more of a tenant's than
 // its own limit, and round-robin across the tenants with work queued, so one that queues a thousand tasks
@@ -31,10 +33,15 @@ export interface SchedulerOptions {
   keepTaskDirs?: boolean;
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
   onApproval?: (task: Task, approval: Approval) => void;
+  /** Where its runs, leases and failures are counted (default: a registry of its own, which nothing serves). */
+  metrics?: ServiceMetrics;
+  log?: Log;
 }
 
 interface Run {
   tenant: string;
+  /** When this replica claimed it, in milliseconds. */
+  claimed: number;
   handle?: RunHandle;
   /** Why it is being stopped, if it is. */
   stopping?: "cancelled" | "shutdown" | "lost";
@@ -70,8 +77,10 @@ export class Scheduler {
   private maxEvents: number;
   private keepTaskDirs: boolean;
   private onApproval?: (task: Task, approval: Approval) => void;
+  private metrics: ServiceMetrics;
+  private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, onApproval }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -80,6 +89,8 @@ export class Scheduler {
     this.maxEvents = maxEvents;
     this.keepTaskDirs = keepTaskDirs;
     this.onApproval = onApproval;
+    this.metrics = metrics ?? serviceMetrics();
+    this.log = log ?? createLog("service");
     store.changes.on("cancel", this.cancelled);
   }
 
@@ -96,6 +107,7 @@ export class Scheduler {
    * renews this replica's leases, ends the tasks whose lease ran out and looks for work again.
    */
   async start(): Promise<string[]> {
+    await this.store.heartbeat(this.replicaId, this.leaseMs);
     const expired = await this.expire();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
@@ -107,11 +119,13 @@ export class Scheduler {
     this.keeping ??= (async () => {
       try {
         await this.renew();
+        await this.store.heartbeat(this.replicaId, this.leaseMs);
         await this.expire();
         // A slot another replica freed, or a task it queued, is looked for here.
         void this.poke();
       } catch (err) {
-        console.error("jig service: couldn't renew the leases on its runs:", err);
+        this.metrics.leaseErrors.inc();
+        this.log.error("couldn't renew the leases on its runs", { err });
       }
     })().finally(() => (this.keeping = undefined));
     return this.keeping;
@@ -138,7 +152,19 @@ export class Scheduler {
   private async expire(): Promise<string[]> {
     const expired = await this.store.expire(EXPIRED);
     for (const id of expired) this.updates.emit(id, { done: "error" } satisfies Update);
+    // Rare (a replica is gone), so each is read again for its tenant and start, to be counted.
+    for (const id of expired) {
+      const task = await this.store.task(id);
+      if (task) this.ended(task, "error", task.started && task.ended ? Date.parse(task.ended) - Date.parse(task.started) : undefined);
+    }
     return expired;
+  }
+
+  /** Counts a task that this replica ended, and how long it ran (in milliseconds) if it started. */
+  private ended(task: Task, status: TaskStatus, ms?: number): void {
+    this.metrics.ended.inc({ tenant: task.tenant, status });
+    if (ms !== undefined) this.metrics.runSeconds.observe({ status }, Math.max(0, ms) / 1000);
+    this.log.debug("task ended", { tenant: task.tenant, task: task.id, status });
   }
 
   /** Looks for work: after a task is queued, and whenever a run ends. */
@@ -152,7 +178,10 @@ export class Scheduler {
     while (this.again && !this.closed) {
       this.again = false;
       // A store that fails now may not later: the next poke tries again.
-      await this.fill().catch((err: unknown) => console.error("jig service: couldn't start queued tasks:", err));
+      await this.fill().catch((err: unknown) => {
+        this.metrics.storeErrors.inc();
+        this.log.error("couldn't start queued tasks", { err });
+      });
     }
   }
 
@@ -175,6 +204,7 @@ export class Scheduler {
     }
     if (task.status === "queued" && (await this.store.cancelQueued(task.id))) {
       this.updates.emit(task.id, { done: "cancelled" } satisfies Update);
+      this.ended(task, "cancelled");
       return "cancelled";
     }
     // Running on another replica (or claimed meanwhile): its replica is told, and stops it.
@@ -197,6 +227,8 @@ export class Scheduler {
     await Promise.all([...this.runs.values()].map((run) => run.done));
     await this.settled();
     await this.keeping;
+    // Counted no more among the replicas up; one that can't say so is forgotten when its heartbeat runs out.
+    await this.store.leave(this.replicaId).catch(() => {});
   }
 
   /** The tasks this scheduler is running, by tenant. */
@@ -232,7 +264,9 @@ export class Scheduler {
         }
         progress = true;
         this.lastTenant = id;
-        const run: Run = { tenant: id };
+        this.metrics.queueSeconds.observe({}, Math.max(0, Date.parse(task.started!) - Date.parse(task.created)) / 1000);
+        this.log.debug("task started", { tenant: id, task: task.id });
+        const run: Run = { tenant: id, claimed: Date.now() };
         this.runs.set(task.id, run);
         run.done = this.run(task, tenant, run);
       }
@@ -248,7 +282,11 @@ export class Scheduler {
     try {
       run.handle = await this.runner.start(task, tenant);
       if (run.stopping) run.handle.cancel();
+      // With a pool, whether a warm worker took it; and how long jig took to start, either way.
+      const start = run.handle.warm ? "warm" : "cold";
+      if (this.runner.pool) this.metrics.poolTakes.inc({ result: run.handle.warm ? "hit" : "miss" });
       for await (const event of run.handle.events) {
+        if (!stored) this.metrics.startSeconds.observe({ start }, (Date.now() - run.claimed) / 1000);
         if (event.type === "end") end = event;
         let kept = event;
         // Past the cap, a run's events are dropped, but for its end, and one notice in place of the first
@@ -267,9 +305,13 @@ export class Scheduler {
         // jig's own word on how it was answered is the record, but for an answer by the API it never gave:
         // a run's commands may write its events (on Docker and Kubernetes), so that one is only logged.
         const answered = approvalAnswer(kept);
-        if (answered && !(await this.store.recordApproval(task.id, answered.id, answered.answer)) && answered.answer.by === "api") {
-          console.error(`jig service: ${task.id}'s run says the API answered ${answered.id} with ${answered.answer.decision}${answered.answer.always ? " always" : ""}, which it didn't: left out of the record`);
+        const recorded = answered && (await this.store.recordApproval(task.id, answered.id, answered.answer));
+        if (answered && !recorded && answered.answer.by === "api") {
+          const said = `${answered.answer.decision}${answered.answer.always ? " always" : ""}`;
+          this.log.warn(`the run says the API answered ${answered.id} with ${said}, which it didn't: left out of the record`, { tenant: task.tenant, task: task.id });
         }
+        // An answer through the API is counted as it is given (api.ts); a timeout, as jig records it.
+        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id).catch(() => this.metrics.storeErrors.inc());
         this.updates.emit(task.id, { event: kept } satisfies Update);
         if (approval) this.onApproval?.(task, approval);
       }
@@ -284,21 +326,37 @@ export class Scheduler {
       }
     }
     run.ended = true;
-    const recorded = this.record(task.id, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => console.error(`jig service: couldn't store how ${task.id} ended:`, err));
+    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => {
+      this.metrics.storeErrors.inc();
+      this.log.error("couldn't store how the task ended", { tenant: task.tenant, task: task.id, err });
+    });
     this.recording.add(recorded);
     await recorded.finally(() => this.recording.delete(recorded));
   }
 
-  private async record(id: string, outcome: Outcome): Promise<void> {
+  /** Counts how long an approval jig's timeout denied waited. */
+  private async waited(task: string, id: string): Promise<void> {
+    const approval = await this.store.approval(task, id);
+    if (approval?.decidedAt) this.metrics.approvalWait.observe({ decision: "timeout" }, Math.max(0, Date.parse(approval.decidedAt) - Date.parse(approval.requestedAt)) / 1000);
+  }
+
+  private async record(task: Task, run: Run, outcome: Outcome): Promise<void> {
+    const { id, tenant } = task;
     try {
-      await this.store.finish(id, this.replicaId, outcome);
+      // One this replica no longer held was ended by another, which counted it.
+      if (await this.store.finish(id, this.replicaId, outcome)) {
+        this.ended(task, outcome.status, Date.now() - run.claimed);
+        const spent = spentOf(outcome);
+        if (spent.costUsd) this.metrics.cost.inc({ tenant }, spent.costUsd);
+        for (const [kind, n] of [["input", spent.input], ["output", spent.output], ["cache_read", spent.cacheRead], ["cache_write", spent.cacheWrite]] as const) if (n) this.metrics.tokens.inc({ tenant, kind }, n);
+      }
       this.updates.emit(id, { done: outcome.status } satisfies Update);
     } finally {
       // The slot is free even if the outcome couldn't be stored: the task's lease, no longer renewed,
       // runs out, and it ends as an error.
       this.runs.delete(id);
       if (!this.closed) void this.poke();
-      if (!this.keepTaskDirs) await this.runner.removeFiles?.(id).catch((err: unknown) => console.error(`jig service: couldn't remove ${id}'s folder:`, err));
+      if (!this.keepTaskDirs) await this.runner.removeFiles?.(id).catch((err: unknown) => this.log.warn("couldn't remove the task's folder", { tenant, task: id, err }));
     }
   }
 }

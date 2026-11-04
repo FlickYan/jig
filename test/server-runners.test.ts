@@ -15,6 +15,7 @@ import { DockerRunner } from "../server/runners/docker.ts";
 import { KubernetesRunner, objectName, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
 import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
+import { parseYaml } from "./yaml.ts";
 
 // The Docker and Kubernetes runners (server/runners/), with a fake docker CLI (fixtures/fake-docker.mjs)
 // and a fake Kubernetes API server, the worker a task's pod runs (server/worker.ts), and the deploy files.
@@ -922,79 +923,6 @@ describe("the warm pool", () => {
   });
 });
 
-/**
- * The YAML the deploy files are written in, and no more: block maps and lists, plain, quoted and JSON
- * flow scalars, `|` blocks, whole-line comments, and `---` between documents. Anything else is refused.
- */
-function parseYaml(text: string): unknown[] {
-  if (/\t/.test(text)) throw new Error("tabs");
-  const documents: unknown[] = [];
-  for (const part of text.split(/^---$/m)) {
-    const lines = part.split("\n");
-    let i = 0;
-    const indent = (line: string) => line.length - line.trimStart().length;
-    const skip = () => {
-      while (i < lines.length && /^\s*(#.*)?$/.test(lines[i])) i++;
-    };
-    const item = (line: string) => /^\s*-( |$)/.test(line);
-    const scalar = (value: string): unknown => {
-      if (/^["[{]/.test(value)) return JSON.parse(value);
-      if (/ #|^[&*!|>'%@`]/.test(value)) throw new Error(`a scalar this reader doesn't take: ${value}`);
-      if (value === "true" || value === "false") return value === "true";
-      if (value === "null") return null;
-      return /^-?\d+(\.\d+)?$/.test(value) ? Number(value) : value;
-    };
-    const node = (at: number): unknown => (item(lines[i]) ? list(at) : map(at));
-    const list = (at: number): unknown[] => {
-      const items: unknown[] = [];
-      for (skip(); i < lines.length && indent(lines[i]) === at && item(lines[i]); skip()) {
-        const rest = lines[i].trim().slice(1).trim();
-        if (/^[\w./-]+:( |$)/.test(rest)) {
-          // A map that starts on the dash's line: the same map as if it started on the next.
-          lines[i] = `${" ".repeat(at + 2)}${rest}`;
-          items.push(map(at + 2));
-        } else if (rest) {
-          i++;
-          items.push(scalar(rest));
-        } else {
-          i++;
-          skip();
-          items.push(node(indent(lines[i])));
-        }
-      }
-      return items;
-    };
-    const map = (at: number): Record<string, unknown> => {
-      const result: Record<string, unknown> = {};
-      for (skip(); i < lines.length && indent(lines[i]) === at && !item(lines[i]); skip()) {
-        const [, key, value = ""] = /^([\w./-]+):(?: (.*))?$/.exec(lines[i].trim()) ?? [];
-        if (!key) throw new Error(`line ${i + 1}: ${lines[i]}`);
-        if (key in result) throw new Error(`line ${i + 1}: ${key} twice`);
-        i++;
-        if (value === "|") {
-          const block: string[] = [];
-          for (; i < lines.length && (!lines[i].trim() || indent(lines[i]) > at); i++) block.push(lines[i]);
-          const margin = Math.min(...block.filter((line) => line.trim()).map(indent));
-          result[key] = `${block.map((line) => line.slice(margin)).join("\n").trimEnd()}\n`;
-        } else if (value) {
-          result[key] = scalar(value);
-        } else {
-          skip();
-          const next = lines[i] === undefined ? -1 : indent(lines[i]);
-          result[key] = next > at || (next === at && item(lines[i])) ? node(next) : null;
-        }
-      }
-      return result;
-    };
-    skip();
-    if (i === lines.length) continue;
-    documents.push(node(indent(lines[i])));
-    skip();
-    if (i < lines.length) throw new Error(`line ${i + 1} isn't read: ${lines[i]}`);
-  }
-  return documents;
-}
-
 describe("the deploy files", () => {
   async function manifests(): Promise<any[]> {
     const dir = join(DEPLOY, "k8s");
@@ -1010,7 +938,7 @@ describe("the deploy files", () => {
 
   it("parse, with a reader that refuses what it doesn't read", async () => {
     assert.deepEqual(parseYaml('# a comment\na:\n  b: [1]\n  c:\n    - d: x:y\n      e: "no"\n    - 2\n---\nk: |\n  two\n    lines\nl: true\n'), [{ a: { b: [1], c: [{ d: "x:y", e: "no" }, 2] } }, { k: "two\n  lines\n", l: true }]);
-    for (const text of ["a: &anchor 1", "a: b # a comment", "a:\n\tb: 1", "a: 1\na: 2", "a: 1\n b: 2", "a: >\n  folded"]) assert.throws(() => parseYaml(text), text);
+    for (const text of ["a: &anchor 1", "a: b # a comment", "a:\n\tb: 1", "a: 1\na: 2", "a: 1\n b: 2", "a: >\n  folded", "a: b: c"]) assert.throws(() => parseYaml(text), text);
   });
 
   it("keep the task pods to the gateway, the internal listener and DNS, and give the service only what the runner needs", async () => {

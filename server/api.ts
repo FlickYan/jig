@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -6,13 +6,16 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
+import { createLog, type Log } from "./log.ts";
 import { type Runner, workspaceProblem } from "./runner.ts";
 import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
 import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
 import { Scheduler, type Update } from "./scheduler.ts";
+import { routeOf, type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import {
   type Approval,
+  type Counts,
   type Decision,
   FINISHED,
   isoDay,
@@ -33,7 +36,8 @@ import {
 
 // The task service's HTTP API (docs/server.md): tenants create tasks, follow their events, answer the
 // approvals they ask for and cancel them, each with its own API key, and sees only its own tasks. A second
-// listener, which only tasks reach, is where their jig waits for those answers (approvals.ts).
+// listener, which only tasks reach, is where their jig waits for those answers (approvals.ts), and a third,
+// if the config asks for it, serves the metrics (service-metrics.ts) to Prometheus.
 // `node server/api.ts --config <file>` runs it.
 
 export interface TenantConfig {
@@ -89,6 +93,8 @@ export interface Config {
   keepTaskDirs?: boolean;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
   adminKeyEnv?: string;
+  /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
+  metrics?: { host?: string; port: number };
   tenants: TenantConfig[];
 }
 
@@ -98,26 +104,49 @@ type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
 const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
+/** How long what the metrics read from the store is used for, however many scrape meanwhile. */
+const COUNTS_MS = 5_000;
+/** A client's x-request-id that is used as it is; any other gets one of the service's own. */
+const REQUEST_ID = /^[\w.-]{1,128}$/;
 
 export interface Service {
   url: string;
   /** The internal listener's address, as this replica listens on it. */
   internalUrl: string;
+  /** The metrics listener's address, if the config asks for one. */
+  metricsUrl?: string;
+  metrics: ServiceMetrics;
   server: Server;
   store: Store;
   scheduler: Scheduler;
   close(): Promise<void>;
 }
 
+/** A request as the service logs it: its id, and its tenant once it is known. */
+interface Request {
+  id: string;
+  log: Log;
+  tenant?: string;
+}
+
 /**
  * Checks the config, opens the store, puts the config's tenants in it and shuts out those it no longer
- * lists, ends the tasks of replicas that are gone, and listens, on the internal listener too. The runner is
- * the local one unless one is given (a test's); `webhookRetryMs` is the pause before a webhook's first retry;
- * `now` is the clock the quotas' days and months, and the usage report's default range, are read from.
+ * lists, ends the tasks of replicas that are gone, and listens, on the internal and metrics listeners too.
+ * The runner is the local one unless one is given (a test's); `webhookRetryMs` is the pause before a
+ * webhook's first retry; `now` is the clock the quotas' days and months, and the usage report's default
+ * range, are read from; `log` is where its lines go (createLog's, by default); `countsMs`, how long the
+ * metrics' reads of the store are used for.
  */
 export async function startService(
   config: Config,
-  { secret, runner, webhookRetryMs, now = () => new Date() }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date },
+  {
+    secret,
+    runner,
+    webhookRetryMs,
+    now = () => new Date(),
+    log = createLog("service"),
+    countsMs = COUNTS_MS,
+  }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date; log?: Log; countsMs?: number },
 ): Promise<Service> {
   checkConfig(config);
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
@@ -125,18 +154,53 @@ export async function startService(
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
   const store = await openStore(config.database);
   const answers = new Answers(store);
-  const handler = (serve: (req: IncomingMessage, res: ServerResponse) => Promise<void>) => (req: IncomingMessage, res: ServerResponse) =>
-    void serve(req, res).catch((err) => {
-      if (!res.headersSent) reply(res, 500, { error: "Internal error" });
-      else res.end();
-      console.error(err);
-    });
+  const metrics = serviceMetrics();
+  /**
+   * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
+   * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
+   */
+  const handler =
+    (serve: (req: IncomingMessage, res: ServerResponse, request: Request) => Promise<void>, api = false) =>
+    (req: IncomingMessage, res: ServerResponse) => {
+      const began = performance.now();
+      const given = req.headers["x-request-id"];
+      const id = typeof given === "string" && REQUEST_ID.test(given) ? given : randomUUID();
+      res.setHeader("x-request-id", id);
+      const request: Request = { id, log: log.with({ request: id }) };
+      const path = URL.parse(req.url ?? "/", "http://service")?.pathname ?? "/";
+      res.once("close", () => {
+        const seconds = (performance.now() - began) / 1000;
+        const route = routeOf(path);
+        if (api) {
+          metrics.httpRequests.inc({ route, status: res.statusCode });
+          metrics.httpSeconds.observe({ route }, seconds);
+        }
+        request.log.debug("request", { method: req.method, path, status: res.statusCode, ms: Math.round(seconds * 1000), tenant: request.tenant });
+      });
+      void serve(req, res, request).catch((err) => {
+        if (!res.headersSent) reply(res, 500, { error: "Internal error" });
+        else res.end();
+        request.log.error("request failed", { err, tenant: request.tenant });
+      });
+    };
   // A warm worker's claim is its runner's to answer (pool.ts); the rest are approvals.
   const internal = createServer(
     handler((req, res) => (runner?.claim && req.url?.split("?")[0] === "/internal/pool/claim" ? runner.claim(req, res) : handleInternal(req, res, { store, answers, secret }))),
   );
+  // Prometheus's, apart from the API and from what the tasks reach.
+  const metricsServer =
+    config.metrics &&
+    createServer(
+      handler(async (req, res) => {
+        const path = URL.parse(req.url ?? "/", "http://service")?.pathname;
+        if (req.method === "GET" && path === "/metrics") return metrics.registry.serve(res);
+        if (req.method === "GET" && path === "/healthz") return reply(res, 200, { ok: true });
+        reply(res, 404, { error: "Not found: this listener serves GET /metrics and GET /healthz" });
+      }),
+    );
   let scheduler: Scheduler;
   let internalUrl: string;
+  let metricsUrl: string | undefined;
   try {
     for (const tenant of config.tenants) {
       const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
@@ -144,21 +208,23 @@ export async function startService(
     }
     // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
     const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
-    if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
+    if (retired) log.warn(`${retired} queued task(s) of tenants no longer in the config cancelled`);
     // Before any task starts, as their jig asks for approvals there.
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval: (task, approval) => webhooks.send(task, approval) });
+    const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval, metrics, log });
     const expired = await scheduler.start();
-    if (expired.length) console.error(`jig service: ${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
+    if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
     await runner?.close?.();
     if (internal.listening) await new Promise((done) => internal.close(done));
     await store.close();
     throw err;
   }
+  collect(metrics, { store, runner, tenants: config.tenants.map((tenant) => tenant.id), countsMs });
   const context = {
     store,
     scheduler,
@@ -168,14 +234,16 @@ export async function startService(
     heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000,
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
     now,
+    metrics,
   };
-  const server = createServer(handler((req, res) => handle(req, res, context)));
+  const server = createServer(handler((req, res, request) => handle(req, res, context, request), true));
   const close = async () => {
     webhooks.close();
     // The idle workers first, their claims answered while the internal listener is still up.
     await runner!.close?.();
-    for (const listener of [server, internal]) listener.closeAllConnections();
-    await Promise.all([server, internal].map((listener) => new Promise((done) => listener.close(done))));
+    const listeners = [server, internal, ...(metricsServer ? [metricsServer] : [])];
+    for (const listener of listeners) listener.closeAllConnections();
+    await Promise.all(listeners.map((listener) => new Promise((done) => listener.close(done))));
     await answers.close();
     await scheduler.close();
     await store.close();
@@ -183,12 +251,50 @@ export async function startService(
   let url: string;
   try {
     url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
+    if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
   } catch (err) {
     // Its port is taken, say: what has started stops.
     await close();
     throw err;
   }
-  return { url, internalUrl, server, store, scheduler, close };
+  return { url, internalUrl, metricsUrl, metrics, server, store, scheduler, close };
+}
+
+/**
+ * Sets the gauges that are read at a scrape: the tasks queued and running, the approvals waiting and the
+ * replicas up, from the store, and the pool's idle workers, from the runner. The store's are read at most
+ * every `countsMs`, however many scrape, and are its whole: on Postgres, every replica's alike.
+ */
+function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: { store: Store; runner: Runner; tenants: string[]; countsMs: number }): void {
+  let read: { at: number; counts: Promise<Counts> } | undefined;
+  const counts = () => {
+    if (read && Date.now() - read.at < countsMs) return read.counts;
+    const reading = store.counts();
+    read = { at: Date.now(), counts: reading };
+    // A failed read is tried again at the next scrape; meanwhile the gauges stay as they were.
+    reading.catch(() => {
+      metrics.storeErrors.inc();
+      if (read?.counts === reading) read = undefined;
+    });
+    return reading;
+  };
+  metrics.tasks.onCollect(async () => {
+    const { tasks } = await counts();
+    metrics.tasks.reset();
+    // The config's tenants show 0 rather than nothing, so a graph of them doesn't break off.
+    for (const tenant of tenants) for (const status of ["queued", "running"]) metrics.tasks.set({ tenant, status }, 0);
+    for (const { tenant, status, count } of tasks) metrics.tasks.set({ tenant, status }, count);
+  });
+  metrics.oldestQueued.onCollect(async () => {
+    const { tasks } = await counts();
+    metrics.oldestQueued.reset();
+    for (const { tenant, status, oldest } of tasks) if (status === "queued") metrics.oldestQueued.set({ tenant }, Math.max(0, Date.now() - Date.parse(oldest)) / 1000);
+  });
+  metrics.approvalsPending.onCollect(async () => metrics.approvalsPending.set({}, (await counts()).pendingApprovals));
+  metrics.replicas.onCollect(async () => metrics.replicas.set({}, (await counts()).replicas));
+  metrics.poolIdle.onCollect(() => {
+    if (runner.pool) metrics.poolIdle.set({}, runner.pool.stats().idle);
+  });
 }
 
 /** Listens, and gives the address it listens on as a URL. */
@@ -269,6 +375,10 @@ function configProblem(config: Config): string | undefined {
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
     text("adminKeyEnv", config.adminKeyEnv, false) ??
+    (config.metrics === undefined || isObject(config.metrics) ? undefined : "metrics must be an object, {host, port}") ??
+    text("metrics.host", config.metrics?.host, false) ??
+    (config.metrics && config.metrics.port === undefined ? "metrics.port is missing" : undefined) ??
+    whole("metrics.port", config.metrics?.port, 0, 65535) ??
     (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
   if (problem) return problem;
   const tenants = new Set<string>();
@@ -317,17 +427,19 @@ interface Context {
   /** The SHA-256 of the admin key, when there is one. */
   adminKey?: Buffer;
   now: () => Date;
+  metrics: ServiceMetrics;
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest();
 
-async function handle(req: IncomingMessage, res: ServerResponse, context: Context): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse, context: Context, request: Request): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
   if (url.pathname === "/healthz") return reply(res, 200, { ok: true });
   const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
   if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) return admin(req, res, url, key, context);
   const tenant = key && (await context.store.tenantByKey(createHash("sha256").update(key).digest("hex")));
   if (!tenant) return reply(res, 401, { error: "A tenant's API key is needed: Authorization: Bearer <key>" }, { "www-authenticate": "Bearer" });
+  request.tenant = tenant.id;
 
   if (url.pathname === "/v1/usage") return req.method === "GET" ? usage(res, url, context, { tenant: tenant.id }) : reply(res, 405, { error: "Use GET" });
 
@@ -364,12 +476,14 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   if (req.method !== "GET") return reply(res, 405, { error: "Use GET" });
   const after = req.headers["last-event-id"] ?? url.searchParams.get("after") ?? "0";
   if (typeof after !== "string" || !/^\d{1,9}$/.test(after)) return reply(res, 400, { error: "Last-Event-ID and after must be an event's seq" });
-  return streamEvents(req, res, task, Number(after), context);
+  return streamEvents(req, res, task, Number(after), context, request);
 }
 
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
+  const refused = (reason: "queue" | "quota" | "invalid") => context.metrics.refused.inc({ tenant: tenant.id, reason });
   const body = await readBody(req, context.maxBody);
   if (body === undefined) {
+    refused("invalid");
     res.setHeader("connection", "close");
     return reply(res, 413, { error: `The body is over ${context.maxBody} bytes` });
   }
@@ -377,16 +491,21 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   try {
     input = JSON.parse(body);
   } catch {
+    refused("invalid");
     return reply(res, 400, { error: "The body isn't JSON" });
   }
   const spec = taskSpec(input, tenant, context.model);
-  if (typeof spec === "string") return reply(res, 400, { error: spec });
+  if (typeof spec === "string") {
+    refused("invalid");
+    return reply(res, 400, { error: spec });
+  }
   // A queue without an end would fill the disk, and a tenant's waits only grow. The caps are counted with
   // the insert, so replicas sharing the store keep to them together.
   const now = context.now();
   const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now });
   if ("quota" in task) {
     const { quota, limit, used } = task;
+    refused(quota === "maxQueued" ? "queue" : "quota");
     if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start` });
     const { nextDay, nextMonth } = periods(now);
     const resets = quota === "usdPerMonth" ? nextMonth : nextDay;
@@ -394,6 +513,7 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     const retryAfter = String(Math.max(1, Math.ceil((resets.getTime() - now.getTime()) / 1000)));
     return reply(res, 429, { error: `The tenant has ${what}: its ${quota} quota resets at ${resets.toISOString()}`, quota, limit, used, resetsAt: resets.toISOString() }, { "retry-after": retryAfter });
   }
+  context.metrics.created.inc({ tenant: tenant.id });
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });
 }
@@ -467,7 +587,7 @@ function csv(res: ServerResponse, rows: UsageRow[], keys: string[]): void {
  * hasn't asked for (or not yet), 409 for one answered already or a task that has ended. The jig waiting for
  * it, maybe through another replica, hears it at once.
  */
-async function answer(req: IncomingMessage, res: ServerResponse, task: Task, id: string, { store, answers, maxBody }: Context): Promise<void> {
+async function answer(req: IncomingMessage, res: ServerResponse, task: Task, id: string, { store, answers, maxBody, metrics }: Context): Promise<void> {
   if (req.method !== "POST") return reply(res, 405, { error: "Use POST" });
   const body = await readBody(req, maxBody);
   if (body === undefined) {
@@ -492,6 +612,7 @@ async function answer(req: IncomingMessage, res: ServerResponse, task: Task, id:
   const answered: Approval | undefined = asked.decision ? undefined : await store.decideApproval(task.id, id, { decision: decision as Decision, always, by: "api" });
   if (!answered) return reply(res, 409, { error: "The approval has been answered already", approval: (await store.approval(task.id, id)) ?? asked });
   answers.answered(task.id, id);
+  metrics.approvalWait.observe({ decision: answered.decision! }, Math.max(0, Date.parse(answered.decidedAt!) - Date.parse(answered.requestedAt)) / 1000);
   reply(res, 200, answered);
 }
 
@@ -574,7 +695,7 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
  * (SQLite, or a lost connection to Postgres), the store is read again every second.
  */
-async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs }: Context): Promise<void> {
+async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: Request): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;
@@ -600,7 +721,10 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
         for (const { seq, event } of await store.events(task.id, last)) send(seq, event);
         if (FINISHED.has(status)) end(status);
       })
-      .catch((err: unknown) => console.error(`jig service: couldn't read ${task.id}'s events:`, err));
+      .catch((err: unknown) => {
+        metrics.storeErrors.inc();
+        request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
+      });
   };
   // The next event as it comes goes at once; one after a gap, or the end, sends what is stored first.
   const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 ? send(update.event.seq, update.event) : pull());
@@ -641,11 +765,12 @@ async function main(): Promise<void> {
   const base = dirname(resolve(values.config));
   if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
   config.dataDir = resolve(base, config.dataDir);
-  const service = await startService(config, { secret });
-  console.error(`jig service listening on ${service.url}`);
+  const log = createLog("service");
+  const service = await startService(config, { secret, log });
+  log.info(`listening on ${service.url}`, { internal: service.internalUrl, metrics: service.metricsUrl });
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {
-      console.error("jig service: stopping the runs and exiting");
+      log.info("stopping the runs and exiting");
       void service.close().then(() => process.exit(0));
     });
   }
@@ -653,7 +778,7 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err: unknown) => {
-    console.error(err instanceof Error ? err.message : String(err));
+    createLog("service").error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   });
 }

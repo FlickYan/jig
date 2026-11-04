@@ -16,6 +16,9 @@ spec:
       labels:
         app.kubernetes.io/name: jig
         app.kubernetes.io/component: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9181"
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -30,6 +33,8 @@ spec:
           command: ["node", "server/gateway.ts", "--config", "/etc/jig/gateway.json"]
           ports:
             - containerPort: 8081
+            - containerPort: 9181
+              name: metrics
           env:
             - name: JIG_GATEWAY_SECRET
               valueFrom:

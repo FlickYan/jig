@@ -32,10 +32,14 @@ export interface RunHandle {
   wait(): Promise<RunExit>;
   /** Stops the run and everything it started. */
   cancel(): void;
+  /** It runs on a worker started ahead of it (pool.ts), rather than one started for it. */
+  warm?: boolean;
 }
 
 export interface Runner {
   start(task: Task, tenant: Tenant): Promise<RunHandle>;
+  /** The workers it keeps warm, if it keeps any: how many wait for a task. */
+  readonly pool?: { stats(): { idle: number } };
   /** Removes what a task's run left on this machine (its folder), once the run has ended. */
   removeFiles?(id: string): Promise<void>;
   /** Starts the workers it keeps warm (pool.ts), which claim their tasks at the internal listener, as they reach it. */

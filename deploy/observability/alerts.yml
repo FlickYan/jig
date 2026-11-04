@@ -1,0 +1,162 @@
+# Prometheus's alerting rules for jig (docs/server.md, Metrics and logs), on the symptoms an operator acts
+# on: work backing up, tasks or requests failing more than usual, a provider or a region away, and the
+# store or Redis failing. The thresholds are a start: set them to what is usual for your fleet. A gauge
+# read from the database (jig_service_tasks, _queue_oldest_seconds, _approvals_pending, _replicas) is the
+# same on every replica of a region, so it is taken with max, never summed.
+groups:
+  - name: jig-service
+    rules:
+      - alert: JigQueueBackingUp
+        expr: max by (tenant) (jig_service_queue_oldest_seconds) > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A task of {{ $labels.tenant }}'s has waited over 15 minutes to start"
+          description: "Slots are short (the service's concurrency, or the tenant's own), or the replicas aren't starting tasks: see jig_service_tasks and jig_service_replicas."
+      - alert: JigQueueSlow
+        expr: histogram_quantile(0.9, sum by (le) (rate(jig_service_queue_seconds_bucket[10m]))) > 300
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "One task in ten waits over 5 minutes in the queue"
+          description: "The 90th percentile of the seconds from a task's creation to its start, over 10 minutes."
+      - alert: JigTaskErrors
+        expr: sum(rate(jig_service_tasks_ended_total{status="error"}[15m])) / sum(rate(jig_service_tasks_ended_total[15m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 10% of tasks end in error"
+          description: "error is jig's own failure, a workspace that couldn't be made, or a replica lost while it ran: the tasks' error fields say which."
+      - alert: JigApiErrors
+        expr: sum(rate(jig_service_http_requests_total{status=~"5.."}[5m])) / sum(rate(jig_service_http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of the task service's requests fail with a 5xx"
+          description: "Its error lines (level error, with the request's id) say why."
+      - alert: JigStoreErrors
+        expr: sum(increase(jig_service_store_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The task service can't read or write its database"
+          description: "Tasks aren't started, or their events and outcomes aren't stored."
+      - alert: JigLeaseErrors
+        expr: sum by (instance) (increase(jig_service_lease_errors_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A replica of the task service can't renew the leases on its runs"
+          description: "Past leaseSeconds its running tasks are taken as lost and end in error."
+      - alert: JigQuotaRefusals
+        expr: sum by (tenant) (increase(jig_service_tasks_refused_total{reason="quota"}[15m])) > 20
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.tenant }} is being refused tasks at a quota"
+          description: "Its tasksPerDay, usdPerDay or usdPerMonth: GET /admin/usage shows what it used."
+      - alert: JigServiceDown
+        expr: up{component="api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A replica of the task service can't be scraped"
+          description: "{{ $labels.instance }} doesn't answer at its metrics listener."
+
+  - name: jig-gateway
+    rules:
+      - alert: JigGatewayErrors
+        expr: sum(rate(jig_gateway_requests_total{status=~"5.."}[5m])) / sum(rate(jig_gateway_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of the model calls through the gateway fail with a 5xx"
+          description: "By upstream: jig_gateway_requests_total{status=~\"5..\"}; upstream none when no provider answered."
+      - alert: JigGatewayFailovers
+        expr: sum by (from, to) (increase(jig_gateway_failovers_total[10m])) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "The gateway keeps failing over from {{ $labels.from }} to {{ $labels.to }}"
+          description: "The reason label says why: connect, timeout, a status, or keys."
+      - alert: JigUpstreamOpen
+        expr: max by (upstream) (jig_gateway_upstream_open) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The breaker of upstream {{ $labels.upstream }} has been open for 5 minutes"
+          description: "Its model calls go to the next upstream that serves their model, if there is one."
+      - alert: JigKeysExhausted
+        expr: max by (upstream) (jig_gateway_keys{state="ok"}) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No key of upstream {{ $labels.upstream }} is usable"
+          description: "Every key rests (rate-limited) or was refused: add keys, or see the provider's console."
+      - alert: JigGatewayQuotaRefusals
+        expr: sum by (tenant) (increase(jig_gateway_refused_total{reason="quota"}[15m])) > 20
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.tenant }}'s model calls are refused at its spending quota"
+          description: "Its dailyUsd or monthlyUsd in the gateway's limits."
+      - alert: JigGatewayStateErrors
+        expr: sum(increase(jig_gateway_state_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The gateway can't reach its Redis"
+          description: "With onStateError closed it answers 503; with open each replica keeps its own counts."
+      - alert: JigGatewayDown
+        expr: up{component="gateway"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A replica of the gateway can't be scraped"
+          description: "{{ $labels.instance }} doesn't answer at its metrics listener."
+
+  - name: jig-router
+    rules:
+      - alert: JigRegionDown
+        expr: max by (region) (jig_router_region_up) == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Region {{ $labels.region }} is down to every router"
+          description: "Its tasks can't be read until it is back; new tasks of tenants that allow it fail over."
+      - alert: JigRouterFailovers
+        expr: sum by (from, to) (increase(jig_router_failovers_total[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "New tasks are sent from region {{ $labels.from }} to {{ $labels.to }}"
+          description: "Their home region is down, and their tenants allow failover."
+      - alert: JigRouterErrors
+        expr: sum by (region) (rate(jig_router_requests_total{status=~"5.."}[5m])) / sum by (region) (rate(jig_router_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over 5% of the router's requests to region {{ $labels.region }} fail with a 5xx"
+          description: "The router's own 502 and 503, and the region's 5xx."
+      - alert: JigRouterDown
+        expr: up{component="router"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "A router can't be scraped"
+          description: "{{ $labels.instance }} doesn't answer at its metrics listener."

@@ -7,6 +7,10 @@ import {
   type Caps,
   type ClaimTerms,
   type Changes,
+  COUNT_PENDING,
+  COUNT_TASKS,
+  type Counts,
+  countsOf,
   ENDED,
   type Given,
   isoDay,
@@ -77,6 +81,8 @@ const MIGRATIONS = [
      input bigint NOT NULL, output bigint NOT NULL, cache_read bigint NOT NULL, cache_write bigint NOT NULL, cost_usd double precision NOT NULL, seconds double precision NOT NULL);
    CREATE INDEX usage_by_tenant ON usage (tenant, day);
    CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
+  // The replicas up, each until its heartbeat runs out, which the metrics count.
+  `CREATE TABLE replicas (id text PRIMARY KEY, seen_until timestamptz NOT NULL);`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -269,13 +275,14 @@ export class PostgresStore implements Store {
     return rows.length === 1;
   }
 
-  async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
+  async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
-    await this.pool.query(
+    const { rows } = await this.pool.query(
       `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
        WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${ENDED}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
       [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd],
     );
+    return rows.length === 1;
   }
 
   async addEvent(task: string, seq: number, event: object): Promise<void> {
@@ -347,6 +354,23 @@ export class PostgresStore implements Store {
     const where = ["day >= $1", "day <= $2", ...(query.tenant !== undefined ? [`tenant = $${params.push(query.tenant)}`] : [])];
     const sql = `SELECT ${[...keys, USAGE_SUMS].join(", ")} FROM usage WHERE ${where.join(" AND ")}${keys.length ? ` GROUP BY ${keys.join(", ")}` : ""}`;
     return usageRows((await this.pool.query(sql, params)).rows, keys);
+  }
+
+  async heartbeat(replica: string, ms: number): Promise<void> {
+    // The database's clock, as for the leases.
+    await this.pool.query("INSERT INTO replicas (id, seen_until) VALUES ($1, now() + $2 * interval '1 millisecond') ON CONFLICT (id) DO UPDATE SET seen_until = excluded.seen_until", [replica, ms]);
+    await this.pool.query("DELETE FROM replicas WHERE seen_until < now()");
+  }
+
+  async leave(replica: string): Promise<void> {
+    await this.pool.query("DELETE FROM replicas WHERE id = $1", [replica]);
+  }
+
+  async counts(): Promise<Counts> {
+    const tasks = (await this.pool.query(COUNT_TASKS)).rows;
+    const [pending] = (await this.pool.query(COUNT_PENDING)).rows;
+    const [replicas] = (await this.pool.query("SELECT count(*) AS n FROM replicas WHERE seen_until >= now()")).rows;
+    return countsOf(tasks, Number(pending.n), Number(replicas.n));
   }
 
   async close(): Promise<void> {

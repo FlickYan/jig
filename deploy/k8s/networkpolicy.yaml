@@ -46,3 +46,63 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+---
+# Who reaches the service's pods: the tenants' API from anywhere (the ingress or load balancer in front of
+# it), the internal listener from the pods in this namespace (the tasks), and the metrics listener only from
+# the monitoring namespace, where Prometheus runs: a task can't read every tenant's numbers there.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jig-api
+  namespace: jig
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: api
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8082
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9180
+---
+# The gateway's pods: the model calls from the pods in this namespace (the tasks), and the metrics listener
+# only from the monitoring namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jig-gateway
+  namespace: jig
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8081
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 9181

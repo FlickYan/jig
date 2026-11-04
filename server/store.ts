@@ -55,6 +55,16 @@ export interface Refusal {
   used: number;
 }
 
+/** What the metrics read from the store at a scrape: the same on every replica sharing it. */
+export interface Counts {
+  /** Queued and running tasks by tenant, with when the oldest of them was created (an ISO time). */
+  tasks: { tenant: string; status: "queued" | "running"; count: number; oldest: string }[];
+  /** Approvals of running tasks with no answer yet. */
+  pendingApprovals: number;
+  /** Replicas whose heartbeat hasn't run out. */
+  replicas: number;
+}
+
 /** A row of the usage report: the ended tasks of a tenant, day or model (those it is grouped by), summed. */
 export interface UsageRow {
   tenant?: string;
@@ -239,10 +249,10 @@ export interface Store {
   /** Moves a queued task to cancelled; false if it was no longer queued. */
   cancelQueued(id: string): Promise<boolean>;
   /**
-   * Ends a running task, if the owner still holds it. Every way a task ends (this, expire, cancelQueued and
-   * retireTenants) writes its row of the usage ledger in the same transaction, once.
+   * Ends a running task, if the owner still holds it: false if it doesn't. Every way a task ends (this,
+   * expire, cancelQueued and retireTenants) writes its row of the usage ledger in the same transaction, once.
    */
-  finish(id: string, owner: string, outcome: Outcome): Promise<void>;
+  finish(id: string, owner: string, outcome: Outcome): Promise<boolean>;
   /** Keeps one of a task's events; one with a seq already kept is ignored. */
   addEvent(task: string, seq: number, event: object): Promise<void>;
   /** A task's events after seq `after`, in order. */
@@ -265,6 +275,12 @@ export interface Store {
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
   /** The usage ledger summed by the query's groups, sorted by them; a group with no ended task is left out. */
   usage(query: UsageQuery): Promise<UsageRow[]>;
+  /** Says the replica is up for `ms` more, and forgets those whose heartbeat ran out. */
+  heartbeat(replica: string, ms: number): Promise<void>;
+  /** Forgets the replica: it is stopping. */
+  leave(replica: string): Promise<void>;
+  /** The tasks queued and running, the approvals waiting and the replicas up, across the store. */
+  counts(): Promise<Counts>;
   /** What other replicas did, as it happens; a store that can't hear it never emits. */
   readonly changes: Changes;
   /** Whether changes are heard as they happen now: if not, whoever waits on them must look again itself. */
@@ -308,6 +324,8 @@ const MIGRATIONS = [
      input INTEGER NOT NULL, output INTEGER NOT NULL, cache_read INTEGER NOT NULL, cache_write INTEGER NOT NULL, cost_usd REAL NOT NULL, seconds REAL NOT NULL);
    CREATE INDEX usage_by_tenant ON usage (tenant, day);
    CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
+  // The replicas up, each until its heartbeat runs out, which the metrics count.
+  `CREATE TABLE replicas (id TEXT PRIMARY KEY, seen_until TEXT NOT NULL);`,
 ];
 
 type Row = Record<string, unknown>;
@@ -490,12 +508,13 @@ class SqliteStore implements Store {
     });
   }
 
-  async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
-    this.atomically(() => {
+  async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
+    return this.atomically(() => {
       const rows = this.db
         .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
         .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner) as Row[];
       this.ledger(rows, spentOf(outcome));
+      return rows.length === 1;
     });
   }
 
@@ -517,6 +536,23 @@ class SqliteStore implements Store {
     const where = ["day >= ?", "day <= ?", ...(query.tenant !== undefined ? ["tenant = ?"] : [])];
     const sql = `SELECT ${[...keys, USAGE_SUMS].join(", ")} FROM usage WHERE ${where.join(" AND ")}${keys.length ? ` GROUP BY ${keys.join(", ")}` : ""}`;
     return usageRows(this.db.prepare(sql).all(query.from, query.to, ...(query.tenant !== undefined ? [query.tenant] : [])) as Row[], keys);
+  }
+
+  async heartbeat(replica: string, ms: number): Promise<void> {
+    const now = Date.now();
+    this.db.prepare("INSERT INTO replicas (id, seen_until) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET seen_until = excluded.seen_until").run(replica, new Date(now + ms).toISOString());
+    this.db.prepare("DELETE FROM replicas WHERE seen_until < ?").run(new Date(now).toISOString());
+  }
+
+  async leave(replica: string): Promise<void> {
+    this.db.prepare("DELETE FROM replicas WHERE id = ?").run(replica);
+  }
+
+  async counts(): Promise<Counts> {
+    const tasks = this.db.prepare(COUNT_TASKS).all() as Row[];
+    const pending = this.db.prepare(COUNT_PENDING).get() as Row;
+    const replicas = this.db.prepare("SELECT count(*) AS n FROM replicas WHERE seen_until >= ?").get(new Date().toISOString()) as Row;
+    return countsOf(tasks, Number(pending.n), Number(replicas.n));
   }
 
   /** Runs `body` in a transaction: committed if it returns, rolled back if it throws. It must not wait. */
@@ -590,6 +626,17 @@ class SqliteStore implements Store {
   async close(): Promise<void> {
     this.db.close();
   }
+}
+
+// What the metrics count, in SQL either store runs: through the status index, and the approvals of running
+// tasks only, as those of a task that ended are never answered.
+export const COUNT_TASKS = "SELECT tenant, status, count(*) AS n, min(created) AS oldest FROM tasks WHERE status IN ('queued', 'running') GROUP BY tenant, status";
+export const COUNT_PENDING = "SELECT count(*) AS n FROM approvals JOIN tasks ON tasks.id = approvals.task WHERE tasks.status = 'running' AND approvals.decision IS NULL";
+
+/** The counts from either store's rows. */
+export function countsOf(tasks: Row[], pendingApprovals: number, replicas: number): Counts {
+  const counted = tasks.map((row) => ({ tenant: String(row.tenant), status: row.status as "queued" | "running", count: Number(row.n), oldest: time(row.oldest)! }));
+  return { tasks: counted, pendingApprovals, replicas };
 }
 
 /** The columns of a task that just ended that its row of the ledger needs. */

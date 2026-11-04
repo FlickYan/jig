@@ -239,6 +239,52 @@ that isn't one is a 400. `/admin/usage` is there only with `adminKeyEnv` in the 
 variable that holds the admin key (which must be set); without it every `/admin` route is a 404. To bill a
 month, take the admin's CSV of it by model once it is over, or read the `usage` table, by `(tenant, day)`.
 
+### Metrics and logs
+
+With a `metrics` block, `{"host", "port"}` (host 127.0.0.1 by default), each replica serves its metrics in
+Prometheus's text format on a listener of its own, which answers only `GET /metrics` and `GET /healthz`:
+apart from the tenants' API, and from the internal listener the tasks reach. Without the block there is
+none. A label is never a key, a token, a prompt or a task's id: a route is its template (`/v1/tasks/:id`).
+
+| metric | what |
+|--------|------|
+| `jig_service_http_requests_total{route,status}`, `jig_service_http_request_seconds{route}` | the API's requests, and their seconds to the end of the response (an event stream's lasts as long as it is followed) |
+| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413) |
+| `jig_service_tasks_ended_total{tenant,status}`, `jig_service_run_seconds{status}` | tasks ended, and their seconds from start to end |
+| `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
+| `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
+| `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` |
+| `jig_service_lease_errors_total`, `jig_service_store_errors_total` | rounds of renewing the leases that failed, and reads and writes of the store that failed outside a request |
+| `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
+| `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
+| `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
+
+The counters and histograms are the replica's own, a task counted by the replica that ended it (that
+started it, for its queue's seconds), so their sum over the replicas is the service's. The last two rows are
+read from the store at a scrape, at most every 5 seconds however many scrape, and are the whole store's: on
+Postgres each replica gives the same numbers, so take their max, not their sum. A replica is up while its
+heartbeat in the store, written every third of `leaseSeconds`, holds: it is forgotten as it stops, or a
+lease's length after it crashed.
+
+Every response, from each listener, carries `x-request-id`: the client's, if it sent one of at most 128
+letters, digits, `_`, `.` and `-`, or else one of the service's own. It isn't passed to the runs. The
+service's lines on stderr are `jig service: ...` with their fields after them, or with
+`JIG_LOG_FORMAT=json` one JSON object a line (`ts`, `level`, `component`, `msg`, then fields such as
+`request`, `tenant`, `task` and `err`); `JIG_LOG_LEVEL` (`info` by default) is the least a line must be. At
+`debug` there is a line for each request (its `request`, method, path, status, `ms` and `tenant`) and for
+each task started and ended; at `error`, a request that failed (a 500) and the store's failures, with the
+error as `err`. The Kubernetes runner's few lines (a Job it couldn't delete) are still plain text.
+
+`deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
+and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
+`alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
+upstream's breaker open, a provider's keys used up, quota refusals, a region down, and the store's, the
+leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all three, by region. In
+`deploy/k8s/` the service's metrics listener is on port 9180 and the gateway's on 9181, the pods carry
+`prometheus.io/scrape` and `prometheus.io/port`, and NetworkPolicies let only the `monitoring` namespace
+reach those ports (the tenants' API from anywhere, the internal listener and the gateway from the pods in
+`jig`).
+
 ### The local runner
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
