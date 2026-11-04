@@ -89,10 +89,13 @@ interface Key {
   value: string;
   /** What other gateways know it by: never the key itself. */
   id: string;
-  /** Refused by the provider (401 or 403): never used again. */
+  /** Refused by the provider (401 or 403): not used again until a restart, or with `state` while Redis has its mark. */
   bad: boolean;
   /** Rate-limited by the provider: rests until then. */
   coolUntil: number;
+  /** This gateway's marks of it on their way to the state, and when the last one got there. */
+  marking: number;
+  markedAt: number;
 }
 
 /** The upstream keys, taken in turn, passing over a bad one and one that is cooling down. */
@@ -104,13 +107,32 @@ class KeyPool {
     this.keys = keys;
   }
 
-  /** Takes in what other gateways learned of the keys: which the provider refused, and which rest. */
+  /**
+   * Takes in what the gateways know of the keys: which the provider refused, and which rest. What is shared
+   * stands, so a mark that expired or that an operator removed is gone here too; only a mark of this
+   * gateway's own that the read may not have seen yet is kept as well. Without the state, nothing changes.
+   */
   async refresh(state: State): Promise<void> {
     if (!state.keys) return;
+    const asked = Date.now();
     const shared = await state.keys(this.keys.map((key) => key.id));
-    shared.forEach(({ bad, coolUntil }, i) => {
-      this.keys[i].bad ||= bad;
-      this.keys[i].coolUntil = Math.max(this.keys[i].coolUntil, coolUntil);
+    shared?.forEach(({ bad, coolUntil }, i) => {
+      const key = this.keys[i];
+      const fresh = key.marking > 0 || key.markedAt >= asked;
+      key.bad = bad || (fresh && key.bad);
+      key.coolUntil = fresh ? Math.max(key.coolUntil, coolUntil) : coolUntil;
+    });
+  }
+
+  /** Marks `key` refused or resting until a time, here and in the state for the other gateways. */
+  mark(state: State, key: Key, mark: "bad" | number): void {
+    if (mark === "bad") key.bad = true;
+    else key.coolUntil = mark;
+    if (!state.markKey) return;
+    key.marking++;
+    void state.markKey(key.id, mark).finally(() => {
+      key.marking--;
+      key.markedAt = Date.now();
     });
   }
 
@@ -269,7 +291,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   const secret = env.JIG_GATEWAY_SECRET!;
   const base = new URL(config.upstream.baseUrl);
   const keyId = (value: string) => createHash("sha256").update(value).digest("hex").slice(0, 16);
-  const pool = new KeyPool(config.upstream.keyEnv.map((name) => ({ name, value: env[name]!, id: keyId(env[name]!), bad: false, coolUntil: 0 })));
+  const pool = new KeyPool(config.upstream.keyEnv.map((name) => ({ name, value: env[name]!, id: keyId(env[name]!), bad: false, coolUntil: 0, marking: 0, markedAt: 0 })));
   const metrics = new Metrics();
   metrics.add("jig_gateway_state_errors_total", {}, 0);
   const state: State = config.state
@@ -344,14 +366,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       const status = reply.statusCode ?? 502;
       const refused = status === 401 || status === 403;
       if (refused || status >= 500) metrics.add("jig_gateway_upstream_errors_total", { status: String(status) });
-      if (refused) {
-        key.bad = true;
-        void state.markKey?.(key.id, "bad");
-      }
-      if (status === 429) {
-        key.coolUntil = Date.now() + retryAfterMs(reply.headers["retry-after"]);
-        void state.markKey?.(key.id, key.coolUntil);
-      }
+      if (refused) pool.mark(state, key, "bad");
+      if (status === 429) pool.mark(state, key, Date.now() + retryAfterMs(reply.headers["retry-after"]));
       if (refused || status === 429) {
         if (pool.take(tried, true)) {
           reply.resume();

@@ -48,8 +48,11 @@ export interface State {
   spent(tenant: string, task: string): Promise<Spent | undefined>;
   /** What `tenant` spent on a UTC day (YYYY-MM-DD), for quotas and billing to read. */
   spentOn(tenant: string, day: string): Promise<Spent | undefined>;
-  /** The keys' standing, shared with other gateways; one process needs none beyond its own. */
-  keys?(ids: string[]): Promise<KeyState[]>;
+  /**
+   * The keys' standing, shared with other gateways; undefined when it can't be read. One process needs none
+   * beyond its own.
+   */
+  keys?(ids: string[]): Promise<KeyState[] | undefined>;
   markKey?(id: string, state: "bad" | number): Promise<void>;
   close(): void;
 }
@@ -261,11 +264,20 @@ end
 redis.call('HSET', KEYS[1], 'budgetUsd', ARGV[9])
 return 0`);
 
-/** KEYS: the keys' hash. ARGV: the key's hash, 'bad' or the time it rests until. A bad key stays bad. */
-const MARK_KEY = redisScript(`local was = redis.call('HGET', KEYS[1], ARGV[1])
-if was ~= 'bad' and (ARGV[2] == 'bad' or not was or tonumber(was) < tonumber(ARGV[2])) then redis.call('HSET', KEYS[1], ARGV[1], ARGV[2]) end
--- Remembered for a day after the last mark: a key an operator put right is tried again by then.
-redis.call('EXPIRE', KEYS[1], 86400)
+/** How long a refused key's mark is kept after it was last refused: a key an operator put right is tried again by then. */
+const BAD_KEY_SECONDS = 86_400;
+
+/**
+ * KEYS: the key's mark. ARGV: 'bad' or the time it rests until, then the milliseconds until that time.
+ * Each key's mark expires on its own: a refused one a day after it was last refused, a resting one when
+ * its rest is over. A rest doesn't undo a refusal.
+ */
+const MARK_KEY = redisScript(`if ARGV[1] == 'bad' then
+  redis.call('SET', KEYS[1], 'bad', 'EX', ${BAD_KEY_SECONDS})
+  return 0
+end
+local was = redis.call('GET', KEYS[1])
+if was ~= 'bad' and (not was or tonumber(was) < tonumber(ARGV[1])) then redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2]) end
 return 0`);
 
 export interface RedisStateOptions {
@@ -339,12 +351,13 @@ export class RedisState implements State {
   }
 
   async keys(ids: string[]): Promise<KeyState[]> {
-    const states = (await this.redis.command(["HMGET", this.key("keys"), ...ids])) as RedisReply[];
+    const states = (await this.redis.command(["MGET", ...ids.map((id) => this.key("key", id))])) as RedisReply[];
     return states.map((state) => ({ bad: state === "bad", coolUntil: state === "bad" ? 0 : Number(state ?? 0) }));
   }
 
   async markKey(id: string, state: "bad" | number): Promise<void> {
-    await this.redis.eval(MARK_KEY, [this.key("keys")], [id, state === "bad" ? state : Math.ceil(state)]);
+    const args = state === "bad" ? [state, 0] : [Math.ceil(state), Math.max(1, Math.ceil(state - Date.now()))];
+    await this.redis.eval(MARK_KEY, [this.key("key", id)], args);
   }
 
   close(): void {
@@ -456,12 +469,12 @@ export class SharedState implements State {
 
   // A key's standing is worth sharing but never worth refusing a request for: without Redis, the gateway
   // goes by what this replica knows.
-  async keys(ids: string[]): Promise<KeyState[]> {
+  async keys(ids: string[]): Promise<KeyState[] | undefined> {
     try {
       return await this.redis.keys(ids);
     } catch (err) {
       this.onError(err as Error);
-      return ids.map(() => ({ bad: false, coolUntil: 0 }));
+      return undefined;
     }
   }
 

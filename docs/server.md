@@ -288,9 +288,10 @@ queue that serves the tenants in turn, a request of each, so a tenant with a tho
 delays another tenant's request by one slot at most. After `maxWaitMs` (30 seconds by default) it gets 429
 with `retry-after`, and jig's SDK waits that long and tries again, twice at most.
 
-**Keys.** The pool's keys are used in turn. A key the provider refuses (401 or 403) is never used again,
-and one it rate-limits (429) rests for the reply's `retry-after` (30 seconds without one); either way the
-request goes again with another usable key, once each. With none left the provider's 429 goes back to jig
+**Keys.** The pool's keys are used in turn. A key the provider refuses (401 or 403) is not used again
+until a restart (with `state`, below, until its mark in Redis is gone), and one it rate-limits (429)
+rests for the reply's `retry-after` (30 seconds without one); either way the request goes again with
+another usable key, once each. With none left the provider's 429 goes back to jig
 as it came, and while every key rests the gateway answers 429 itself: it doesn't retry on its own, so a
 rate limit doesn't become a storm. Server errors go back as they came, and jig's SDK retries them.
 
@@ -321,8 +322,13 @@ on, so the slots of a replica that died come back within `leaseMs` (60 seconds).
 tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
 the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
 week after its token expires, a tenant's day for 35 days; a key the provider refused or rate-limited is
-passed over by every replica (Redis has its SHA-256, never the key), a refused one for a day after it was
-last refused. `prefix` (`jig:gw:`) starts every key, so gateways of different setups can share a Redis.
+passed over by every replica (Redis has its SHA-256, never the key), a rate-limited one until its rest is
+over, and a refused one for a day after it was last refused, restarts or not. Each key's mark is its own
+Redis key, `<prefix>key:<id>`, `id` being the first 16 hex digits of the key's SHA-256. To have the
+replicas try a key you put right before the day is over, delete its mark:
+`redis-cli DEL "jig:gw:key:$(printf %s "$KEY" | sha256sum | cut -c1-16)"`. A replaced key has another
+hash, so it is used at once. `prefix` (`jig:gw:`) starts every key, so gateways of different setups can
+share a Redis.
 
 When Redis can't be reached (a command waits 2 seconds at most), `onStateError` says what happens:
 `closed`, the default, answers each request 503 with `retry-after: 1` (jig's SDK tries again), and the

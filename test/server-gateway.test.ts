@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders, type ServerResponse } from "node:http";
 import { type AddressInfo, connect, createServer as createTcpServer, type Server, type Socket } from "node:net";
@@ -486,15 +486,28 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
   it("gets back the slot of a gateway that died with it when its lease ends, and renews a live one's", async () => {
     const provider = await fakeProvider();
     const state = { redis: REDIS!, prefix: prefix(), leaseMs: 300 };
-    const limits = { tenantDefaults: { concurrent: 1 } };
-    // A replica took the tenant's one slot and died without giving it back.
+    // Of the tenant's two slots, a replica took one and died without giving it back, and a live one holds
+    // the other, renewing it, so the tenant's leases never go idle long enough to expire as a whole.
+    const two = { tenant: { concurrent: 2 }, global: {} };
     const crashed = new RedisState(REDIS!, { prefix: state.prefix, leaseMs: 300 });
-    assert.equal(await crashed.admit("acme", "crashed", { tenant: limits.tenantDefaults, global: {} }), 0);
+    assert.equal(await crashed.admit("acme", "crashed", two), 0);
     crashed.close();
-    const gw = await gateway(provider.url, { state, limits });
+    const live = new RedisState(REDIS!, { prefix: state.prefix, leaseMs: 300 });
+    closing.push(() => live.close());
+    assert.equal(await live.admit("acme", "live", two), 0);
+    const renewing = setInterval(() => void live.renew("acme", "live"), 100);
+    closing.push(() => clearInterval(renewing));
+    const gw = await gateway(provider.url, { state, limits: { maxWaitMs: 3000, tenantDefaults: two.tenant } });
     const start = Date.now();
     assert.equal((await ask(gw, token())).status, 200);
     assert.ok(Date.now() - start >= 200, `it waited for the lease to end (${Date.now() - start} ms)`);
+    const redis = new Redis(REDIS!);
+    closing.push(() => redis.close());
+    assert.deepEqual(await redis.command(["ZRANGE", `${state.prefix}inflight:acme`, 0, -1]), ["live"], "only the live lease is left");
+    clearInterval(renewing);
+    await live.release("acme", "live");
+
+    const limits = { tenantDefaults: { concurrent: 1 } };
 
     // A reply that streams for three leases keeps its slot all along.
     let finish!: () => void;
@@ -529,8 +542,47 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     assert.deepEqual(provider.seen.map((s) => s.headers["x-api-key"]), ["pool-key-1", "pool-key-2", "pool-key-2"]);
     const redis = new Redis(REDIS!);
     closing.push(() => redis.close());
-    const stored = JSON.stringify(await redis.command(["HGETALL", `${state.prefix}keys`]));
+    const names = (await redis.command(["KEYS", `${state.prefix}key:*`])) as string[];
+    const stored = JSON.stringify([names, await redis.command(["MGET", ...names])]);
+    assert.equal(names.length, 1);
     assert.ok(!stored.includes("pool-key"), `no key in Redis: ${stored}`);
+    // A resting key's mark goes when its rest is over.
+    const ttl = Number(await redis.command(["PTTL", names[0]]));
+    assert.ok(ttl > 50_000 && ttl <= 60_000, `it expires with the rest: ${ttl} ms`);
+  });
+
+  it("keeps each key's mark for itself: a refused one for a day, and then, or once removed, it is tried again", async () => {
+    const marks = prefix();
+    const shared = new RedisState(REDIS!, { prefix: marks });
+    closing.push(() => shared.close());
+    const redis = new Redis(REDIS!);
+    closing.push(() => redis.close());
+    // A refused key's mark keeps its own day, whatever other keys go through.
+    await shared.markKey("k1", "bad");
+    assert.ok(Number(await redis.command(["TTL", `${marks}key:k1`])) > 86_000);
+    await redis.command(["EXPIRE", `${marks}key:k1`, 5]); // as if the day were nearly over
+    await shared.markKey("k2", Date.now() + 60_000);
+    await shared.markKey("k1", Date.now() + 60_000); // a rest doesn't undo a refusal, nor extend it
+    assert.ok(Number(await redis.command(["TTL", `${marks}key:k1`])) <= 5);
+    assert.deepEqual((await shared.keys(["k1", "k3"])).map((key) => key.bad), [true, false]);
+
+    // A gateway that saw the provider refuse a key tries it again once its mark is gone.
+    let refuse = true;
+    const provider = await fakeProvider((seen, res) => {
+      if (seen.headers["x-api-key"] === "pool-key-1" && refuse) return void res.writeHead(403).end();
+      streamed(res);
+    });
+    const state = { redis: REDIS!, prefix: prefix() };
+    const gw = await gateway(provider.url, { state, upstream: { baseUrl: provider.url, keyEnv: ["POOL_KEY_1", "POOL_KEY_2"] } });
+    for (let i = 0; i < 2; i++) assert.equal((await ask(gw, token())).status, 200);
+    assert.deepEqual(provider.seen.map((s) => s.headers["x-api-key"]), ["pool-key-1", "pool-key-2", "pool-key-2"]);
+    // The operator put the key right and removed its mark, by the first 16 hex digits of its SHA-256.
+    refuse = false;
+    const id = createHash("sha256").update("pool-key-1").digest("hex").slice(0, 16);
+    assert.equal(await redis.command(["DEL", `${state.prefix}key:${id}`]), 1);
+    provider.seen.length = 0;
+    for (let i = 0; i < 2; i++) assert.equal((await ask(gw, token())).status, 200);
+    assert.deepEqual(provider.seen.map((s) => s.headers["x-api-key"]), ["pool-key-1", "pool-key-2"]);
   });
 
   it("answers 503 when Redis goes away mid-run, or goes on alone, and comes back with it", async () => {
