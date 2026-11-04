@@ -264,9 +264,12 @@ export class Scheduler {
         const approval = request && (await this.store.addApproval(task.id, request));
         await this.store.addEvent(task.id, kept.seq, kept);
         stored++;
-        // jig's own word on how it was answered is the record.
+        // jig's own word on how it was answered is the record, but for an answer by the API it never gave:
+        // a run's commands may write its events (on Docker and Kubernetes), so that one is only logged.
         const answered = approvalAnswer(kept);
-        if (answered) await this.store.recordApproval(task.id, answered.id, answered.answer);
+        if (answered && !(await this.store.recordApproval(task.id, answered.id, answered.answer)) && answered.answer.by === "api") {
+          console.error(`jig service: ${task.id}'s run says the API answered ${answered.id} with ${answered.answer.decision}${answered.answer.always ? " always" : ""}, which it didn't: left out of the record`);
+        }
         this.updates.emit(task.id, { event: kept } satisfies Update);
         if (approval) this.onApproval?.(task, approval);
       }

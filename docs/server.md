@@ -173,7 +173,10 @@ has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer 
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
 `timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
-it times out as a deny.
+it times out as a deny. The answer jig is given is always the API's, though: on Docker and Kubernetes a
+task's commands can write its events, so the record of how jig acted is only as good as they are. An
+`approval` event that says the API answered when it didn't, or answered otherwise, is left out of the
+record (and logged), and a timeout is only ever a deny.
 
 jig waits on a second listener, `internal` (`{"host", "port"}`, 127.0.0.1:8082 by default), which serves
 only `GET /internal/approvals/<id>?wait=<seconds>` and `GET /healthz`. Its Bearer is the task's gateway

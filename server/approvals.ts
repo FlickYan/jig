@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { JigEvent } from "./runner.ts";
-import type { Answer, Approval, ApprovalMode, ApprovalRequest, Store, Task } from "./store.ts";
+import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task } from "./store.ts";
 import { verifyToken } from "./token.ts";
 
 // Approvals over the API (docs/server.md, the approval contract). A task with approvals runs its jig with
@@ -11,6 +11,8 @@ import { verifyToken } from "./token.ts";
 // approval_request event and long-polls the service's internal listener for the answer, with its gateway
 // token. The approval exists once that event is stored; the tenant answers it through the API, and jig's
 // own approval event, which says how it was answered in the end (by the API, or its timeout), is the record.
+// jig is only ever given the API's answer, though, and an event that says the API answered is kept only if
+// it gave that answer: on Docker and Kubernetes a run's commands can write its events.
 
 /** jig's --mode values but auto, which never asks. */
 export const APPROVAL_MODES: ApprovalMode[] = ["plan", "ask", "edits"];
@@ -30,6 +32,8 @@ export function approvalRequest(event: JigEvent): ApprovalRequest | undefined {
 export function approvalAnswer(event: JigEvent): { id: string; answer: Answer } | undefined {
   const { id, decision, always, by } = event;
   if (event.type !== "approval" || typeof id !== "string" || (decision !== "allow" && decision !== "deny") || (by !== "api" && by !== "timeout")) return undefined;
+  // A timeout is a deny: an event that says otherwise isn't one jig would write.
+  if (by === "timeout" && decision !== "deny") return undefined;
   return { id, answer: { decision, always: always === true, by } };
 }
 
@@ -53,8 +57,8 @@ export class Answers {
     this.local.emit("approval", task, id);
   }
 
-  /** The approval once it has an answer, or as it is after `ms`; undefined once `signal` aborts. */
-  wait(task: string, id: string, ms: number, signal: AbortSignal): Promise<Approval | undefined> {
+  /** The answer jig is given (Store.given) once there is one; undefined if there is none after `ms`, or once `signal` aborts. */
+  wait(task: string, id: string, ms: number, signal: AbortSignal): Promise<Given | undefined> {
     const waiting = this.waitFor(task, id, ms, AbortSignal.any([signal, this.closing.signal]));
     this.waits.add(waiting);
     return waiting.finally(() => this.waits.delete(waiting));
@@ -66,7 +70,7 @@ export class Answers {
     await Promise.all(this.waits);
   }
 
-  private async waitFor(task: string, id: string, ms: number, signal: AbortSignal): Promise<Approval | undefined> {
+  private async waitFor(task: string, id: string, ms: number, signal: AbortSignal): Promise<Given | undefined> {
     const deadline = Date.now() + ms;
     let changed = false;
     let wake: (() => void) | undefined;
@@ -84,9 +88,9 @@ export class Answers {
       for (;;) {
         changed = false;
         if (signal.aborted) return undefined;
-        const approval = await this.store.approval(task, id);
+        const given = await this.store.given(task, id);
         const left = deadline - Date.now();
-        if (approval?.decision || left <= 0) return approval;
+        if (given || left <= 0) return given;
         if (changed) continue;
         await new Promise<void>((done) => {
           const timer = setTimeout(done, this.store.live ? left : Math.min(left, 1000));
@@ -109,7 +113,8 @@ export class Answers {
 /**
  * The internal listener, which only tasks reach: GET /internal/approvals/<id>?wait=<seconds> with the task's
  * gateway token as its Bearer long-polls (up to MAX_WAIT seconds) for the answer to that approval of the
- * token's task: 200 {decision, always}, or 204 while there is none. And GET /healthz.
+ * token's task: 200 {decision, always}, or 204 while there is none. The answer is the API's (or a deny once
+ * jig's timeout is recorded), never what the run's own events say. And GET /healthz.
  */
 export async function handleInternal(req: IncomingMessage, res: ServerResponse, { store, answers, secret }: { store: Store; answers: Answers; secret: string }): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
@@ -127,9 +132,9 @@ export async function handleInternal(req: IncomingMessage, res: ServerResponse, 
   // A jig that stops waiting (its time limit, an interrupt) lets go of the request: so does the wait.
   const gone = new AbortController();
   res.on("close", () => gone.abort());
-  const approval = await answers.wait(task.id, match[1], Math.min(wait, MAX_WAIT) * 1000, gone.signal);
+  const given = await answers.wait(task.id, match[1], Math.min(wait, MAX_WAIT) * 1000, gone.signal);
   if (res.destroyed) return;
-  if (approval?.decision) return reply(res, 200, { decision: approval.decision, always: approval.always ?? false });
+  if (given) return reply(res, 200, given);
   res.writeHead(204).end();
 }
 

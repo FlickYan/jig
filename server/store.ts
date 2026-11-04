@@ -107,6 +107,12 @@ export interface Answer {
   by: "api" | "timeout";
 }
 
+/** The answer jig is given at the internal listener: {decision, always}. */
+export interface Given {
+  decision: Decision;
+  always: boolean;
+}
+
 /** An approval, with its answer once it has one. */
 export interface Approval extends ApprovalRequest {
   requestedAt: string;
@@ -187,8 +193,13 @@ export interface Store {
   approvals(task: string): Promise<Approval[]>;
   /** Answers an approval that has no answer yet: the approval, or undefined if there is no such one. */
   decideApproval(task: string, id: string, answer: Answer): Promise<Approval | undefined>;
-  /** Keeps jig's own record of an approval's answer (its approval event), in place of any other. */
-  recordApproval(task: string, id: string, answer: Answer): Promise<void>;
+  /**
+   * Keeps jig's own record of an approval's answer (its approval event), in place of any other: a timeout,
+   * or an answer by the API that is the one the API gave. False if it isn't kept.
+   */
+  recordApproval(task: string, id: string, answer: Answer): Promise<boolean>;
+  /** The answer jig is given: the API's, or a deny once jig's timeout is recorded; undefined while there is none. */
+  given(task: string, id: string): Promise<Given | undefined>;
   /** How many of each task's approvals have no answer yet; a task with none is left out. */
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
   /** What other replicas did, as it happens; a store that can't hear it never emits. */
@@ -220,10 +231,13 @@ const MIGRATIONS = [
   `ALTER TABLE tasks ADD COLUMN owner TEXT;
    ALTER TABLE tasks ADD COLUMN lease_until TEXT;
    ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0;`,
-  // The approvals a task's jig asked for, and their answers.
+  // The approvals a task's jig asked for, and their answers: the API's (api_*), which only an answer
+  // through the API sets and jig is given, and the record (decision to decided_at), which jig's own
+  // approval event replaces.
   `CREATE TABLE approvals (
      task TEXT NOT NULL REFERENCES tasks (id), id TEXT NOT NULL, step INTEGER, tool TEXT NOT NULL, description TEXT NOT NULL,
-     requested_at TEXT NOT NULL, decision TEXT, always INTEGER, decided_by TEXT, decided_at TEXT, PRIMARY KEY (task, id));`,
+     requested_at TEXT NOT NULL, api_decision TEXT, api_always INTEGER, api_at TEXT,
+     decision TEXT, always INTEGER, decided_by TEXT, decided_at TEXT, PRIMARY KEY (task, id));`,
 ];
 
 type Row = Record<string, unknown>;
@@ -416,16 +430,27 @@ class SqliteStore implements Store {
 
   async decideApproval(task: string, id: string, { decision, always, by }: Answer): Promise<Approval | undefined> {
     const row = this.db
-      .prepare("UPDATE approvals SET decision = ?, always = ?, decided_by = ?, decided_at = ? WHERE task = ? AND id = ? AND decision IS NULL RETURNING *")
+      .prepare(
+        "UPDATE approvals SET api_decision = ?1, api_always = ?2, api_at = ?4, decision = ?1, always = ?2, decided_by = ?3, decided_at = ?4 WHERE task = ?5 AND id = ?6 AND decision IS NULL RETURNING *",
+      )
       .get(decision, Number(always), by, new Date().toISOString(), task, id) as Row | undefined;
     return row && toApproval(row);
   }
 
-  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<void> {
-    // jig confirming the API's answer leaves the time it was given; a timeout is decided now.
-    this.db
-      .prepare("UPDATE approvals SET decision = ?, always = ?, decided_by = ?, decided_at = CASE WHEN decided_at IS NOT NULL AND ? = 'api' THEN decided_at ELSE ? END WHERE task = ? AND id = ?")
-      .run(decision, Number(always), by, by, new Date().toISOString(), task, id);
+  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<boolean> {
+    // A timeout is decided now. An answer by the API is kept only as the API gave it (always may be
+    // dropped, as jig drops it from a deny), and with the time it was given.
+    const { changes } =
+      by === "timeout"
+        ? this.db.prepare("UPDATE approvals SET decision = 'deny', always = 0, decided_by = 'timeout', decided_at = ? WHERE task = ? AND id = ?").run(new Date().toISOString(), task, id)
+        : this.db
+            .prepare("UPDATE approvals SET decision = ?1, always = ?2, decided_by = 'api', decided_at = api_at WHERE task = ?3 AND id = ?4 AND api_decision = ?1 AND (?2 = 0 OR api_always = 1)")
+            .run(decision, Number(always), task, id);
+    return Number(changes) > 0;
+  }
+
+  async given(task: string, id: string): Promise<Given | undefined> {
+    return toGiven(this.db.prepare("SELECT api_decision, api_always, decided_by FROM approvals WHERE task = ? AND id = ?").get(task, id) as Row | undefined);
   }
 
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
@@ -472,6 +497,15 @@ export function toApproval(row: Row): Approval {
       decidedAt: time(row.decided_at)!,
     }),
   };
+}
+
+/** The answer jig is given, from an approval's row in either store (see Store.given). */
+export function toGiven(row: Row | undefined): Given | undefined {
+  if (!row) return undefined;
+  if (row.api_decision !== null) return { decision: row.api_decision as Decision, always: Boolean(row.api_always) };
+  // jig's timeout stands for a deny, whatever its event said.
+  if (row.decided_by === "timeout") return { decision: "deny", always: false };
+  return undefined;
 }
 
 /** A task from its row, in either store. */

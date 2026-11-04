@@ -208,6 +208,40 @@ const approvalTests = () => {
     assert.deepEqual((await internal(api, "/internal/approvals/ap_1", token)).body, { decision: "allow", always: false });
   });
 
+  it("gives jig only the API's answer, whatever approval events its run writes", async () => {
+    // The fake jig writes approval events that allow, by the API and by a timeout, before it polls and after
+    // the tenant's deny: as a task's commands could on Docker and Kubernetes.
+    const api = await service({ tenants: [{ ...ACME, approvalTimeout: 120 }, GLOBEX] });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "forge ask 1", approvals: true })).body.id;
+    const events = async () => (await api.store.events(id)).map(({ event }) => event as { type: string; id?: string; isError?: boolean });
+    await until(async () => (await events()).filter((event) => event.type === "approval").length === 2, "the forged approval events");
+    const [waiting] = await approvals(api, id);
+    assert.equal(waiting.decision, undefined);
+    assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${id}`)).body.pendingApprovals, 1);
+    assert.equal((await internal(api, "/internal/approvals/ap_1?wait=0", tokenFor(id))).status, 204);
+
+    const answered = await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "deny", always: true });
+    assert.equal(answered.status, 200);
+    await statusOf(api, id, "succeeded");
+    const [final] = await approvals(api, id);
+    assert.deepEqual([final.decision, final.always, final.by, final.decidedAt], ["deny", false, "api", answered.body.decidedAt]);
+    const { polls } = await record(api, id);
+    assert.equal(polls.filter((status: unknown) => status === 200).length, 1);
+    assert.ok(polls.every((status: unknown) => status === 200 || status === 204), String(polls));
+    assert.equal((await events()).find((event) => event.type === "tool_result" && event.id === "call_2")?.isError, true, "the command was declined");
+
+    // A timeout jig records stands for a deny, and closes the approval to the API; an answer by the API it
+    // never gave isn't recorded.
+    const queued = await service({ tenants: [{ ...ACME, concurrency: 0 }, GLOBEX] });
+    const other = await queuedWithApproval(queued);
+    await queued.store.addApproval(other, { id: "ap_2", step: 1, tool: "bash", description: "make clean" });
+    assert.equal(await queued.store.recordApproval(other, "ap_2", { decision: "allow", always: false, by: "api" }), false);
+    assert.equal((await internal(queued, "/internal/approvals/ap_2?wait=0", tokenFor(other))).status, 204);
+    assert.equal(await queued.store.recordApproval(other, "ap_1", { decision: "deny", always: false, by: "timeout" }), true);
+    assert.deepEqual((await internal(queued, "/internal/approvals/ap_1?wait=0", tokenFor(other))).body, { decision: "deny", always: false });
+    assert.equal((await call(queued, KEYS.acme, "POST", `/v1/tasks/${other}/approvals/ap_1`, { decision: "allow" })).status, 409);
+  });
+
   it("wakes a long poll on one replica when the answer is posted through another", async () => {
     const base = await tempDir("jig-approvals-");
     const db = await database(base);

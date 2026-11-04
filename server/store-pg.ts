@@ -6,6 +6,7 @@ import {
   type ApprovalRequest,
   type ClaimTerms,
   type Changes,
+  type Given,
   json,
   newTaskId,
   type Outcome,
@@ -16,6 +17,7 @@ import {
   type TaskStatus,
   type Tenant,
   toApproval,
+  toGiven,
   toTask,
 } from "./store.ts";
 
@@ -47,10 +49,13 @@ const MIGRATIONS = [
    CREATE INDEX tasks_queue ON tasks (tenant, status, n);
    CREATE INDEX tasks_by_status ON tasks (status);
    CREATE TABLE events (task text NOT NULL REFERENCES tasks (id), seq integer NOT NULL, json text NOT NULL, PRIMARY KEY (task, seq));`,
-  // The approvals a task's jig asked for, and their answers.
+  // The approvals a task's jig asked for, and their answers: the API's (api_*), which only an answer
+  // through the API sets and jig is given, and the record (decision to decided_at), which jig's own
+  // approval event replaces.
   `CREATE TABLE approvals (
      n bigserial UNIQUE, task text NOT NULL REFERENCES tasks (id), id text NOT NULL, step integer, tool text NOT NULL, description text NOT NULL,
-     requested_at timestamptz NOT NULL, decision text, always boolean, decided_by text, decided_at timestamptz, PRIMARY KEY (task, id));`,
+     requested_at timestamptz NOT NULL, api_decision text, api_always boolean, api_at timestamptz,
+     decision text, always boolean, decided_by text, decided_at timestamptz, PRIMARY KEY (task, id));`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -256,7 +261,8 @@ export class PostgresStore implements Store {
     // Announced, so a replica whose jig is waiting for it hears it at once.
     const [row] = (
       await this.pool.query(
-        `WITH decided AS (UPDATE approvals SET decision = $3, always = $4, decided_by = $5, decided_at = now() WHERE task = $1 AND id = $2 AND decision IS NULL RETURNING *)
+        `WITH decided AS (UPDATE approvals SET api_decision = $3, api_always = $4, api_at = now(), decision = $3, always = $4, decided_by = $5, decided_at = now()
+           WHERE task = $1 AND id = $2 AND decision IS NULL RETURNING *)
          SELECT *, pg_notify('${APPROVALS}', json_build_object('task', task, 'id', id)::text) FROM decided`,
         [task, id, decision, always, by],
       )
@@ -264,12 +270,20 @@ export class PostgresStore implements Store {
     return row && toApproval(row);
   }
 
-  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<void> {
-    // jig confirming the API's answer leaves the time it was given; a timeout is decided now.
-    await this.pool.query(
-      "UPDATE approvals SET decision = $3, always = $4, decided_by = $5, decided_at = CASE WHEN decided_at IS NOT NULL AND $5 = 'api' THEN decided_at ELSE now() END WHERE task = $1 AND id = $2",
-      [task, id, decision, always, by],
-    );
+  async recordApproval(task: string, id: string, { decision, always, by }: Answer): Promise<boolean> {
+    // As in SQLite's: a timeout is decided now, an answer by the API kept only as the API gave it.
+    const { rowCount } =
+      by === "timeout"
+        ? await this.pool.query("UPDATE approvals SET decision = 'deny', always = false, decided_by = 'timeout', decided_at = now() WHERE task = $1 AND id = $2", [task, id])
+        : await this.pool.query(
+            "UPDATE approvals SET decision = $3, always = $4, decided_by = 'api', decided_at = api_at WHERE task = $1 AND id = $2 AND api_decision = $3 AND (NOT $4 OR api_always)",
+            [task, id, decision, always],
+          );
+    return rowCount > 0;
+  }
+
+  async given(task: string, id: string): Promise<Given | undefined> {
+    return toGiven((await this.pool.query("SELECT api_decision, api_always, decided_by FROM approvals WHERE task = $1 AND id = $2", [task, id])).rows[0]);
   }
 
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
