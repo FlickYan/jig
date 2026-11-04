@@ -302,6 +302,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(VERSION);
     return;
   }
+  // With --events -, stdout is for the events alone, so what jig says goes to stderr from here on: its
+  // refusals of bad arguments too.
+  if (values.events === "-") ui.toStderr();
   const cwd = resolve(values.cwd);
   if (values.sessions) return listSessions(cwd);
   const given = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
@@ -333,7 +336,6 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (values.events !== undefined) {
     if (!taskText || skillsVerb || memoryVerb) throw new Error('--events is for a task given on the command line or stdin: jig --events <file> "task".');
     events = new Events(values.events === "-" ? "-" : resolve(values.events), model);
-    if (values.events === "-") ui.toStderr();
     ui.onTold((text) => events?.notice(text));
     events.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   }

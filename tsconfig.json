@@ -13,5 +13,5 @@
     "erasableSyntaxOnly": true,
     "skipLibCheck": true
   },
-  "include": ["src", "test", "server", "bench/*.ts", "bench/train/*.ts"]
+  "include": ["src", "server", "test", "bench/*.ts", "bench/train/*.ts"]
 }

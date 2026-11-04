@@ -1,0 +1,8 @@
+# gVisor for the task pods, a kernel of its own between each task and the node's: install runsc and its
+# containerd shim on the nodes, apply this, and set "runtimeClassName": "gvisor" in the config's
+# "kubernetes" block.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc

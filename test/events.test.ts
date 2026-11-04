@@ -170,6 +170,10 @@ describe("--events", () => {
       const events = parse(stdout);
       assert.deepEqual(types(events), ["start", "step", "tool_call", "tool_result", "step", "text", "end"]);
       assert.match(stderr, /● glob \*\n {2}parser\.py\nDone\.\n2 steps · /);
+      // A refusal of its arguments, before anything runs, goes to stderr too: stdout stays for events.
+      const refused = await runSplit(api, [...args, "--events", "-", "--max-steps", "0", "Fix the parser."]);
+      assert.deepEqual([refused.code, refused.stdout], [1, ""]);
+      assert.match(refused.stderr, /--max-steps must be a positive integer/);
     } finally {
       api.close();
     }
