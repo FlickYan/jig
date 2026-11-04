@@ -1,0 +1,13 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 8090 },
+  "metrics": { "host": "0.0.0.0", "port": 9090 },
+  "regions": [
+    { "name": "eu", "url": "https://jig-eu.example.com" },
+    { "name": "us", "url": "https://jig-us.example.com" }
+  ],
+  "tenants": [
+    { "id": "acme", "keys": ["<sha256 of acme's API key, in hex>"], "home": "eu" },
+    { "id": "globex", "keys": ["<sha256 of globex's API key, in hex>"], "home": "us", "allowed": ["us", "eu"], "failover": true }
+  ],
+  "health": { "intervalMs": 5000, "failures": 2 }
+}

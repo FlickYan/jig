@@ -102,10 +102,12 @@ export class PostgresStore implements Store {
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   private pool: Pool;
   private listener: Listener;
+  private region?: string;
 
-  private constructor(pool: Pool, listener: Listener) {
+  private constructor(pool: Pool, listener: Listener, region?: string) {
     this.pool = pool;
     this.listener = listener;
+    this.region = region;
     listener.on("notification", (channel: string, payload: string) => {
       let message: { task?: unknown; seq?: unknown; done?: unknown; id?: unknown };
       try {
@@ -123,15 +125,15 @@ export class PostgresStore implements Store {
     listener.on("connected", () => this.changes.emit("resync"));
   }
 
-  /** Connects, moves the schema on to this version's and starts listening. */
-  static async open(url: string): Promise<PostgresStore> {
+  /** Connects, moves the schema on to this version's and starts listening; with a region, its tasks' ids carry it. */
+  static async open(url: string, region?: string): Promise<PostgresStore> {
     let pool: Pool | undefined;
     try {
       pool = new Pool(url);
       await migrate(pool);
       const listener = pool.listen([EVENTS, CANCELS, APPROVALS]);
       await listener.ready;
-      return new PostgresStore(pool, listener);
+      return new PostgresStore(pool, listener, region);
     } catch (err) {
       await pool?.close();
       // The URL's password stays out of the message.
@@ -178,7 +180,7 @@ export class PostgresStore implements Store {
   async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
     const { prompt, ...rest } = spec;
     const insert = async (db: Client) => {
-      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(), tenant, prompt, json(rest)]);
+      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest)]);
       return toTask(rows[0]);
     };
     if (!caps) return insert(this.pool);

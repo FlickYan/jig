@@ -665,6 +665,70 @@ counts until Redis is back, so for that while each replica holds a tenant to its
 and quotas count only what went through it. Either way the gateway says so once on stderr and counts each failure in
 `jig_gateway_state_errors_total`.
 
+## Several regions
+
+One deployment is one region: tenants far from it wait on every request, its outage stops them all, and a
+tenant whose data must stay in the EU can't be sure it does. So each region runs a whole stack of its own,
+as above (the service's replicas, their Postgres, the gateway and its Redis, the runners), and a router,
+`server/router.ts`, sends each tenant's requests to the region they belong in. In front of the routers,
+which keep nothing, goes GeoDNS or a global load balancer, so a client reaches the nearest.
+
+**Regions.** A service with `"region": "eu"` (1 to 16 lowercase letters and digits) gives its new tasks
+ids that say so, `task_eu_<32 hex digits>`; one without makes `task_<32 hex digits>`, as before. Its `GET
+/healthz` is `{"ok": true, "region": "eu"}` (`null` without one), a task's view has `region`, and a task
+posted with `"region"` is made only if that is its own region: any other is 400, `this is region eu; post
+to region us's service or through the router`. What is per region stays there: the database (tasks, their
+events and approvals), the workspaces, the runners' containers and pods, and the gateway with its
+spending and limits, which may itself fail over from one provider to another. No task's data is copied to
+another region, by design: that is what keeps a tenant's data where it was put.
+
+**The router.** `node server/router.ts --config router.json` (`deploy/router.json`):
+
+```json
+{
+  "listen": { "host": "0.0.0.0", "port": 8090 },
+  "metrics": { "host": "0.0.0.0", "port": 9090 },
+  "regions": [{ "name": "eu", "url": "https://jig-eu.example.com" }, { "name": "us", "url": "https://jig-us.example.com" }],
+  "tenants": [{ "id": "acme", "keys": ["<sha256 of its key>"], "home": "eu", "allowed": ["eu", "us"], "failover": true }],
+  "health": { "intervalMs": 5000, "failures": 2 }
+}
+```
+
+`regions` are the regions' services' public URLs, each named as that service's `region`. Each tenant has
+the key hashes the regions have for it, its `home` region, the regions its tasks may be in (`allowed`, its
+home alone by default) and `failover` (false). The router maps a request's key to its tenant (401, as a
+service's, for one it doesn't know) and passes the request on, `Authorization` and all, so the region's
+service still checks the key; of what a tenant sends, it reads only a new task's `region` (in a body of
+16 MiB at most). Every answer has `x-jig-region`, the region that gave it, and `x-request-id`, the
+client's if it sent one (`^[\w.-]{1,128}$`) or a new one, which the region is sent too.
+
+- `POST /v1/tasks` goes to the spec's `region` if it names one (403 if the tenant may not use it), else to
+  the home. The body goes as it came.
+- `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
+  region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
+  of events is passed on as it comes, and a client that leaves it closes the request to the region.
+- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default). `GET /v1/usage?region=all`
+  asks every region the tenant may use and adds up their answers, the rows with the same day and model and
+  the total, with `regions`, those that answered (502 if none did); it is JSON only.
+- Anything else goes to the home.
+
+**Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails
+`failures` times in a row (no answer in 2 seconds, not 200, or another region's name) is down until it
+answers again. While a tenant's home is down, a new task that names no region goes, if the tenant has
+`failover`, to the first region in `regions` that is up and that it may use; otherwise, and for a task that
+names the region that is down, it is 503 with the region and `retry-after`. A task never fails over: it
+runs where it was made, and while its region is down it can't be read, streamed or cancelled (503), since
+its data is there alone; it is all there once the region is back. A tenant is placed by its `home`, where
+its tasks and their data go unless it asks otherwise; one whose data must stay in a region gets that
+region alone in `allowed`, and no failover.
+
+`GET /healthz` is `{"ok": true, "regions": {"eu": true, "us": false}}`. With `metrics`, a listener of its
+own (127.0.0.1 by default) serves `GET /metrics` and `GET /healthz` only: `jig_router_requests_total` by
+region (empty for the router's own answers, `all` for usage added up), route and status, `jig_router_request_seconds` (to the
+answer's headers) by region and route, `jig_router_region_up` by region, and `jig_router_failovers_total`
+by `from` and `to`. The router keeps nothing between requests, so any number of replicas can run,
+anywhere; `deploy/k8s/router.yaml` runs two.
+
 ## Deploying
 
 `deploy/` has the images and the files to run them, to adapt rather than apply as they are:
