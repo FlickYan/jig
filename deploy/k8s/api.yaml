@@ -1,24 +1,13 @@
-# The task service: one replica, as its SQLite store takes one writer, on a volume that outlives the pod.
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: jig-data
-  namespace: jig
-spec:
-  accessModes: ["ReadWriteOnce"]
-  resources:
-    requests:
-      storage: 10Gi
----
+# The task service: two replicas sharing one Postgres database, whose URL (with its password) comes from
+# the jig-database Secret, yours to make:
+#   kubectl -n jig create secret generic jig-database --from-literal=url='postgres://jig:...@postgres.example.com:5432/jig?sslmode=require'
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: jig-api
   namespace: jig
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: jig
@@ -49,6 +38,11 @@ spec:
                 secretKeyRef:
                   name: jig-secrets
                   key: gateway-secret
+            - name: JIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: jig-database
+                  key: url
           readinessProbe:
             httpGet:
               path: /healthz
@@ -70,9 +64,9 @@ spec:
         - name: config
           configMap:
             name: jig-config
+        # The Kubernetes runner keeps nothing of a task's here: the state is in the database.
         - name: data
-          persistentVolumeClaim:
-            claimName: jig-data
+          emptyDir: {}
         - name: tmp
           emptyDir: {}
 ---

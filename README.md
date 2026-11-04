@@ -637,7 +637,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/version.ts`](src/version.ts) | jig's version, read from `package.json` (`--version`, and the MCP client's name) |
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`src/events.ts`](src/events.ts) | `--events`: a task's start, steps, tool calls, text, notices and end as JSON lines, for a service that runs jig |
-| [`server/`](server) | jig as a service ([docs/server.md](docs/server.md)): the task service's HTTP API for many tenants, its SQLite store, a fair scheduler, and the runners that start jig for each task: on this machine, in a Docker container or as a Kubernetes Job |
+| [`server/`](server) | jig as a service ([docs/server.md](docs/server.md)): the task service's HTTP API for many tenants, its store (SQLite, or Postgres for several replicas, through a client of its own in `pg.ts`), a fair scheduler, and the runners that start jig for each task: on this machine, in a Docker container or as a Kubernetes Job |
 | [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits, usage and budgets |
 | [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, and Kubernetes manifests |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |

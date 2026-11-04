@@ -55,6 +55,10 @@ export class DockerRunner implements Runner {
     return join(this.config.dataDir, "tasks", id);
   }
 
+  async removeFiles(id: string): Promise<void> {
+    await rm(this.dir(id), { recursive: true, force: true });
+  }
+
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
     const { docker = ["docker"], jig = ["jig"], user = "10001:10001", graceSeconds, pollMs = 100 } = this.config;
     const dir = this.dir(task.id);

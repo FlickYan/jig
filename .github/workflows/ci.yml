@@ -32,6 +32,31 @@ jobs:
       - name: Tests (the sandbox tests run on both systems)
         run: npm test
 
+  postgres:
+    # The task service's tests on Postgres as well as SQLite: they skip that half without
+    # JIG_TEST_POSTGRES_URL, which here names a Postgres of the job's own.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jig
+          POSTGRES_PASSWORD: jigtest
+          POSTGRES_DB: jig
+        ports:
+          - 5432:5432
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      JIG_TEST_POSTGRES_URL: postgres://jig:jigtest@127.0.0.1:5432/jig
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node --test test/server-*.test.ts
+
   benchmark-tasks:
     # Every task must be solvable (the reference solutions pass) and not already solved (doing nothing
     # fails). No model is called.

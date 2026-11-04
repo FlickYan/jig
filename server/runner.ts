@@ -35,6 +35,8 @@ export interface RunHandle {
 
 export interface Runner {
   start(task: Task, tenant: Tenant): Promise<RunHandle>;
+  /** Removes what a task's run left on this machine (its folder), once the run has ended. */
+  removeFiles?(id: string): Promise<void>;
 }
 
 /** A gateway token's payload (the token contract). */

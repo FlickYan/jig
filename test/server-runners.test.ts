@@ -42,11 +42,11 @@ afterEach(async () => {
   await removeTempDirs();
 });
 
-/** The service with the given runner and one tenant, acme, with its key. */
+/** The service with the given runner and one tenant, acme, with its key. It keeps the task folders, which the tests look in. */
 async function service(runner: Runner): Promise<Service> {
   const base = await tempDir("jig-runners-");
   const started = await startService(
-    { port: 0, database: join(base, "jig.db"), dataDir: join(base, "data"), gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
+    { port: 0, database: join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
     { secret: SECRET, runner },
   );
   services.push(started);
@@ -662,6 +662,14 @@ describe("the deploy files", () => {
     assert.equal(config.gatewayBaseUrl, `http://jig-gateway.jig.svc:${find(all, "Service", "jig-gateway").spec.ports[0].port}/anthropic`);
     // Secrets are referenced, never included.
     assert.ok(!all.some((doc) => doc.kind === "Secret"));
+
+    // Two replicas of the service, sharing the database the jig-database Secret names.
+    const api = find(all, "Deployment", "jig-api").spec;
+    assert.equal(api.replicas, 2);
+    assert.equal(config.database, undefined);
+    const env = api.template.spec.containers[0].env.find((variable: { name: string }) => variable.name === "JIG_DATABASE_URL");
+    assert.deepEqual(env.valueFrom, { secretKeyRef: { name: "jig-database", key: "url" } });
+    assert.ok(!all.some((doc) => doc.kind === "PersistentVolumeClaim"), "the replicas share no disk");
   });
 
   it("put the gateway on the tasks' internal network on one machine, and the worker image runs jig as the runners' user", async () => {

@@ -43,6 +43,10 @@ export class LocalRunner implements Runner {
     return join(this.config.dataDir, "tasks", id);
   }
 
+  async removeFiles(id: string): Promise<void> {
+    await rm(this.dir(id), { recursive: true, force: true });
+  }
+
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
     const { graceSeconds, pollMs = 100 } = this.config;
     const dir = this.dir(task.id);

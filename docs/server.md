@@ -13,8 +13,9 @@ modules, and it isn't part of the npm package.
 
 ## The task service
 
-`server/api.ts` is the API, `server/store.ts` the state (tenants, tasks and their events, in SQLite through
-`node:sqlite`, in WAL mode, the schema moved on by `PRAGMA user_version`), `server/scheduler.ts` starts
+`server/api.ts` is the API, `server/store.ts` the state (tenants, tasks and their events: in SQLite through
+`node:sqlite`, in WAL mode, the schema moved on by `PRAGMA user_version`, or in Postgres, below),
+`server/scheduler.ts` starts
 queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, tenant)` gives a handle with
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
@@ -49,7 +50,12 @@ key: `printf %s "$KEY" | sha256sum` gives it. A tenant taken out of the config i
 start: its keys stop working, and its queued tasks are cancelled. Also: `graceSeconds` (30), `jig` (the
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
 (`["https"]`), `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
-`docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block.
+`docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
+the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
+event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
+`keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
+service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type) is
+refused at the start, with the field and what is wrong with it.
 
 ### The API
 
@@ -65,7 +71,10 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
   -d '{"prompt": "...", "workspace": {"git": "https://github.com/owner/repo", "ref": "main"}, "maxSteps": 30}'
 
 curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost and stats
-curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY" # the tenant's latest 100, newest first
+# The tenant's latest 100 (or ?limit=), newest first, without their prompts unless ?full=1; with "next"
+# when the page is full, the id that ?before= takes for the page after it.
+curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
+curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8080/v1/tasks/$ID/cancel -H "Authorization: Bearer $KEY"
 
 # Its events (jig's --events lines) as server-sent events, each one's id its seq: those so far, the rest
@@ -103,17 +112,47 @@ The scheduler starts queued tasks while fewer than `concurrency` run in all and 
 slot: a tenant that queues a thousand tasks takes one slot at a time like the others, and doesn't hold back
 another's one. It reads only the next task of the tenant whose turn it is, never the whole queue, so a long
 queue doesn't slow the service. A task is claimed in the store (`queued` to `running`) before it starts, so
-it never runs twice. When the service starts, tasks the last run of it left `running` (it crashed, or was
-killed) are marked `error`, not run again, since their workspace is half changed; what was still queued
-runs. A SIGTERM or Ctrl+C kills the runs and marks them `error` the same way. A local run a crashed service
-started can outlive it, until jig's own `--time-limit` stops it.
+it never runs twice, and the running tasks are counted there, so replicas sharing the store keep to the
+caps together (below).
+
+A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the
+lease is renewed every third of that while the run goes on. A task whose lease ran out has lost its
+replica (it crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it
+first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
+what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
+service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
+out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`.
+A local run a crashed service started can outlive it, until jig's own `--time-limit` stops it.
+
+### Several replicas, on Postgres
+
+With `"database": "postgres://user:password@host:5432/jig?sslmode=require"` (or the URL in
+`JIG_DATABASE_URL`, which takes the config's place, as a password belongs in a secret), the state is in
+Postgres, through `server/pg.ts`, a client of jig's own with no dependencies (SCRAM-SHA-256, md5 or
+cleartext logins; `sslmode=require` checks the server's certificate against the system's CAs, or the file
+in `sslrootcert`), and several replicas of the service share it: each runs the same config, with a
+`replicaId` of its own (the host's name, the process's id and a random part, by default). The schema is
+moved on by the `jig_schema` table, under a lock, so replicas starting together do it once.
+
+A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
+counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`
+and each tenant's own hold across the replicas, and two can't both take the last slot; the turn among
+tenants is each replica's own. A run's events are stored and announced (`NOTIFY jig_events`), so a stream
+through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
+and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
+leases. While a replica's connection that hears these is lost, its streams read the database every second,
+and it connects again. A replica that crashes leaves its runs going (a Kubernetes Job until its deadline);
+its tasks end as `error` once their leases run out, and the others go on. SQLite takes several processes
+on one machine too, with no announcements: streams read it every second, and a cancel is found as leases
+are renewed.
 
 ### The local runner
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
 there, or the repository cloned with `--depth 1`, no hooks and only `gitProtocols`), `home/`, its `HOME`
 and `JIG_HOME`, and beside them, outside the project where its commands can't write, the events and stats
-files and `output.log`, what jig printed. jig runs as
+files and `output.log`, what jig printed. The folder is removed once the task has ended and its outcome
+is stored (unless `keepTaskDirs`), as the Docker runner's is. jig runs as
 
 ```
 jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
@@ -310,6 +349,6 @@ gateway's config is `deploy/gateway.json` (DeepSeek, its key in `DEEPSEEK_API_KE
 `deploy/k8s/` has the namespace, the service's and the gateway's Deployments and Services, the service's
 account with a Role to run Jobs, the tasks' account with none, the NetworkPolicy, a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
-(`jig-secrets` with `gateway-secret`, and `jig-provider-keys`) are yours to make. The service runs one
-replica, as its SQLite store takes one writer, and so does the gateway, which counts limits and spending in
-memory.
+(`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
+are yours to make. The service runs two replicas on that database; the gateway runs one, as it counts
+limits and spending in memory.

@@ -29,11 +29,11 @@ export interface TenantConfig {
 export interface Config {
   host?: string;
   port?: number;
-  /** The SQLite file. */
+  /** The SQLite file, or a Postgres URL (postgres://...), which replicas of the service share. */
   database: string;
   /** Where each task's folder goes. */
   dataDir: string;
-  /** Tasks that may run at once, across tenants. */
+  /** Tasks that may run at once, across tenants (and across replicas sharing the database). */
   concurrency?: number;
   /** The model a task gets if it names none. */
   model?: string;
@@ -47,6 +47,14 @@ export interface Config {
   runner?: "local" | "docker" | "kubernetes";
   docker?: Omit<DockerRunnerConfig, Shared>;
   kubernetes?: Omit<KubernetesRunnerConfig, Shared>;
+  /** This replica's name in the database, unique among those running (default: host, process id and a random part). */
+  replicaId?: string;
+  /** How long a replica's hold on a running task lasts unless renewed, in seconds. */
+  leaseSeconds?: number;
+  /** The most events of a task's that are stored. */
+  maxEvents?: number;
+  /** Keep each task's folder after it ends. */
+  keepTaskDirs?: boolean;
   tenants: TenantConfig[];
 }
 
@@ -66,22 +74,30 @@ export interface Service {
 }
 
 /**
- * Opens the store, puts the config's tenants in it and shuts out those it no longer lists, ends what a
- * crash left running, and listens. The runner is the local one unless one is given (a test's).
+ * Checks the config, opens the store, puts the config's tenants in it and shuts out those it no longer
+ * lists, ends the tasks of replicas that are gone, and listens. The runner is the local one unless one is given (a test's).
  */
 export async function startService(config: Config, { secret, runner }: { secret: string; runner?: Runner }): Promise<Service> {
-  const store = openStore(config.database);
-  for (const tenant of config.tenants) {
-    const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
-    await store.putTenant({ id: tenant.id, limits }, tenant.keys.map((key) => key.toLowerCase()));
-  }
-  // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
-  const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
-  if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
+  checkConfig(config);
   runner ??= runnerFor(config, secret);
-  const scheduler = new Scheduler(store, runner, config.concurrency ?? 4);
-  const recovered = await scheduler.recover();
-  if (recovered.length) console.error(`jig service: ${recovered.length} task(s) left running by the last run of the service marked as errors`);
+  const store = await openStore(config.database);
+  let scheduler: Scheduler;
+  try {
+    for (const tenant of config.tenants) {
+      const limits: Limits = { ...DEFAULT_LIMITS, ...Object.fromEntries(Object.entries(tenant).filter(([key]) => key in DEFAULT_LIMITS)) };
+      await store.putTenant({ id: tenant.id, limits }, tenant.keys.map((key) => key.toLowerCase()));
+    }
+    // A tenant taken out of the config is revoked: its keys stop working and what it queued won't run.
+    const retired = await store.retireTenants(config.tenants.map((tenant) => tenant.id));
+    if (retired) console.error(`jig service: ${retired} queued task(s) of tenants no longer in the config cancelled`);
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs });
+    const expired = await scheduler.start();
+    if (expired.length) console.error(`jig service: ${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
+  } catch (err) {
+    await store.close();
+    throw err;
+  }
   const server = createServer((req, res) => {
     handle(req, res, { store, scheduler, model: config.model ?? "deepseek-flash", maxBody: config.maxBodyBytes ?? 1024 * 1024, heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000 }).catch((err) => {
       if (!res.headersSent) reply(res, 500, { error: "Internal error" });
@@ -90,7 +106,6 @@ export async function startService(config: Config, { secret, runner }: { secret:
     });
   });
   await new Promise<void>((done) => server.listen(config.port ?? 8080, config.host ?? "127.0.0.1", done));
-  void scheduler.poke();
   const { address, port } = server.address() as AddressInfo;
   return {
     url: `http://${address.includes(":") ? `[${address}]` : address}:${port}`,
@@ -117,6 +132,70 @@ function runnerFor(config: Config, secret: string): Runner {
   throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
 }
 
+/** Throws with what is wrong if the config isn't one the service can run with. */
+export function checkConfig(config: Config): void {
+  const problem = configProblem(config);
+  if (problem) throw new Error(`The config's ${problem}`);
+}
+
+function configProblem(config: Config): string | undefined {
+  if (!isObject(config)) return "top level must be a JSON object";
+  const fields = config as unknown as Record<string, unknown>;
+  const text = (name: string, value: unknown, required: boolean) =>
+    value === undefined ? (required ? `${name} is missing` : undefined) : typeof value === "string" && value ? undefined : `${name} must be a string that isn't empty`;
+  const whole = (name: string, value: unknown, least: number, most = Number.MAX_SAFE_INTEGER) =>
+    value === undefined || (Number.isInteger(value) && (value as number) >= least && (value as number) <= most) ? undefined : `${name} must be a whole number from ${least}${most < Number.MAX_SAFE_INTEGER ? ` to ${most}` : " up"}, not ${JSON.stringify(value)}`;
+  const positive = (name: string, value: unknown, zero = false) =>
+    value === undefined || (typeof value === "number" && Number.isFinite(value) && (zero ? value >= 0 : value > 0)) ? undefined : `${name} must be a number over ${zero ? "or at " : ""}0, not ${JSON.stringify(value)}`;
+  const strings = (name: string, value: unknown) =>
+    value === undefined || (Array.isArray(value) && value.length && value.every((item) => typeof item === "string" && item)) ? undefined : `${name} must be a list of strings`;
+  const problem =
+    text("database", config.database, true) ??
+    text("dataDir", config.dataDir, true) ??
+    text("gatewayBaseUrl", config.gatewayBaseUrl, true) ??
+    (/^https?:\/\//i.test(config.gatewayBaseUrl) && URL.canParse(config.gatewayBaseUrl) ? undefined : `gatewayBaseUrl must be an http or https URL, not ${JSON.stringify(config.gatewayBaseUrl)}`) ??
+    text("host", config.host, false) ??
+    whole("port", config.port, 0, 65535) ??
+    whole("concurrency", config.concurrency, 1) ??
+    text("model", config.model, false) ??
+    positive("graceSeconds", config.graceSeconds, true) ??
+    strings("jig", config.jig) ??
+    strings("gitProtocols", config.gitProtocols) ??
+    whole("maxBodyBytes", config.maxBodyBytes, 1) ??
+    positive("heartbeatSeconds", config.heartbeatSeconds) ??
+    text("replicaId", config.replicaId, false) ??
+    positive("leaseSeconds", config.leaseSeconds) ??
+    whole("maxEvents", config.maxEvents, 1) ??
+    (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
+    (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
+  if (problem) return problem;
+  const tenants = new Set<string>();
+  /** Which tenant each key opens: one key may open only one. */
+  const owners = new Map<string, string>();
+  for (const [i, tenant] of config.tenants.entries()) {
+    const at = `tenants[${i}]`;
+    if (!isObject(tenant)) return `${at} must be an object`;
+    const problem =
+      text(`${at}.id`, tenant.id, true) ??
+      (tenants.has(tenant.id) ? `${at}.id ${JSON.stringify(tenant.id)} is another tenant's too` : undefined) ??
+      (Array.isArray(tenant.keys) ? undefined : `${at}.keys must be a list of the SHA-256 hashes of its API keys, in hex`) ??
+      whole(`${at}.concurrency`, tenant.concurrency, 0) ??
+      whole(`${at}.maxSteps`, tenant.maxSteps, 1) ??
+      whole(`${at}.timeLimit`, tenant.timeLimit, 1) ??
+      (tenant.budgetUsd === null ? undefined : positive(`${at}.budgetUsd`, tenant.budgetUsd)) ??
+      whole(`${at}.maxQueued`, tenant.maxQueued, 0);
+    if (problem) return problem;
+    tenants.add(tenant.id);
+    for (const [j, key] of tenant.keys.entries()) {
+      if (typeof key !== "string" || !/^[0-9a-f]{64}$/i.test(key)) return `${at}.keys[${j}] must be a key's SHA-256 hash, 64 hex digits (printf %s "$KEY" | sha256sum)`;
+      const owner = owners.get(key.toLowerCase());
+      if (owner !== undefined) return `${at}.keys[${j}] is ${owner === tenant.id ? "there twice" : `tenant ${owner}'s key too: a key opens one tenant`}`;
+      owners.set(key.toLowerCase(), tenant.id);
+    }
+  }
+  return undefined;
+}
+
 interface Context {
   store: Store;
   scheduler: Scheduler;
@@ -137,15 +216,22 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (req.method !== "GET") return reply(res, 405, { error: "Use GET or POST" });
     const status = url.searchParams.get("status") ?? undefined;
     if (status !== undefined && !STATUSES.includes(status as TaskStatus)) return reply(res, 400, { error: `status must be one of: ${STATUSES.join(", ")}` });
-    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined });
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, false)) });
+    const before = url.searchParams.get("before") ?? undefined;
+    if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
+    const limit = Number(url.searchParams.get("limit") ?? 100);
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
+    // The prompts can be long: a list leaves them out unless asked.
+    const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
+    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
+    // A full page may have more after it: the next is read with before=<next>.
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full })), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events)?$/.exec(url.pathname);
   // Another tenant's task is as missing as one that never was.
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, true)) : reply(res, 405, { error: "Use GET" });
+  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true })) : reply(res, 405, { error: "Use GET" });
   if (action === "/cancel") {
     if (req.method !== "POST") return reply(res, 405, { error: "Use POST" });
     if (FINISHED.has(task.status)) return reply(res, 409, { error: `The task has already ended: ${task.status}`, id: task.id, status: task.status });
@@ -230,10 +316,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** A task as the API shows it; the list leaves out the stats. */
-function view(task: Task, full: boolean) {
+/** A task as the API shows it; the list leaves out the stats, and the prompt unless asked. */
+function view(task: Task, show: { prompt?: boolean; stats?: boolean }) {
   const { spec, tenant, stats, ...rest } = task;
-  return { ...rest, prompt: spec.prompt, model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...(full && { stats }) };
+  return { ...rest, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...(show.stats && { stats }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {
@@ -244,7 +330,9 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
 /**
  * The task's events after `after` as server-sent events (each one's id its seq): those stored, then the
  * live ones, then `event: done` with the status it ended in, and the stream ends. A client that reconnects
- * with Last-Event-ID gets only what came after.
+ * with Last-Event-ID gets only what came after. The task may run on this replica, whose scheduler passes on
+ * its events as they are stored, or on another, whose events and end the store announces; while it can't
+ * (SQLite, or a lost connection to Postgres), the store is read again every second.
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs }: Context): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
@@ -261,26 +349,40 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     cleanup();
     res.end(`event: done\ndata: ${JSON.stringify({ status })}\n\n`);
   };
-  // Followed before the stored events are read, so none falls between the two; held until those are sent.
-  let held: Update[] | undefined = [];
-  const follow = (update: Update) => {
-    if (held) held.push(update);
-    else if ("event" in update) send(update.event.seq, update.event);
-    else end(update.done);
+  // Sends what is stored after the last event sent, and ends the stream if the task has ended. The status
+  // is read first: once a task has ended, all its events are stored. One read at a time, in order.
+  let reading = Promise.resolve();
+  const pull = () => {
+    reading = reading
+      .then(async () => {
+        if (ended || res.destroyed) return;
+        const { status } = (await store.task(task.id))!;
+        for (const { seq, event } of await store.events(task.id, last)) send(seq, event);
+        if (FINISHED.has(status)) end(status);
+      })
+      .catch((err: unknown) => console.error(`jig service: couldn't read ${task.id}'s events:`, err));
   };
+  // The next event as it comes goes at once; one after a gap, or the end, sends what is stored first.
+  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 ? send(update.event.seq, update.event) : pull());
+  const changed = (id: string, seq?: unknown) => id === task.id && !(typeof seq === "number" && seq <= last) && pull();
   scheduler.updates.on(task.id, follow);
+  store.changes.on("event", changed);
+  store.changes.on("done", changed);
+  store.changes.on("resync", pull);
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), heartbeatMs);
+  const poll = setInterval(() => store.live || pull(), 1000);
   const cleanup = () => {
     scheduler.updates.off(task.id, follow);
+    store.changes.off("event", changed);
+    store.changes.off("done", changed);
+    store.changes.off("resync", pull);
     clearInterval(heartbeat);
+    clearInterval(poll);
   };
   res.on("close", cleanup);
-  for (const { seq, event } of await store.events(task.id, after)) send(seq, event);
-  const now = (await store.task(task.id))!;
-  const updates = held;
-  held = undefined;
-  for (const update of updates) follow(update);
-  if (FINISHED.has(now.status)) end(now.status);
+  // Followed before the stored events are read, so none falls between the two.
+  pull();
+  await reading;
 }
 
 async function main(): Promise<void> {
@@ -289,9 +391,12 @@ async function main(): Promise<void> {
   const secret = process.env.JIG_GATEWAY_SECRET;
   if (!secret) throw new Error("Set JIG_GATEWAY_SECRET, the secret the gateway checks tasks' tokens with.");
   const config: Config = JSON.parse(readFileSync(values.config, "utf8"));
+  // A Postgres URL holds a password, which belongs in a secret rather than the config.
+  if (process.env.JIG_DATABASE_URL) config.database = process.env.JIG_DATABASE_URL;
+  checkConfig(config);
   // Paths in the config are relative to it.
   const base = dirname(resolve(values.config));
-  config.database = config.database === ":memory:" ? config.database : resolve(base, config.database);
+  if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
   config.dataDir = resolve(base, config.dataDir);
   const service = await startService(config, { secret });
   console.error(`jig service listening on ${service.url}`);

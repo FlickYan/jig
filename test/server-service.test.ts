@@ -3,16 +3,18 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, it } from "node:test";
-import { type Config, type Service, startService } from "../server/api.ts";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { Scheduler } from "../server/scheduler.ts";
-import { openStore, type Task, type Tenant } from "../server/store.ts";
+import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
+import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // The task service (server/): its API, its store, the fair scheduler and the local runner, with a fake jig
-// (fixtures/fake-jig.mjs) that writes events in the event contract's shape. No model is called.
+// (fixtures/fake-jig.mjs) that writes events in the event contract's shape. No model is called. Each test
+// runs on both stores: SQLite, and Postgres where JIG_TEST_POSTGRES_URL names one.
 
 const FAKE_JIG = join(import.meta.dirname, "fixtures", "fake-jig.mjs");
 const SECRET = "the gateway's secret";
@@ -23,17 +25,39 @@ const services: Service[] = [];
 afterEach(async () => {
   await Promise.all(services.splice(0).map((service) => service.close()));
   await removeTempDirs();
+  await dropPostgresDatabases();
 });
 
-/** A service on a port of its own, with the fake jig, two tenants and a database in a new folder. */
+const BACKENDS = [
+  { name: "SQLite", skip: false },
+  { name: "Postgres", skip: NO_POSTGRES },
+] as const;
+/** The store the tests in the describe being run use. */
+let backend: (typeof BACKENDS)[number]["name"] = "SQLite";
+
+/** A new database of the backend's: a file in `base`, or a schema in the test Postgres. */
+async function database(base: string): Promise<string> {
+  return backend === "SQLite" ? join(base, "jig.db") : postgresDatabase();
+}
+
+/** A new store of the backend's, empty. */
+async function newStore(): Promise<Store> {
+  return openStore(backend === "SQLite" ? ":memory:" : await postgresDatabase());
+}
+
+/**
+ * A service on a port of its own, with the fake jig, two tenants and a database in a new folder (a new
+ * schema, on Postgres). It keeps each task's folder, which the tests look in.
+ */
 async function service(config: Partial<Config> = {}, base?: string): Promise<Service & { dataDir: string }> {
   base ??= await tempDir("jig-service-");
   const dataDir = join(base, "data");
   const started = await startService(
     {
       port: 0,
-      database: join(base, "jig.db"),
+      database: config.database ?? (await database(base)),
       dataDir,
+      keepTaskDirs: true,
       gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
       jig: [process.execPath, FAKE_JIG],
       graceSeconds: 5,
@@ -115,7 +139,8 @@ const alive = (pid: number) => {
   }
 };
 
-describe("the task service's API", () => {
+/** The tests of the task service's API, which run on each store. */
+const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
   it("needs a tenant's key, and shows a tenant only its own tasks", async () => {
     const api = await service();
     assert.equal((await call(api, undefined, "GET", "/v1/tasks")).status, 401);
@@ -293,15 +318,18 @@ describe("the task service's API", () => {
 
   it("ends the tasks a crashed service left running when it starts again, and runs those still queued", async () => {
     const base = await tempDir("jig-service-");
-    // The crash: a run claimed and never finished, and a task still queued.
-    const store = openStore(join(base, "jig.db"));
+    const db = await database(base);
+    // The crash: a run claimed, its lease left to run out, and a task still queued.
+    const store = await openStore(db);
     await store.putTenant({ id: "acme", limits: { concurrency: 2, maxSteps: 50, timeLimit: 60, budgetUsd: null } }, [sha256(KEYS.acme)]);
     const left = await store.createTask("acme", { prompt: "hang", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
     const queued = await store.createTask("acme", { prompt: "exit 0", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
-    assert.ok(await store.claim(left.id));
+    const claimed = await store.claim("acme", { owner: "the crashed replica", leaseMs: 100, concurrency: 4, tenantConcurrency: 2 });
+    assert.equal(typeof claimed === "object" && claimed.id, left.id);
     await store.close();
+    await new Promise((done) => setTimeout(done, 150));
 
-    const api = await service({}, base);
+    const api = await service({ database: db }, base);
     const task = (await call(api, KEYS.acme, "GET", `/v1/tasks/${left.id}`)).body;
     assert.equal(task.status, "error");
     assert.match(task.error, /the task service stopped while it ran/);
@@ -311,13 +339,14 @@ describe("the task service's API", () => {
 
   it("shuts out a tenant taken out of the config: its key stops working and its queued tasks never run", async () => {
     const base = await tempDir("jig-service-");
+    const db = await database(base);
     // globex may run none at once, so its task is still queued when the service stops.
-    const first = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] }, base);
+    const first = await service({ database: db, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] }, base);
     const id = (await call(first, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
     services.splice(services.indexOf(first), 1);
     await first.close();
 
-    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] }, base);
+    const api = await service({ database: db, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] }, base);
     assert.equal((await call(api, KEYS.globex, "GET", "/v1/tasks")).status, 401);
     assert.equal((await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 401);
     const task = (await api.store.task(id))!;
@@ -336,16 +365,64 @@ describe("the task service's API", () => {
     assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued")).body.tasks.length, 2);
   });
 
-  it("makes the database's folder, and names the database when it can't open it", async () => {
+  it("makes the database's folder, and names the database when it can't open it", { skip: name !== "SQLite" && "SQLite's own" }, async () => {
     const base = await tempDir("jig-service-");
     const api = await service({ database: join(base, "not", "made", "jig.db") }, base);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
     assert.ok(existsSync(join(base, "not", "made", "jig.db")));
     await writeFile(join(base, "a-file"), "");
     const path = join(base, "a-file", "jig.db");
-    assert.throws(() => openStore(path), (err: Error) => err.message.startsWith(`Couldn't open the database ${path}: `));
+    await assert.rejects(openStore(path), (err: Error) => err.message.startsWith(`Couldn't open the database ${path}: `));
   });
-});
+
+  it("lists a tenant's tasks a page at a time, newest first, without their prompts unless asked", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)] }] });
+    const ids: string[] = [];
+    for (let i = 0; i < 5; i++) ids.unshift((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: `task ${i}` })).body.id);
+    const first = (await call(api, KEYS.acme, "GET", "/v1/tasks?limit=2")).body;
+    assert.deepEqual(first.tasks.map((task: Task) => task.id), ids.slice(0, 2));
+    assert.equal(first.next, ids[1]);
+    assert.ok(first.tasks.every((task: object) => !("prompt" in task)));
+    const second = (await call(api, KEYS.acme, "GET", `/v1/tasks?limit=2&before=${first.next}`)).body;
+    assert.deepEqual([second.tasks.map((task: Task) => task.id), second.next], [ids.slice(2, 4), ids[3]]);
+    const last = (await call(api, KEYS.acme, "GET", `/v1/tasks?limit=2&before=${second.next}&full=1`)).body;
+    assert.deepEqual(last, { tasks: [{ ...last.tasks[0], id: ids[4], prompt: "task 0" }] });
+    assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.length, 4);
+    // Another tenant's task leads nowhere, and a page is 1 to 100 tasks.
+    assert.deepEqual((await call(api, KEYS.globex, "GET", `/v1/tasks?before=${ids[0]}`)).body, { tasks: [] });
+    for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).status, 400, query);
+    assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${ids[0]}`)).body.prompt, "task 4");
+  });
+
+  it("stores a run's events up to maxEvents, then one notice and its end, and the run goes on", async () => {
+    const api = await service({ maxEvents: 3 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    const frames = await collect(sse(api, `/v1/tasks/${id}/events`));
+    assert.deepEqual(frames.map((frame) => frame.id ?? frame.event), ["1", "2", "3", "4", "7", "done"]);
+    const stored = (await api.store.events(id)).map(({ seq, event }) => [seq, (event as { type: string }).type]);
+    assert.deepEqual(stored, [[1, "start"], [2, "tool_call"], [3, "tool_result"], [4, "notice"], [7, "end"]]);
+    assert.match(JSON.parse(frames[3].data).text, /past 3 aren't kept/);
+    const task = await statusOf(api, id, "succeeded");
+    assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
+  });
+
+  it("removes a task's folder once it has ended, unless keepTaskDirs", async () => {
+    const api = await service({ keepTaskDirs: false });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await until(() => existsSync(join(api.dataDir, "tasks", id)), "the task's folder");
+    await statusOf(api, id, "succeeded");
+    await api.scheduler.settled();
+    assert.equal(existsSync(join(api.dataDir, "tasks", id)), false);
+    assert.equal((await api.store.events(id)).length, 7);
+  });
+};
+
+for (const { name, skip } of BACKENDS) {
+  describe(`the task service's API (${name})`, { skip }, () => {
+    beforeEach(() => void (backend = name));
+    apiTests(name);
+  });
+}
 
 /** A runner whose runs end when the test says, recording how many run at once. */
 class FakeRunner implements Runner {
@@ -373,13 +450,14 @@ class FakeRunner implements Runner {
   }
 }
 
-describe("the scheduler", () => {
+/** The tests of the scheduler, which run on each store. */
+const schedulerTests = () => {
   it("holds the global and each tenant's limit under 50 tasks from 3 tenants, and takes the tenants in turn", async () => {
-    const store = openStore(":memory:");
+    const store = await newStore();
     const caps: Record<string, number> = { a: 3, b: 2, c: 1 };
     for (const [id, concurrency] of Object.entries(caps)) await store.putTenant({ id, limits: { concurrency, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     const runner = new FakeRunner();
-    const scheduler = new Scheduler(store, runner, 4);
+    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
     // a queues 30 before b's 15 and c's 5.
     for (const [tenant, count] of [["a", 30], ["b", 15], ["c", 5]] as const) {
       for (let i = 0; i < count; i++) await store.createTask(tenant, { prompt: `${tenant}${i}`, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
@@ -405,7 +483,7 @@ describe("the scheduler", () => {
   });
 
   it("stops a run whose events can't be read, and holds its slot until the run has ended", async () => {
-    const store = openStore(":memory:");
+    const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     for (const prompt of ["a0", "a1"]) await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
     const started: string[] = [];
@@ -428,7 +506,7 @@ describe("the scheduler", () => {
         };
       },
     };
-    const scheduler = new Scheduler(store, runner, 4);
+    const scheduler = new Scheduler(store, runner, { concurrency: 4 });
     await scheduler.poke();
     while (!cancels) await new Promise((done) => setImmediate(done));
     await scheduler.settled();
@@ -445,7 +523,7 @@ describe("the scheduler", () => {
   });
 
   it("reads only the tasks it starts, however many are queued", async () => {
-    const store = openStore(":memory:");
+    const store = await newStore();
     for (const id of ["a", "b"]) await store.putTenant({ id, limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     for (let i = 0; i < 5000; i++) await store.createTask("a", { prompt: "x".repeat(1000), maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
     await store.createTask("b", { prompt: "b0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
@@ -463,7 +541,7 @@ describe("the scheduler", () => {
       },
     });
     const runner = new FakeRunner();
-    const scheduler = new Scheduler(counted, runner, 4);
+    const scheduler = new Scheduler(counted, runner, { concurrency: 4 });
     await scheduler.poke();
     assert.deepEqual([runner.started, read], [["a", "b"], 2]);
     // a is at its limit and b's queue is empty: another poke starts nothing and reads nothing.
@@ -477,5 +555,82 @@ describe("the scheduler", () => {
     for (const run of runner.active.values()) run.end();
     await scheduler.close();
     await store.close();
+  });
+
+  it("frees a run's slot even when its outcome can't be stored", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    for (const prompt of ["a0", "a1"]) await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // The database fails as the first run's outcome is written.
+    let failures = 1;
+    const failing = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name !== "finish") return typeof value === "function" ? value.bind(target) : value;
+        return async (...args: unknown[]) => {
+          if (failures-- > 0) throw new Error("the database went away");
+          return value.apply(target, args);
+        };
+      },
+    });
+    const runner = new FakeRunner();
+    const scheduler = new Scheduler(failing, runner, { concurrency: 4, leaseMs: 300 });
+    const logged = console.error;
+    console.error = () => {};
+    try {
+      await scheduler.start();
+      await until(() => runner.active.size, "a0 to start");
+      runner.active.values().next().value!.end();
+      // a0's lease, no longer renewed, runs out: it ends as an error, and a1 takes the slot it had.
+      await until(() => runner.started.length === 2, "a1 to start");
+    } finally {
+      console.error = logged;
+    }
+    const [lost] = await store.inStatus("error");
+    assert.equal(lost.spec.prompt, "a0");
+    assert.match(lost.error!, /stopped renewing its lease/);
+    assert.equal(scheduler.running("a"), 1);
+    for (const run of runner.active.values()) run.end();
+    await scheduler.close();
+    await store.close();
+  });
+};
+
+for (const { name, skip } of BACKENDS) {
+  describe(`the scheduler (${name})`, { skip }, () => {
+    beforeEach(() => void (backend = name));
+    schedulerTests();
+  });
+}
+
+describe("the service's config", () => {
+  const base = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [] } satisfies Config;
+  const problem = (config: object) => {
+    try {
+      checkConfig({ ...base, ...config } as Config);
+      return undefined;
+    } catch (err) {
+      return (err as Error).message;
+    }
+  };
+
+  it("is refused with what is wrong, before anything starts", async () => {
+    assert.equal(problem({}), undefined);
+    assert.equal(problem({ concurrency: 0 }), "The config's concurrency must be a whole number from 1 up, not 0");
+    assert.equal(problem({ concurrency: 2.5 }), "The config's concurrency must be a whole number from 1 up, not 2.5");
+    assert.equal(problem({ port: 70000 }), "The config's port must be a whole number from 0 to 65535, not 70000");
+    assert.equal(problem({ database: undefined }), "The config's database is missing");
+    assert.equal(problem({ gatewayBaseUrl: "gateway:8081" }), 'The config\'s gatewayBaseUrl must be an http or https URL, not "gateway:8081"');
+    assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, not 0");
+    assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
+    assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    const key = sha256(KEYS.acme);
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [key] }, { id: "acme", keys: [] }] }), 'The config\'s tenants[1].id "acme" is another tenant\'s too');
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [key] }, { id: "globex", keys: [key.toUpperCase()] }] }), "The config's tenants[1].keys[0] is tenant acme's key too: a key opens one tenant");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [key, key] }] }), "The config's tenants[0].keys[1] is there twice");
+    assert.match(problem({ tenants: [{ id: "acme", keys: [KEYS.acme] }] })!, /tenants\[0\]\.keys\[0\] must be a key's SHA-256 hash/);
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], concurrency: -1 }] }), "The config's tenants[0].concurrency must be a whole number from 0 up, not -1");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], budgetUsd: null, maxQueued: 0 }] }), undefined);
+    await assert.rejects(startService({ ...base, concurrency: 0 }, { secret: SECRET }), /concurrency must be a whole number from 1 up/);
   });
 });

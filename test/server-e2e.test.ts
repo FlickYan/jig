@@ -71,6 +71,8 @@ async function stack(replies: Block[][]): Promise<{ service: Service; gateway: G
       model: MODEL,
       gatewayBaseUrl: `${gateway.url}/anthropic`,
       graceSeconds: 5,
+      // The test reads what jig printed in the task's folder.
+      keepTaskDirs: true,
       tenants: [{ id: "acme", keys: [sha256(TENANT_KEY)], budgetUsd: 1 }],
     },
     { secret: SECRET },

@@ -1,0 +1,233 @@
+import { EventEmitter } from "node:events";
+import { type Listener, Pool, type Row } from "./pg.ts";
+import { type ClaimTerms, type Changes, json, newTaskId, type Outcome, type Store, TASK_COLUMNS, type Task, type TaskSpec, type TaskStatus, type Tenant, toTask } from "./store.ts";
+
+// The task service's state in Postgres (pg.ts), which several replicas of the service share. Claims count
+// the running tasks under a lock the database holds for the transaction, so two replicas can't both take
+// the last slot. Every change another replica may wait on is announced with NOTIFY in the statement that
+// makes it: an event stored or a task ended on jig_events, a cancel asked for on jig_cancel.
+
+const EVENTS = "jig_events";
+const CANCELS = "jig_cancel";
+// pg_advisory_xact_lock's keys: claims, and migrations (so two replicas starting at once don't both run them).
+const CLAIM_LOCK = 7_366_000_001;
+const MIGRATE_LOCK = 7_366_000_002;
+
+// Each entry moves the schema one version on (jig_schema counts them). Never edit one that has shipped:
+// add another. JSON is kept as `json`, which holds the text as it came, or as text: jsonb would turn away
+// a "\u0000" in a command's output.
+const MIGRATIONS = [
+  `CREATE TABLE tenants (id text PRIMARY KEY, limits json NOT NULL);
+   CREATE TABLE api_keys (hash text PRIMARY KEY, tenant text NOT NULL REFERENCES tenants (id));
+   CREATE TABLE tasks (
+     n bigserial UNIQUE, id text PRIMARY KEY, tenant text NOT NULL REFERENCES tenants (id), prompt text NOT NULL, spec json NOT NULL,
+     status text NOT NULL, exit_code integer, stop text, error text,
+     created timestamptz NOT NULL, started timestamptz, ended timestamptz, stats json, usage json, cost double precision,
+     owner text, lease_until timestamptz, cancel_requested boolean NOT NULL DEFAULT false);
+   CREATE INDEX tasks_by_tenant ON tasks (tenant, n);
+   CREATE INDEX tasks_queue ON tasks (tenant, status, n);
+   CREATE INDEX tasks_by_status ON tasks (status);
+   CREATE TABLE events (task text NOT NULL REFERENCES tasks (id), seq integer NOT NULL, json text NOT NULL, PRIMARY KEY (task, seq));`,
+];
+
+/** The statement's rows, each announced as a task that ended (its id and status columns). */
+const NOTIFY_DONE = `SELECT id, pg_notify('${EVENTS}', json_build_object('task', id, 'done', status)::text) FROM done`;
+const IDS = "SELECT json_array_elements_text($1::json)";
+
+export class PostgresStore implements Store {
+  readonly changes: Changes = new EventEmitter().setMaxListeners(0);
+  private pool: Pool;
+  private listener: Listener;
+
+  private constructor(pool: Pool, listener: Listener) {
+    this.pool = pool;
+    this.listener = listener;
+    listener.on("notification", (channel: string, payload: string) => {
+      let message: { task?: unknown; seq?: unknown; done?: unknown };
+      try {
+        message = JSON.parse(payload);
+      } catch {
+        return;
+      }
+      if (typeof message.task !== "string") return;
+      if (channel === EVENTS && typeof message.seq === "number") this.changes.emit("event", message.task, message.seq);
+      else if (channel === EVENTS && typeof message.done === "string") this.changes.emit("done", message.task, message.done);
+      else if (channel === CANCELS) this.changes.emit("cancel", message.task);
+    });
+    // What was announced while it was away is missed: whoever waits looks again.
+    listener.on("connected", () => this.changes.emit("resync"));
+  }
+
+  /** Connects, moves the schema on to this version's and starts listening. */
+  static async open(url: string): Promise<PostgresStore> {
+    let pool: Pool | undefined;
+    try {
+      pool = new Pool(url);
+      await migrate(pool);
+      const listener = pool.listen([EVENTS, CANCELS]);
+      await listener.ready;
+      return new PostgresStore(pool, listener);
+    } catch (err) {
+      await pool?.close();
+      // The URL's password stays out of the message.
+      const shown = url.replace(/\/\/([^:@/]*):[^@/]*@/, "//$1:***@");
+      throw new Error(`Couldn't open the database ${shown}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  get live(): boolean {
+    return this.listener.live;
+  }
+
+  async putTenant(tenant: Tenant, keyHashes: string[]): Promise<void> {
+    await this.pool.transaction(async (db) => {
+      await db.query("INSERT INTO tenants (id, limits) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET limits = excluded.limits", [tenant.id, json(tenant.limits)]);
+      await db.query("DELETE FROM api_keys WHERE tenant = $1", [tenant.id]);
+      await db.query(`INSERT INTO api_keys (hash, tenant) SELECT hash, $2 FROM (${IDS} AS hash) AS keys ON CONFLICT (hash) DO UPDATE SET tenant = excluded.tenant`, [json([...new Set(keyHashes)]), tenant.id]);
+    });
+  }
+
+  async tenant(id: string): Promise<Tenant | undefined> {
+    const [row] = (await this.pool.query("SELECT id, limits FROM tenants WHERE id = $1", [id])).rows;
+    return row && { id: String(row.id), limits: row.limits as Tenant["limits"] };
+  }
+
+  async tenantByKey(keyHash: string): Promise<Tenant | undefined> {
+    const [row] = (await this.pool.query("SELECT tenants.id, tenants.limits FROM api_keys JOIN tenants ON tenants.id = api_keys.tenant WHERE api_keys.hash = $1", [keyHash])).rows;
+    return row && { id: String(row.id), limits: row.limits as Tenant["limits"] };
+  }
+
+  async retireTenants(keep: string[]): Promise<number> {
+    return this.pool.transaction(async (db) => {
+      await db.query(`DELETE FROM api_keys WHERE tenant NOT IN (${IDS})`, [json(keep)]);
+      const { rows } = await db.query(
+        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING id, status) ${NOTIFY_DONE}`,
+        [json(keep)],
+      );
+      return rows.length;
+    });
+  }
+
+  async createTask(tenant: string, spec: TaskSpec): Promise<Task> {
+    const { prompt, ...rest } = spec;
+    const { rows } = await this.pool.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(), tenant, prompt, json(rest)]);
+    return toTask(rows[0]);
+  }
+
+  async task(id: string): Promise<Task | undefined> {
+    const [row] = (await this.pool.query("SELECT * FROM tasks WHERE id = $1", [id])).rows;
+    return row && toTask(row);
+  }
+
+  async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
+    const params: unknown[] = [tenant];
+    const where = ["tenant = $1"];
+    if (status) where.push(`status = $${params.push(status)}`);
+    if (before) where.push(`n < (SELECT n FROM tasks WHERE id = $${params.push(before)} AND tenant = $1)`);
+    const sql = `SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
+    return (await this.pool.query(sql, params)).rows.map(toTask);
+  }
+
+  async inStatus(status: TaskStatus): Promise<Task[]> {
+    return (await this.pool.query("SELECT * FROM tasks WHERE status = $1 ORDER BY n", [status])).rows.map(toTask);
+  }
+
+  async queuedTenants(): Promise<string[]> {
+    const { rows } = await this.pool.query("SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.tenant = tenants.id AND status = 'queued') ORDER BY id");
+    return rows.map((row) => String(row.id));
+  }
+
+  async queuedCount(tenant: string): Promise<number> {
+    return Number((await this.pool.query("SELECT count(*) AS n FROM tasks WHERE tenant = $1 AND status = 'queued'", [tenant])).rows[0].n);
+  }
+
+  async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {
+    return this.pool.transaction(async (db) => {
+      // Held to the transaction's end: the count below and the claim are one replica's at a time. The
+      // count is a statement of its own, so it sees what the claim before this one committed.
+      await db.query(`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`);
+      const [counts] = (await db.query("SELECT count(*) AS total, count(*) FILTER (WHERE tenant = $1) AS mine FROM tasks WHERE status = 'running'", [tenant])).rows;
+      if (Number(counts.total) >= concurrency) return "full";
+      if (Number(counts.mine) >= tenantConcurrency) return "tenant full";
+      // SKIP LOCKED passes over a task a cancel is changing meanwhile, rather than waiting for it.
+      const [row] = (
+        await db.query(
+          `UPDATE tasks SET status = 'running', started = now(), owner = $2, lease_until = now() + $3 * interval '1 millisecond', cancel_requested = false
+           WHERE id = (SELECT id FROM tasks WHERE tenant = $1 AND status = 'queued' ORDER BY n LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`,
+          [tenant, owner, leaseMs],
+        )
+      ).rows;
+      return row && toTask(row);
+    });
+  }
+
+  async renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]> {
+    const { rows } = await this.pool.query(
+      `UPDATE tasks SET lease_until = now() + $3 * interval '1 millisecond' WHERE id IN (${IDS}) AND owner = $2 AND status = 'running' RETURNING id, cancel_requested`,
+      [json(ids), owner, leaseMs],
+    );
+    return rows.map((row: Row) => ({ id: String(row.id), cancel: row.cancel_requested === true }));
+  }
+
+  async expire(error: string): Promise<string[]> {
+    // The database's clock, not the replicas', says when a lease ran out.
+    const { rows } = await this.pool.query(
+      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now()) RETURNING id, status) ${NOTIFY_DONE}`,
+      [error],
+    );
+    return rows.map((row) => String(row.id));
+  }
+
+  async requestCancel(id: string): Promise<boolean> {
+    const { rows } = await this.pool.query(
+      `WITH asked AS (UPDATE tasks SET cancel_requested = true WHERE id = $1 AND status = 'running' RETURNING id) SELECT pg_notify('${CANCELS}', json_build_object('task', id)::text) FROM asked`,
+      [id],
+    );
+    return rows.length === 1;
+  }
+
+  async cancelQueued(id: string): Promise<boolean> {
+    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING id, status) ${NOTIFY_DONE}`, [id]);
+    return rows.length === 1;
+  }
+
+  async finish(id: string, owner: string, outcome: Outcome): Promise<void> {
+    await this.pool.query(
+      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
+       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING id, status) ${NOTIFY_DONE}`,
+      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost],
+    );
+  }
+
+  async addEvent(task: string, seq: number, event: object): Promise<void> {
+    await this.pool.query(
+      `WITH added AS (INSERT INTO events (task, seq, json) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING task, seq)
+       SELECT pg_notify('${EVENTS}', json_build_object('task', task, 'seq', seq)::text) FROM added`,
+      [task, seq, JSON.stringify(event)],
+    );
+  }
+
+  async events(task: string, after = 0): Promise<{ seq: number; event: object }[]> {
+    const { rows } = await this.pool.query("SELECT seq, json FROM events WHERE task = $1 AND seq > $2 ORDER BY seq", [task, after]);
+    return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
+  }
+
+  async close(): Promise<void> {
+    await this.pool.close();
+  }
+}
+
+/** Moves the schema on, under a lock, so replicas starting together run each migration once. */
+async function migrate(pool: Pool): Promise<void> {
+  await pool.transaction(async (db) => {
+    await db.query(`SELECT pg_advisory_xact_lock(${MIGRATE_LOCK})`);
+    await db.query("CREATE TABLE IF NOT EXISTS jig_schema (version integer NOT NULL)");
+    const [row] = (await db.query("SELECT version FROM jig_schema")).rows;
+    const version = row ? Number(row.version) : 0;
+    if (!row) await db.query("INSERT INTO jig_schema (version) VALUES (0)");
+    if (version > MIGRATIONS.length) throw new Error(`it was made by a newer version of the task service (schema ${version})`);
+    // Postgres changes its schema in a transaction like anything else: a migration that fails leaves none of it.
+    for (const migration of MIGRATIONS.slice(version)) for (const statement of migration.split(";").filter((part) => part.trim())) await db.query(statement);
+    await db.query("UPDATE jig_schema SET version = $1", [MIGRATIONS.length]);
+  });
+}
