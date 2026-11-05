@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { AgentUI } from "../src/agent.ts";
 import { type Event as Written, Events } from "../src/events.ts";
+import type { CallModel } from "../src/model.ts";
 import { type FakeApi, fakeMessagesApi, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -276,6 +277,22 @@ describe("Events", () => {
     assert.deepEqual([long.truncated, short.description, short.truncated], [true, "ls", undefined]);
     assert.ok(String(request.description).length <= 64_000, `${String(request.description).length} characters`);
     assert.equal(request.truncated, true);
+  });
+
+  it("prices the end by the model the reply names when that has a price, else by jig's own", async () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+    const replying = (model: string) => (async () => ({ message: { role: "assistant", content: [], usage, model }, malformed: new Map() })) as unknown as CallModel;
+    const endOf = async (jigs: string, replies: string[]) => {
+      const events = new Events(() => {}, jigs);
+      for (const model of replies) await events.meter(replying(model), jigs)([], new AbortController().signal);
+      return events.end("done", 0)!.cost;
+    };
+    // A gateway's alias jig has no price for, served by claude-opus-5-5: $4 for the 1M in, $2 for the 100k out.
+    assert.equal(await endOf("claude-fast", ["claude-opus-5-5"]), 6);
+    // A reply's model without a price (the fake API's "m", or a dated id) leaves jig's own price.
+    assert.equal(await endOf("claude-opus-5-5", ["m"]), 6);
+    assert.equal(await endOf("claude-fast", ["m"]), null);
+    assert.equal(await endOf("claude-fast", ["constructor"]), null);
   });
 });
 

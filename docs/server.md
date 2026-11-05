@@ -226,17 +226,19 @@ task of the day; `maxQueued` is counted the same way. The USD quotas count only 
 the tasks running when one is reached can take the tenant past it by what they spend: the service only
 refuses new tasks, and spending is held as it happens by the gateway, which sees every model call (each
 task's `budgetUsd`, and its own limits, below). And the ledger they add up holds only what the runs said
-they spent (below): a run killed or lost counts 0, and one whose commands forged its `end` event counts
-what that says. The gateway's own quotas (`dailyUsd`, `monthlyUsd`) and budgets are the hard limit.
+they spent (below): a run killed or lost counts 0, so does one of a model `src/prices.ts` has no price for
+(a gateway's alias, unless its replies name the model they came from), and one whose commands forged its
+`end` event counts what that says. The gateway's own quotas (`dailyUsd`, `monthlyUsd`) and budgets are the
+hard limit.
 
 Each task that ends, however it ends (a cancel before it started, or a replica lost, too), writes a row of
 the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, `task`, `day` (the UTC day it
 ended, `YYYY-MM-DD`), `model`, `status`, `input`, `output`, `cache_read`, `cache_write`, `cost_usd` and
 `seconds` (from its start to its end; 0 if it never started). The tokens and cost are those of jig's `end`
-event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, and on
-every runner (on the local one when `dataDir` is in a temp folder) a task's commands can write that event,
-so for what a tenant must pay the gateway's counts are the record. Tasks that ended before the ledger came
-have no row.
+event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, as does
+the cost of one whose `end` has none (`null`: a model without a price), and on every runner (on the local
+one when `dataDir` is in a temp folder) a task's commands can write that event, so for what a tenant must
+pay the gateway's counts are the record. Tasks that ended before the ledger came have no row.
 
 ```bash
 # The tenant's own usage, by UTC day, model or both (day,model), over from..to (both included; this month
@@ -393,9 +395,10 @@ it stays after. A Secret the Job owns, so deleted with it, holds the task's toke
 key, and the prompt and workspace. A Secret holds at most 1 MiB, so a task whose prompt and workspace, with
 the token, come to more is refused (an `error` that says so) before a Job is made for it: keep
 `maxBodyBytes` at its default with this runner. The Job is labelled with its task's id (`jig.dev/task`) and its tenant's
-(`jig.dev/tenant`); a tenant id that can't be a label's value (over 63 characters, or with characters
-other than letters, digits, `-`, `_` and `.`) is labelled `h-` and 40 hex digits of its SHA-256 instead,
-and the id itself is in the Job's `jig.dev/tenant` annotation.
+(`jig.dev/tenant`); a tenant id that can't be a label's value (over 63 characters, with characters
+other than letters, digits, `-`, `_` and `.`, or not starting and ending with a letter or digit) is
+labelled `h-` and 40 hex digits of its SHA-256 instead, and the id itself is in the Job's `jig.dev/tenant`
+annotation.
 
 ```json
 "runner": "kubernetes",
@@ -501,7 +504,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `notice` | `text`: what jig told the user |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
-| `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call, `seconds` |
+| `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
 goes to stdout: the terminal's output goes to stderr.
@@ -792,10 +795,11 @@ it as `task`; a client that leaves before its new task's body is read gets no an
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
-- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default). `GET /v1/usage?region=all`
-  asks every region the tenant may use and adds up their answers, the rows with the same day and model and
-  the total, with `regions`, those that answered (502 if none did); it is JSON only. A client that leaves,
-  or the router closing, ends those requests, and the client is neither answered nor counted.
+- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default; given twice, a 400).
+  `GET /v1/usage?region=all` asks every region the tenant may use and adds up their answers, the rows with
+  the same day and model and the total, with `regions`, those that answered (502 if none did); it is JSON
+  only. A client that leaves, or the router closing, ends those requests, and the client is neither
+  answered nor counted.
 - Anything else goes to the home.
 
 **Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails

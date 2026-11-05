@@ -64,6 +64,7 @@ export class Events {
   private step = 0; // the loop's step, for the tool calls and text that come in it
   private readonly usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
   private cost: number | null;
+  private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
 
   constructor(path: string | ((event: Event) => void), model: string) {
@@ -123,9 +124,15 @@ export class Events {
       const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
       addUsage(usage, turn.message.usage);
       addUsage(this.usage, turn.message.usage);
-      const cost = costOf(model, usage);
+      // Priced by the model the reply names when it has a price, as the gateway prices it: an alias jig
+      // has no price for (a gateway's my-opus for claude-opus-5-5) then still has a cost.
+      const served = turn.message.model;
+      const cost = (typeof served === "string" ? costOf(served, usage) : undefined) ?? costOf(model, usage);
+      // Before the first call, the cost is null for a task's model without a price, which its replies may have.
+      const before = this.metered ? this.cost : 0;
+      this.metered = true;
       // One call of a model without a price leaves the whole without one.
-      this.cost = this.cost === null || cost === undefined ? null : this.cost + cost;
+      this.cost = before === null || cost === undefined ? null : before + cost;
       return turn;
     };
   }

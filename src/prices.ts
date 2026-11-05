@@ -10,7 +10,8 @@ export const PRICES: Record<string, { input: number; cacheRead: number; output: 
 
 /** What a model's usage cost, or undefined for a model without a price. Cache writes count as input. */
 export function costOf(model: string, usage: Usage): number | undefined {
+  // Own keys only: a reply's model is the server's word, and "constructor" isn't a price.
+  if (!Object.hasOwn(PRICES, model)) return undefined;
   const price = PRICES[model];
-  if (!price) return undefined;
   return ((usage.input + usage.cacheWrite) * price.input + usage.cacheRead * price.cacheRead + usage.output * price.output) / 1e6;
 }

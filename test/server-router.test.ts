@@ -394,6 +394,19 @@ describe("the router", () => {
     assert.deepEqual(answer.body, { error: "No region answered", regions: [] });
   });
 
+  it("refuses a region given twice, as the service refuses its own parameters given twice", async () => {
+    const asked: string[] = [];
+    const answer = (name: string) => (req: IncomingMessage, res: ServerResponse) => (asked.push(name), res.writeHead(200, { "content-type": "application/json" }).end("{}"));
+    const front = await router({ eu: await fakeRegion("eu", answer("eu")), us: await fakeRegion("us", answer("us")) });
+    for (const path of ["/v1/usage?region=us&region=eu", "/v1/usage?region=all&region=eu", "/v1/tasks?region=eu&region=eu"]) {
+      const refused = await call(front.url, KEYS.acme, "GET", path);
+      assert.deepEqual([refused.status, refused.body], [400, { error: "region may be given once" }], path);
+    }
+    assert.deepEqual(asked, []);
+    assert.equal((await call(front.url, KEYS.acme, "GET", "/v1/usage?region=us")).status, 200);
+    assert.deepEqual(asked, ["us"]);
+  });
+
   it("closes the request to the region when the client leaves a stream", async () => {
     let closed = false;
     const eu = await fakeRegion("eu", (req, res) => {
