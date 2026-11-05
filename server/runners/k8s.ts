@@ -123,6 +123,16 @@ export class KubernetesRunner implements Runner {
     await this.pool?.close();
   }
 
+  /**
+   * Deletes the Jobs a gone replica left running for the task, whichever replica asks: they carry its
+   * label, its own Job and a warm worker's given it alike, and the API server is the same for all.
+   */
+  async abandon(id: string): Promise<void> {
+    const ns = await this.namespace();
+    const jobs = await this.call<Resource>("GET", `/apis/batch/v1/namespaces/${ns}/jobs?labelSelector=${encodeURIComponent(`${TASK_LABEL}=${id}`)}`);
+    for (const job of jobs?.items ?? []) if (job.metadata?.name) await this.remove(`/apis/batch/v1/namespaces/${ns}/jobs/${job.metadata.name}`);
+  }
+
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
     const warm = this.pool?.take(task.id);
     const handle = warm && (await this.startWarm(warm, task, tenant));
@@ -158,7 +168,7 @@ export class KubernetesRunner implements Runner {
     try {
       await this.call("PATCH", jobPath, { metadata: { labels: taskLabels(task, tenant), annotations: tenantAnnotation(tenant) }, spec: { activeDeadlineSeconds: deadline } }, [], "application/merge-patch+json");
     } catch (err) {
-      console.error(`jig service: couldn't give ${task.id} to a warm worker:`, err instanceof Error ? err.message : err);
+      this.log.warn("couldn't give the task to a warm worker, which is stopped; the task starts cold", { task: task.id, err });
       warm.stop();
       return undefined;
     }
@@ -201,7 +211,7 @@ export class KubernetesRunner implements Runner {
       if (stopping) return;
       stopping = true;
       void this.remove(jobPath)
-        .catch((err: unknown) => console.error(`jig service: couldn't delete the warm worker's Job ${name}:`, err instanceof Error ? err.message : err))
+        .catch((err: unknown) => this.log.warn("couldn't delete a warm worker's Job", { job: name, err }))
         .finally(gone);
     };
     return { slot: { job: name, ns, jobPath, created, selector: `${POOL_LABEL}=${id}` }, exited, stop };
@@ -233,7 +243,7 @@ export class KubernetesRunner implements Runner {
     let finished = false;
     let retry: NodeJS.Timeout | undefined;
     const backstop = Date.now() + (task.spec.timeLimit + graceSeconds) * 1000 + SLACK_MS;
-    const exit = this.follow(ns, jobPath, selector, events, pollMs, backstop).finally(() => {
+    const exit = this.follow(ns, jobPath, selector, task.id, events, pollMs, backstop).finally(() => {
       finished = true;
       clearTimeout(retry);
       events.close();
@@ -241,7 +251,7 @@ export class KubernetesRunner implements Runner {
     // A DELETE lost to a blip of the API server would leave the run going, and spending, until its deadline.
     const remove = () => {
       this.remove(jobPath).catch((err: unknown) => {
-        console.error(`jig service: couldn't delete the Job of ${task.id}:`, err instanceof Error ? err.message : err);
+        this.log.warn("couldn't delete the task's Job", { task: task.id, err });
         if (!finished) retry = setTimeout(remove, Math.max(pollMs, 1000) * 2);
       });
     };
@@ -323,7 +333,7 @@ export class KubernetesRunner implements Runner {
    * the pod and the Job. While the pod hasn't started, it looks less and less often, up to every 5 seconds:
    * a cluster may have many tasks waiting for a node.
    */
-  private async follow(ns: string, jobPath: string, selector: string, events: Channel<JigEvent>, pollMs: number, backstop: number): Promise<RunExit> {
+  private async follow(ns: string, jobPath: string, selector: string, task: string, events: Channel<JigEvent>, pollMs: number, backstop: number): Promise<RunExit> {
     let seq = 0;
     let said: string | undefined;
     let worker: { exitCode?: number; stats?: unknown } = {};
@@ -352,7 +362,7 @@ export class KubernetesRunner implements Runner {
                 // rotated it before a read again (or ones too long to read). A notice takes the first's seq.
                 if (event.seq > seq + 1) {
                   const text = `Events ${seq + 1} to ${event.seq - 1} aren't in the pod's log: it was rotated before it was read again, or they were too long to read.`;
-                  console.error(`jig service: ${text}`);
+                  this.log.warn(text, { task });
                   await events.push({ v: 1, seq: seq + 1, ts: event.ts, type: "notice", text });
                 }
                 seq = event.seq;

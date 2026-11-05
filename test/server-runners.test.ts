@@ -13,8 +13,8 @@ import { createLog } from "../server/log.ts";
 import { type Exited, WarmPool } from "../server/pool.ts";
 import type { JigEvent, Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
-import type { Task, Tenant } from "../server/store.ts";
-import { Channel, KubernetesRunner, labelValue, objectName, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
+import { openStore, type Task, type Tenant } from "../server/store.ts";
+import { Channel, KubernetesRunner, labelValue, objectName, POOL_LABEL, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
 import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 import { parseYaml } from "./yaml.ts";
@@ -46,15 +46,46 @@ afterEach(async () => {
   await removeTempDirs();
 });
 
-/** The service with the given runner and one tenant, acme (or `tenant`), with its key. It keeps the task folders, which the tests look in. */
-async function service(runner: Runner, tenant = "acme"): Promise<Service> {
+/**
+ * The service with the given runner and one tenant, acme (or `tenant`), with its key, on a database of its
+ * own (or `database`). It keeps the task folders, which the tests look in.
+ */
+async function service(runner: Runner, tenant = "acme", database?: string): Promise<Service> {
   const base = await tempDir("jig-runners-");
   const started = await startService(
-    { port: 0, internal: { port: 0 }, database: join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: tenant, keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
+    { port: 0, internal: { port: 0 }, database: database ?? join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: tenant, keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
     { secret: SECRET, runner },
   );
   services.push(started);
   return started;
+}
+
+/**
+ * A replica of the service on the database at `database`, which claims tasks of acme's (each to be started
+ * on a runner by the test) and then crashes: its store closed, and its leases left to run out.
+ */
+async function crashingReplica(database: string) {
+  const store = await openStore(database);
+  const tenant: Tenant = { id: "acme", limits: { concurrency: 4, maxSteps: 50, timeLimit: 600, budgetUsd: null } };
+  await store.putTenant(tenant, [createHash("sha256").update(KEY).digest("hex")]);
+  return {
+    tenant,
+    claim: async (prompt = "hang"): Promise<Task> => {
+      const created = await store.createTask("acme", { prompt, maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" });
+      const task = await store.claim("acme", { owner: "the crashed replica", leaseMs: 300, concurrency: 4, tenantConcurrency: 4 });
+      assert.ok(typeof task === "object" && task.id === created.id);
+      return task;
+    },
+    crash: async () => {
+      await store.close();
+      await new Promise((done) => setTimeout(done, 350));
+    },
+  };
+}
+
+/** A log whose JSON lines go to `lines`. */
+function logTo(lines: any[]) {
+  return createLog("service", { format: "json", level: "debug", write: (line) => lines.push(JSON.parse(line)) });
 }
 
 async function call(service: Service, method: string, path: string, body?: unknown): Promise<{ status: number; body: any }> {
@@ -96,13 +127,17 @@ const alive = (pid: number) => {
 };
 
 describe("the Docker runner", () => {
+  type Options = Partial<ConstructorParameters<typeof DockerRunner>[0]>;
+  /** The runner's config, with its folders in `base` and the fake docker's state in `state`. */
+  const options = (base: string, state: string, config: Options = {}) => ({ dataDir: join(base, "data"), docker: [process.execPath, FAKE_DOCKER, state], image: "jig-worker:test", network: "jig-tasks", gatewayBaseUrl: "http://gateway:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config });
+
   /** The service on the Docker runner, with the fake docker's state files (`files`) there before it starts. */
-  async function docker(config: Partial<ConstructorParameters<typeof DockerRunner>[0]> = {}, files: Record<string, string> = {}) {
+  async function docker(config: Options = {}, files: Record<string, string> = {}) {
     const base = await tempDir("jig-docker-");
     const state = join(base, "state");
     await mkdir(state);
     for (const [name, text] of Object.entries(files)) await writeFile(join(state, name), text);
-    const runner = new DockerRunner({ dataDir: join(base, "data"), docker: [process.execPath, FAKE_DOCKER, state], image: "jig-worker:test", network: "jig-tasks", gatewayBaseUrl: "http://gateway:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config });
+    const runner = new DockerRunner(options(base, state, config));
     const api = await service(runner);
     return { api, state, runner, dir: (id: string) => runner.dir(id), container: async (id: string) => JSON.parse(await readFile(join(state, `jig-${id}.json`), "utf8")) };
   }
@@ -203,6 +238,28 @@ describe("the Docker runner", () => {
     assert.ok(signals.slice(first).every((signal) => signal === "KILL"));
     const { pid, child } = JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8"));
     await until(() => !alive(pid) && !alive(child), "the container's processes to be gone");
+  });
+
+  it("kills the container a crashed replica left running once its lease has run out, as it would spend until its time limit", async () => {
+    const base = await tempDir("jig-docker-");
+    const state = join(base, "state");
+    await mkdir(state);
+    const database = join(base, "jig.db");
+    const replica = await crashingReplica(database);
+    const task = await replica.claim();
+    const crashed = new DockerRunner(options(base, state));
+    const handle = await crashed.start(task, replica.tenant);
+    const { pid, child } = await until(async () => JSON.parse(await readFile(join(crashed.dir(task.id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
+    await replica.crash();
+
+    // Another replica, on the same daemon, ends the task and kills its container.
+    const api = await service(new DockerRunner(options(base, state)), "acme", database);
+    assert.equal((await api.store.task(task.id))!.status, "error");
+    await until(() => !alive(pid) && !alive(child), "the container's processes to be gone");
+    assert.deepEqual(await kills(state), [{ signal: "KILL", name: `jig-${task.id}` }]);
+    assert.equal((await handle.wait()).exitCode, 137);
+    // A container that isn't there (on another daemon, or gone) is nothing to kill, not a failure.
+    await new DockerRunner(options(base, state)).abandon("task_none");
   });
 
   /** The containers the fake docker ran, as it recorded them, by name. */
@@ -479,6 +536,11 @@ class FakeCluster {
       this.jobs.set(job.metadata.name, job);
       return reply(201, job);
     }
+    if (req.method === "GET" && url.pathname === `/apis/batch/v1${ns}jobs`) {
+      const [key, value] = url.searchParams.get("labelSelector")!.split("=");
+      const items = [...this.jobs.values()].filter((job) => job.metadata.labels?.[key] === value);
+      return reply(200, { kind: "JobList", items: items.map((job) => ({ metadata: job.metadata })) });
+    }
     if (req.method === "POST" && url.pathname === `/api/v1${ns}secrets`) {
       this.secrets.set(body.metadata.name, body);
       // A warm worker's pod starts, and claims, before anyone looks for it.
@@ -597,8 +659,9 @@ describe("the Kubernetes runner", () => {
     const base = await tempDir("jig-k8s-");
     const tokenFile = join(base, "token");
     await writeFile(tokenFile, `${cluster.token}\n`);
-    const runner = new KubernetesRunner({ apiUrl: cluster.url, tokenFile, caFile: join(FIXTURES, "k8s-api.crt"), namespace: "jig", image: "registry.example.com/jig-worker:1", gatewayBaseUrl: "http://jig-gateway.jig.svc:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config });
-    return { cluster, tokenFile, runner };
+    const options = { apiUrl: cluster.url, tokenFile, caFile: join(FIXTURES, "k8s-api.crt"), namespace: "jig", image: "registry.example.com/jig-worker:1", gatewayBaseUrl: "http://jig-gateway.jig.svc:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config };
+    // `another` is a second replica's runner on the same cluster.
+    return { cluster, tokenFile, runner: new KubernetesRunner(options), another: () => new KubernetesRunner(options) };
   }
 
   async function kubernetes(config: Partial<ConstructorParameters<typeof KubernetesRunner>[0]> = {}, tenant?: string) {
@@ -733,8 +796,9 @@ describe("the Kubernetes runner", () => {
     assert.equal(cluster.jobs.size, 0);
   });
 
-  it("asks again to delete a cancelled task's Job when the API server fails the first time", async () => {
-    const { cluster, api } = await kubernetes();
+  it("asks again to delete a cancelled task's Job when the API server fails the first time, and logs the failure", async () => {
+    const lines: any[] = [];
+    const { cluster, api } = await kubernetes({ log: logTo(lines) });
     cluster.script = () => ({ lines: logOf(undefined, undefined), hold: true });
     cluster.failDeletes = 1;
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
@@ -744,6 +808,37 @@ describe("the Kubernetes runner", () => {
     const deletes = cluster.requests.filter((request) => request.method === "DELETE").map((request) => request.path);
     assert.deepEqual(deletes, Array(2).fill(`/apis/batch/v1/namespaces/jig/jobs/${objectName(id)}?propagationPolicy=Background`));
     assert.equal(cluster.jobs.size, 0);
+    // In the service's log, with the task, not as a plain line on stderr.
+    const failed = lines.filter((line) => line.level !== "debug");
+    assert.deepEqual(failed.map(({ level, msg, task }) => ({ level, msg, task })), [{ level: "warn", msg: "couldn't delete the task's Job", task: id }]);
+    assert.match(failed[0].err.message, /^DELETE \/apis\/batch\/v1\/namespaces\/jig\/jobs\/.*: 500 etcdserver: request timed out$/);
+  });
+
+  it("deletes the Jobs a crashed replica left running, a warm worker's too, once their leases have run out", async () => {
+    const { cluster, runner, another } = await bare();
+    cluster.script = () => ({ lines: logOf(undefined, undefined), hold: true });
+    const database = join(await tempDir("jig-k8s-"), "jig.db");
+    const replica = await crashingReplica(database);
+    // A task on a Job of its own; one on a warm worker's, which keeps the worker's name but has the task's
+    // label (as the patch that gave it the task left it); and another task's Job, which runs on.
+    const cold = await replica.claim();
+    const handle = await runner.start(cold, replica.tenant);
+    await until(() => [...cluster.pods.values()].some((pod) => pod.reads), "the pod's log followed");
+    const warm = await replica.claim();
+    const job = (name: string, labels: Record<string, string>, podLabels: Record<string, string>) => ({ metadata: { name, labels: { ...ROLE_LABELS, ...labels } }, spec: { template: { metadata: { labels: { ...ROLE_LABELS, ...podLabels } } } }, status: {} });
+    cluster.jobs.set("jig-pool-0123456789abcdef", job("jig-pool-0123456789abcdef", { [TASK_LABEL]: warm.id, "jig.dev/tenant": "acme" }, { [POOL_LABEL]: "pool-0123456789abcdef" }));
+    cluster.jobs.set("jig-task-elsewhere", job("jig-task-elsewhere", { [TASK_LABEL]: "task_elsewhere" }, { [TASK_LABEL]: "task_elsewhere" }));
+    await replica.crash();
+
+    // Another replica ends both tasks, and deletes their Jobs, which would run and spend until their deadlines.
+    const api = await service(another(), "acme", database);
+    for (const task of [cold, warm]) assert.equal((await api.store.task(task.id))!.status, "error");
+    await until(() => cluster.jobs.size === 1, "the crashed replica's Jobs deleted");
+    assert.deepEqual([...cluster.jobs.keys()], ["jig-task-elsewhere"]);
+    const deletes = cluster.requests.filter((request) => request.method === "DELETE").map((request) => request.path);
+    assert.deepEqual(deletes.sort(), [objectName(cold.id), "jig-pool-0123456789abcdef"].map((name) => `/apis/batch/v1/namespaces/jig/jobs/${name}?propagationPolicy=Background`).sort());
+    // The run the crashed replica followed ends with its Job.
+    assert.equal((await handle.wait()).message, "its Job was deleted");
   });
 
   it("looks at a pod that hasn't started less and less often", async () => {
@@ -1230,7 +1325,7 @@ describe("the deploy files", () => {
 
     // The service's account may run Jobs, follow their pods and make their Secrets, and no more.
     const rules = find(all, "Role", "jig-api").rules.map((rule: any) => [rule.apiGroups, rule.resources, rule.verbs]);
-    assert.deepEqual(rules, [[["batch"], ["jobs"], ["create", "get", "patch", "delete"]], [[""], ["pods"], ["get", "list"]], [[""], ["pods/log"], ["get"]], [[""], ["secrets"], ["create"]]]);
+    assert.deepEqual(rules, [[["batch"], ["jobs"], ["create", "get", "list", "patch", "delete"]], [[""], ["pods"], ["get", "list"]], [[""], ["pods/log"], ["get"]], [[""], ["secrets"], ["create"]]]);
     assert.deepEqual(find(all, "RoleBinding", "jig-api").subjects, [{ kind: "ServiceAccount", name: "jig-api", namespace: "jig" }]);
     assert.equal(find(all, "Deployment", "jig-api").spec.template.spec.serviceAccountName, "jig-api");
     assert.equal(find(all, "ServiceAccount", "jig-task").automountServiceAccountToken, false);

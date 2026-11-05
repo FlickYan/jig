@@ -97,6 +97,22 @@ export class DockerRunner implements Runner {
     await this.pool?.close();
   }
 
+  /**
+   * Kills the container a gone replica left running for the task, if it is on this replica's daemon: a cold
+   * one is named for its task. A warm worker's isn't, and runs on until the task's time limit.
+   */
+  async abandon(id: string): Promise<void> {
+    const { docker = ["docker"] } = this.config;
+    const [program, ...first] = docker;
+    const name = `jig-${id}`;
+    const killer = spawn(program, [...first, "kill", "--signal", "KILL", name], { env: cliEnv(), stdio: ["ignore", "ignore", "pipe"], timeout: TERM_MS });
+    let said = "";
+    killer.stderr!.on("data", (chunk) => (said += chunk));
+    const code = await new Promise<number | null>((done, fail) => killer.on("error", fail).on("close", done));
+    // No such container: it has ended, or runs on another daemon.
+    if (code !== 0 && !/no such container/i.test(said)) throw new Error(`docker kill ${name} exited with ${code}: ${said.trim().slice(-500)}`);
+  }
+
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
     const warm = this.pool?.take(task.id);
     const handle = warm && (await this.startWarm(warm, task, tenant));
@@ -207,8 +223,7 @@ export class DockerRunner implements Runner {
   /** Starts docker run, `secrets` in the CLI's environment only, its output to `log`, and `stdin` to the container. */
   private launch(name: string, args: string[], secrets: Record<string, string>, log: string, stdin?: string): Container {
     const { docker = ["docker"] } = this.config;
-    const env: NodeJS.ProcessEnv = { ...secrets };
-    for (const variable of PASSED) if (process.env[variable] !== undefined) env[variable] = process.env[variable];
+    const env = cliEnv(secrets);
     const out = openSync(log, "w");
     const [program, ...first] = docker;
     const child = spawn(program, [...first, ...args], { env, stdio: [stdin === undefined ? "ignore" : "pipe", out, out] });
@@ -287,6 +302,13 @@ interface Slot {
   dir: string;
   container: Container;
   assigned: boolean;
+}
+
+/** The docker CLI's environment: what it needs of the service's to reach its daemon, and `secrets`. */
+function cliEnv(secrets: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...secrets };
+  for (const variable of PASSED) if (process.env[variable] !== undefined) env[variable] = process.env[variable];
+  return env;
 }
 
 async function chownTree(path: string, uid: number, gid: number): Promise<void> {

@@ -125,7 +125,9 @@ first, at its start or as it renews its own; it isn't run again, since its works
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
 out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`.
-A local run a crashed service started can outlive it, until jig's own `--time-limit` stops it.
+The replica that ends a crashed one's task stops what its runner can reach of the run (a Kubernetes Job, or
+a Docker container on its own daemon, below), which would otherwise go on spending; a local run a crashed
+service started can outlive it, until jig's own `--time-limit` stops it.
 
 ### Several replicas, on Postgres
 
@@ -144,10 +146,10 @@ tenants is each replica's own. A run's events are stored and announced (`NOTIFY 
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
-and it connects again. A replica that crashes leaves its runs going (a Kubernetes Job until its deadline);
-its tasks end as `error` once their leases run out, and the others go on. SQLite takes several processes
-on one machine too, with no announcements: streams read it every second, and a cancel is found as leases
-are renewed.
+and it connects again. A replica that crashes leaves its runs going until another ends its tasks as
+`error`, once their leases run out, and stops their Jobs or containers (above); the others go on. SQLite
+takes several processes on one machine too, with no announcements: streams read it every second, and a
+cancel is found as leases are renewed.
 
 ### Approvals
 
@@ -273,7 +275,7 @@ service's lines on stderr are `jig service: ...` with their fields after them, o
 `request`, `tenant`, `task` and `err`); `JIG_LOG_LEVEL` (`info` by default) is the least a line must be. At
 `debug` there is a line for each request (its `request`, method, path, status, `ms` and `tenant`) and for
 each task started and ended; at `error`, a request that failed (a 500) and the store's failures, with the
-error as `err`. The Kubernetes runner's few lines (a Job it couldn't delete) are still plain text.
+error as `err`.
 
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
@@ -338,8 +340,10 @@ without holding it, so what a task writes there can make up its own events (what
 gateway's to count) but not fill the service's memory. A run whose events can't be read or stored is
 stopped, and keeps its slot until it has ended. A cancel or the time limit is `docker kill --signal TERM`,
 sent again each second until it reaches the container (one whose image is still being pulled doesn't
-exist yet), then `docker kill` 5 seconds later, again each second until the run ends; a container a
-crashed service left runs until jig's own `--time-limit`.
+exist yet), then `docker kill` 5 seconds later, again each second until the run ends. A container a
+crashed replica left is killed (`docker kill --signal KILL jig-<id>`) by the replica that ends its task, if
+that replica's daemon runs it; one on another daemon, or a warm worker's, which is named for the worker and
+not the task, runs until jig's own `--time-limit`.
 
 The network must reach only the gateway and the service's internal listener: an internal network (`docker
 network create --internal jig-tasks`) with the gateway and the service attached to it too (`docker network
@@ -383,10 +387,12 @@ takes the exit code from the pod, the stats from that line and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
 says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
 reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
-and Secret with it, asked again every few seconds if the API server fails it. While a pod hasn't started,
-it is looked at less and less often, up to every 5 seconds. The log is read only as fast as the events
-are stored, the rest waiting on the API server's side. Read again after the kubelet rotated it (at 10 MiB
-by default), the log may lack events: a `notice` event in place of the first says which.
+and Secret with it, asked again every few seconds if the API server fails it. The Jobs a crashed replica
+left are deleted the same way by the replica that ends their tasks, found by their `jig.dev/task` label (a
+warm worker's Job too, once given its task), so the Role in `deploy/k8s/rbac.yaml` allows `list` on Jobs.
+While a pod hasn't started, it is looked at less and less often, up to every 5 seconds. The log is read
+only as fast as the events are stored, the rest waiting on the API server's side. Read again after the
+kubelet rotated it (at 10 MiB by default), the log may lack events: a `notice` event in place of the first says which.
 
 As on Docker, jig runs with `--no-sandbox`, the pod being the wall. Its commands run as the same user as
 the worker, the pod's first process, so they can write the pod's log too and make up events, and one with

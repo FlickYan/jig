@@ -12,10 +12,11 @@ metadata:
   name: jig-api
   namespace: jig
 rules:
-  # patch: a warm worker's Job gets its task's deadline and labels (docs/server.md, Warm pools).
+  # patch: a warm worker's Job gets its task's deadline and labels (docs/server.md, Warm pools). list: the
+  # Jobs a crashed replica left are found by their task's label, and deleted.
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "patch", "delete"]
+    verbs: ["create", "get", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

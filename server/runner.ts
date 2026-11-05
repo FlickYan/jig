@@ -42,6 +42,11 @@ export interface Runner {
   readonly pool?: { stats(): { idle: number } };
   /** Removes what a task's run left on this machine (its folder), once the run has ended. */
   removeFiles?(id: string): Promise<void>;
+  /**
+   * Stops what may still run of a task whose replica is gone (its container or Job), as far as this
+   * replica can reach it: the task has ended as an error, and the run would spend until its deadline.
+   */
+  abandon?(id: string): Promise<void>;
   /** Starts the workers it keeps warm (pool.ts), which claim their tasks at the internal listener, as they reach it. */
   warm?(internalBaseUrl: string): void;
   /** Answers a warm worker's claim, POST /internal/pool/claim on the internal listener. */
