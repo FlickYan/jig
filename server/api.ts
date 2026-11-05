@@ -100,8 +100,8 @@ export interface Config {
   tenants: TenantConfig[];
 }
 
-/** What every runner takes from the config's top level. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl";
+/** What every runner takes from the config's top level, and the service's log. */
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl" | "log";
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
 const MAX_PROMPT = 100_000;
@@ -153,7 +153,7 @@ export async function startService(
   checkConfig(config);
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
-  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
+  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
   const metrics = serviceMetrics();
@@ -213,7 +213,7 @@ export async function startService(
     if (retired) log.warn(`${retired} queued task(s) of tenants no longer in the config cancelled`);
     // Before any task starts, as their jig asks for approvals there.
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
-    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl);
+    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
@@ -319,8 +319,9 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
   return hooks;
 }
 
-function runnerFor(config: Config, secret: string, internalBaseUrl: string): Runner {
-  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl };
+/** The runner the config names, its lines (and its pool's) in the service's `log`. */
+function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log): Runner {
+  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") return new LocalRunner({ ...shared, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });

@@ -2,7 +2,7 @@ import { createHmac } from "node:crypto";
 import { EventEmitter } from "node:events";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
-import { createLog } from "./log.ts";
+import { createLog, type Log } from "./log.ts";
 import type { JigEvent } from "./runner.ts";
 import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task } from "./store.ts";
 import { verifyToken } from "./token.ts";
@@ -150,8 +150,6 @@ export interface Webhook {
   secret: string;
 }
 
-const log = createLog("service");
-
 /** Tries after a first that fails, and how long each may take. */
 const RETRIES = 3;
 const ATTEMPT_MS = 10_000;
@@ -165,10 +163,13 @@ export class Webhooks {
   private hooks: Map<string, Webhook>;
   private retryMs: number;
   private pending = new Set<AbortController>();
+  private log: Log;
 
-  constructor(hooks: Map<string, Webhook>, retryMs = 1000) {
+  /** `log` is where a webhook that keeps failing is said (the service's). */
+  constructor(hooks: Map<string, Webhook>, retryMs = 1000, log = createLog("service")) {
     this.hooks = hooks;
     this.retryMs = retryMs;
+    this.log = log;
   }
 
   send(task: Task, approval: Approval): void {
@@ -192,7 +193,7 @@ export class Webhooks {
           last = err instanceof Error ? err.message : String(err);
         }
       }
-      log.warn(`the approval webhook failed for ${approval.id}, ${RETRIES + 1} times: ${last}`, { tenant: task.tenant, task: task.id });
+      this.log.warn(`the approval webhook failed for ${approval.id}, ${RETRIES + 1} times: ${last}`, { tenant: task.tenant, task: task.id });
     })().finally(() => this.pending.delete(stop));
   }
 

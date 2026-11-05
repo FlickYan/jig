@@ -4,7 +4,8 @@ import { closeSync, openSync } from "node:fs";
 import { lchown, mkdir, readdir, rm } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
+import { createLog, type Log } from "../log.ts";
+import { type Exited, type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
 import { jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
 import type { PoolAnswer } from "../worker.ts";
@@ -47,6 +48,8 @@ export interface DockerRunnerConfig {
   /** How a warm worker starts in the image (default: node /opt/jig/server/worker.ts). */
   worker?: string[];
   pollMs?: number;
+  /** Where the runner's and its pool's lines go (default: the service's log). */
+  log?: Log;
 }
 
 // The docker CLI needs these of the service's environment to reach its daemon; it gets nothing else of it.
@@ -62,10 +65,12 @@ export class DockerRunner implements Runner {
   private folders = new Map<string, string>();
   /** Where the warm workers claim their tasks. */
   private poolUrl = "";
+  private log: Log;
 
   constructor(config: DockerRunnerConfig) {
     this.config = config;
-    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket));
+    this.log = config.log ?? createLog("service");
+    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket), this.log);
   }
 
   /** The task's folder. */
@@ -90,6 +95,22 @@ export class DockerRunner implements Runner {
 
   async close(): Promise<void> {
     await this.pool?.close();
+  }
+
+  /**
+   * Kills the container a gone replica left running for the task, if it is on this replica's daemon: a cold
+   * one is named for its task. A warm worker's isn't, and runs on until the task's time limit.
+   */
+  async abandon(id: string): Promise<void> {
+    const { docker = ["docker"] } = this.config;
+    const [program, ...first] = docker;
+    const name = `jig-${id}`;
+    const killer = spawn(program, [...first, "kill", "--signal", "KILL", name], { env: cliEnv(), stdio: ["ignore", "ignore", "pipe"], timeout: TERM_MS });
+    let said = "";
+    killer.stderr!.on("data", (chunk) => (said += chunk));
+    const code = await new Promise<number | null>((done, fail) => killer.on("error", fail).on("close", done));
+    // No such container: it has ended, or runs on another daemon.
+    if (code !== 0 && !/no such container/i.test(said)) throw new Error(`docker kill ${name} exited with ${code}: ${said.trim().slice(-500)}`);
   }
 
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
@@ -121,7 +142,7 @@ export class DockerRunner implements Runner {
    */
   private async startWarm(warm: Warm<Slot>, task: Task, tenant: Tenant): Promise<RunHandle | undefined> {
     const { jig = ["jig"], graceSeconds } = this.config;
-    const { dir, container } = warm.slot;
+    const { name, dir, container } = warm.slot;
     try {
       await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"]);
       await this.chown(dir);
@@ -140,6 +161,8 @@ export class DockerRunner implements Runner {
     if (!warm.answer(answer)) return undefined;
     warm.slot.assigned = true;
     this.folders.set(task.id, dir);
+    // The container and folder keep the worker's names, not the task's: this says which are the task's.
+    this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, container: name, folder: dir });
     return { ...this.handle(container, dir, task), warm: true };
   }
 
@@ -153,11 +176,15 @@ export class DockerRunner implements Runner {
     const name = `jig-${id}`;
     const args = [...this.runArgs(name, dir, ["--label", `jig.pool=${id}`], "JIG_POOL_TICKET"), ...worker, "--pool", this.poolUrl];
     const container = this.launch(name, args, { JIG_POOL_TICKET: ticket }, join(dir, "output.log"));
-    const slot: Slot = { dir, container, assigned: false };
+    const slot: Slot = { name, dir, container, assigned: false };
     // A worker that never got a task leaves its folder; one that did, the task's. The pool waits on this,
-    // not on the exit alone, so a service that closes has removed the folders of its idle workers.
-    const exited = container.exit.then(async () => {
-      if (!slot.assigned) await rm(dir, { recursive: true, force: true }).catch(() => {});
+    // not on the exit alone, so a service that closes has removed the folders of its idle workers. What
+    // one that never got a task said last is read first, for the pool to log.
+    const exited = container.exit.then(async ({ code, message }): Promise<Exited> => {
+      if (slot.assigned) return { code };
+      const said = message ?? (await lastLine(join(dir, "output.log")).catch(() => undefined));
+      await rm(dir, { recursive: true, force: true }).catch(() => {});
+      return { code, said };
     });
     return { slot, exited, stop: container.stop };
   }
@@ -196,8 +223,7 @@ export class DockerRunner implements Runner {
   /** Starts docker run, `secrets` in the CLI's environment only, its output to `log`, and `stdin` to the container. */
   private launch(name: string, args: string[], secrets: Record<string, string>, log: string, stdin?: string): Container {
     const { docker = ["docker"] } = this.config;
-    const env: NodeJS.ProcessEnv = { ...secrets };
-    for (const variable of PASSED) if (process.env[variable] !== undefined) env[variable] = process.env[variable];
+    const env = cliEnv(secrets);
     const out = openSync(log, "w");
     const [program, ...first] = docker;
     const child = spawn(program, [...first, ...args], { env, stdio: [stdin === undefined ? "ignore" : "pipe", out, out] });
@@ -270,11 +296,19 @@ interface Container {
   stop(): void;
 }
 
-/** A warm worker's container and folder; `assigned` once a task is given to it. */
+/** A warm worker's container, by its name, and folder; `assigned` once a task is given to it. */
 interface Slot {
+  name: string;
   dir: string;
   container: Container;
   assigned: boolean;
+}
+
+/** The docker CLI's environment: what it needs of the service's to reach its daemon, and `secrets`. */
+function cliEnv(secrets: Record<string, string> = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...secrets };
+  for (const variable of PASSED) if (process.env[variable] !== undefined) env[variable] = process.env[variable];
+  return env;
 }
 
 async function chownTree(path: string, uid: number, gid: number): Promise<void> {

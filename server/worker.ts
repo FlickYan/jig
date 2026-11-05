@@ -67,6 +67,9 @@ async function claim(baseUrl: string | undefined): Promise<PoolAnswer | undefine
   // node:http, which has no timeout of its own: the answer comes when a task does.
   const res = await new Promise<IncomingMessage>((done, fail) => {
     const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, { method: "POST", headers: { authorization: `Bearer ${ticket}`, "content-length": 0 } }, done);
+    // The claim may wait many minutes: keepalive breaks it if the replica's node dies, and the worker exits
+    // rather than wait out its Job's deadline.
+    req.on("socket", (socket) => socket.setKeepAlive(true, 15_000));
     req.on("error", fail);
     req.end();
   });
@@ -82,6 +85,8 @@ async function claim(baseUrl: string | undefined): Promise<PoolAnswer | undefine
 
 /** Makes the workspace and runs jig in it, the prompt on stdin, then exits as jig did. */
 async function run(task: WorkerInput, program: string, args: string[], env: Record<string, string>, report: boolean): Promise<void> {
+  // The pod's HOME is in /task, which starts empty: git config --global or pip install --user need it there.
+  if (process.env.HOME) await mkdir(process.env.HOME, { recursive: true });
   await mkdir(task.work, { recursive: true });
   await prepareWorkspace(task.work, task.workspace, task.gitProtocols);
   child = spawn(program, args, { cwd: task.work, env: { ...process.env, ...env }, stdio: ["pipe", "inherit", "inherit"] });

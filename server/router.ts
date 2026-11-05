@@ -29,6 +29,8 @@ export interface RouterConfig {
   tenants: RouterTenant[];
   /** How often each region's /healthz is asked (default 5000 ms), and how many failures in a row make it down (default 2). */
   health?: { intervalMs?: number; failures?: number };
+  /** The largest new task body the router reads (default 1 MiB, the services' default; set it to the largest any region's maxBodyBytes allows). */
+  maxBodyBytes?: number;
 }
 
 export interface RouterTenant {
@@ -58,8 +60,6 @@ const REGIONAL_ID = /^task_([a-z0-9]{1,16})_[0-9a-f]{32}$/;
 const LEGACY_ID = /^task_[0-9a-f]{32}$/;
 const REGION_NAME = /^[a-z0-9]{1,16}$/;
 const REQUEST_ID = /^[\w.-]{1,128}$/;
-/** A new task's body is read to find its region: none the service takes is near this. */
-const MAX_BODY_BYTES = 16 * 1024 * 1024;
 /** A region's /healthz that takes longer has failed. */
 const HEALTH_TIMEOUT_MS = 2000;
 // Not forwarded either way: they describe one connection, not the request.
@@ -114,6 +114,7 @@ function configProblem(config: RouterConfig): string | undefined {
     block("health", config.health, "{intervalMs, failures}") ??
     whole("health.intervalMs", config.health?.intervalMs, 1) ??
     whole("health.failures", config.health?.failures, 1) ??
+    whole("maxBodyBytes", config.maxBodyBytes, 1) ??
     (Array.isArray(config.regions) && config.regions.length ? undefined : "regions must be a list of {name, url}, one at least") ??
     (Array.isArray(config.tenants) ? undefined : "tenants must be a list");
   if (problem) return problem;
@@ -164,6 +165,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
     for (const key of tenant.keys) tenants.set(key.toLowerCase(), entry);
   }
   const { intervalMs = 5000, failures: most = 2 } = config.health ?? {};
+  // A new task's body is read whole to find its region, so it is held in memory: no more than a region takes.
+  const maxBody = config.maxBodyBytes ?? 1024 * 1024;
 
   const registry = new Registry();
   const requests = registry.counter("jig_router_requests_total", "Requests the router answered, by the region that answered (empty for the router's own answers), route and status.", ["region", "route", "status"]);
@@ -264,6 +267,9 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
   /** The usage of every region the tenant may use, summed: rows with the same day and model are one. */
   const usageEverywhere = async (x: Exchange, tenant: Tenant, path: string, query: URLSearchParams) => {
     if (query.get("format") === "csv") return reply(x, 400, { error: "region=all gives JSON: ask each region for its CSV" });
+    // A client that leaves, or the router closing, takes the requests to the regions with it.
+    const left = new AbortController();
+    x.res.once("close", () => left.abort());
     const answers = await Promise.all(
       tenant.allowed.map(async (name) => {
         const region = regions.get(name)!;
@@ -271,15 +277,17 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
         try {
           const res = await fetch(under(region.url, `${path}${query.size ? `?${query}` : ""}`), {
             headers: { authorization: x.req.headers.authorization ?? "", "x-request-id": x.id },
-            signal: AbortSignal.timeout(30_000),
+            signal: AbortSignal.any([probes.signal, left.signal, AbortSignal.timeout(30_000)]),
           });
           return { name, status: res.status, body: (await res.json().catch(() => undefined)) as UsageReport | undefined };
         } catch (err) {
-          x.log.error(`couldn't reach region ${name}`, { region: name, err });
+          if (!probes.signal.aborted && !left.signal.aborted) x.log.error(`couldn't reach region ${name}`, { region: name, err });
           return { name, status: 502, body: undefined };
         }
       }),
     );
+    // No one is left to answer, as forward() does: no reply, and no count.
+    if (left.signal.aborted) return;
     const answered = answers.filter((answer) => answer.status === 200 && answer.body && Array.isArray(answer.body.rows));
     if (!answered.length) {
       // The regions' own refusal (a bad range, say) is the same in each: it goes back as it came.
@@ -305,10 +313,20 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
 
     if (url.pathname === "/v1/tasks" && req.method === "POST") {
       x.route = "create";
-      const body = await readBody(req, MAX_BODY_BYTES);
+      let body: Buffer | undefined;
+      try {
+        body = await readBody(req, maxBody);
+      } catch (err) {
+        // A client that left before its body was read is not the router's fault: no answer, and no count.
+        if (req.destroyed || x.res.destroyed) {
+          x.log.debug("the client left before its body was read", { err });
+          return void x.res.destroy();
+        }
+        throw err;
+      }
       if (body === undefined) {
         x.res.setHeader("connection", "close");
-        return reply(x, 413, { error: `The body is over ${MAX_BODY_BYTES} bytes` });
+        return reply(x, 413, { error: `The body is over ${maxBody} bytes` });
       }
       let named: unknown;
       try {
@@ -317,7 +335,9 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
         // The region's service says what is wrong with it.
       }
       if (named !== undefined) {
-        if (typeof named !== "string" || !allowed(named)) return reply(x, 403, { error: `Tenant ${tenant.id} may not use region ${JSON.stringify(named)}: it may use ${tenant.allowed.join(", ")}`, region: named });
+        // The service's own answer to a region that is no region's name.
+        if (typeof named !== "string" || !REGION_NAME.test(named)) return reply(x, 400, { error: "region must be a region's name" });
+        if (!allowed(named)) return reply(x, 403, { error: `Tenant ${tenant.id} may not use region ${JSON.stringify(named)}: it may use ${tenant.allowed.join(", ")}`, region: named });
         const region = regions.get(named)!;
         if (!region.up) return down(x, named, "try again once it is back, or name another region");
         return forward(x, region, url.pathname + url.search, body);
@@ -338,6 +358,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       x.route = { "/events": "events", "/cancel": "cancel", "/approvals": "approvals" }[task[2] ?? ""] ?? "task";
       // An id without a region is from before regions: it lives in the home region.
       const name = REGIONAL_ID.exec(task[1])?.[1] ?? (LEGACY_ID.test(task[1]) ? tenant.home : undefined);
+      // Only an id's shape is put in the log, never any other text from the path.
+      if (name !== undefined) x.log = x.log.with({ task: task[1] });
       if (name === undefined || !regions.has(name) || !allowed(name)) return reply(x, 404, { error: "No such task" });
       const region = regions.get(name)!;
       if (!region.up) return down(x, name, "its tasks can't be read or changed until it is back (task data stays in its region)");

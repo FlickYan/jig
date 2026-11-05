@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
@@ -47,7 +49,7 @@ async function database(base: string): Promise<string> {
  * A service with the fake jig, its metrics on a listener of their own, read fresh at each scrape, and its
  * log's JSON lines, at debug, in `lines`.
  */
-async function service(config: Partial<Config> = {}, runner?: Runner): Promise<Service & { dataDir: string; lines: any[] }> {
+async function service(config: Partial<Config> = {}, runner?: Runner, options: { webhookRetryMs?: number } = {}): Promise<Service & { dataDir: string; lines: any[] }> {
   const base = await tempDir("jig-observe-");
   const dataDir = join(base, "data");
   const lines: any[] = [];
@@ -69,7 +71,7 @@ async function service(config: Partial<Config> = {}, runner?: Runner): Promise<S
       ],
       ...config,
     },
-    { secret: SECRET, runner, log, countsMs: 0 },
+    { secret: SECRET, runner, log, countsMs: 0, ...options },
   );
   services.push(started);
   return { ...started, dataDir, lines };
@@ -362,6 +364,41 @@ describe("the task service's metrics on the Docker runner, with a warm pool", ()
     // The cold one waited for its container, the warm one didn't.
     assert.ok(value('jig_service_start_seconds_sum{start="cold"}')! >= 1);
     assert.ok(value('jig_service_start_seconds_sum{start="warm"}')! < value('jig_service_start_seconds_sum{start="cold"}')!);
+  });
+
+  it("writes the warm pool's and the approval webhooks' lines to the service's log, with their task", async () => {
+    const base = await tempDir("jig-observe-docker-");
+    const state = join(base, "state");
+    await mkdir(state);
+    // No container exists for a second, so the task finds no warm worker waiting.
+    await writeFile(join(state, "delay"), "1000");
+    const receiver = createServer((req, res) => void req.resume().on("end", () => res.writeHead(500).end()));
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    const saved = process.env.ACME_WEBHOOK_SECRET;
+    process.env.ACME_WEBHOOK_SECRET = "acme's webhook secret";
+    try {
+      const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks`;
+      // The runner is the one the config names, as in production.
+      const api = await service(
+        {
+          dataDir: join(base, "data"),
+          runner: "docker",
+          docker: { image: "jig-worker:test", network: "jig-tasks", docker: [process.execPath, FAKE_DOCKER, state], pollMs: 20, pool: { size: 1 } },
+          tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], approvalWebhook: url, webhookSecretEnv: "ACME_WEBHOOK_SECRET" }],
+        },
+        undefined,
+        { webhookRetryMs: 10 },
+      );
+      const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id;
+      const missed = await until(() => api.lines.find((line) => line.msg.startsWith("no warm worker was waiting")), "the pool's line");
+      assert.deepEqual([missed.level, missed.component, missed.task], ["info", "service", id]);
+      const failed = await until(() => api.lines.find((line) => line.msg.startsWith("the approval webhook failed")), "the webhook's line");
+      assert.deepEqual([failed.level, failed.msg, failed.tenant, failed.task], ["warn", "the approval webhook failed for ap_1, 4 times: 500", "acme", id]);
+    } finally {
+      if (saved === undefined) delete process.env.ACME_WEBHOOK_SECRET;
+      else process.env.ACME_WEBHOOK_SECRET = saved;
+      await new Promise((done) => (receiver.closeAllConnections(), receiver.close(done)));
+    }
   });
 });
 

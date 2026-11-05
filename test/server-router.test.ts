@@ -59,9 +59,10 @@ async function region(name: string | undefined, { base, port = 0, database }: { 
  * A router in front of the regions: acme lives in eu and may use us, and fails over to it; globex lives in
  * eu alone; initech in us. Health is asked every 50 ms, and two failures make a region down.
  */
-async function router(regions: Record<string, string>, lines: string[] = []): Promise<Router> {
+async function router(regions: Record<string, string>, lines: string[] = [], more: Partial<RouterConfig> = {}): Promise<Router> {
   const started = await startRouter(
     {
+      ...more,
       listen: { port: 0 },
       metrics: { port: 0 },
       regions: Object.entries(regions).map(([name, url]) => ({ name, url })),
@@ -93,8 +94,8 @@ async function call(base: string, key: string | undefined, method: string, path:
   return { status: res.status, headers: res.headers, body: await res.json() };
 }
 
-async function until<T>(check: () => Promise<T | undefined | false> | T | undefined | false, what: string): Promise<T> {
-  for (const deadline = Date.now() + 15_000; Date.now() < deadline; await new Promise((done) => setTimeout(done, 20))) {
+async function until<T>(check: () => Promise<T | undefined | false> | T | undefined | false, what: string, ms = 15_000): Promise<T> {
+  for (const deadline = Date.now() + ms; Date.now() < deadline; await new Promise((done) => setTimeout(done, 20))) {
     const result = await check();
     if (result) return result;
   }
@@ -219,6 +220,14 @@ describe("the router", () => {
     assert.equal(forbidden.headers.get("x-jig-region"), null);
     assert.deepEqual((await call(us.url, KEYS.globex, "GET", "/v1/tasks")).body, { tasks: [] });
     assert.equal((await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0", region: "mars" })).status, 403);
+    // A region that is no region's name is the service's 400, before any region sees it.
+    for (const named of [null, 5]) {
+      const wrong = await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0", region: named });
+      assert.equal(wrong.status, 400);
+      assert.deepEqual(wrong.body, { error: "region must be a region's name" });
+      assert.equal(wrong.headers.get("x-jig-region"), null);
+    }
+    for (const service of [eu, us]) assert.deepEqual((await call(service.url, KEYS.globex, "GET", "/v1/tasks")).body, { tasks: [] });
 
     // The same 401 as a service's, for no key and a key no tenant has.
     for (const key of [undefined, "not-a-key"]) {
@@ -236,13 +245,15 @@ describe("the router", () => {
   it("routes a task's view, its live events and its cancel by the region in its id, and lists a region's tasks", async () => {
     const eu = await region("eu");
     const us = await region("us");
-    const front = await router({ eu: eu.url, us: us.url });
+    const lines: string[] = [];
+    const front = await router({ eu: eu.url, us: us.url }, lines);
 
     // A task in us streams through the router as it runs: the fake jig waits for go before it ends.
     const waiting = (await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait", region: "us" })).body.id;
     const view = await call(front.url, KEYS.acme, "GET", `/v1/tasks/${waiting}`);
     assert.equal(view.body.region, "us");
     assert.equal(view.headers.get("x-jig-region"), "us");
+    assert.ok(lines.some((line) => new RegExp(`GET /v1/tasks/${waiting} 200 \\(.*tenant=acme task=${waiting} region=us\\)`).test(line)));
     const res = await fetch(`${front.url}/v1/tasks/${waiting}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } });
     assert.equal(res.headers.get("content-type"), "text/event-stream");
     assert.equal(res.headers.get("x-jig-region"), "us");
@@ -400,6 +411,125 @@ describe("the router", () => {
     await until(() => closed, "the region's request to close");
   });
 
+  it("breaks off the client's stream when the region breaks off its own", async () => {
+    const eu = await fakeRegion("eu", (_req, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(`id: 1\ndata: ${JSON.stringify({ type: "start" })}\n\n`);
+      setTimeout(() => res.destroy(), 50);
+    });
+    const front = await router({ eu, us: await fakeRegion("us", () => {}) });
+    const res = await fetch(`${front.url}/v1/tasks/task_eu_${"c".repeat(32)}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } });
+    const stream = frames(res);
+    assert.equal(JSON.parse((await stream.next()).value!.data).type, "start");
+    // A client left waiting on the rest would hang: it must hear the stream ended short, and soon.
+    let timer: NodeJS.Timeout | undefined;
+    const hung = new Promise((_, fail) => (timer = setTimeout(() => fail(new Error("the client's stream was left open")), 5000)));
+    await Promise.race([
+      assert.rejects(async () => {
+        for await (const _ of stream);
+      }),
+      hung,
+    ]).finally(() => clearTimeout(timer));
+  });
+
+  it("sends the region the request's id", async () => {
+    const seen: (string | undefined)[] = [];
+    const eu = await fakeRegion("eu", (req, res) => {
+      seen.push(req.headers["x-request-id"] as string | undefined);
+      res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ tasks: [] }));
+    });
+    const front = await router({ eu, us: await fakeRegion("us", () => {}) });
+    // A new id where the client sent none, or one that isn't an id; the client's own where it is one.
+    for (const headers of [{}, { "x-request-id": "not a valid id!" }] as Record<string, string>[]) {
+      const answer = await call(front.url, KEYS.acme, "GET", "/v1/tasks", undefined, headers);
+      assert.equal(seen.at(-1), answer.headers.get("x-request-id"));
+      assert.notEqual(seen.at(-1), "not a valid id!");
+    }
+    await call(front.url, KEYS.acme, "GET", "/v1/tasks", undefined, { "x-request-id": "req-9" });
+    assert.equal(seen.at(-1), "req-9");
+  });
+
+  it("routes ids by the region in them, the regions the tenant may use, and its home", async () => {
+    const asked: string[] = [];
+    const recording = (name: string) => (req: IncomingMessage, res: ServerResponse) => {
+      asked.push(`${name} ${req.method} ${req.url}`);
+      res.writeHead(200, { "content-type": "application/json" }).end("{}");
+    };
+    // eu comes first in the config: initech's home, us, is not.
+    const front = await router({ eu: await fakeRegion("eu", recording("eu")), us: await fakeRegion("us", recording("us")) });
+    const regional = `task_us_${"d".repeat(32)}`;
+    for (const [method, path] of [["GET", ""], ["GET", "/events"], ["POST", "/cancel"]]) {
+      const answer = await call(front.url, KEYS.globex, method, `/v1/tasks/${regional}${path}`);
+      assert.equal(answer.status, 404);
+      assert.deepEqual(answer.body, { error: "No such task" });
+    }
+    assert.deepEqual(asked, []);
+    const legacy = `task_${"e".repeat(32)}`;
+    for (const [key, home] of [[KEYS.initech, "us"], [KEYS.acme, "eu"]]) {
+      asked.length = 0;
+      assert.equal((await call(front.url, key, "GET", `/v1/tasks/${legacy}`)).headers.get("x-jig-region"), home);
+      assert.deepEqual(asked, [`${home} GET /v1/tasks/${legacy}`]);
+    }
+  });
+
+  it("takes a client that leaves during a new task's body as no fault of its own", async () => {
+    const lines: string[] = [];
+    const front = await router({ eu: await fakeRegion("eu", () => {}), us: await fakeRegion("us", () => {}) }, lines);
+    const { hostname, port } = new URL(front.url);
+    const socket = connect(Number(port), hostname);
+    // The 100 Continue says the router has the head, and is reading the body when the client goes.
+    socket.write(`POST /v1/tasks HTTP/1.1\r\nhost: ${hostname}:${port}\r\nauthorization: Bearer ${KEYS.acme}\r\ncontent-type: application/json\r\ncontent-length: 1000\r\nexpect: 100-continue\r\n\r\n`);
+    await new Promise((done) => socket.once("data", done));
+    socket.write('{"prompt": "exit 0", ');
+    await new Promise((done) => setTimeout(done, 50));
+    socket.destroy();
+    await until(() => lines.some((line) => /couldn't route a request|the client left before its body was read/.test(line)), "the router to see the client go");
+    assert.ok(!lines.some((line) => line.includes("couldn't route a request")), lines.join("\n"));
+    assert.doesNotMatch(await (await fetch(`${front.metricsUrl}/metrics`)).text(), /route="create",status="500"/);
+  });
+
+  it("caps a new task's body at maxBodyBytes", async () => {
+    const asked: number[] = [];
+    const eu = await fakeRegion("eu", async (req, res) => {
+      let size = 0;
+      for await (const chunk of req) size += chunk.length;
+      asked.push(size);
+      res.writeHead(201, { "content-type": "application/json" }).end("{}");
+    });
+    const front = await router({ eu, us: await fakeRegion("us", () => {}) }, [], { maxBodyBytes: 64 });
+    const over = await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(87) });
+    assert.equal(over.status, 413);
+    assert.deepEqual(over.body, { error: "The body is over 64 bytes" });
+    assert.deepEqual(asked, []);
+    assert.equal((await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(27) })).status, 201);
+    assert.deepEqual(asked, [40]);
+  });
+
+  it("stops asking the regions for usage once the client has left, or the router closes", async () => {
+    for (const end of ["client", "router"] as const) {
+      let asked = false;
+      let closed = false;
+      const never = (req: IncomingMessage) => {
+        asked = true;
+        req.socket.once("close", () => (closed = true));
+      };
+      const front = await router({ eu: await fakeRegion("eu", never), us: await fakeRegion("us", never) });
+      const client = new AbortController();
+      const answer = fetch(`${front.url}/v1/usage?region=all`, { headers: { authorization: `Bearer ${KEYS.acme}` }, signal: client.signal }).catch(() => undefined);
+      await until(() => asked, "a region to be asked");
+      if (end === "client") client.abort();
+      else await (routers.splice(routers.indexOf(front), 1), front.close());
+      // Not after the 30 seconds a region has to answer.
+      await until(() => closed, `the region's request to close when the ${end} ends`, 3000);
+      await answer;
+      // A client that left is no 502 of the router's.
+      if (end === "client") {
+        await new Promise((done) => setTimeout(done, 100));
+        assert.doesNotMatch(await (await fetch(`${front.metricsUrl}/metrics`)).text(), /route="usage",status="502"/);
+      }
+    }
+  });
+
   it("sends a request whose target names another host to the region all the same, with its key", async () => {
     const asked: string[] = [];
     const elsewhere: string[] = [];
@@ -459,6 +589,7 @@ describe("the router", () => {
       [{ tenants: [{ id: "acme", keys: [sha256("k")], home: "eu", allowed: ["us"] }] }, /tenants\[0\]\.allowed\[0\] must be one of the regions/],
       [{ tenants: [{ id: "acme", keys: ["abc"], home: "eu" }] }, /tenants\[0\]\.keys\[0\] must be a key's SHA-256 hash/],
       [{ health: { failures: 0 } }, /health\.failures must be a whole number from 1 up/],
+      [{ maxBodyBytes: 0 }, /maxBodyBytes must be a whole number from 1 up/],
       [{ metrics: {} as { port: number } }, /metrics\.port is missing/],
     ];
     for (const [change, message] of cases) assert.throws(() => checkRouterConfig({ ...base, ...change }), message);

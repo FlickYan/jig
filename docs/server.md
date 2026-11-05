@@ -125,7 +125,9 @@ first, at its start or as it renews its own; it isn't run again, since its works
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
 out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`.
-A local run a crashed service started can outlive it, until jig's own `--time-limit` stops it.
+The replica that ends a crashed one's task stops what its runner can reach of the run (a Kubernetes Job, or
+a Docker container on its own daemon, below), which would otherwise go on spending; a local run a crashed
+service started can outlive it, until jig's own `--time-limit` stops it.
 
 ### Several replicas, on Postgres
 
@@ -144,10 +146,10 @@ tenants is each replica's own. A run's events are stored and announced (`NOTIFY 
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
-and it connects again. A replica that crashes leaves its runs going (a Kubernetes Job until its deadline);
-its tasks end as `error` once their leases run out, and the others go on. SQLite takes several processes
-on one machine too, with no announcements: streams read it every second, and a cancel is found as leases
-are renewed.
+and it connects again. A replica that crashes leaves its runs going until another ends its tasks as
+`error`, once their leases run out, and stops their Jobs or containers (above); the others go on. SQLite
+takes several processes on one machine too, with no announcements: streams read it every second, and a
+cancel is found as leases are renewed.
 
 ### Approvals
 
@@ -273,7 +275,7 @@ service's lines on stderr are `jig service: ...` with their fields after them, o
 `request`, `tenant`, `task` and `err`); `JIG_LOG_LEVEL` (`info` by default) is the least a line must be. At
 `debug` there is a line for each request (its `request`, method, path, status, `ms` and `tenant`) and for
 each task started and ended; at `error`, a request that failed (a 500) and the store's failures, with the
-error as `err`. The Kubernetes runner's few lines (a Job it couldn't delete) are still plain text.
+error as `err`.
 
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
@@ -338,8 +340,10 @@ without holding it, so what a task writes there can make up its own events (what
 gateway's to count) but not fill the service's memory. A run whose events can't be read or stored is
 stopped, and keeps its slot until it has ended. A cancel or the time limit is `docker kill --signal TERM`,
 sent again each second until it reaches the container (one whose image is still being pulled doesn't
-exist yet), then `docker kill` 5 seconds later, again each second until the run ends; a container a
-crashed service left runs until jig's own `--time-limit`.
+exist yet), then `docker kill` 5 seconds later, again each second until the run ends. A container a
+crashed replica left is killed (`docker kill --signal KILL jig-<id>`) by the replica that ends its task, if
+that replica's daemon runs it; one on another daemon, or a warm worker's, which is named for the worker and
+not the task, runs until jig's own `--time-limit`.
 
 The network must reach only the gateway and the service's internal listener: an internal network (`docker
 network create --internal jig-tasks`) with the gateway and the service attached to it too (`docker network
@@ -361,7 +365,12 @@ no privilege escalation, no capabilities, a read-only root, seccomp's `RuntimeDe
 token and `runtimeClassName` if one is set (`gvisor`, with `deploy/k8s/runtimeclass.yaml`); the Job's
 `activeDeadlineSeconds` is the task's time limit and the grace, and `ttlSecondsAfterFinished` (600) how long
 it stays after. A Secret the Job owns, so deleted with it, holds the task's token, which jig gets as its
-key, and the prompt and workspace.
+key, and the prompt and workspace. A Secret holds at most 1 MiB, so a task whose prompt and workspace, with
+the token, come to more is refused (an `error` that says so) before a Job is made for it: keep
+`maxBodyBytes` at its default with this runner. The Job is labelled with its task's id (`jig.dev/task`) and its tenant's
+(`jig.dev/tenant`); a tenant id that can't be a label's value (over 63 characters, or with characters
+other than letters, digits, `-`, `_` and `.`) is labelled `h-` and 40 hex digits of its SHA-256 instead,
+and the id itself is in the Job's `jig.dev/tenant` annotation.
 
 ```json
 "runner": "kubernetes",
@@ -370,7 +379,7 @@ key, and the prompt and workspace.
 ```
 
 A pod's files are on its node, out of the service's reach, so the events come in its log: the pod runs
-`node server/worker.ts`, which makes the workspace (writing the files, or cloning the repository there),
+`node server/worker.ts`, which makes `HOME` and the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events
 it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) and
@@ -378,7 +387,18 @@ takes the exit code from the pod, the stats from that line and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
 says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
 reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
-and Secret with it.
+and Secret with it, asked again every few seconds if the API server fails it. The Jobs a crashed replica
+left are deleted the same way by the replica that ends their tasks, found by their `jig.dev/task` label (a
+warm worker's Job too, once given its task), so the Role in `deploy/k8s/rbac.yaml` allows `list` on Jobs.
+While a pod hasn't started, it is looked at less and less often, up to every 5 seconds. The log is read
+only as fast as the events are stored, the rest waiting on the API server's side. Read again after the
+kubelet rotated it (at 10 MiB by default), the log may lack events: a `notice` event in place of the first says which.
+
+As on Docker, jig runs with `--no-sandbox`, the pod being the wall. Its commands run as the same user as
+the worker, the pod's first process, so they can write the pod's log too and make up events, and one with
+a higher `seq` than jig's hides jig's events after it, the `end` included. The task's status still comes
+from the pod's exit code, and what it spends from the gateway; only the stop, usage and cost reported come
+from the `end` event.
 
 `deploy/k8s/networkpolicy.yaml` lets the task pods reach only the gateway, the service's internal listener
 (`jig-api-internal`, on its own port) and the cluster's DNS, where the
@@ -398,31 +418,43 @@ workers started ahead of tasks (`server/pool.ts`), and a task that finds one wai
 `size` (0, no pool, by default) is how many idle workers the replica keeps; `pool` goes in the
 `kubernetes` block the same way. A worker is a container (`docker.worker`, `node
 /opt/jig/server/worker.ts` by default, with `--pool <internalBaseUrl>`) or a Job made as a task's is, the
-same image, user, limits, network and runtime, with a ticket of its own in `JIG_POOL_TICKET`: 32 random
-bytes, which the replica keeps only as their hash, with their expiry. The worker long-polls `POST
-/internal/pool/claim` on the internal listener with the ticket as its Bearer, which spends it: a second
-use is 401, and an expired ticket 410. When the scheduler starts a task and a worker waits, the task is
-given to it in the answer to its claim, with what a cold start would have given it: the prompt, the
-workspace, the task's gateway token and jig's arguments. On Docker the service makes the workspace in the
+same image, user, limits, network and runtime (on Docker the worker's Node process stays in the container
+as jig's parent, a few tens of MB of its memory limit that a cold task doesn't spend; on Kubernetes cold
+pods run the worker too), with a ticket of its own in `JIG_POOL_TICKET`: 32 random bytes, which the
+replica keeps only as their hash, with their expiry. The worker long-polls `POST /internal/pool/claim` on
+the internal listener with the ticket as its Bearer, which spends it: a second use is 401, and an expired
+ticket 410. When the scheduler starts a task and a worker waits, the task is given to it in the answer to
+its claim, with what a cold start would have given it: the prompt, the workspace, the task's gateway token
+and jig's arguments. On Docker the service makes the workspace in the
 worker's own folder, bound at `/task` since the container started, and reads the events file there; on
 Kubernetes the worker makes it, and the events come in the pod's log, its Job given the task's deadline
 (from now) and labels with a merge patch (the Role in `deploy/k8s/rbac.yaml` allows `patch` on Jobs).
 With none waiting the task starts cold, as before, and the pool is filled behind it. A miss is logged,
-with the pool's idle workers, hits and misses so far.
+with the pool's idle workers, hits and misses so far; a worker that went away before it was given the
+task counts as a miss too, its task starting cold.
+
+A task run on a warm worker keeps the worker's names: on Docker the container `jig-pool_<hex>`, with only
+the `jig.pool` label, and the folder `dataDir/tasks/pool_<hex>`; on Kubernetes the Job `jig-pool-<hex>`,
+which is given the task's labels, while its pod keeps only `jig.dev/pool`. The service logs which worker
+took each task ("the task runs on a warm worker", with the task, its tenant and the container and folder,
+or the Job).
 
 A worker runs one task and exits: none is used again, so no tenant's files, memory or processes meet
 another's, and what tenants share is what cold tasks share, the image and the node. The worker takes the
 ticket out of its environment before it starts jig; spent, it opens nothing anyway. A worker idle for
 `maxIdleSeconds` is told so (410) and stopped, and another started in its place; one that exits before it
 claims is started again after a pause that doubles, up to a minute, so an image that can't run doesn't
-loop; on Kubernetes, where only its claim says a worker is up, one that never claims is found at its
-`maxIdleSeconds`. A service that stops stops its idle workers, and on Docker removes their folders
-(`dataDir/tasks/pool_<hex>`) before it exits. A replica that crashes leaves them waiting on a connection
-that breaks, and they exit (an idle Job's own deadline is `maxIdleSeconds` and a minute); their folders
-stay, as a running task's does, since replicas may share `dataDir` and another's may be in use.
+loop, and on Docker is logged with its exit code and the last line it wrote (a `pool.baseUrl` its
+containers can't reach, such as the default `127.0.0.1` internal listener, shows there); on Kubernetes,
+where only its claim says a worker is up, one that never claims is found at its `maxIdleSeconds`. A
+service that stops stops its idle workers, and on Docker removes their folders (`dataDir/tasks/pool_<hex>`)
+before it exits. A replica that crashes leaves them waiting on a connection that breaks, and they exit (an
+idle Job's own deadline is `maxIdleSeconds` and a minute); their folders stay, as a running task's does,
+since replicas may share `dataDir` and another's may be in use.
 
-A worker claims from the replica that started it, which alone holds its ticket. `pool.baseUrl` is that
-replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on
+A worker claims from the replica that started it, which alone holds its ticket, on a connection both ends
+send TCP keepalives on, so one whose other end's node died breaks rather than stays open. `pool.baseUrl`
+is that replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on
 Kubernetes that is a Service in front of every replica, so each replica takes its pod's own address from
 `JIG_POOL_BASE_URL`, which `deploy/k8s/api.yaml` sets (`http://$(POD_IP):8082`) and which takes the
 config's place.
@@ -710,7 +742,8 @@ another region, by design: that is what keeps a tenant's data where it was put.
   "metrics": { "host": "0.0.0.0", "port": 9182 },
   "regions": [{ "name": "eu", "url": "https://jig-eu.example.com" }, { "name": "us", "url": "https://jig-us.example.com" }],
   "tenants": [{ "id": "acme", "keys": ["<sha256 of its key>"], "home": "eu", "allowed": ["eu", "us"], "failover": true }],
-  "health": { "intervalMs": 5000, "failures": 2 }
+  "health": { "intervalMs": 5000, "failures": 2 },
+  "maxBodyBytes": 1048576
 }
 ```
 
@@ -719,18 +752,22 @@ the key hashes the regions have for it, its `home` region, the regions its tasks
 home alone by default) and `failover` (false). The router maps a request's key to its tenant (401, as a
 service's, for one it doesn't know) and passes the request on, `Authorization` and all, so the region's
 service still checks the key; of what a tenant sends, it reads only a new task's `region` (in a body of
-16 MiB at most). Every answer a region gave has `x-jig-region`, that region (the router's own, a 401, 403,
-404, 413, 502 or 503, have none; a 503 for a region that is down names it in its body), and every answer has
-`x-request-id`, the client's if it sent one (`^[\w.-]{1,128}$`) or a new one, which the region is sent too.
+`maxBodyBytes` at most, 1 MiB by default as a service's: set it to the largest any region takes, since the
+router holds the body while it reads it). Every answer a region gave has `x-jig-region`, that region (the
+router's own answers have none: its `/healthz`, and a 400, 401, 403, 404, 413, 500, 502 or 503; a 503 for a
+region that is down names it in its body), and every answer has `x-request-id`, the client's if it sent one
+(`^[\w.-]{1,128}$`) or a new one, which the region is sent too. A line the router logs about a task's id has
+it as `task`; a client that leaves before its new task's body is read gets no answer, and isn't counted.
 
-- `POST /v1/tasks` goes to the spec's `region` if it names one (403 if the tenant may not use it), else to
-  the home. The body goes as it came.
+- `POST /v1/tasks` goes to the spec's `region` if it names one (400 if `region` isn't a region's name, 403
+  if the tenant may not use it), else to the home. The body goes as it came.
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
 - `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default). `GET /v1/usage?region=all`
   asks every region the tenant may use and adds up their answers, the rows with the same day and model and
-  the total, with `regions`, those that answered (502 if none did); it is JSON only.
+  the total, with `regions`, those that answered (502 if none did); it is JSON only. A client that leaves,
+  or the router closing, ends those requests, and the client is neither answered nor counted.
 - Anything else goes to the home.
 
 **Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails

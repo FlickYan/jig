@@ -15,7 +15,7 @@ import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskS
 //
 // A running task is leased to the replica that runs it, which renews the lease while the run goes on: a
 // task whose lease ran out has lost its replica (it crashed, or lost the database), and any replica ends it
-// as an error.
+// as an error, and has its runner stop the container or Job it may have left running.
 
 /** What followers of a task hear: each event once it is stored, then the status it ended with. */
 export type Update = { event: JigEvent } | { done: TaskStatus };
@@ -62,6 +62,8 @@ export class Scheduler {
   private runs = new Map<string, Run>();
   /** Runs that have ended, their outcomes being stored. */
   private recording = new Set<Promise<void>>();
+  /** What a gone replica's runs left, being stopped. */
+  private abandoning = new Set<Promise<void>>();
   private ticking: Promise<void> | undefined;
   private again = false;
   private closed = false;
@@ -148,10 +150,17 @@ export class Scheduler {
     }
   }
 
-  /** Ends, as errors, the tasks whose lease ran out. */
+  /** Ends, as errors, the tasks whose lease ran out, and stops what their runs left going. */
   private async expire(): Promise<string[]> {
     const expired = await this.store.expire(EXPIRED);
     for (const id of expired) this.updates.emit(id, { done: "error" } satisfies Update);
+    // Not waited for here: a slow API server mustn't hold up the renewal of this replica's own leases.
+    for (const id of expired) {
+      const abandoned = this.runner.abandon?.(id).catch((err: unknown) => this.log.warn("couldn't stop the run of a task whose replica is gone", { task: id, err }));
+      if (!abandoned) continue;
+      this.abandoning.add(abandoned);
+      void abandoned.finally(() => this.abandoning.delete(abandoned));
+    }
     // Rare (a replica is gone), so each is read again for its tenant and start, to be counted.
     for (const id of expired) {
       const task = await this.store.task(id);
@@ -227,6 +236,7 @@ export class Scheduler {
     await Promise.all([...this.runs.values()].map((run) => run.done));
     await this.settled();
     await this.keeping;
+    await Promise.all(this.abandoning);
     // Counted no more among the replicas up; one that can't say so is forgotten when its heartbeat runs out.
     await this.store.leave(this.replicaId).catch(() => {});
   }

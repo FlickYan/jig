@@ -9,5 +9,6 @@
     { "id": "acme", "keys": ["<sha256 of acme's API key, in hex>"], "home": "eu" },
     { "id": "globex", "keys": ["<sha256 of globex's API key, in hex>"], "home": "us", "allowed": ["us", "eu"], "failover": true }
   ],
-  "health": { "intervalMs": 5000, "failures": 2 }
+  "health": { "intervalMs": 5000, "failures": 2 },
+  "maxBodyBytes": 1048576
 }
