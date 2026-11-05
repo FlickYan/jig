@@ -389,7 +389,8 @@ function configProblem(config: Config): string | undefined {
       ((pool.size as number) > (config.concurrency ?? 4) ? `${block}.pool.size must be at most concurrency, ${config.concurrency ?? 4}: idle workers past it are never used` : undefined) ??
       positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ??
       http(`${block}.pool.baseUrl`, pool.baseUrl));
-  const runner = config.runner ?? "local";
+  // Only an absent runner is the local one: null is a wrong value, as it is for every other field.
+  const runner = config.runner === undefined ? "local" : config.runner;
   const problem =
     (config.region === undefined || (typeof config.region === "string" && /^[a-z0-9]{1,16}$/.test(config.region)) ? undefined : `region must be 1 to 16 lowercase letters and digits, not ${JSON.stringify(config.region)}`) ??
     text("database", config.database, true) ??

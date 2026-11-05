@@ -710,6 +710,7 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 1e7 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 10000000");
     assert.equal(problem({ heartbeatSeconds: 1e7 }), "The config's heartbeatSeconds must be a number over 0, up to 3600, not 10000000");
     assert.equal(problem({ runner: "podman" }), 'The config\'s runner must be local, docker or kubernetes, not "podman"');
+    assert.equal(problem({ runner: null }), "The config's runner must be local, docker or kubernetes, not null");
     assert.equal(problem({ runner: "docker", docker: { image: "x" } }), "The config's docker.network is missing");
     assert.equal(problem({ runner: "docker" }), "The config's docker.image is missing");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "" } }), "The config's kubernetes.image must be a string that isn't empty");
