@@ -284,11 +284,24 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   // listener. Opened now, before anything runs; only for a task, since a session has no end to report.
   const sink = library?.onEvent ?? (values.events === "-" ? "-" : values.events === undefined ? undefined : resolve(values.events));
   if (sink !== undefined && (!taskText || skillsVerb || memoryVerb)) throw new Error('--events is for a task given on the command line or stdin: jig --events <file> "task".');
+  // The misuse of --approve-via first, then what is wrong with its address, timeout or key.
+  if (values["approve-via"] !== undefined) {
+    if (!taskText || skillsVerb || memoryVerb) throw new Error('--approve-via is for a task given on the command line or stdin: jig --approve-via <url> "task".');
+    if (mode === "auto") throw new Error("--approve-via asks before the tool calls the mode doesn't allow, and --yes (--mode auto) allows them all: use one.");
+  }
   const viaService = approveVia(values, model, api, library?.apiKey);
-  if (viaService && (!taskText || skillsVerb || memoryVerb)) throw new Error('--approve-via is for a task given on the command line or stdin: jig --approve-via <url> "task".');
-  if (viaService && mode === "auto") throw new Error("--approve-via asks before the tool calls the mode doesn't allow, and --yes (--mode auto) allows them all: use one.");
-  // Who answers in the terminal's place: a library's approver, or the service.
-  const approver = library?.approve ?? viaService;
+  // The service follows the contract: an approval exists once its event is stored, so without the events
+  // every call would wait out the timeout.
+  if (viaService && sink === undefined) throw new Error("--approve-via tells the service of each call by its approval_request event: give --events too.");
+  // Who answers in the terminal's place: a library's approver, or the service. Only the service's timeout
+  // answers by "timeout": what else a library's approver returns isn't passed on.
+  const asked = library?.approve;
+  const approver = asked
+    ? async (request: ApprovalRequest, signal: AbortSignal): Promise<Answer> => {
+        const answer = await asked(request, signal);
+        return { decision: answer?.decision, always: answer?.always };
+      }
+    : viaService;
   const events = (state.events = sink === undefined ? undefined : new Events(sink, model));
   events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   // Ctrl+C before the first task starts (while the MCP servers connect, say) ends jig as it would without a
@@ -517,7 +530,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
    * A library's approver or --approve-via's service, asked where the terminal would ask, and answered as
    * there: allow is [y]es, allow with `always` [a]lways (where the terminal offers it), deny [n]o. The task
    * stopping (at --time-limit, or by its signal) stops the wait. The events say what was asked, and the
-   * answer as given, unless the task stopped first.
+   * answer, with always only where it took effect, as the terminal offers it, unless the task stopped first.
+   * An approver that throws leaves the request without an approval: the call fails its permission check.
    */
   async function approval(approve: (request: ApprovalRequest, signal: AbortSignal) => Promise<Answer>, tool: Tool, input: ToolInput): Promise<string | null> {
     const signal = task!.signal;
@@ -528,10 +542,10 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     const answer = await Promise.race([approve(request, signal), stopped]).finally(() => signal.removeEventListener("abort", onAbort));
     if (signal.aborted) return `Not run: ${whyStopped(signal, "the task was stopped")}.`;
     const allow = answer?.decision === "allow";
-    const always = allow && answer.always === true;
+    const always = allow && answer.always === true && permissions.alwaysLabel(tool, input) !== null;
     events?.approval({ id: request.id, decision: allow ? "allow" : "deny", always, by: answer?.by ?? "api" });
     if (!allow) return "The user declined this tool call. Ask them how they want to proceed.";
-    if (always && permissions.alwaysLabel(tool, input)) permissions.allowAlways(tool, input);
+    if (always) permissions.allowAlways(tool, input);
     return null;
   }
 
@@ -992,7 +1006,8 @@ async function loadSettings(cwd: string, terminal: boolean): Promise<Settings> {
 }
 
 /**
- * --approve-via's approver, or undefined without the flag. Refuses an address that isn't http or https, a
+ * --approve-via's approver, or undefined without the flag. Refuses an address that isn't http or https, or
+ * has credentials (fetch refuses them), a query or a fragment (jig adds /<id>?wait=25 to it), a
  * --approval-timeout (600 seconds by default) that isn't a positive number or comes without it, and a model
  * with no API key to send.
  */
@@ -1003,16 +1018,18 @@ function approveVia(values: Values, model: string, api: Api, apiKey?: string) {
     if (given !== undefined) throw new Error("--approval-timeout is for --approve-via: how long a tool call waits for its answer.");
     return undefined;
   }
-  let protocol = "";
+  let parsed: URL | undefined;
   try {
-    protocol = new URL(url).protocol;
+    parsed = new URL(url);
   } catch {}
-  if (protocol !== "http:" && protocol !== "https:") throw new Error("--approve-via must be an http or https address, like http://127.0.0.1:8082/internal/approvals");
+  if (parsed?.protocol !== "http:" && parsed?.protocol !== "https:") throw new Error("--approve-via must be an http or https address, like http://127.0.0.1:8082/internal/approvals");
+  // A bare ? or # leaves search and hash empty, but still ends the path.
+  if (parsed.username || parsed.password || /[?#]/.test(url)) throw new Error("--approve-via must be an address without credentials, a query or a fragment: jig adds /<id>?wait=25 to it.");
   const timeout = given === undefined ? 600 : Number(given);
   if (!(timeout > 0 && Math.ceil(timeout * 1000) < 2 ** 31)) throw new Error("--approval-timeout must be a positive number of seconds, under 24 days");
   const key = apiKey ?? apiKeyFor(model, api);
   if (!key) throw new Error("--approve-via sends the API key jig uses for the model to the service, and there is none: set DEEPSEEK_API_KEY (DeepSeek models), ANTHROPIC_API_KEY (Claude models) or OPENAI_API_KEY (others).");
-  return httpApprover(url, key, timeout);
+  return httpApprover(url, key, timeout, ui.notice);
 }
 
 /** The settings' hooks around every tool call. A broken hook is reported to the user and otherwise ignored. */

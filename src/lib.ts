@@ -41,7 +41,8 @@ export interface TaskOptions {
   onEvent?: (event: Event) => void;
   /**
    * Asked where the CLI would ask at a terminal. Without it, and without `yes`, such a call is denied, as with
-   * no terminal: the third ends the task `unapproved`.
+   * no terminal: the third ends the task `unapproved`. If it rejects, the call doesn't run (its result says
+   * the permission check failed) and its approval_request gets no approval event.
    */
   approve?: (request: ApprovalRequest, signal: AbortSignal) => Promise<Approval>;
   /** false: commands run directly on this machine, as --no-sandbox. */

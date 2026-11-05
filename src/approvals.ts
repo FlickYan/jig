@@ -4,9 +4,10 @@
 // its API: GET <url>/<id>?wait=25 with the API key jig uses as the Bearer (in the service, the task's
 // gateway token), which the service holds up to that many seconds. 200 with {decision, always} is the
 // answer; 204 is none yet, asked again at once; anything else, or a connection that fails, is asked again
-// after 1, 2, 4 ... seconds, 10 at most, so a service that is down or restarting isn't flooded. With no
-// answer by --approval-timeout the call is denied. The task stopping (its signal, at --time-limit too)
-// stops the wait. run.ts answers the call as the terminal would, as for a library's approver.
+// after 1, 2, 4 ... seconds, 10 at most, so a service that is down or restarting isn't flooded; the first
+// such poll of a call is told, since a wrong token or address would otherwise show only as the timeout's
+// deny. With no answer by --approval-timeout the call is denied. The task stopping (its signal, at
+// --time-limit too) stops the wait. run.ts answers the call as the terminal would, as for a library's approver.
 
 import { setTimeout as sleep } from "node:timers/promises";
 import type { Approval, ApprovalRequest } from "./run.ts";
@@ -19,14 +20,19 @@ const LAST_RETRY_MS = 10_000;
 /** An answer, and who gave it: the service, or the timeout, where none came in time. */
 export type Answer = Approval & { by?: "api" | "timeout" };
 
-/** Asks `url` about each call, as `Bearer key`, until it answers or `timeout` seconds have passed. */
-export function httpApprover(url: string, key: string, timeout: number) {
+/**
+ * Asks `url` about each call, as `Bearer key`, until it answers or `timeout` seconds have passed, and tells
+ * `notice` of the first poll of a call that failed.
+ */
+export function httpApprover(url: string, key: string, timeout: number, notice: (text: string) => void) {
   const base = url.replace(/\/+$/, "");
   return async ({ id }: ApprovalRequest, signal: AbortSignal): Promise<Answer> => {
     // In whole milliseconds: AbortSignal.timeout throws on a fraction of one, as 1.0001 seconds would give.
     const waiting = AbortSignal.any([signal, AbortSignal.timeout(Math.ceil(timeout * 1000))]);
     let retry = FIRST_RETRY_MS;
+    let told = false;
     while (!waiting.aborted) {
+      let problem: string;
       try {
         const response = await fetch(`${base}/${encodeURIComponent(id)}?wait=${WAIT_SECONDS}`, { headers: { authorization: `Bearer ${key}` }, signal: waiting });
         if (response.status === 204) {
@@ -36,12 +42,23 @@ export function httpApprover(url: string, key: string, timeout: number) {
         }
         if (response.status !== 200) {
           await response.body?.cancel();
+          problem = `answered ${response.status}`;
         } else {
-          const answer = decision(await response.json());
+          // A body that isn't JSON is tried again like an error status.
+          const answer = decision(await response.json().catch(() => undefined));
           if (answer) return { ...answer, by: "api" };
+          problem = "answered 200 without a decision";
         }
-      } catch {
-        // A connection that failed, or a body that isn't JSON: tried again like an error status.
+      } catch (err) {
+        // The connection failed: fetch's own message is only "fetch failed", its cause (or the cause's code,
+        // where it tried several addresses) says why.
+        const { message, cause } = err as Error & { cause?: Error & { code?: string } };
+        problem = `couldn't be reached (${cause?.message || cause?.code || message})`;
+      }
+      // Not where the task or the timeout ended the poll: that isn't the service's doing.
+      if (!told && !waiting.aborted) {
+        told = true;
+        notice(`The approvals service ${problem} for ${id}; asking again until --approval-timeout (${timeout} s) is up.`);
       }
       await sleep(retry, undefined, { signal: waiting }).catch(() => {});
       retry = Math.min(retry * 2, LAST_RETRY_MS);

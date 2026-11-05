@@ -7,7 +7,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
-import { type Event, runTask, type TaskOptions } from "../src/lib.ts";
+import { type Approval, type Event, runTask, type TaskOptions } from "../src/lib.ts";
 import { type FakeApi, fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -165,6 +165,43 @@ describe("runTask", () => {
         ofType(events, "approval").map(({ id, decision, always, by }) => [id, decision, always, by]),
         [["ap_1", "deny", false, "api"], ["ap_2", "allow", false, "api"], ["ap_3", "allow", true, "api"]],
       );
+    } finally {
+      api.close();
+    }
+  });
+
+  it("reports always only where it was remembered, and every answer as the API's, whatever the approver adds", async () => {
+    // touch is remembered at the first; the second leaves the project, so it is asked again, and its always,
+    // which the terminal wouldn't offer, remembers nothing. Only --approve-via's own timeout is by: "timeout".
+    const commands = ["touch a", "touch ../outside-x"];
+    const api = await fakeMessagesApi((request) => {
+      const calls = (request.messages as unknown[]).length >> 1;
+      return calls < commands.length ? [{ tool: "bash", input: { command: commands[calls] } }] : [{ text: "Done." }];
+    });
+    try {
+      const answer = { decision: "allow", always: true, by: "timeout" } as Approval;
+      const { project, events, options } = await setUp(api, { approve: async () => answer });
+      const result = await runTask(options);
+      assert.equal(result.stop, "end_turn");
+      assert.ok(existsSync(join(project, "a")) && existsSync(join(project, "..", "outside-x")));
+      assert.deepEqual(
+        ofType(events, "approval").map(({ id, decision, always, by }) => [id, decision, always, by]),
+        [["ap_1", "allow", true, "api"], ["ap_2", "allow", false, "api"]],
+      );
+    } finally {
+      api.close();
+    }
+  });
+
+  it("doesn't run a call whose approver rejects, and writes no approval for it", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "touch made" } }] : [{ text: "Done." }]));
+    try {
+      const { project, events, options } = await setUp(api, { approve: async () => Promise.reject(new Error("the approver broke")) });
+      const result = await runTask(options);
+      assert.equal(result.stop, "end_turn");
+      assert.equal(existsSync(join(project, "made")), false);
+      assert.match(String(ofType(events, "tool_result")[0].output), /Not run: the permission check failed: the approver broke/);
+      assert.deepEqual([ofType(events, "approval_request").length, ofType(events, "approval").length], [1, 0]);
     } finally {
       api.close();
     }

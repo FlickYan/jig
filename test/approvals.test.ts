@@ -80,14 +80,15 @@ const running = (commands: string[]) =>
   });
 
 describe("--approve-via", () => {
-  it("asks the service where the terminal would ask, polling again after a 204, and answers as yes, always and no do", async () => {
-    // Denied, allowed once, allowed always (so the fourth, the same program, isn't asked), then done.
+  it("asks the service where the terminal would ask, polling again at once after a 204, and answers as yes, always and no do", async () => {
+    // Denied (always is for an allow alone), allowed once, allowed always (so the fourth, the same program,
+    // isn't asked), then done. A call asked once too often is denied after the short timeout, not left hanging.
     const commands = ["touch denied", "touch once", "touch always", "touch again"];
     const api = await running(commands);
-    const decisions: Record<string, object> = { ap_1: { decision: "deny" }, ap_2: { decision: "allow" }, ap_3: { decision: "allow", always: true } };
+    const decisions: Record<string, object> = { ap_1: { decision: "deny", always: true }, ap_2: { decision: "allow" }, ap_3: { decision: "allow", always: true } };
     const approvals = await fakeApprovals((id, n) => (n === 1 ? { status: 204 } : { status: 200, body: decisions[id] }));
     try {
-      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--events", file, "Make the files."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "20", "--events", file, "Make the files."], { api, cwd: project, timeout: 60_000 });
       assert.equal(code, 0, output);
       assert.deepEqual(
         ["denied", "once", "always", "again"].map((name) => existsSync(join(project, name))),
@@ -98,6 +99,8 @@ describe("--approve-via", () => {
         approvals.polls.map((poll) => poll.url),
         ["ap_1", "ap_1", "ap_2", "ap_2", "ap_3", "ap_3"].map((id) => `${path}/${id}?wait=25`),
       );
+      // A 204 is asked again at once, not after the second an error waits.
+      for (let k = 0; k < 6; k += 2) assert.ok(approvals.polls[k + 1].at - approvals.polls[k].at < 500, `${approvals.polls[k + 1].at - approvals.polls[k].at} ms`);
       // The key jig uses for the model: in the service, the task's gateway token.
       assert.ok(approvals.polls.every((poll) => poll.authorization === "Bearer test-key"));
       const events = await read();
@@ -121,17 +124,25 @@ describe("--approve-via", () => {
     }
   });
 
-  it("tries again after an error or a dropped connection, waiting 1 second, then 2", async () => {
+  it("tries again after an error or a dropped connection, waiting 1 second, then 2, and after a 204 from 1 second again", async () => {
     const api = await running(["touch made"]);
-    const approvals = await fakeApprovals((_, n) => (n === 1 ? { status: 500 } : n === 2 ? "drop" : { status: 200, body: { decision: "allow" } }));
+    const answers: Answer[] = [{ status: 500 }, "drop", { status: 204 }, { status: 500 }, { status: 200, body: { decision: "allow" } }];
+    const approvals = await fakeApprovals((_, n) => answers[n - 1]);
     try {
-      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--events", file, "Make the file."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "20", "--events", file, "Make the file."], { api, cwd: project, timeout: 60_000 });
       assert.equal(code, 0, output);
       assert.ok(existsSync(join(project, "made")));
-      const [a, b, c] = approvals.polls.map((poll) => poll.at);
-      assert.equal(approvals.polls.length, 3);
-      assert.ok(b - a >= 900 && c - b >= 1900, `${b - a} ms, then ${c - b} ms`);
-      assert.deepEqual(ofType(await read(), "approval").map(without), [{ type: "approval", id: "ap_1", decision: "allow", always: false, by: "api" }]);
+      const [a, b, c, d, e] = approvals.polls.map((poll) => poll.at);
+      assert.equal(approvals.polls.length, 5);
+      // 1 second, 2, none after the 204, and 1 again after the next error, not the 4 the doubling had reached.
+      assert.ok(b - a >= 900 && c - b >= 1900 && d - c < 500 && e - d >= 900 && e - d < 3000, `${b - a}, ${c - b}, ${d - c}, then ${e - d} ms`);
+      const events = await read();
+      assert.deepEqual(ofType(events, "approval").map(without), [{ type: "approval", id: "ap_1", decision: "allow", always: false, by: "api" }]);
+      // The first failed poll is told, once.
+      assert.deepEqual(
+        ofType(events, "notice").map((event) => event.text),
+        ["The approvals service answered 500 for ap_1; asking again until --approval-timeout (20 s) is up."],
+      );
     } finally {
       api.close();
       approvals.close();
@@ -144,12 +155,18 @@ describe("--approve-via", () => {
     const api = await running(["touch made"]);
     const approvals = await fakeApprovals(() => ({ status: 401 }));
     try {
-      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "1.5001", "--events", file, "Make the file."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--approval-timeout", "2.5001", "--events", file, "Make the file."], { api, cwd: project, timeout: 60_000 });
       assert.equal(code, 0, output);
       assert.equal(existsSync(join(project, "made")), false);
       assert.ok(approvals.polls.length >= 2, `${approvals.polls.length} polls`);
       assert.ok(approvals.polls.every((poll) => poll.authorization === "Bearer test-key"));
       const events = await read();
+      // Said at the first refusal, so a wrong token or address shows before the timeout, and only once.
+      const notices = ofType(events, "notice");
+      assert.equal(notices.length, 1, JSON.stringify(notices));
+      assert.match(String(notices[0].text), /answered 401 for ap_1/);
+      assert.ok(events.indexOf(notices[0]) < events.indexOf(ofType(events, "approval")[0]));
+      assert.ok(!output.includes("test-key"), output);
       assert.deepEqual(ofType(events, "approval").map(without), [{ type: "approval", id: "ap_1", decision: "deny", always: false, by: "timeout" }]);
       assert.match(String(ofType(events, "tool_result")[0].output), /The user declined this tool call/);
     } finally {
@@ -162,7 +179,7 @@ describe("--approve-via", () => {
     const api = await running(["touch made"]);
     const approvals = await fakeApprovals(() => "hang");
     try {
-      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--time-limit", "1", "--events", file, "Make the file."], { api, cwd: project });
+      const { code, output } = await runJig([...args, "--approve-via", approvals.url, "--time-limit", "1", "--events", file, "Make the file."], { api, cwd: project, timeout: 60_000 });
       assert.equal(code, 7, output);
       let events = await read();
       assert.deepEqual([events.at(-1)!.type, events.at(-1)!.stop], ["end", "time_limit"]);
@@ -189,20 +206,31 @@ describe("--approve-via", () => {
     }
   });
 
-  it("is refused with --yes or --mode auto, without a task, and with a bad address, timeout or no key", async () => {
+  it("is refused with --yes or --mode auto, without a task or --events, and with a bad address, timeout or no key", async () => {
     const api = await fakeMessagesApi(() => [{ text: "Done." }]);
     try {
       const url = "http://127.0.0.1:9/internal/approvals";
+      const noKey = { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" };
+      const where = /--approve-via must be an address without credentials, a query or a fragment/;
       const refusals: [string[], RegExp, NodeJS.ProcessEnv?][] = [
         [["--approve-via", url, "--yes", "Do it."], /--approve-via .* --yes/],
         [["--approve-via", url, "--mode", "auto", "Do it."], /--approve-via .* --yes/],
         [["--approve-via", url], /--approve-via is for a task given on the command line/],
+        // Misuse is said before a key is missing.
+        [["--approve-via", url, "--yes", "Do it."], /--approve-via .* --yes/, noKey],
+        [["--approve-via", url], /--approve-via is for a task given on the command line/, noKey],
         [["--approval-timeout", "60", "Do it."], /--approval-timeout is for --approve-via/],
         [["--approve-via", "ftp://example.com/approvals", "Do it."], /--approve-via must be an http or https address/],
+        // fetch refuses credentials in an address, and jig adds /<id>?wait=25 after the path.
+        [["--approve-via", "http://u:p@127.0.0.1:9/a", "Do it."], where],
+        [["--approve-via", "http://127.0.0.1:9/a?x=1", "Do it."], where],
+        [["--approve-via", "http://127.0.0.1:9/a#x", "Do it."], where],
         [["--approve-via", url, "--approval-timeout", "0", "Do it."], /--approval-timeout must be a positive number of seconds/],
         // Just under 2 ** 31 ms, but not once rounded up to a whole millisecond, where a timer would fire at once.
         [["--approve-via", url, "--approval-timeout", "2147483.6475", "Do it."], /--approval-timeout must be a positive number of seconds/],
-        [["--approve-via", url, "Do it."], /--approve-via sends the API key/, { ANTHROPIC_API_KEY: "", ANTHROPIC_AUTH_TOKEN: "" }],
+        [["--approve-via", url, "Do it."], /--approve-via sends the API key/, noKey],
+        // The service learns of a call from its approval_request event: without one, every call would time out.
+        [["--approve-via", url, "Do it."], /give --events too/],
       ];
       for (const [given, refusal, env] of refusals) {
         const { code, output } = await runJig([...args, ...given], { api, cwd: project, env });
@@ -216,7 +244,11 @@ describe("--approve-via", () => {
   });
 });
 
-/** Resolves once `done` holds, checking every 20 ms. */
-async function waitFor(done: () => boolean): Promise<void> {
-  while (!done()) await new Promise((wait) => setTimeout(wait, 20));
+/** Resolves once `done` holds, checking every 20 ms, and throws if it doesn't within `ms`. */
+async function waitFor(done: () => boolean, ms = 10_000): Promise<void> {
+  const until = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > until) throw new Error("timed out waiting");
+    await new Promise((wait) => setTimeout(wait, 20));
+  }
 }

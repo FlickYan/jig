@@ -168,12 +168,15 @@ terminal, jig writes an `approval_request` event (`step`, `id`: `ap_1`, `ap_2`, 
 cut from the middle to 64,000 characters, with `"truncated":true` when cut) and polls
 `GET <url>/<id>?wait=25`, with `Authorization: Bearer <the model's API key>`, for the answer: 200 with
 `{"decision": "allow" | "deny", "always": true}` (`always` optional), or 204 for none yet, asked again at
-once; any other status, or a failed connection, is asked again after 1, 2, 4 ... seconds, 10 at most.
-`allow` is the terminal's yes, with `always` its always, and `deny` its no; with no answer after
-`--approval-timeout` seconds (600) the call is denied. An `approval` event (`id`, `decision`, `always`,
-`by`: `api`, or `timeout`) follows, and the task goes on as after the terminal's answer. `--time-limit`,
-Ctrl+C and SIGTERM stop the wait as they stop the task. It is only for a task given on the command line or
-stdin, and not with `--yes` or `--mode auto`, which never ask.
+once; any other status, or a failed connection, is asked again after 1, 2, 4 ... seconds, 10 at most, and
+the first of these for a call is a `notice` (the status, or why it couldn't connect). `allow` is the
+terminal's yes, with `always` its always, and `deny` its no; with no answer after `--approval-timeout`
+seconds (600) the call is denied. An `approval` event (`id`, `decision`, `always`: true only where jig
+remembered it, as where the terminal offers always; `by`: `api`, or `timeout`) follows, and the task goes on
+as after the terminal's answer. `--time-limit`, Ctrl+C and SIGTERM stop the wait as they stop the task. It
+is only for a task given on the command line or stdin, with `--events` (the service learns of a call from
+its event), not with `--yes` or `--mode auto`, which never ask, and the address can't have credentials, a
+query or a fragment.
 
 `--check-writes` checks what `write_file` and `edit_file` wrote, and adds what is wrong to their result: a
 syntax error the change made in a Python, JavaScript, shell or JSON file (python3's `ast.parse`,
@@ -290,9 +293,11 @@ where the CLI would ask at a terminal, before a tool call the mode doesn't allow
 (`ap_1`, `ap_2`, ...), `step`, `tool` and `description`: `allow` is the terminal's yes, `allow` with
 `always: true` its always, `deny` its no. Without `approve` or `yes`, such a call is refused as with no
 terminal, and the third ends the task `unapproved`. Each call put to `approve`, and its answer, are
-`approval_request` and `approval` events, as `--approve-via`'s are. `exitCode` is what `jig` would exit
-with. A failure ends the task with `stop: "error"` and says what failed in `error`; only options that are
-wrong, before it starts, reject. A task prints nothing, and leaves the process's signal handlers, exit
+`approval_request` and `approval` events, as `--approve-via`'s are. If `approve` rejects, the call doesn't
+run (its result says the permission check failed) and its `approval_request` gets no `approval` event.
+`exitCode` is what `jig` would exit with. A failure ends the task with `stop: "error"` and says what
+failed in `error`; only options that are wrong, before it starts, reject. A task prints nothing, and
+leaves the process's signal handlers, exit
 code and working directory alone. Several can run at once in one process, each with its own project, jig directory, model
 and API, and each sees only its own events, permissions, memories, sessions and stats: what the CLI leaves
 to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but for the skills in
