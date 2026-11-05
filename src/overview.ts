@@ -4,7 +4,7 @@
 // evolve2 runs with budget notes (milestone 30), the model read the named files at its first step and the
 // test file, whose path it learned from a listing, at its second or third, so the first write came at step
 // 3 or 4, with no step left after the first test result. Facts only, and only those the model's own glob and
-// read_file would give it unasked (cli.ts says when they wouldn't): the model can still look anywhere.
+// read_file would give it unasked (run.ts says when they wouldn't): the model can still look anywhere.
 
 import type { Stats } from "node:fs";
 import { stat } from "node:fs/promises";

@@ -90,7 +90,8 @@ describe("runTask", () => {
     );
     try {
       const results = await Promise.all(tasks.map((task) => runTask(task.options)));
-      assert.ok(order.indexOf("c:start") < order.indexOf("a:end"), "the three ran at the same time");
+      // Each start is written before runTask's first await, so only later events show the three overlapping.
+      assert.ok(order.indexOf("c:tool_call") < order.indexOf("a:end"), "c was running when a ended");
       // Task a's one step and its wrap-up call; the others' steps.
       const ends = [{ stop: "max_steps", steps: 1, calls: 2 }, ...[3, 4].map((steps) => ({ stop: "end_turn", steps, calls: steps }))];
       tasks.forEach(({ name, api, home, events }, i) => {
@@ -115,7 +116,7 @@ describe("runTask", () => {
         for (const request of api.requests) assert.match(JSON.stringify(request.messages), new RegExp(`Do task ${name}\\.`));
         assert.equal(systemText(api.requests[0] as { system: string }).includes("The user indents with tabs."), name === "a");
       });
-      assert.ok(order.indexOf("c:start") < order.indexOf("a:notice"), "task a was told after all three had started");
+      assert.ok(order.indexOf("a:notice") < order.indexOf("c:end"), "task a was told while c still ran");
       for (const [i, { name, project, home }] of tasks.entries()) {
         // Its commands ran in its project with its environment.
         assert.equal(await readFile(join(project, "who.txt"), "utf8"), Array.from({ length: i + 1 }, (_, call) => `${name} ${call + 1}\n`).join(""));
@@ -259,9 +260,46 @@ describe("runTask", () => {
       assert.equal(events.at(-1)!.stop, "error");
 
       events.length = 0;
-      await assert.rejects(runTask({ ...options, maxSteps: 0 }), /--max-steps must be a positive integer/);
+      // Under the names the caller gave them, not the flags'.
+      await assert.rejects(runTask({ ...options, maxSteps: 0 }), /^Error: runTask: maxSteps must be a positive integer$/);
+      await assert.rejects(runTask({ ...options, timeLimit: -1 }), /^Error: runTask: timeLimit must be a positive number of seconds/);
+      await assert.rejects(runTask({ ...options, mode: "nope" as TaskOptions["mode"] }), /^Error: runTask: mode must be one of: plan, ask, edits, auto$/);
       await assert.rejects(runTask({ ...options, prompt: " " }), /runTask needs a prompt/);
       assert.deepEqual(events, []);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with a listener's error when it throws, and rejects when it throws at the end", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
+    try {
+      const { options } = await setUp(api, { yes: true });
+      const throwingAt = (type: string) => (event: Event) => {
+        if (event.type === type) throw new Error(`listener bug at ${type}`);
+      };
+      const result = await runTask({ ...options, onEvent: throwingAt("tool_call") });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at tool_call"]);
+      await assert.rejects(runTask({ ...options, onEvent: throwingAt("end") }), /^Error: listener bug at end$/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("starts MCP servers with the task's environment, not the process's", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "mcp__test__env", input: {} }] : [{ text: "Done." }]));
+    try {
+      const fixture = join(import.meta.dirname, "fixtures", "mcp-server.mjs");
+      const ownHome = await tempDir("jig-lib-home-");
+      // The project's settings declare the server; the task's environment, not the process's, trusts them.
+      const env = { ...(process.env as Record<string, string>), HOME: ownHome, JIG_TRUST_PROJECT: "1" };
+      const { project, events, options } = await setUp(api, { yes: true, env });
+      await mkdir(join(project, ".jig"));
+      await writeFile(join(project, ".jig", "settings.json"), JSON.stringify({ mcpServers: { test: { command: process.execPath, args: [fixture] } } }));
+      const result = await runTask(options);
+      assert.equal(result.stop, "end_turn", String(result.error));
+      assert.deepEqual(ofType(events, "tool_call").map((event) => event.name), ["mcp__test__env"]);
+      assert.deepEqual(ofType(events, "tool_result").map((event) => event.output), [ownHome]);
     } finally {
       api.close();
     }
@@ -279,9 +317,11 @@ describe("runTask", () => {
         const { runTask } = await import(${JSON.stringify(lib)});
         const listeners = () => ["SIGINT", "SIGTERM", "SIGHUP", "exit"].map((name) => process.listenerCount(name));
         const before = { listeners: listeners(), cwd: process.cwd() };
-        const result = await runTask(${JSON.stringify({ ...options, onEvent: undefined })});
+        // Counted while the task runs too: a handler it removes when it ends would pass the count after.
+        let during;
+        const result = await runTask({ ...${JSON.stringify({ ...options, onEvent: undefined })}, onEvent: (event) => { if (event.type === "tool_call") during = listeners(); } });
         const after = { listeners: listeners(), cwd: process.cwd(), exitCode: process.exitCode ?? null };
-        process.stdout.write(JSON.stringify({ stop: result.stop, before, after }));
+        process.stdout.write(JSON.stringify({ stop: result.stop, before, during, after }));
       `;
       const child = spawn(process.execPath, ["--input-type=module", "-e", program], { env: { ...process.env, NO_COLOR: "1" } });
       let stdout = "";
@@ -291,8 +331,9 @@ describe("runTask", () => {
       child.stdin.end();
       assert.equal(await new Promise((done) => child.on("close", done)), 0, stderr);
       assert.equal(stderr, "");
-      const { stop, before, after } = JSON.parse(stdout);
+      const { stop, before, during, after } = JSON.parse(stdout);
       assert.equal(stop, "end_turn");
+      assert.deepEqual(during, before.listeners);
       assert.deepEqual(after, { ...before, exitCode: null });
     } finally {
       api.close();

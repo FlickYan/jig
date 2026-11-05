@@ -99,7 +99,7 @@ export async function reviewCommand(args: string[]): Promise<void> {
 
   // jig's own bookkeeping (the review's session) needs a directory; the commands run in the copy. It goes
   // when jig exits, whether the review ended well or failed. A command still running is killed first, as a
-  // task's are (cli.ts): each runs in a process group of its own, which nothing else stops with jig, and
+  // task's are (run.ts): each runs in a process group of its own, which nothing else stops with jig, and
   // through an --exec that runs it on this machine, one still making files in the directory would keep it.
   const cwd = mkdtempSync(join(tmpdir(), "jig-review-"));
   process.once("exit", () => {
@@ -108,7 +108,7 @@ export async function reviewCommand(args: string[]): Promise<void> {
   });
   // A signal ends jig without the exit event, so a harness stopping a review (SIGTERM), a closed terminal
   // (SIGHUP) or Ctrl+C would leave the directory behind, and the commands: they end it with an ordinary exit
-  // instead, and the exit code a shell would give, as in a task (cli.ts).
+  // instead, and the exit code a shell would give, as in a task (run.ts).
   for (const signal of ["SIGHUP", "SIGTERM", "SIGINT"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   const stats = values.stats ? new Stats(resolve(values.stats), model) : undefined;
   const count = stats && ((event: Mechanism) => stats.count(event));

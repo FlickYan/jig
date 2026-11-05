@@ -1,11 +1,13 @@
 {
   // The npm package: Node won't strip types from files under node_modules, so installed copies of jig
-  // run JavaScript compiled from src/ into dist/. From a clone, Node runs src/ directly.
+  // run JavaScript compiled from src/ into dist/. From a clone, Node runs src/ directly. The declarations
+  // give a TypeScript program that imports runTask its types.
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
     "rootDir": "src",
     "outDir": "dist",
+    "declaration": true,
     "rewriteRelativeImportExtensions": true
   },
   "include": ["src"]

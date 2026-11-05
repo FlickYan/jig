@@ -98,8 +98,10 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   directory came from `JIG_HOME`, its commands' environment from the process's, and its notices went to
   one listener set for the process. `runTask` can run several tasks at once in one process, so those are a
   task's own, in a context (`src/context.ts`, Node's `AsyncLocalStorage`) that the few places reading them
-  look up: `jigHome()`, `withoutKeys()` and `ui.ts`. Passing them down instead would have meant a parameter
-  through most of jig's modules, for three values. The rest of a run (the permissions, the sandbox, the
+  look up: `jigHome()`, `withoutKeys()`, `ui.ts`, the MCP servers' environment (`mcp.ts`), the project-trust
+  check in `run.ts`, which reads `JIG_TRUST_PROJECT` from the task's environment, and `openai.ts`'s
+  once-per-task notice. Passing them down instead would have meant a parameter through most of jig's
+  modules, for three values. The rest of a run (the permissions, the sandbox, the
   sessions, the stats, the events) was already made per run, in what is now `src/run.ts`, which the CLI and
   the library both run: the library builds the command line's options from their defaults, so a task given
   to it runs as one given to `jig` would.

@@ -98,8 +98,14 @@ jobs:
       - run: npm pack
       - run: npm install -g ./*.tgz
       - run: jig --version && jig --help
-      - name: Import runTask from the package, installed in a project of its own
+      - name: Import runTask from the package, installed in a project of its own, and type-check a use of it
         run: |
           mkdir "$RUNNER_TEMP/uses-jig" && cp ./*.tgz "$RUNNER_TEMP/uses-jig/"
           cd "$RUNNER_TEMP/uses-jig" && npm init -y && npm install ./*.tgz
           node -e "import('jig-agent').then(({ runTask }) => { if (typeof runTask !== 'function') throw new Error('runTask is ' + typeof runTask) })"
+          # Its types, as a strict program sees them: a missing or broken declaration fails here. They use
+          # Node's, which a TypeScript program on Node has from @types/node.
+          npm install --no-save typescript @types/node
+          printf '%s\n' 'import { runTask, type TaskResult } from "jig-agent";' 'const result: Promise<TaskResult> = runTask({ prompt: "x", cwd: "." });' 'export const text: Promise<string> = result.then((r) => r.text);' > uses.mts
+          printf '%s\n' '{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext", "strict": true, "noEmit": true }, "files": ["uses.mts"] }' > tsconfig.json
+          npx tsc -p .

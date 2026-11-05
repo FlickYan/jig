@@ -198,7 +198,7 @@ describe("MCP", () => {
   it("lists every page of a server's tools, named mcp__<server>__<tool>", async () => {
     const servers = await connect({ test: { command: process.execPath, args: [fixture] } });
     assert.deepEqual(servers.errors, []);
-    assert.deepEqual(servers.status, ['MCP server "test": 5 tools']);
+    assert.deepEqual(servers.status, ['MCP server "test": 6 tools']);
     assert.deepEqual(
       servers.tools.map((tool) => [tool.definition.name, tool.kind]),
       [
@@ -207,6 +207,7 @@ describe("MCP", () => {
         ["mcp__test__crash", "external"],
         ["mcp__test__pid", "read"],
         ["mcp__test__slow", "external"],
+        ["mcp__test__env", "read"],
       ],
     );
     assert.deepEqual(find(servers, "mcp__test__add").definition.input_schema.required, ["a", "b"]);
@@ -239,7 +240,7 @@ describe("MCP", () => {
       missing: { command: join(dir, "no-such-server") },
       test: { command: process.execPath, args: [fixture] },
     });
-    assert.equal(servers.tools.length, 5);
+    assert.equal(servers.tools.length, 6);
     assert.match(servers.errors.join(), /The MCP server "missing" failed to start: .*ENOENT/);
   });
 
@@ -250,7 +251,7 @@ describe("MCP", () => {
       test: { command: process.execPath, args: [fixture] },
     });
     const names = servers.tools.map((tool) => tool.definition.name);
-    assert.equal(new Set(names).size, 15);
+    assert.equal(new Set(names).size, 18);
     assert.ok(names.includes("mcp__test__fail"), "a name no other tool has stays as it is");
     // The model tells the two apart by the description, which names the server.
     const fail = (server: string) =>
@@ -264,7 +265,7 @@ describe("MCP", () => {
   it("and to tools whose names are cut to the same 64 characters", async () => {
     const servers = await connect({ [`server-${"x".repeat(60)}`]: { command: process.execPath, args: [fixture] } });
     const names = servers.tools.map((tool) => tool.definition.name);
-    assert.equal(new Set(names).size, 5);
+    assert.equal(new Set(names).size, 6);
     assert.ok(names.every((name) => /^mcp__server-x+_[0-9a-f]{8}$/.test(name) && name.length === 64), names.join());
     const add = servers.tools.find((tool) => tool.definition.description!.includes('"add" tool'))!;
     assert.equal(await add.run({ a: 2, b: 3 }, context()), "5");

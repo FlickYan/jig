@@ -285,24 +285,30 @@ const result = await runTask({
 
 `prompt` and `cwd` are needed; the rest are as their flags: `model` (`deepseek-flash` without one),
 `baseUrl`, `maxSteps` (50), `timeLimit` (seconds), `mode` (`edits`), `yes`, `sandbox` (false is
-`--no-sandbox`) and `stats` (the file's path). `apiKey` is the key, or without one the environment variable
-jig uses for the model; `home` is jig's directory for the task (`JIG_HOME`: its sessions, snapshots,
-memories and settings), or the process's; `env` is the environment its commands get (less the API keys), or
-the process's. Each event is the object `--events` would write as a line (see above). `approve` is asked
-where the CLI would ask at a terminal, before a tool call the mode doesn't allow, with the call's `id`
-(`ap_1`, `ap_2`, ...), `step`, `tool` and `description`: `allow` is the terminal's yes, `allow` with
-`always: true` its always, `deny` its no. Without `approve` or `yes`, such a call is refused as with no
-terminal, and the third ends the task `unapproved`. Each call put to `approve`, and its answer, are
-`approval_request` and `approval` events, as `--approve-via`'s are. If `approve` rejects, the call doesn't
-run (its result says the permission check failed) and its `approval_request` gets no `approval` event.
-`exitCode` is what `jig` would exit with. A failure ends the task with `stop: "error"` and says what
-failed in `error`; only options that are wrong, before it starts, reject. A task prints nothing, and
-leaves the process's signal handlers, exit
-code and working directory alone. Several can run at once in one process, each with its own project, jig directory, model
-and API, and each sees only its own events, permissions, memories, sessions and stats: what the CLI leaves
-to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but for the skills in
-your home directory's `.agents/skills` and `.claude/skills`, which are the process's, as `HOME` is. The
-CLI runs the same code ([`src/run.ts`](src/run.ts)), so the two can't drift.
+`--no-sandbox`) and `stats` (the file's path; a relative path, like a relative `cwd`, is from the process's
+working directory). `apiKey` is the key, or without one the environment variable jig uses for the model;
+`home` is jig's directory for the task (`JIG_HOME`: its sessions, snapshots, memories and settings), or the
+process's; `env` is the environment its commands and hooks get (less the API keys), and its MCP servers
+their `HOME`, `PATH` and the like from, or the process's; it is also where `JIG_TRUST_PROJECT` is read, so
+pass it in `env` to trust a project's settings without a terminal. Each event is the object `--events`
+would write as a line (see above). `approve` is asked where the CLI would ask at a terminal, before a tool
+call the mode doesn't allow, with the call's `id` (`ap_1`, `ap_2`, ...), `step`, `tool` and `description`:
+`allow` is the terminal's yes, `allow` with `always: true` its always, `deny` its no. Without `approve` or
+`yes`, such a call is refused as with no terminal, and the third ends the task `unapproved`. Each call put
+to `approve`, and its answer, are `approval_request` and `approval` events, as `--approve-via`'s are. If
+`approve` rejects, the call doesn't run (its result tells the model the permission check failed, with the
+error's message), its `approval_request` gets no `approval` event, and the task goes on. `exitCode` is what
+`jig` would exit with. A failure ends the task with `stop: "error"` and says what failed in `error`, as
+does an `onEvent` that throws; only options that are wrong, before it starts, and an `onEvent` that throws
+at the end event reject. A signal aborted while the task is still starting (connecting MCP servers, taking
+its snapshot) stops it once that is done. A task prints nothing, and leaves the process's signal handlers,
+exit code and working directory alone. Several can run at once in one process, each with its own project,
+jig directory, model and API, and each sees only its own events, permissions, memories, sessions and stats:
+what the CLI leaves to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but
+for the skills in your home directory's `.agents/skills` and `.claude/skills`, `~/` in hiddenPaths and the
+home-directory checks, which are the process's, as `HOME` is. The CLI runs the same code
+([`src/run.ts`](src/run.ts)), so the two can't drift. The package ships its types, which use Node's
+(`@types/node`).
 
 ## What it does
 

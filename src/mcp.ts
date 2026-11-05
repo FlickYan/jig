@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { getDefaultEnvironment, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import type Anthropic from "@anthropic-ai/sdk";
+import { context } from "./context.ts";
 import type { McpServerConfig } from "./settings.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
 import { VERSION } from "./version.ts";
@@ -96,7 +97,7 @@ function connection(name: string, config: McpServerConfig, cwd: string) {
       const transport = new StdioClientTransport({
         command: config.command,
         args: config.args,
-        env: { ...getDefaultEnvironment(), ...config.env },
+        env: { ...inherited(), ...config.env },
         cwd,
         stderr: "ignore",
       });
@@ -105,6 +106,21 @@ function connection(name: string, config: McpServerConfig, cwd: string) {
     },
     close: async () => void (await current?.close().catch(() => {})),
   };
+}
+
+/**
+ * What a server gets of the environment besides its settings' env: the few variables the SDK passes on
+ * (HOME, PATH, USER, ...), taken, as the SDK's own getDefaultEnvironment() takes them, but from the task's
+ * environment, which a library's task can have of its own (context.ts), rather than the process's.
+ */
+function inherited(): Record<string, string> {
+  const source = context().env ?? process.env;
+  const env: Record<string, string> = {};
+  for (const key of DEFAULT_INHERITED_ENV_VARS) {
+    const value = source[key];
+    if (value !== undefined && !value.startsWith("()")) env[key] = value; // the SDK skips shell functions too
+  }
+  return env;
 }
 
 type McpTool = Awaited<ReturnType<Client["listTools"]>>["tools"][number];

@@ -8,14 +8,14 @@
 import { resolve } from "node:path";
 import type { Usage } from "./agent.ts";
 import type { Event } from "./events.ts";
-import type { Mode } from "./permissions.ts";
+import { type Mode, MODES } from "./permissions.ts";
 import { type Approval, type ApprovalRequest, type Ending, parseOptions, run, type Values } from "./run.ts";
 
 export type { Approval, ApprovalRequest, Event, Mode, Usage };
 
 export interface TaskOptions {
   prompt: string;
-  /** The project's directory. */
+  /** The project's directory; a relative one is from the process's working directory. */
   cwd: string;
   /** jig's default (deepseek-flash) without one. */
   model?: string;
@@ -33,21 +33,30 @@ export interface TaskOptions {
   yes?: boolean;
   /** jig's directory, for $JIG_HOME (or ~/.jig): sessions, snapshots, memories, settings. */
   home?: string;
-  /** The environment the task's commands get (less the API keys), for the process's. */
+  /**
+   * The environment the task's commands and hooks get (less the API keys), and its MCP servers their HOME,
+   * PATH and the like from, for the process's. It is also where JIG_TRUST_PROJECT is read: pass it here to
+   * trust a project's settings.
+   */
   env?: Record<string, string>;
   /** Stops the task: it ends `interrupted`. */
   signal?: AbortSignal;
-  /** Each event, as --events would write it, as it happens. */
+  /**
+   * Each event, as --events would write it, as it happens. A listener that throws ends the task with stop
+   * "error" and its message; one that throws at the end event (or at every event) makes runTask reject with
+   * its error.
+   */
   onEvent?: (event: Event) => void;
   /**
    * Asked where the CLI would ask at a terminal. Without it, and without `yes`, such a call is denied, as with
-   * no terminal: the third ends the task `unapproved`. If it rejects, the call doesn't run (its result says
-   * the permission check failed) and its approval_request gets no approval event.
+   * no terminal: the third ends the task `unapproved`. If it rejects, the call doesn't run (its result tells
+   * the model the permission check failed, with the error's message), its approval_request gets no approval
+   * event, and the task goes on.
    */
   approve?: (request: ApprovalRequest, signal: AbortSignal) => Promise<Approval>;
   /** false: commands run directly on this machine, as --no-sandbox. */
   sandbox?: boolean;
-  /** A path for the --stats file. */
+  /** A path for the --stats file; a relative one is from the process's working directory, as for `cwd`. */
   stats?: string;
 }
 
@@ -68,11 +77,17 @@ export interface TaskResult {
 }
 
 /**
- * Runs a task to its end. Rejects only when the options are wrong, before the task starts; however the task
- * then ends, a failure included, it resolves to how, as the end event says.
+ * Runs a task to its end. Rejects only when the options are wrong, before the task starts, or when onEvent
+ * throws at the end; however the task then ends, a failure included, it resolves to how, as the end event
+ * says.
  */
 export async function runTask(options: TaskOptions): Promise<TaskResult> {
   if (!options.prompt?.trim()) throw new Error("runTask needs a prompt.");
+  // Checked here under the names the caller used; run.ts's checks name the command line's flags.
+  const { maxSteps, timeLimit, mode } = options;
+  if (maxSteps !== undefined && !(Number.isInteger(maxSteps) && maxSteps >= 1)) throw new Error("runTask: maxSteps must be a positive integer");
+  if (timeLimit !== undefined && !(timeLimit > 0 && timeLimit * 1000 < 2 ** 31)) throw new Error("runTask: timeLimit must be a positive number of seconds, under 24 days");
+  if (mode !== undefined && !MODES.includes(mode)) throw new Error(`runTask: mode must be one of: ${MODES.join(", ")}`);
   // The command line's defaults, so a task here runs as one given there would.
   const values: Values = {
     ...parseOptions([]).values,
