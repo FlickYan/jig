@@ -139,9 +139,9 @@ interface Request {
  * lists, listens, on the internal and metrics listeners too, and only then ends the tasks of replicas that
  * are gone and starts what is queued.
  * The runner is the local one unless one is given (a test's); `webhookRetryMs` is the pause before a
- * webhook's first retry; `now` is the clock the quotas' days and months, and the usage report's default
- * range, are read from; `log` is where its lines go (createLog's, by default); `countsMs`, how long the
- * metrics' reads of the store are used for.
+ * webhook's first retry; `now` is the clock the quotas' days and months, the tasks' creation times they
+ * count, and the usage report's default range, are read from; `log` is where its lines go (createLog's, by
+ * default); `countsMs`, how long the metrics' reads of the store are used for.
  */
 export async function startService(
   config: Config,
@@ -213,6 +213,9 @@ export async function startService(
   const server = createServer(handler(async (req, res, request) => handle(req, res, await ready, request), true));
   let scheduler: Scheduler | undefined;
   const close = async () => {
+    // No task is claimed from here on: one posted while the runner closes stays queued, rather than start
+    // cold and be stopped as an error.
+    scheduler?.pause();
     webhooks.close();
     // The idle workers first, their claims answered while the internal listener is still up.
     await runner?.close?.();

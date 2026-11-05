@@ -110,9 +110,10 @@ A task is `queued`, then `running`, then one of:
 | `cancelled` | cancelled through the API |
 | `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, or the service stopping while it ran |
 
-`stop` is how jig's run ended, from its `end` event (or its exit code, without one), and `usage` and `cost`
-come from that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is
-stored as U+FFFD.
+`stop` is how jig's run ended, from its `end` event (or its exit code, without one; a run stopped by a
+cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
+that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
+U+FFFD.
 
 ### Scheduling
 
@@ -130,8 +131,10 @@ replica (it crashed, was killed, or lost the database) and is marked `error` by 
 first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`.
-A local run a crashed service started can outlive it, until jig's own `--time-limit` stops it.
+out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
+the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
+for another replica or the next start. A local run a crashed service started can outlive it, until jig's
+own `--time-limit` stops it.
 
 ### Several replicas, on Postgres
 
@@ -150,8 +153,11 @@ tenants is each replica's own. A run's events are stored and announced (`NOTIFY 
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
-and it connects again. A replica that crashes leaves its runs going (a Kubernetes Job until its deadline);
-its tasks end as `error` once their leases run out, and the others go on. SQLite takes several processes
+and it connects again. Each connection asks the server to end a transaction left idle for over a minute
+(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
+lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
+replica that crashes leaves its runs going (a Kubernetes Job until its deadline); its tasks end as `error`
+once their leases run out, and the others go on. SQLite takes several processes
 on one machine too, with no announcements: streams read it every second, and a cancel is found as leases
 are renewed.
 

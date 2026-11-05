@@ -176,7 +176,7 @@ for (const { name, skip } of BACKENDS) {
     it("run a task posted to one on either, its events followed live and the task cancelled through the other", async () => {
       const config = await shared();
       const first = await replica(config);
-      const id = (await call(first, "POST", "/v1/tasks", { prompt: "wait, then finish" })).body.id;
+      const id = (await call(first, "POST", "/v1/tasks", { prompt: "wait twice, then finish" })).body.id;
       await statusOf(first, id, "running");
       // A replica that starts while another runs a task leaves it alone.
       const second = await replica(config);
@@ -185,13 +185,24 @@ for (const { name, skip } of BACKENDS) {
       await new Promise((done) => setTimeout(done, 1500));
       assert.equal((await call(second, "GET", `/v1/tasks/${id}`)).body.status, "running");
 
-      // The events come through the replica that doesn't run it, while the run goes on.
+      // The events come through the replica that doesn't run it, while the run goes on: the first four were
+      // stored before the stream opened, and the fifth is written after, with the run still waiting for go2.
+      const work = join(owner.dataDir, "tasks", id, "work");
       const frames = sse(other, `/v1/tasks/${id}/events`);
       const seen: string[] = [];
-      for await (const frame of frames) {
-        seen.push(frame.id ?? frame.event!);
-        if (seen.length === 4) await writeFile(join(owner.dataDir, "tasks", id, "work", "go"), "");
+      while (seen.length < 4) {
+        const { value } = await frames.next();
+        seen.push(value!.id ?? value!.event!);
       }
+      await writeFile(join(work, "go"), "");
+      let timer: NodeJS.Timeout | undefined;
+      const fifth = await Promise.race([frames.next(), new Promise<undefined>((done) => (timer = setTimeout(() => done(undefined), 5000)))]);
+      clearTimeout(timer);
+      assert.equal(fifth?.value?.id, "5", "the event jig wrote after the stream opened, before the run ended");
+      assert.equal((await call(other, "GET", `/v1/tasks/${id}`)).body.status, "running");
+      seen.push(fifth.value.id);
+      await writeFile(join(work, "go2"), "");
+      for await (const frame of frames) seen.push(frame.id ?? frame.event!);
       assert.deepEqual(seen, ["1", "2", "3", "4", "5", "6", "7", "done"]);
       assert.equal((await call(other, "GET", `/v1/tasks/${id}`)).body.status, "succeeded");
 

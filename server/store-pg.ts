@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { type Client, type Listener, Pool, type Row } from "./pg.ts";
+import { type Client, type Listener, Pool, redactUrl, type Row } from "./pg.ts";
 import {
   type Answer,
   type Approval,
@@ -83,6 +83,8 @@ const MIGRATIONS = [
    CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
   // The replicas up, each until its heartbeat runs out, which the metrics count.
   `CREATE TABLE replicas (id text PRIMARY KEY, seen_until timestamptz NOT NULL);`,
+  // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
+  `CREATE INDEX usage_by_day ON usage (day);`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -137,8 +139,7 @@ export class PostgresStore implements Store {
     } catch (err) {
       await pool?.close();
       // The URL's password stays out of the message.
-      const shown = url.replace(/\/\/([^:@/]*):[^@/]*@/, "//$1:***@");
-      throw new Error(`Couldn't open the database ${shown}: ${err instanceof Error ? err.message : String(err)}`);
+      throw new Error(`Couldn't open the database ${redactUrl(url)}: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -179,8 +180,10 @@ export class PostgresStore implements Store {
   createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
   async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
     const { prompt, ...rest } = spec;
+    // With caps, created at their `now`, the clock the quotas' days are read from, so it is counted on the
+    // day they say; without, at the database's.
     const insert = async (db: Client) => {
-      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', now()) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest)]);
+      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', coalesce($5, now())) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest), caps?.now ?? null]);
       return toTask(rows[0]);
     };
     if (!caps) return insert(this.pool);
@@ -221,10 +224,6 @@ export class PostgresStore implements Store {
   async queuedTenants(): Promise<string[]> {
     const { rows } = await this.pool.query("SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.tenant = tenants.id AND status = 'queued') ORDER BY id");
     return rows.map((row) => String(row.id));
-  }
-
-  async queuedCount(tenant: string): Promise<number> {
-    return Number((await this.pool.query("SELECT count(*) AS n FROM tasks WHERE tenant = $1 AND status = 'queued'", [tenant])).rows[0].n);
   }
 
   async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {

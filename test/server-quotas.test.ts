@@ -131,6 +131,18 @@ const quotaTests = () => {
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
   });
 
+  it("counts tasksPerDay by the service's clock, which stamps the tasks it creates too", async () => {
+    // The last second of a year: a task stamped by another clock (the database's, the machine's) would
+    // be counted on some other day.
+    clock = new Date("2026-12-31T23:59:59Z");
+    const api = await service(undefined, { tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, quotas: { tasksPerDay: 1 } }] });
+    const created = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.equal(created.status, 201);
+    assert.equal((await api.store.task(created.body.id))!.created, clock.toISOString());
+    const refused = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.deepEqual([refused.status, refused.body.quota, refused.body.used], [429, "tasksPerDay", 1]);
+  });
+
   it("refuses new tasks once what the tenant's tasks spent today reaches usdPerDay, until the next day", async () => {
     clock = new Date();
     const api = await service({ usdPerDay: 0.004 });
@@ -295,6 +307,9 @@ const quotaTests = () => {
     await ran(api, KEYS.globex, { model: "claude-sonnet-4-5" });
     await sql(api.database, "UPDATE usage SET day = '2026-03-02', seconds = 2");
     for (const key of [undefined, KEYS.acme, "not the admin key"]) assert.equal((await call(api, key, "GET", "/admin/usage?from=2026-03-01&to=2026-03-31")).status, 401);
+    // Every tenant's report reads the ledger by day alone, through an index of its own.
+    const index = backend === "SQLite" ? "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'usage_by_day'" : "SELECT to_regclass('usage_by_day')::text AS name";
+    assert.deepEqual((await sql(api.database, index)).map((row) => row.name), ["usage_by_day"]);
 
     const all = await call(api, ADMIN, "GET", "/admin/usage?from=2026-03-01&to=2026-03-31&group=model");
     assert.equal(all.status, 200);

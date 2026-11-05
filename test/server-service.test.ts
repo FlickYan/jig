@@ -14,7 +14,8 @@ import { bracketHost, checkConfig, type Config, resolvePaths, type Service, star
 import { createLog } from "../server/log.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
-import { Scheduler } from "../server/scheduler.ts";
+import { outcomeOf, Scheduler } from "../server/scheduler.ts";
+import { serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -248,6 +249,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(await call(api, KEYS.acme, "POST", `/v1/tasks/${running}/cancel`), { status: 202, body: { id: running, status: "running" } });
     const task = await statusOf(api, running, "cancelled");
     assert.equal(task.error, null);
+    // jig, stopped, writes no end event: the stop says it was interrupted, not that it failed.
+    assert.equal(task.stop, "interrupted");
     await until(() => !alive(pid) && !alive(child), "the fake jig and its child to be gone");
     assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${running}/cancel`)).status, 409);
     // The cancelled queued task never ran.
@@ -261,6 +264,48 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     const task = await statusOf(api, id, "stopped");
     assert.equal(task.stop, "time_limit");
     await until(() => !alive(pid) && !alive(child), "the fake jig and its child to be gone");
+  });
+
+  it("kills what a run left behind when jig exits", async () => {
+    const api = await service();
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "leave" })).body.id;
+    await statusOf(api, id, "succeeded");
+    const { child } = await record(api, id);
+    try {
+      await until(() => !alive(child), "the child jig left, which ignores SIGTERM, to be gone");
+    } finally {
+      if (alive(child)) process.kill(child, "SIGKILL");
+    }
+  });
+
+  it("claims nothing once it is closing: a task posted while the runner closes stays queued", async () => {
+    const base = await tempDir("jig-service-");
+    const db = await database(base);
+    let release!: () => void;
+    const gate = new Promise<void>((done) => (release = done));
+    const runner = Object.assign(new FakeRunner(), { close: () => gate });
+    const api = await startService(
+      { port: 0, internal: { port: 0 }, database: db, dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+      { secret: SECRET, runner },
+    );
+    let closing: Promise<void> | undefined;
+    const close = () => (closing ??= api.close());
+    // Closed after the test even if it fails, with the runner's close let through.
+    services.push({ ...api, close: () => (release(), close()) });
+    // The runner's close takes a while (a pool's containers being removed), and the API is still up.
+    void close();
+    const { status, body } = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.equal(status, 201);
+    await api.scheduler.settled();
+    assert.deepEqual(runner.started, []);
+    release();
+    await close();
+    const after = await openStore(db);
+    try {
+      assert.equal((await after.task(body.id))!.status, "queued");
+    } finally {
+      await after.close();
+    }
   });
 
   it("maps jig's exit codes to statuses", async () => {
@@ -637,23 +682,126 @@ const schedulerTests = () => {
       },
     });
     const runner = new FakeRunner();
-    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300 });
-    const logged = console.error;
-    console.error = () => {};
-    try {
-      await scheduler.start();
-      await until(() => runner.active.size, "a0 to start");
-      runner.active.values().next().value!.end();
-      // a0's lease, no longer renewed, runs out: it ends as an error, and a1 takes the slot it had.
-      await until(() => runner.started.length === 2, "a1 to start");
-    } finally {
-      console.error = logged;
-    }
+    const lines: string[] = [];
+    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, log: createLog("service", { write: (line) => lines.push(line) }) });
+    await scheduler.start();
+    await until(() => runner.active.size, "a0 to start");
+    runner.active.values().next().value!.end();
+    // a0's lease, no longer renewed, runs out: it ends as an error, and a1 takes the slot it had.
+    await until(() => runner.started.length === 2, "a1 to start");
+    assert.ok(lines.some((line) => line.includes("couldn't store how the task ended")), lines.join("\n"));
     const [lost] = await store.inStatus("error");
     assert.equal(lost.spec.prompt, "a0");
     assert.match(lost.error!, /stopped renewing its lease/);
     assert.equal(scheduler.running("a"), 1);
     for (const run of runner.active.values()) run.end();
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stops a run whose claim was in flight as it closed, before it says it has closed", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // The claim waits for the gate, as one on a slow database would.
+    let claiming = false;
+    let open!: () => void;
+    const gate = new Promise<void>((done) => (open = done));
+    const slow = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name !== "claim") return typeof value === "function" ? value.bind(target) : value;
+        return async (...args: unknown[]) => {
+          claiming = true;
+          await gate;
+          return value.apply(target, args);
+        };
+      },
+    });
+    const runner = new FakeRunner();
+    const scheduler = newScheduler(slow, runner, { concurrency: 4 });
+    void scheduler.poke();
+    await until(() => claiming, "the claim");
+    const closed = scheduler.close();
+    open();
+    await closed;
+    assert.equal(scheduler.running(), 0);
+    // It started, was stopped, and ended as the service's stop.
+    assert.deepEqual([runner.started, runner.active.size], [["a"], 0]);
+    const ended = (await store.task(task.id))!;
+    assert.deepEqual([ended.status, ended.error], ["error", "the task service stopped while it ran"]);
+    await store.close();
+  });
+
+  it("counts a task only on the replica that ended it", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // Replica A can't renew its lease (it lost the database), and its run ends only once B has ended the task.
+    const cut = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name === "renew") return async () => Promise.reject(new Error("the database went away"));
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    let release!: () => void;
+    const released = new Promise<void>((done) => (release = done));
+    let started = 0;
+    const runner: Runner = {
+      async start() {
+        started++;
+        return {
+          events: (async function* () {
+            await released;
+            yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "end", stop: "end_turn", usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }, cost: 0.5 };
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel: () => release(),
+        };
+      },
+    };
+    const quiet = createLog("service", { write: () => {} });
+    const [mine, theirs] = [serviceMetrics(), serviceMetrics()];
+    const a = newScheduler(cut, runner, { concurrency: 4, leaseMs: 300, metrics: mine, log: quiet });
+    await a.start();
+    await until(() => started, "A's run to start");
+    const b = newScheduler(store, new FakeRunner(), { concurrency: 4, leaseMs: 300, metrics: theirs, log: quiet });
+    await b.start();
+    await until(async () => (await store.task(task.id))!.status === "error", "B to end the task whose lease ran out");
+    release();
+    await until(() => !a.running(), "A's run to end");
+    await a.settled();
+    // A's own run ended, but the task was B's to end by then: only B counts it.
+    assert.deepEqual([mine.ended.get({ tenant: "a", status: "succeeded" }), mine.ended.get({ tenant: "a", status: "error" })], [0, 0]);
+    assert.deepEqual([mine.cost.get({ tenant: "a" }), mine.tokens.get({ tenant: "a", kind: "input" })], [0, 0]);
+    assert.equal(theirs.ended.get({ tenant: "a", status: "error" }), 1);
+    assert.equal((await store.task(task.id))!.status, "error");
+    await a.close();
+    await b.close();
+    await store.close();
+  });
+
+  it("starts even when a task whose lease ran out can't be read again to be counted", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const left = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    await store.claim("a", { owner: "a crashed replica", leaseMs: 100, concurrency: 4, tenantConcurrency: 1 });
+    await new Promise((done) => setTimeout(done, 150));
+    const unreadable = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name === "task") return async () => Promise.reject(new Error("the database went away"));
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const metrics = serviceMetrics();
+    const lines: string[] = [];
+    const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
+    assert.deepEqual(await scheduler.start(), [left.id]);
+    assert.equal(metrics.storeErrors.get(), 1);
+    assert.ok(lines.some((line) => line.includes("couldn't read an expired task to count it")), lines.join("\n"));
+    assert.equal((await store.task(left.id))!.status, "error");
     await scheduler.close();
     await store.close();
   });
@@ -665,6 +813,21 @@ for (const { name, skip } of BACKENDS) {
     schedulerTests();
   });
 }
+
+describe("a run's outcome", () => {
+  it("has stop interrupted when the run was stopped and left no end event", () => {
+    const killed = { exitCode: 143, timedOut: false };
+    const cancelled = outcomeOf(killed, undefined, undefined, "cancelled");
+    assert.deepEqual([cancelled.status, cancelled.stop, cancelled.error], ["cancelled", "interrupted", null]);
+    const shutdown = outcomeOf(killed, undefined, undefined, "shutdown");
+    assert.deepEqual([shutdown.status, shutdown.stop, shutdown.error], ["error", "interrupted", "the task service stopped while it ran"]);
+    // Its own end event, a time limit and an exit code alone say otherwise.
+    assert.equal(outcomeOf(killed, { v: 1, seq: 9, ts: "", type: "end", stop: "max_steps" }, undefined, "cancelled").stop, "max_steps");
+    assert.equal(outcomeOf({ exitCode: null, timedOut: true }, undefined, undefined, undefined).stop, "time_limit");
+    assert.equal(outcomeOf(killed, undefined, undefined, undefined).stop, "error");
+    assert.equal(outcomeOf(undefined, undefined, "the workspace couldn't be made", undefined).stop, null);
+  });
+});
 
 describe("the service's config", () => {
   const base = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [] } satisfies Config;
