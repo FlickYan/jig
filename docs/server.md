@@ -722,7 +722,8 @@ another region, by design: that is what keeps a tenant's data where it was put.
   "metrics": { "host": "0.0.0.0", "port": 9182 },
   "regions": [{ "name": "eu", "url": "https://jig-eu.example.com" }, { "name": "us", "url": "https://jig-us.example.com" }],
   "tenants": [{ "id": "acme", "keys": ["<sha256 of its key>"], "home": "eu", "allowed": ["eu", "us"], "failover": true }],
-  "health": { "intervalMs": 5000, "failures": 2 }
+  "health": { "intervalMs": 5000, "failures": 2 },
+  "maxBodyBytes": 1048576
 }
 ```
 
@@ -731,18 +732,22 @@ the key hashes the regions have for it, its `home` region, the regions its tasks
 home alone by default) and `failover` (false). The router maps a request's key to its tenant (401, as a
 service's, for one it doesn't know) and passes the request on, `Authorization` and all, so the region's
 service still checks the key; of what a tenant sends, it reads only a new task's `region` (in a body of
-16 MiB at most). Every answer a region gave has `x-jig-region`, that region (the router's own, a 401, 403,
-404, 413, 502 or 503, have none; a 503 for a region that is down names it in its body), and every answer has
-`x-request-id`, the client's if it sent one (`^[\w.-]{1,128}$`) or a new one, which the region is sent too.
+`maxBodyBytes` at most, 1 MiB by default as a service's: set it to the largest any region takes, since the
+router holds the body while it reads it). Every answer a region gave has `x-jig-region`, that region (the
+router's own answers have none: its `/healthz`, and a 400, 401, 403, 404, 413, 500, 502 or 503; a 503 for a
+region that is down names it in its body), and every answer has `x-request-id`, the client's if it sent one
+(`^[\w.-]{1,128}$`) or a new one, which the region is sent too. A line the router logs about a task's id has
+it as `task`; a client that leaves before its new task's body is read gets no answer, and isn't counted.
 
-- `POST /v1/tasks` goes to the spec's `region` if it names one (403 if the tenant may not use it), else to
-  the home. The body goes as it came.
+- `POST /v1/tasks` goes to the spec's `region` if it names one (400 if `region` isn't a region's name, 403
+  if the tenant may not use it), else to the home. The body goes as it came.
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
 - `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default). `GET /v1/usage?region=all`
   asks every region the tenant may use and adds up their answers, the rows with the same day and model and
-  the total, with `regions`, those that answered (502 if none did); it is JSON only.
+  the total, with `regions`, those that answered (502 if none did); it is JSON only. A client that leaves,
+  or the router closing, ends those requests, and the client is neither answered nor counted.
 - Anything else goes to the home.
 
 **Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails
