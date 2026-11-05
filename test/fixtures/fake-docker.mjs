@@ -47,7 +47,8 @@ if (command === "run") {
   const env = { PATH: process.env.PATH };
   for (const entry of values("--env")) {
     const [key, ...value] = entry.split("=");
-    env[key] = value.length ? value.join("=") : process.env[key];
+    // A path in the container (HOME=/task/home) is the mount's on the host, as for the arguments.
+    env[key] = value.length ? host(value.join("=")) : process.env[key];
   }
   let argv = [FAKE_JIG, ...args.map(host)];
   if (args.includes("--pool")) {
