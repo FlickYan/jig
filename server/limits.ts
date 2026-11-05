@@ -115,7 +115,9 @@ export class Limiter {
 
   /** `tenant`'s own limits and quotas: its entry in `tenants`, or else `tenantDefaults`. */
   tenantLimits(tenant: string): Limits {
-    return this.options.tenants?.[tenant] ?? this.options.tenantDefaults ?? {};
+    // Its own entry only: a tenant named "constructor" is no member of every object.
+    const { tenants } = this.options;
+    return (tenants && Object.hasOwn(tenants, tenant) ? tenants[tenant] : undefined) ?? this.options.tenantDefaults ?? {};
   }
 
   private limits(tenant: string): { tenant: Limits; global: Limits } {

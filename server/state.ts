@@ -202,10 +202,16 @@ export class MemoryState implements State {
     return this.copy(this.months.get(JSON.stringify([tenant, month])));
   }
 
-  /** Forgets tasks a day past their token, old days and months, and tenants' full buckets, so the maps don't grow forever. */
-  prune(now = this.now()): void {
-    for (const map of [this.tasks, this.days, this.months]) for (const [key, spent] of map) if (spent.until <= now) map.delete(key);
-    for (const [tenant, bucket] of this.buckets) if (!bucket || bucket.full(now)) this.buckets.delete(tenant);
+  /**
+   * Forgets tasks a day past their token, old days and months, and tenants' full buckets, so the maps don't
+   * grow forever. Tokens and buckets are in real time (`wall`), days and months by the clock they are counted
+   * by, so a test's clock weeks ahead can't drop a live task's spending or a bucket.
+   */
+  prune(wall = Date.now(), clock = this.now === Date.now ? wall : this.now()): void {
+    for (const [map, now] of [[this.tasks, wall], [this.days, clock], [this.months, clock]] as const) {
+      for (const [key, spent] of map) if (spent.until <= now) map.delete(key);
+    }
+    for (const [tenant, bucket] of this.buckets) if (!bucket || bucket.full(wall)) this.buckets.delete(tenant);
   }
 
   /** How many entries it holds, for the tests to see it pruned. */
@@ -441,12 +447,12 @@ export class SharedState implements State {
   private readonly redis: RedisState;
   private readonly fallback?: MemoryState;
   private readonly onError: (err: Error) => void;
-  private readonly log: (line: string) => void;
+  private readonly log: (line: string, level: "info" | "warn") => void;
   /** Slots the fallback gave, which go back to it. */
   private readonly local = new Set<string>();
   private down = false;
 
-  constructor(redis: RedisState, options: { onStateError: "closed" | "open"; onError(err: Error): void; log?(line: string): void; now?: () => number }) {
+  constructor(redis: RedisState, options: { onStateError: "closed" | "open"; onError(err: Error): void; log?(line: string, level: "info" | "warn"): void; now?: () => number }) {
     this.redis = redis;
     this.leaseMs = redis.leaseMs;
     if (options.onStateError === "open") this.fallback = new MemoryState({ now: options.now });
@@ -459,7 +465,7 @@ export class SharedState implements State {
       const result = await shared();
       if (this.down) {
         this.down = false;
-        this.log("jig gateway: Redis is back; limits and spending are shared again.");
+        this.log("jig gateway: Redis is back; limits and spending are shared again.", "info");
       }
       return result;
     } catch (err) {
@@ -467,7 +473,7 @@ export class SharedState implements State {
       if (!this.down) {
         this.down = true;
         const doing = this.fallback ? "using this replica's own limits and counts until it is back" : "refusing requests (503) until it is back";
-        this.log(`jig gateway: Redis can't be reached (${(err as Error).message}); ${doing}.`);
+        this.log(`jig gateway: Redis can't be reached (${(err as Error).message}); ${doing}.`, "warn");
       }
       if (!this.fallback) throw new StateError(`The gateway's shared state can't be reached: ${(err as Error).message}`);
       return local(this.fallback);

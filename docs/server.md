@@ -538,6 +538,8 @@ provider not called, with a message naming the quota, its amount, what is spent 
 doesn't retry a 402, so the jig run ends with an error, as for a budget. The check is soft by the requests
 already in flight: they finish and are counted when their replies end, so a tenant can go past a quota by
 what they cost. A tenant with a quota may only use a priced model (400 otherwise), as a task with a budget.
+A tenant named in `tenants` has only what its own entry sets: it takes nothing from `tenantDefaults`, its
+quotas included.
 Refusals are counted in `jig_gateway_refused_total` with `reason="quota"`. The task service checks the
 same quotas when a task is posted, so a tenant past one has its new tasks refused before they queue; the
 gateway's check, on every model call, is the hard limit on what a tenant spends.
@@ -611,17 +613,17 @@ without the block there is none, and the public port never serves metrics. Each 
 |--------|--------|------|
 | `jig_gateway_requests_total` | `tenant`, `upstream`, `status` | model calls by their final status (499 when jig went away first), and the upstream whose reply went back (`none` when none answered; `tenant` is `none` for a token that fails) |
 | `jig_gateway_request_seconds` | `upstream` | histogram: from a call's arrival to its reply's end |
-| `jig_gateway_first_byte_seconds` | `upstream` | histogram: from a call's arrival to the headers of the provider's reply passed back |
-| `jig_gateway_queue_seconds` | `tenant` | histogram: how long a call waited for a slot under the limits |
+| `jig_gateway_first_byte_seconds` | `upstream` | histogram: from a call's arrival to the headers of the provider's reply passed back, a failed one passed back once every upstream failed included |
+| `jig_gateway_queue_seconds` | `tenant` | histogram: how long a call waited for a slot under the limits, one turned away with 429 after `maxWaitMs` included |
 | `jig_gateway_inflight` | `tenant` | gauge: calls let through whose reply is not over |
 | `jig_gateway_waiting` | | gauge: calls waiting for a slot on this replica |
 | `jig_gateway_tokens_total` | `tenant`, `kind` | tokens, `kind` being `input`, `output`, `cache_read` or `cache_write` |
 | `jig_gateway_cost_usd_total` | `tenant` | what the priced replies cost |
-| `jig_gateway_failovers_total` | `from`, `to`, `reason` | calls an upstream failed, `to` the next one tried (`none` with none left), `reason` one of `connect`, `timeout`, `status_<code>` or `keys` |
+| `jig_gateway_failovers_total` | `from`, `to`, `reason` | calls an upstream failed, `to` the next one tried (`none` with none left), `reason` one of `connect`, `timeout`, `status_<code>` or `keys`: a pool rate-limited out is `status_429` when the provider rate-limited the last key left to try, `keys` when every key was already resting or refused before the request went (or the provider refused the last one) |
 | `jig_gateway_upstream_open` | `upstream` | gauge: 1 while its circuit is open or half-open |
 | `jig_gateway_keys` | `upstream`, `state` | gauge: how many keys are `ok`, `resting` or `refused` |
 | `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` or `quota` |
-| `jig_gateway_state_errors_total` | | reads and writes of Redis that failed |
+| `jig_gateway_state_errors_total` | | reads and writes of Redis that failed, a scrape's own reads of the keys' standing included |
 
 No label holds a key, a token, a prompt or a task. Every reply carries `x-request-id`: the client's, if it
 sent one of 1 to 128 letters, digits, `_`, `.` and `-`, or else a new one. It isn't sent to the provider.

@@ -494,6 +494,8 @@ interface Failure {
   body?: Buffer;
   /** It was the keys that failed it (a 429, or every key resting or refused), not the upstream: its breaker doesn't count it. */
   keys?: boolean;
+  /** When the provider's reply's headers came, by performance.now(), for a reply that may go back as it came. */
+  at?: number;
 }
 
 /** A failed reply's body, which is small; undefined past MAX_ERROR_BYTES. */
@@ -523,6 +525,8 @@ interface Call {
   upstreamRequest?: string;
   usage?: Usage;
   cost?: number;
+  /** Settles once the reply passed back is counted, so its access line has what it cost. */
+  counted?: Promise<void>;
 }
 
 /**
@@ -567,7 +571,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         now,
         onError: () => metrics.stateErrors.inc(),
         // Its lines, that Redis went away or came back, go out as the gateway's others do.
-        log: (line) => log.warn(line.replace(/^jig gateway: /, "")),
+        log: (line, level) => log[level](line.replace(/^jig gateway: /, "")),
       })
     : new MemoryState({ now });
   const { maxWaitMs = 30_000, tenantDefaults, tenants, ...global } = config.limits ?? {};
@@ -576,9 +580,10 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
   metrics.waiting.onCollect(() => metrics.waiting.set({}, limiter.queued));
   metrics.open.onCollect(() => upstreams.forEach(({ name, breaker }) => metrics.open.set({ upstream: name }, breaker.open ? 1 : 0)));
   metrics.keys.onCollect(async () => {
+    // All at once, so a Redis that doesn't answer holds a scrape for one command's timeout, not one per upstream.
+    await Promise.all(upstreams.map(({ pool }) => pool.refresh(state)));
+    const now = Date.now();
     for (const { name, pool } of upstreams) {
-      await pool.refresh(state);
-      const now = Date.now();
       const counts = { ok: 0, resting: 0, refused: 0 };
       for (const key of pool.keys) counts[key.bad ? "refused" : key.coolUntil > now ? "resting" : "ok"]++;
       for (const [standing, n] of Object.entries(counts)) metrics.keys.set({ upstream: name, state: standing }, n);
@@ -634,9 +639,11 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
       { which: "monthly", quotaUsd: monthlyUsd, read: () => state.spentIn(tenant, day.slice(0, 7)), resets: Date.UTC(year, month, 1), when: "this month" },
       { which: "daily", quotaUsd: dailyUsd, read: () => state.spentOn(tenant, day), resets: Date.UTC(year, month - 1, date + 1), when: "today" },
     ];
-    for (const { which, quotaUsd, read, resets, when } of quotas) {
+    // Both read at once, each a round trip to Redis before the request may wait for its slot.
+    const spent = await Promise.all(quotas.map(({ quotaUsd, read }) => (quotaUsd === undefined ? undefined : read())));
+    for (const [i, { which, quotaUsd, resets, when }] of quotas.entries()) {
       if (quotaUsd === undefined) continue;
-      const spentUsd = (await read())?.costUsd ?? 0;
+      const spentUsd = spent[i]?.costUsd ?? 0;
       if (spentUsd >= quotaUsd) return { which, quotaUsd, spentUsd, when, resets, retryAfter: Math.max(1, Math.ceil((resets - time) / 1000)) };
     }
     return undefined;
@@ -694,6 +701,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
           if (slow.signal.aborted) return { upstream: name, reason: "timeout", why: `no reply from ${base.host} within ${firstByteMs} ms` };
           return { upstream: name, reason: "connect", why: `could not reach ${base.host}: ${(err as Error).message}` };
         }
+        const at = performance.now();
         const status = reply.statusCode ?? 502;
         const refused = status === 401 || status === 403;
         if (refused) pool.mark(state, key, "bad");
@@ -712,7 +720,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         try {
           const failed = await errorBody(reply);
           if (!failed) return { ...failure(reason, status, "api_error", `${status} from ${base.host}, with a body too large to pass on.`), keys };
-          return { upstream: name, reason, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed, keys };
+          return { upstream: name, reason, why: `${status} from ${base.host}`, status, headers: reply.headers, body: failed, keys, at };
         } catch (err) {
           if (slow.signal.aborted) return { upstream: name, reason: "timeout", why: `no reply from ${base.host} within ${firstByteMs} ms` };
           return { upstream: name, reason, why: `${status} from ${base.host}, ${(err as Error).message}` };
@@ -777,6 +785,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     if (failedOver) metrics.failovers.inc({ ...failedOver, to: "none" });
     if (last) {
       call.upstream = last.upstream;
+      // The provider's own reply going back is timed to its headers, as one that streams is.
+      if (last.at !== undefined) metrics.firstByte.observe({ upstream: last.upstream }, (last.at - call.started) / 1000);
       const id = last.headers?.["request-id"];
       if (typeof id === "string") call.upstreamRequest = id;
       res.writeHead(last.status!, { ...Object.fromEntries(Object.entries(last.headers ?? {}).filter(([name]) => !HOP_BY_HOP.has(name))), "x-jig-upstream": last.upstream });
@@ -802,7 +812,9 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     reply.on("data", (chunk: Buffer) => reader.add(chunk));
     // Counted however the reply ends: tokens the provider sent before jig went away were spent too.
     let counted: Promise<void> | undefined;
-    const count = () => (counted ??= (reader.end(), status === 200 ? meter(call, token, model, provided, reader, upstream) : Promise.resolve()));
+    let done!: () => void;
+    call.counted = new Promise((resolve) => (done = resolve));
+    const count = () => (counted ??= (reader.end(), (status === 200 ? meter(call, token, model, provided, reader, upstream) : Promise.resolve()).finally(done)));
     // jig's reply ends once it is counted, so the task's next request, through any replica, sees it.
     reply.once("end", () => void count().finally(() => res.end()));
     reply.once("close", () => {
@@ -949,11 +961,11 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     res.end(JSON.stringify({ tenant, from, to, days: listed, total }));
   };
 
-  /** Counts a model call once its reply is over, however it ended, and writes its access line. */
-  const record = (call: Call, res: ServerResponse): void => {
+  /** Counts a model call whose reply was over at `ended`, however it ended, and writes its access line. */
+  const record = (call: Call, res: ServerResponse, ended: number): void => {
     // 499, as nginx has it, when jig went away before any reply.
     const status = res.headersSent ? res.statusCode : 499;
-    const seconds = (performance.now() - call.started) / 1000;
+    const seconds = (ended - call.started) / 1000;
     const { request, tenant, task, upstream, usage, cost, upstreamRequest } = call;
     metrics.requests.inc({ tenant, upstream, status });
     metrics.seconds.observe({ upstream }, seconds);
@@ -967,7 +979,12 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     const route = `${req.method} ${pathname}`;
     if (route === "POST /anthropic/v1/messages") {
       const call: Call = { request, started: performance.now(), tenant: "none", upstream: "none" };
-      res.once("close", () => record(call, res));
+      // Timed at the close, but written once the reply is counted: when jig leaves partway through a
+      // stream, the provider's reply is broken off after this, and what came of it is counted then.
+      res.once("close", () => {
+        const ended = performance.now();
+        void Promise.resolve(call.counted).finally(() => record(call, res, ended));
+      });
       return messages(req, res, call);
     }
     if (route === "GET /healthz") return void res.writeHead(200, { "content-type": "text/plain" }).end("ok\n");
