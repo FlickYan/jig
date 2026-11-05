@@ -128,7 +128,7 @@ export interface Service {
 }
 
 /** A request as the service logs it: its id, and its tenant once it is known. */
-interface Request {
+interface ServedRequest {
   id: string;
   log: Log;
   tenant?: string;
@@ -157,6 +157,8 @@ export async function startService(
   checkConfig(config);
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
+  // A Bearer is read up to the first whitespace, so a key with some could never be given.
+  if (adminKey && /\s/.test(adminKey)) throw new Error(`${config.adminKeyEnv} holds whitespace (a trailing newline?): the admin key can't hold any`);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
@@ -166,13 +168,13 @@ export async function startService(
    * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
    */
   const handler =
-    (serve: (req: IncomingMessage, res: ServerResponse, request: Request) => Promise<void>, api = false) =>
+    (serve: (req: IncomingMessage, res: ServerResponse, request: ServedRequest) => Promise<void>, api = false) =>
     (req: IncomingMessage, res: ServerResponse) => {
       const began = performance.now();
       const given = req.headers["x-request-id"];
       const id = typeof given === "string" && REQUEST_ID.test(given) ? given : randomUUID();
       res.setHeader("x-request-id", id);
-      const request: Request = { id, log: log.with({ request: id }) };
+      const request: ServedRequest = { id, log: log.with({ request: id }) };
       const path = URL.parse(req.url ?? "/", "http://service")?.pathname ?? "/";
       res.once("close", () => {
         const seconds = (performance.now() - began) / 1000;
@@ -483,7 +485,7 @@ interface Context {
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest();
 
-async function handle(req: IncomingMessage, res: ServerResponse, context: Context, request: Request): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse, context: Context, request: ServedRequest): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
   if (url.pathname === "/healthz") return reply(res, 200, { ok: true, region: context.region });
   const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
@@ -599,6 +601,9 @@ async function usage(res: ServerResponse, url: URL, { store, now }: Context, sco
   const params = url.searchParams;
   const unknown = [...params.keys()].find((name) => !["from", "to", "group", "format", ...allowed].includes(name));
   if (unknown) return reply(res, 400, { error: `Unknown parameter: ${unknown}` });
+  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
+  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
+  if (twice) return reply(res, 400, { error: `${twice} may be given once` });
   const today = now();
   const from = params.get("from") ?? isoDay(periods(today).monthStart);
   const to = params.get("to") ?? isoDay(today);
@@ -632,7 +637,8 @@ function totalOf(rows: UsageRow[]): Omit<UsageRow, "tenant" | "day" | "model"> {
 function csv(res: ServerResponse, rows: UsageRow[], keys: string[]): void {
   const columns = [...keys, ...SUMMED];
   const field = (value: unknown) => {
-    const text = String(value ?? "");
+    // Numbers in plain digits, as a spreadsheet reads them: String gives 1e-7 for a tiny cost.
+    const text = typeof value === "number" && !Number.isInteger(value) ? value.toFixed(9).replace(/0+$/, "").replace(/\.$/, "") : String(value ?? "");
     return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
   };
   const lines = [columns.join(","), ...rows.map((row) => columns.map((column) => field(row[column as keyof UsageRow])).join(","))];
@@ -753,7 +759,7 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
  * (SQLite, or a lost connection to Postgres), the store is read again every second.
  */
-async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: Request): Promise<void> {
+async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;

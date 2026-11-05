@@ -1,6 +1,7 @@
 # The task pods (server/runners/k8s.ts labels them) reach the gateway, the service's internal listener (where
-# they ask for approvals) and the cluster's DNS, nothing else, and nothing reaches them. It holds only where the cluster's network plugin enforces NetworkPolicy. A git
-# workspace is cloned in the pod, so a task with one needs its git host allowed too, by a rule like
+# they ask for approvals) and the cluster's DNS, nothing else, and nothing reaches them. It holds only where
+# the cluster's network plugin enforces NetworkPolicy. A git workspace is cloned in the pod, so a task with
+# one needs its git host allowed too, by a rule like
 #   - to: [{ipBlock: {cidr: <the host's addresses>}}]
 #     ports: [{protocol: TCP, port: 443}]
 apiVersion: networking.k8s.io/v1

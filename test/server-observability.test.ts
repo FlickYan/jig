@@ -44,10 +44,10 @@ async function database(base: string): Promise<string> {
 }
 
 /**
- * A service with the fake jig, its metrics on a listener of their own, read fresh at each scrape, and its
- * log's JSON lines, at debug, in `lines`.
+ * A service with the fake jig, its metrics on a listener of their own, read fresh at each scrape unless
+ * `countsMs` says otherwise, and its log's JSON lines, at debug, in `lines`.
  */
-async function service(config: Partial<Config> = {}, runner?: Runner): Promise<Service & { dataDir: string; lines: any[] }> {
+async function service(config: Partial<Config> = {}, runner?: Runner, countsMs = 0): Promise<Service & { dataDir: string; lines: any[] }> {
   const base = await tempDir("jig-observe-");
   const dataDir = join(base, "data");
   const lines: any[] = [];
@@ -69,7 +69,7 @@ async function service(config: Partial<Config> = {}, runner?: Runner): Promise<S
       ],
       ...config,
     },
-    { secret: SECRET, runner, log, countsMs: 0 },
+    { secret: SECRET, runner, log, countsMs },
   );
   services.push(started);
   return { ...started, dataDir, lines };
@@ -234,6 +234,29 @@ const observeTests = () => {
     assert.equal(value('jig_service_approval_wait_seconds_count{decision="timeout"}'), 2);
     const waited = value('jig_service_approval_wait_seconds_sum{decision="timeout"}')!;
     assert.ok(waited >= 0 && waited < 10, `waited ${waited}`);
+  });
+
+  it("reads the store's counts at most every countsMs, but not keeping a read that failed", async () => {
+    const db = await database(await tempDir("jig-observe-"));
+    const tenants = [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }];
+    const api = await service({ database: db, tenants }, undefined, 60_000);
+    const queued = async (service: Service) => (await scrape(service)).value('jig_service_tasks{tenant="acme",status="queued"}');
+    // A read that fails leaves the gauges as they were, and is counted.
+    api.store.counts = async () => {
+      throw new Error("the database is away");
+    };
+    const { value } = await scrape(api);
+    assert.equal(value('jig_service_tasks{tenant="acme",status="queued"}'), undefined);
+    assert.ok(value("jig_service_store_errors_total")! >= 1);
+    delete (api.store as Partial<Service["store"]>).counts;
+
+    // The next scrape reads again, and that read is kept for a minute.
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    assert.equal(await queued(api), 1);
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    assert.equal(await queued(api), 1, "the read kept");
+    // Read fresh, the store has both.
+    assert.equal(await queued(await service({ database: db, tenants })), 2);
   });
 
   it("counts the replicas whose heartbeat is in the store, and forgets one that stops", async () => {
@@ -455,7 +478,8 @@ describe("the observability deploy files", () => {
       assert.ok(!find("Service", `jig-${component}`).spec.ports.some((open: any) => open.port === port));
       assert.ok(fixed.static_configs.some((group: any) => group.labels.component === component && group.targets.every((target: string) => target.endsWith(`:${port}`))), component);
 
-      // Only the monitoring namespace reaches it; what reached the pod before still does.
+      // Only the monitoring namespace reaches it; the API from anywhere, the internal listener and the gateway
+      // only from the pods in jig.
       const policy = find("NetworkPolicy", `jig-${component}`).spec;
       assert.deepEqual(policy.podSelector.matchLabels, pod.metadata.labels);
       assert.deepEqual(policy.policyTypes, ["Ingress"]);

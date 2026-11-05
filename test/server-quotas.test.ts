@@ -284,9 +284,13 @@ const quotaTests = () => {
       "day,model,tasks,input,output,cacheRead,cacheWrite,costUsd,seconds\r\n" +
         "2026-03-01,claude-haiku-4-5,1,20,10,0,0,0.002,1.5\r\n2026-03-02,claude-haiku-4-5,1,20,10,0,0,0.002,1.5\r\n2026-03-02,claude-sonnet-4-5,1,20,10,0,0,0.002,1.5\r\n",
     );
+    // A cost too small for String's plain digits is written in them all the same, never as 1e-7.
+    await sql(api.database, "UPDATE usage SET cost_usd = 0.0000001 WHERE task = ?", [ids[0]]);
+    const tiny = await call(api, KEYS.acme, "GET", "/v1/usage?from=2026-03-01&to=2026-03-01&format=csv");
+    assert.equal(tiny.body, "day,tasks,input,output,cacheRead,cacheWrite,costUsd,seconds\r\n2026-03-01,1,20,10,0,0,0.0000001,1.5\r\n");
 
     assert.equal((await call(api, KEYS.acme, "GET", "/v1/usage?from=2024-01-01&to=2024-12-31")).status, 200);
-    for (const query of ["from=2025-01-01&to=2026-01-02", "from=2026-02-30", "from=yesterday", "from=2026-03-02&to=2026-03-01", "group=tenant", "group=model,day", "format=xml", "tenant=globex", "to=2026-3-1"]) {
+    for (const query of ["from=2025-01-01&to=2026-01-02", "from=2026-02-30", "from=yesterday", "from=2026-03-02&to=2026-03-01", "group=tenant", "group=model,day", "format=xml", "tenant=globex", "to=2026-3-1", "from=2026-03-01&from=2026-03-02"]) {
       const { status, body } = await call(api, KEYS.acme, "GET", `/v1/usage?${query}`);
       assert.equal(status, 400, query);
       assert.ok(body.error, query);
@@ -300,6 +304,9 @@ const quotaTests = () => {
     for (const key of [undefined, KEYS.acme, ADMIN]) assert.equal((await call(plain, key, "GET", "/admin/usage")).status, 404);
 
     await assert.rejects(service(undefined, { adminKeyEnv: "JIG_TEST_ADMIN_KEY" }), /Set JIG_TEST_ADMIN_KEY/);
+    // A Bearer is one word, so a key with whitespace (a Secret's trailing newline) could never be given.
+    process.env.JIG_TEST_ADMIN_KEY = `${ADMIN}\n`;
+    await assert.rejects(service(undefined, { adminKeyEnv: "JIG_TEST_ADMIN_KEY" }), /JIG_TEST_ADMIN_KEY holds whitespace \(a trailing newline\?\): the admin key can't hold any/);
     process.env.JIG_TEST_ADMIN_KEY = ADMIN;
     const api = await service(undefined, { adminKeyEnv: "JIG_TEST_ADMIN_KEY" });
     await ran(api, KEYS.acme, { model: "claude-haiku-4-5" });
@@ -325,6 +332,9 @@ const quotaTests = () => {
     const csv = await call(api, ADMIN, "GET", "/admin/usage?from=2026-03-01&to=2026-03-31&tenant=acme&format=csv");
     assert.equal(csv.body, "tenant,day,tasks,input,output,cacheRead,cacheWrite,costUsd,seconds\r\nacme,2026-03-02,1,20,10,0,0,0.002,2\r\n");
     assert.equal((await call(api, ADMIN, "GET", "/admin/usage?from=x")).status, 400);
+    // A parameter given twice isn't read as its first.
+    const twice = await call(api, ADMIN, "GET", "/admin/usage?from=2026-03-01&to=2026-03-31&tenant=acme&tenant=globex");
+    assert.deepEqual([twice.status, twice.body], [400, { error: "tenant may be given once" }]);
     assert.equal((await call(api, ADMIN, "GET", "/admin/other")).status, 404);
     // The admin key opens no tenant's tasks.
     assert.equal((await call(api, ADMIN, "GET", "/v1/tasks")).status, 401);

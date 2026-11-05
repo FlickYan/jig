@@ -6,6 +6,8 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
+import { Webhooks } from "../server/approvals.ts";
+import type { Approval, Task } from "../server/store.ts";
 import { mintToken } from "../server/token.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -206,6 +208,22 @@ const approvalTests = () => {
     assert.deepEqual([woken.status, woken.body], [200, { decision: "allow", always: false }]);
     assert.ok(woken.ms < 3000, `answered after ${woken.ms} ms`);
     assert.deepEqual((await internal(api, "/internal/approvals/ap_1", token)).body, { decision: "allow", always: false });
+
+    // An answer through the replica the poll waits on wakes it at once, by itself: with SQLite's look each
+    // second taken away, as if the store heard every change, nothing else could.
+    if (backend !== "SQLite") return;
+    await api.store.addApproval(id, { id: "ap_3", step: 2, tool: "bash", description: "make test" });
+    Object.defineProperty(api.store, "live", { get: () => true, configurable: true });
+    try {
+      const local = internal(api, "/internal/approvals/ap_3?wait=10", token);
+      await new Promise((done) => setTimeout(done, 300));
+      assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/approvals/ap_3`, { decision: "deny" })).status, 200);
+      const heard = await local;
+      assert.deepEqual([heard.status, heard.body], [200, { decision: "deny", always: false }]);
+      assert.ok(heard.ms < 3000, `answered after ${heard.ms} ms`);
+    } finally {
+      Object.defineProperty(api.store, "live", { value: false, configurable: true });
+    }
   });
 
   it("gives jig only the API's answer, whatever approval events its run writes", async () => {
@@ -255,6 +273,29 @@ const approvalTests = () => {
     assert.deepEqual([woken.status, woken.body], [200, { decision: "deny", always: false }]);
     // Announced on Postgres; on SQLite, found by the look each second.
     assert.ok(woken.ms < 3000, `answered after ${woken.ms} ms`);
+  });
+
+  it("takes an answer posted the moment its approval_request event is streamed, through another replica", async () => {
+    // The approval is stored before its event, so a tenant that answers as soon as it sees the event is
+    // never told there is no such approval.
+    const base = await tempDir("jig-approvals-");
+    const db = await database(base);
+    const tenants = [{ ...ACME, approvalTimeout: 120 }, GLOBEX];
+    const [first, second] = [await service({ database: db, tenants }), await service({ database: db, tenants })];
+    const id = (await call(first, KEYS.acme, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id;
+    const stream = await fetch(`${second.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } });
+    const decoder = new TextDecoder();
+    let text = "";
+    let answered: { status: number; body: any } | undefined;
+    for await (const chunk of stream.body!) {
+      text += decoder.decode(chunk, { stream: true });
+      if (answered || !text.includes('"type":"approval_request"')) continue;
+      answered = await call(second, KEYS.acme, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" });
+      // Unanswered, the run would wait out its 120 seconds.
+      if (answered.status !== 200) break;
+    }
+    assert.equal(answered?.status, 200, JSON.stringify(answered?.body));
+    assert.match(text, /event: done\ndata: \{"status":"succeeded"\}/);
   });
 
   it("posts each approval to the tenant's webhook, signed, tried again, and never holds the run up", async () => {
@@ -321,6 +362,30 @@ for (const { name, skip } of BACKENDS) {
     approvalTests();
   });
 }
+
+describe("the approvals' webhooks", () => {
+  it("posts no webhook once the webhooks are closed, as the service stops", async () => {
+    // Runs still draining as the service stops may store an approval after the webhooks are closed: its
+    // POST, retried for up to a minute, would hold up whoever embeds the service.
+    const posts: string[] = [];
+    const receiver = createServer((req, res) => {
+      posts.push(req.url ?? "");
+      res.writeHead(204).end();
+    });
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`;
+    const webhooks = new Webhooks(new Map([["acme", { url, secret: "acme's webhook secret" }]]), 50);
+    const task = { id: "task_1", tenant: "acme" } as Task;
+    const approval: Approval = { id: "ap_1", step: 1, tool: "bash", description: "make deploy", requestedAt: new Date().toISOString() };
+    webhooks.send(task, approval);
+    await until(() => posts.length === 1, "the webhook's POST");
+    webhooks.close();
+    webhooks.send(task, approval);
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(posts.length, 1);
+  });
+});
 
 describe("the approvals' config", () => {
   const base = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [] } satisfies Config;

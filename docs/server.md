@@ -95,10 +95,9 @@ Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file'
 through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
 character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
-quotas (below). A cancel answers 200 for
-a queued task (it is cancelled at once), 202 for a running one (its jig and everything it started are
-killed, and the task ends `cancelled`) and 409 for one that has ended. A stream sends a comment every
-`heartbeatSeconds`, so proxies don't close it.
+quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
+(its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
+ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it.
 
 A task is `queued`, then `running`, then one of:
 
@@ -224,7 +223,9 @@ lock of the tenant's (Postgres's, or SQLite's write lock), so replicas can't bot
 task of the day; `maxQueued` is counted the same way. The USD quotas count only tasks that have ended, so
 the tasks running when one is reached can take the tenant past it by what they spend: the service only
 refuses new tasks, and spending is held as it happens by the gateway, which sees every model call (each
-task's `budgetUsd`, and its own limits, below).
+task's `budgetUsd`, and its own limits, below). And the ledger they add up holds only what the runs said
+they spent (below): a run killed or lost counts 0, and one whose commands forged its `end` event counts
+what that says. The gateway's own quotas (`dailyUsd`, `monthlyUsd`) and budgets are the hard limit.
 
 Each task that ends, however it ends (a cancel before it started, or a replica lost, too), writes a row of
 the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, `task`, `day` (the UTC day it
@@ -248,9 +249,12 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -
 ```
 
 Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
-that isn't one is a 400. `/admin/usage` is there only with `adminKeyEnv` in the config, the environment
-variable that holds the admin key (which must be set); without it every `/admin` route is a 404. To bill a
-month, take the admin's CSV of it by model once it is over, or read the `usage` table, by `(tenant, day)`.
+that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
+the config, the environment variable that holds the admin key (which must be set, and may hold no
+whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
+`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
+month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
+them down by model or to check them against.
 
 ### Metrics and logs
 
@@ -273,11 +277,13 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
 The counters and histograms are the replica's own, a task counted by the replica that ended it (that
-started it, for its queue's seconds), so their sum over the replicas is the service's. The last two rows are
-read from the store at a scrape, at most every 5 seconds however many scrape, and are the whole store's: on
-Postgres each replica gives the same numbers, so take their max, not their sum. A replica is up while its
-heartbeat in the store, written every third of `leaseSeconds`, holds: it is forgotten as it stops, or a
-lease's length after it crashed.
+started it, for its queue's seconds), so their sum over the replicas is the service's. Queued tasks
+cancelled at the start because their tenant left the config aren't counted in
+`jig_service_tasks_ended_total`; the service logs how many. The last two rows are read from the store at
+a scrape, at most every 5 seconds however many scrape, and are the whole store's: on Postgres each
+replica gives the same numbers, so take their max, not their sum. A replica is up while its heartbeat in
+the store, written every third of `leaseSeconds`, holds: it is forgotten as it stops, or a lease's length
+after it crashed.
 
 Every response, from each listener, carries `x-request-id`: the client's, if it sent one of at most 128
 letters, digits, `_`, `.` and `-`, or else one of the service's own. It isn't passed to the runs. The
@@ -537,7 +543,9 @@ within its tenant. `GET /usage?tenant=<id>&from=YYYY-MM-DD&to=YYYY-MM-DD`, to th
 tenant's spending by UTC day, for billing: `{tenant, from, to, days: [{day, requests, input, output,
 cacheRead, cacheWrite, costUsd}], total}`, both days in, the days with nothing spent left out. A range is
 366 days at most, and a day that isn't one (`2026-02-30`), or `from` after `to`, is a 400; days are kept
-35 days (below), so an older one reads as nothing spent.
+35 days (below), so an older one reads as nothing spent. On Kubernetes only the pods in the `jig`
+namespace reach the gateway's port (`deploy/k8s/networkpolicy.yaml`), so a billing job runs there, or
+gets a rule of its own in the `jig-gateway` policy.
 
 **Limits.** Each tenant has a rate (`requestsPerMinute`, a token bucket refilled continuously, holding
 `burst` requests, by default a minute's worth) and a number of requests in flight (`concurrent`, a
