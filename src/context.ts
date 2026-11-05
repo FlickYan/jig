@@ -13,7 +13,10 @@ export interface Context {
   env?: NodeJS.ProcessEnv;
   /** Prints nothing: a library's task has no terminal, and the process's stdout and stderr aren't its own. */
   silent?: boolean;
-  /** Hears each notice and error jig tells the user (but a subagent's, which are its own): --events'. */
+  /**
+   * Hears each notice and error jig tells the user, a subagent's or the reviewer's model notices (retries,
+   * waits) included, but not what a subagent's loop shows under its call (subagentUI): --events'.
+   */
   told?: (text: string) => void;
 }
 

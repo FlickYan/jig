@@ -438,10 +438,10 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `start` | `task`, `cwd`, `model`, `version`, `limits: {maxSteps, timeLimit}` |
 | `step` | `step`, `usage: {input, cacheRead, cacheWrite, output}`, `cost` (null for an unpriced model) |
 | `text` | `step`, `text`: each reply's text as a whole |
-| `tool_call` | `step`, `id`, `name`, `description` |
+| `tool_call` | `step`, `id`, `name`, `description` (at most 4,000 characters, cut from the middle), `truncated` |
 | `tool_result` | `step`, `id`, `isError`, `output` (at most 4,000 characters, cut from the middle), `truncated` |
 | `notice` | `text`: what jig told the user |
-| `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
+| `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always`, `by`: `api` when answered, `timeout` when `--approval-timeout` passed first |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call, `seconds` |
 

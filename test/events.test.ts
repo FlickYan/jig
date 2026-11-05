@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { lstat, mkdir, readFile, realpath, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import type { AgentUI } from "../src/agent.ts";
+import { type Event as Written, Events } from "../src/events.ts";
 import { type FakeApi, fakeMessagesApi, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -136,6 +138,43 @@ describe("--events", () => {
     }
   });
 
+  it("ends with error when the run fails after its start, before the task runs", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig([...args, "--add-dir", join(outside, "missing"), "--events", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 1, output);
+      const events = await read();
+      assert.deepEqual(types(events), ["start", "notice", "end"]);
+      assert.match(String(events[1].text), /--add-dir: .* doesn't exist/);
+      assert.deepEqual([events[2].stop, events[2].exitCode, events[2].steps], ["error", 1, 0]);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with interrupted when jig is stopped before the task starts, by SIGTERM or Ctrl+C", async () => {
+    // An MCP server that never answers keeps jig connecting to it, after the start and before the task.
+    await mkdir(join(project, ".jig"));
+    await writeFile(join(project, ".jig", "settings.json"), JSON.stringify({ mcpServers: { slow: { command: "sh", args: ["-c", "cat >/dev/null"] } } }));
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      for (const [signal, exitCode] of [["SIGTERM", 143], ["SIGINT", 130]] as const) {
+        const child = spawnJig(api, [...args, "--events", file, "Fix the parser."], { JIG_TRUST_PROJECT: "1" });
+        const closed = new Promise((done) => child.on("close", (code, killedBy) => done(code ?? killedBy)));
+        while (!existsSync(file) || !(await readFile(file, "utf8")).includes('"type":"start"')) await new Promise((done) => setTimeout(done, 20));
+        child.kill(signal);
+        assert.equal(await closed, exitCode, signal);
+        const events = await read();
+        assert.deepEqual([events.at(-1)!.type, events.at(-1)!.stop, events.at(-1)!.exitCode], ["end", "interrupted", exitCode], signal);
+        await rm(file);
+      }
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
+  });
+
   it("blanks out secrets, and cuts a long output from the middle to 4,000 characters", async () => {
     const key = `sk-${"a1".repeat(15)}`;
     const api = await fakeMessagesApi((request) =>
@@ -174,6 +213,10 @@ describe("--events", () => {
       const refused = await runSplit(api, [...args, "--events", "-", "--max-steps", "0", "Fix the parser."]);
       assert.deepEqual([refused.code, refused.stdout], [1, ""]);
       assert.match(refused.stderr, /--max-steps must be a positive integer/);
+      // So does one of an option jig doesn't know, which comes before it knows where the events go.
+      const unknown = await runSplit(api, [...args, "--events", "-", "--bogus", "Fix the parser."]);
+      assert.deepEqual([unknown.code, unknown.stdout], [1, ""]);
+      assert.match(unknown.stderr, /Unknown option '--bogus'/);
     } finally {
       api.close();
     }
@@ -204,10 +247,42 @@ describe("--events", () => {
   });
 });
 
+describe("Events", () => {
+  const listen = () => {
+    const got: Written[] = [];
+    const events = new Events((event) => got.push(event), "claude-opus-5-5");
+    return { got, events, ui: events.ui({ toolCall() {}, toolResult() {}, notice() {} } as AgentUI) };
+  };
+
+  it("blanks out a key before it cuts the output, so a key the cut falls in isn't left half there", () => {
+    const { got, ui } = listen();
+    const key = `sk-${"a1".repeat(20)}`;
+    // The cut keeps 1,968 characters from each end: it falls 18 characters into the key, too few to match alone.
+    ui.toolResult(`${"x".repeat(1949)} ${key}\n${"y\n".repeat(3000)}`, false, "t1");
+    const output = String(got[0].output);
+    assert.ok(!output.includes(key.slice(0, 12)), output.slice(1940, 2000));
+    assert.equal(got[0].truncated, true);
+    assert.ok(output.length <= 4000, `${output.length} characters`);
+  });
+
+  it("cuts a long tool call's description to 4,000 characters, and an approval request's to 64,000", () => {
+    const { got, events, ui } = listen();
+    ui.toolCall("bash", "a".repeat(10_000), "t1");
+    ui.toolCall("bash", "ls", "t2");
+    events.approvalRequest({ step: 1, id: "ap_1", tool: "edit_file", description: "+".repeat(2_000_000) });
+    const [long, short, request] = got;
+    assert.ok(String(long.description).length <= 4000, `${String(long.description).length} characters`);
+    assert.match(String(long.description), /characters truncated/);
+    assert.deepEqual([long.truncated, short.description, short.truncated], [true, "ls", undefined]);
+    assert.ok(String(request.description).length <= 64_000, `${String(request.description).length} characters`);
+    assert.equal(request.truncated, true);
+  });
+});
+
 /** jig's CLI against `api`, in the project, with a JIG_HOME of its own and its stdin closed. */
-function spawnJig(api: FakeApi, argv: string[]): ChildProcessWithoutNullStreams {
+function spawnJig(api: FakeApi, argv: string[], extra: NodeJS.ProcessEnv = {}): ChildProcessWithoutNullStreams {
   const cli = join(import.meta.dirname, "..", "src", "cli.ts");
-  const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1" };
+  const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1", ...extra };
   const child = spawn(process.execPath, [cli, ...argv], { cwd: project, env });
   child.stdin.end();
   return child;

@@ -14,8 +14,14 @@ import type { CallModel } from "./model.ts";
 import { costOf } from "./prices.ts";
 import { truncate } from "./tools/index.ts";
 
-/** The most of a tool's output an event holds: the terminal shows a few lines, a backend wants more. */
+/**
+ * The most of a tool's output, or of a tool call's description, an event holds: the terminal shows a few
+ * lines, a backend wants more.
+ */
 export const EVENT_OUTPUT_CHARS = 4_000;
+// The most of an approval request's description: the person deciding should see the whole diff where they can,
+// but a line over a mebibyte is dropped by the service's runners, and the call then waits for an answer in vain.
+const APPROVAL_DESCRIPTION_CHARS = 64_000;
 // What truncate's line saying how much it cut takes, at most, so the output with it stays under the limit.
 const CUT_LINE = 64;
 
@@ -98,14 +104,14 @@ export class Events {
       },
       toolCall: (name, description, id) => {
         base.toolCall(name, description, id);
-        this.write("tool_call", { step: this.step, id, name, description });
+        // A command or a diff can be any length: the terminal shows its first lines.
+        const [shown, truncated] = cut(description, EVENT_OUTPUT_CHARS);
+        this.write("tool_call", { step: this.step, id, name, description: shown, ...(truncated && { truncated }) });
       },
       toolResult: (output, isError, id) => {
         base.toolResult(output, isError, id);
-        // Redacted before the cut, so that a key cut in two isn't left half there.
-        const whole = redact(output).value;
-        const shown = whole.length > EVENT_OUTPUT_CHARS ? truncate(whole, EVENT_OUTPUT_CHARS - CUT_LINE) : whole;
-        this.write("tool_result", { step: this.step, id, isError, output: shown, ...(shown !== whole && { truncated: true }) });
+        const [shown, truncated] = cut(output, EVENT_OUTPUT_CHARS);
+        this.write("tool_result", { step: this.step, id, isError, output: shown, ...(truncated && { truncated }) });
       },
     };
   }
@@ -135,8 +141,9 @@ export class Events {
 
   /** A tool call put to the approver, before it is asked: the service learns of it here (see approvals.ts). */
   approvalRequest(request: { step: number; id: string; tool: string; description: string }): void {
-    const { step, id, tool, description } = request;
-    this.write("approval_request", { step, id, tool, description });
+    const { step, id, tool } = request;
+    const [description, truncated] = cut(request.description, APPROVAL_DESCRIPTION_CHARS);
+    this.write("approval_request", { step, id, tool, description, ...(truncated && { truncated }) });
   }
 
   /** The approver's answer, or the timeout's deny, as the call goes on with it. */
@@ -163,6 +170,15 @@ export class Events {
     if (this.fd === undefined) process.stdout.write(line);
     else writeSync(this.fd, line);
   }
+}
+
+/**
+ * `text` as an event holds it, at most `max` characters, cut from the middle, and whether it was cut. Redacted
+ * before the cut, so that a key cut in two isn't left half there.
+ */
+function cut(text: string, max: number): [string, boolean] {
+  const whole = redact(text).value;
+  return whole.length > max ? [truncate(whole, max - CUT_LINE), true] : [whole, false];
 }
 
 /** Tokens in the contract's order of fields. */

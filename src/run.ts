@@ -291,6 +291,19 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   const approver = library?.approve ?? viaService;
   const events = (state.events = sink === undefined ? undefined : new Events(sink, model));
   events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
+  // Ctrl+C before the first task starts (while the MCP servers connect, say) ends jig as it would without a
+  // handler, but through the exit event, so the end is written and the cleanup below runs.
+  const beforeTask = () => process.exit(130);
+  if (!library) {
+    // A task's end is written when it ends: jig exits before that only on a signal or a forced quit
+    // (interrupted), or on a failure nothing caught (error), whatever it was doing then.
+    process.on("exit", (code) => events?.end(code >= 128 ? "interrupted" : "error", code));
+    // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
+    // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
+    // shell would give.
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
+    process.on("SIGINT", beforeTask);
+  }
   const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
   const dirs = values["add-dir"].map((dir) => resolve(dir));
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
@@ -331,20 +344,14 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     () => inputs?.remove(),
   );
   if (!library) {
-    // So too when jig exits before that, on a forced quit (a second Ctrl+C), and a command still running is
-    // killed as Ctrl+C kills it: only bubblewrap's sandbox would otherwise take them down with jig.
-    process.on("exit", (code) => {
-      // A task's end is written when it ends: jig exits before that only on a signal or a second Ctrl+C.
-      events?.end("interrupted", code);
+    // So too when jig exits before that, on a signal or a forced quit (a second Ctrl+C), and a command still
+    // running is killed as Ctrl+C kills it: only bubblewrap's sandbox would otherwise take them down with jig.
+    process.on("exit", () => {
       killCommands();
       sandbox?.close?.();
       outputs.remove();
       inputs?.remove();
     });
-    // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
-    // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
-    // shell would give.
-    for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
   }
   let snapshots: Snapshots | undefined = new Snapshots(cwd, settings.hiddenPaths);
   // Well before the context window fills: long contexts cost more per step and models use them less well.
@@ -623,7 +630,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     const onAbort = AsyncResource.bind(() => controller.abort());
     if (library?.signal?.aborted) controller.abort();
     library?.signal?.addEventListener("abort", onAbort);
-    if (!library) process.on("SIGINT", onSigint);
+    if (!library) process.off("SIGINT", beforeTask).on("SIGINT", onSigint);
     try {
       return await work(controller.signal);
     } catch (err) {

@@ -152,6 +152,9 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
   if (argv[0] === "memory" && !memoryVerb) return memoryCommand(argv.slice(1));
   if (argv[0] === "sessions") return sessionsCommand(argv.slice(1));
   if (argv[0] === "review") return reviewCommand(argv.slice(1));
+  // With --events -, stdout is for the events alone, so what jig says goes to stderr from here on: its
+  // refusals of bad arguments too, those parseOptions makes before it knows where the events go included.
+  if (argv.some((arg, i) => arg === "--events=-" || (arg === "--events" && argv[i + 1] === "-"))) ui.toStderr();
   const { values, positionals } = parseOptions(skillsVerb || memoryVerb ? argv.slice(2) : argv);
   if (values.help) {
     console.log(HELP);
@@ -161,9 +164,6 @@ async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(VERSION);
     return;
   }
-  // With --events -, stdout is for the events alone, so what jig says goes to stderr from here on: its
-  // refusals of bad arguments too.
-  if (values.events === "-") ui.toStderr();
   if (values.sessions) return listSessions(resolve(values.cwd));
   const given = positionals.join(" ") === "-" ? (await readStdin()).trim() : positionals.join(" ");
   if (positionals.join(" ") === "-" && !given) throw new Error("The task was to come from stdin (jig -), but stdin was empty.");

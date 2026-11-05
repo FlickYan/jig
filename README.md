@@ -150,24 +150,26 @@ a task and follows it there rather than in the terminal's output (`-` puts them 
 output on stderr). Each line is `{"v":1,"seq":n,"ts":"<ISO time>","type":...}` with the type's fields:
 `start` (the task, `cwd`, `model`, `version`, `limits` with `maxSteps` and `timeLimit`), then for each step
 `step` (its number, its call's `usage` and `cost`), the model's `text`, each `tool_call` (`id`, `name` and the
-`description` the terminal shows) and its `tool_result` (`isError`, and the `output`, cut from the middle to
-4,000 characters, with `"truncated":true` when cut), each `notice` jig prints (errors included), and last
-`end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and `cost` of every model
-call in the task (subagents', the reviewer's, compactions' and the wrap-up's included; the wrap-up's report
-is a `text` after the last step). A cost is in US dollars, or null for a model `src/prices.ts` has no price
-for. Every string goes through the redaction `jig sessions export` uses. A reader should pass over a type it
-doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
+`description` the terminal shows, cut from the middle to 4,000 characters, with `"truncated":true` when
+cut) and its `tool_result` (`isError`, and the `output`, cut the same way), each `notice` jig prints (errors
+included), and last `end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and
+`cost` of every model call in the task (subagents', the reviewer's, compactions' and the wrap-up's included;
+the wrap-up's report is a `text` after the last step). A cost is in US dollars, or null for a model
+`src/prices.ts` has no price for. Every string goes through the redaction `jig sessions export` uses. A reader
+should pass over a type it doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
 file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
-written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP
-or a second Ctrl+C, jig still writes an `end`, its stop `interrupted`.
+written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP,
+a Ctrl+C before the task starts or a second one in it, jig still writes an `end`, its stop `interrupted` (and
+`error`, with exit code 1, after a failure nothing caught).
 
 `--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
 task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the
-terminal, jig writes an `approval_request` event (`step`, `id`: `ap_1`, `ap_2`, ..., `tool`, `description`)
-and polls `GET <url>/<id>?wait=25`, with `Authorization: Bearer <the model's API key>`, for the answer:
-200 with `{"decision": "allow" | "deny", "always": true}` (`always` optional), or 204 for none yet, asked
-again at once; any other status, or a failed connection, is asked again after 1, 2, 4 ... seconds, 10 at
-most. `allow` is the terminal's yes, with `always` its always, and `deny` its no; with no answer after
+terminal, jig writes an `approval_request` event (`step`, `id`: `ap_1`, `ap_2`, ..., `tool`, `description`,
+cut from the middle to 64,000 characters, with `"truncated":true` when cut) and polls
+`GET <url>/<id>?wait=25`, with `Authorization: Bearer <the model's API key>`, for the answer: 200 with
+`{"decision": "allow" | "deny", "always": true}` (`always` optional), or 204 for none yet, asked again at
+once; any other status, or a failed connection, is asked again after 1, 2, 4 ... seconds, 10 at most.
+`allow` is the terminal's yes, with `always` its always, and `deny` its no; with no answer after
 `--approval-timeout` seconds (600) the call is denied. An `approval` event (`id`, `decision`, `always`,
 `by`: `api`, or `timeout`) follows, and the task goes on as after the terminal's answer. `--time-limit`,
 Ctrl+C and SIGTERM stop the wait as they stop the task. It is only for a task given on the command line or
