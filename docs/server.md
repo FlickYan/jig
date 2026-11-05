@@ -54,8 +54,14 @@ program and first arguments that start jig: this checkout's `src/cli.ts` by defa
 the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
 event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
-service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type) is
-refused at the start, with the field and what is wrong with it.
+service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
+runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
+`leaseSeconds` over 86,400, `heartbeatSeconds` over 3,600, a tenant's `timeLimit` or `approvalTimeout`
+over 2,000,000) is refused at the start, with the field and what is wrong with it, before the database is
+changed. The listeners are up before any queued task starts, so a port that is taken stops the start with
+nothing run. The config's paths are `database`, `dataDir` and those of `jig`'s entries that start with `./` or
+`../` (a program's name, or an absolute path, is used as it is). A tenant's `concurrency` 0 holds its tasks
+queued.
 
 ### The API
 
@@ -174,10 +180,10 @@ has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer 
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
 `timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
-it times out as a deny. The answer jig is given is always the API's, though: on Docker and Kubernetes a
-task's commands can write its events, so the record of how jig acted is only as good as they are. An
-`approval` event that says the API answered when it didn't, or answered otherwise, is left out of the
-record (and logged), and a timeout is only ever a deny.
+it times out as a deny. The answer jig is given is always the API's, though: on every runner (on the
+local one when `dataDir` is in a temp folder) a task's commands can write its events, so the record of how
+jig acted is only as good as they are. An `approval` event that says the API answered when it didn't, or
+answered otherwise, is left out of the record (and logged), and a timeout is only ever a deny.
 
 jig waits on a second listener, `internal` (`{"host", "port"}`, 127.0.0.1:8082 by default), which serves
 only `GET /internal/approvals/<id>?wait=<seconds>` and `GET /healthz`. Its Bearer is the task's gateway
@@ -219,8 +225,9 @@ the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, 
 ended, `YYYY-MM-DD`), `model`, `status`, `input`, `output`, `cache_read`, `cache_write`, `cost_usd` and
 `seconds` (from its start to its end; 0 if it never started). The tokens and cost are those of jig's `end`
 event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, and on
-Docker and Kubernetes a task's commands can write that event, so for what a tenant must pay the gateway's
-counts are the record. Tasks that ended before the ledger came have no row.
+every runner (on the local one when `dataDir` is in a temp folder) a task's commands can write that event,
+so for what a tenant must pay the gateway's counts are the record. Tasks that ended before the ledger came
+have no row.
 
 ```bash
 # The tenant's own usage, by UTC day, model or both (day,model), over from..to (both included; this month
@@ -289,9 +296,9 @@ reach those ports (the tenants' API from anywhere, the internal listener and the
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
 there, or the repository cloned with `--depth 1`, no hooks and only `gitProtocols`), `home/`, its `HOME`
-and `JIG_HOME`, and beside them, outside the project where its commands can't write, the events and stats
-files and `output.log`, what jig printed. The folder is removed once the task has ended and its outcome
-is stored (unless `keepTaskDirs`), as the Docker runner's is. jig runs as
+and `JIG_HOME`, and beside them, outside the project, the events and stats files and `output.log`, what
+jig printed. The folder is removed once the task has ended and its outcome is stored (unless
+`keepTaskDirs`), as the Docker runner's is. jig runs as
 
 ```
 jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
@@ -306,6 +313,12 @@ environment is the service's `PATH`, `LANG`, `LC_ALL`, `TZ` and `TMPDIR`, and as
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
+
+The local runner is for one trusted tenant, or for development. jig's sandbox lets a task's commands read
+the whole machine, other tasks' folders and the database among them, and write the temp folders (`/tmp`,
+`/var/tmp` and `$TMPDIR`): with `dataDir` or the database there, they can write their own events (the
+`end` event's usage and cost, which go in the ledger) and the database too. The service warns at the start
+when the local runner serves several tenants, or has `dataDir` or the database in a temp folder.
 
 ### The Docker runner
 
@@ -408,7 +421,8 @@ worker's own folder, bound at `/task` since the container started, and reads the
 Kubernetes the worker makes it, and the events come in the pod's log, its Job given the task's deadline
 (from now) and labels with a merge patch (the Role in `deploy/k8s/rbac.yaml` allows `patch` on Jobs).
 With none waiting the task starts cold, as before, and the pool is filled behind it. A miss is logged,
-with the pool's idle workers, hits and misses so far.
+with the pool's idle workers, hits and misses so far. `size` is at most the replica's `concurrency`: a
+replica never runs more tasks at once, so a worker past it would never be used.
 
 A worker runs one task and exits: none is used again, so no tenant's files, memory or processes meet
 another's, and what tenants share is what cold tasks share, the image and the node. The worker takes the
@@ -425,7 +439,7 @@ A worker claims from the replica that started it, which alone holds its ticket. 
 replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on
 Kubernetes that is a Service in front of every replica, so each replica takes its pod's own address from
 `JIG_POOL_BASE_URL`, which `deploy/k8s/api.yaml` sets (`http://$(POD_IP):8082`) and which takes the
-config's place.
+config's place; an IPv6 address there is put in brackets.
 
 ## Events
 
@@ -749,3 +763,7 @@ sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its 
 as a lone gateway's restart would. For spending that must last, use a managed Redis instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one
 gateway, with a Redis that keeps its data in a volume, so a restart of either forgets nothing.
+
+Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sha256sum`) in place of the
+placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
+refuses to start with it.

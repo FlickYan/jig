@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 
 // The task service's state: tenants and their API keys, tasks, each task's events and the approvals its jig
 // asked for. Two stores keep to
@@ -350,6 +350,9 @@ class SqliteStore implements Store {
     try {
       // A fresh checkout has no folder for the file yet.
       if (path !== ":memory:" && path !== "") mkdirSync(dirname(path), { recursive: true });
+      // Loaded here rather than imported, so a service on Postgres doesn't print Node's warning that
+      // SQLite is experimental.
+      const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
       this.db = new DatabaseSync(path);
     } catch (err) {
       throw new Error(`Couldn't open the database ${path}: ${err instanceof Error ? err.message : String(err)}`);

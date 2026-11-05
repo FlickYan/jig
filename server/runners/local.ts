@@ -8,7 +8,9 @@ import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
 // work/ is the project jig works in, home/ its HOME and JIG_HOME, and beside them the events and stats files
-// jig writes, outside the project, where its sandboxed commands can't write.
+// jig writes, outside the project. jig's sandbox lets its commands read the whole machine, other tasks'
+// folders and the database among them, and write the temp folders: with dataDir there, they can write
+// these files too. So this runner is for one trusted tenant, or for development.
 
 export interface LocalRunnerConfig {
   dataDir: string;

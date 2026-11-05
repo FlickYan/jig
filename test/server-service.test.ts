@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
-import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { bracketHost, checkConfig, type Config, resolvePaths, type Service, startService } from "../server/api.ts";
+import { createLog } from "../server/log.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { Scheduler } from "../server/scheduler.ts";
@@ -677,7 +684,7 @@ describe("the service's config", () => {
     assert.equal(problem({ port: 70000 }), "The config's port must be a whole number from 0 to 65535, not 70000");
     assert.equal(problem({ database: undefined }), "The config's database is missing");
     assert.equal(problem({ gatewayBaseUrl: "gateway:8081" }), 'The config\'s gatewayBaseUrl must be an http or https URL, not "gateway:8081"');
-    assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, not 0");
+    assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
@@ -692,5 +699,129 @@ describe("the service's config", () => {
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], concurrency: -1 }] }), "The config's tenants[0].concurrency must be a whole number from 0 up, not -1");
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], budgetUsd: null, maxQueued: 0 }] }), undefined);
     await assert.rejects(startService({ ...base, concurrency: 0 }, { secret: SECRET }), /concurrency must be a whole number from 1 up/);
+  });
+
+  it("refuses what could never run: times past a timer's reach, a runner without its settings, a pool past concurrency", () => {
+    // jig refuses a --time-limit or --approval-timeout of 24 days, and a timer past 2^31 ms fires at once.
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], timeLimit: 3_000_000 }] }), "The config's tenants[0].timeLimit must be a whole number from 1 to 2000000, not 3000000");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], approvalTimeout: 3_000_000 }] }), "The config's tenants[0].approvalTimeout must be a whole number from 1 to 2000000, not 3000000");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], timeLimit: 2_000_000, approvalTimeout: 2_000_000 }], graceSeconds: 86_400, leaseSeconds: 86_400, heartbeatSeconds: 3_600 }), undefined);
+    assert.equal(problem({ graceSeconds: 1e6 }), "The config's graceSeconds must be a number over or at 0, up to 86400, not 1000000");
+    assert.equal(problem({ leaseSeconds: 1e7 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 10000000");
+    assert.equal(problem({ heartbeatSeconds: 1e7 }), "The config's heartbeatSeconds must be a number over 0, up to 3600, not 10000000");
+    assert.equal(problem({ runner: "podman" }), 'The config\'s runner must be local, docker or kubernetes, not "podman"');
+    assert.equal(problem({ runner: "docker", docker: { image: "x" } }), "The config's docker.network is missing");
+    assert.equal(problem({ runner: "docker" }), "The config's docker.image is missing");
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "" } }), "The config's kubernetes.image must be a string that isn't empty");
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w" } }), undefined);
+    // A replica never runs more than concurrency at once, so idle workers past it are never used.
+    assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4000 } } }), "The config's docker.pool.size must be at most concurrency, 4: idle workers past it are never used");
+    assert.equal(problem({ concurrency: 8, kubernetes: { image: "w", pool: { size: 8 } } }), undefined);
+  });
+
+  it("refuses a bad runner config before it changes the store", async () => {
+    const dir = await tempDir("jig-service-");
+    const database = join(dir, "jig.db");
+    const store = await openStore(database);
+    await store.putTenant({ id: "globex", limits: { concurrency: 2, maxSteps: 50, timeLimit: 60, budgetUsd: null } }, [sha256(KEYS.globex)]);
+    const queued = await store.createTask("globex", { prompt: "exit 0", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
+    await store.close();
+    // globex has been taken out of the config, but the config can't run: nothing of the store's changes.
+    const config = { ...base, port: 0, internal: { port: 0 }, database, dataDir: join(dir, "data"), runner: "docker", docker: { image: "jig-worker" } } as unknown as Config;
+    await assert.rejects(startService(config, { secret: SECRET }), /docker\.network is missing/);
+    const after = await openStore(database);
+    opened.push(() => after.close());
+    assert.equal((await after.task(queued.id))!.status, "queued");
+  });
+
+  it("brackets an IPv6 pod address in the pool's URL", () => {
+    assert.equal(bracketHost("http://fd00::1:8082"), "http://[fd00::1]:8082");
+    assert.equal(bracketHost("http://fd00::1:8082/x"), "http://[fd00::1]:8082/x");
+    assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 1, baseUrl: bracketHost("http://fd00::1:8082") } } }), undefined);
+    for (const url of ["http://10.0.0.5:8082", "http://[fd00::1]:8082", "http://api:8082"]) assert.equal(bracketHost(url), url);
+  });
+
+  it("takes the paths in the config as relative to it", () => {
+    const config = { ...base, database: "data/jig.db", dataDir: "data", jig: ["node", "./src/cli.ts", "../jig/cli.ts", "/opt/jig/cli.ts", "--flag"] } as Config;
+    resolvePaths(config, "/etc/jig");
+    assert.deepEqual([config.database, config.dataDir, config.jig], ["/etc/jig/data/jig.db", "/etc/jig/data", ["node", "/etc/jig/src/cli.ts", "/etc/jig/cli.ts", "/opt/jig/cli.ts", "--flag"]]);
+    for (const database of [":memory:", "postgres://jig@db/jig", "postgresql://jig@db/jig"]) {
+      const other = { ...base, database } as Config;
+      resolvePaths(other, "/etc/jig");
+      assert.equal(other.database, database);
+    }
+  });
+});
+
+describe("the service's start", () => {
+  /** Two ports that were free a moment ago. */
+  const freePorts = async () => {
+    const servers = [createServer().listen(0, "127.0.0.1"), createServer().listen(0, "127.0.0.1")];
+    await Promise.all(servers.map((server) => once(server, "listening")));
+    const ports = servers.map((server) => (server.address() as AddressInfo).port);
+    await Promise.all(servers.map((server) => new Promise((done) => server.close(done))));
+    return ports;
+  };
+  /** Whether a port can be listened on. */
+  const free = async (port: number) => {
+    const server = createServer();
+    const listening = await new Promise<boolean>((done) => server.once("error", () => done(false)).listen(port, "127.0.0.1", () => done(true)));
+    if (listening) await new Promise((done) => server.close(done));
+    return listening;
+  };
+
+  for (const taken of ["port", "metrics"] as const) {
+    it(`claims no task when the ${taken === "port" ? "API's" : "metrics'"} port is taken, and closes what it opened`, async () => {
+      const dir = await tempDir("jig-service-");
+      const database = join(dir, "jig.db");
+      const store = await openStore(database);
+      await store.putTenant({ id: "acme", limits: { concurrency: 2, maxSteps: 50, timeLimit: 60, budgetUsd: null } }, [sha256(KEYS.acme)]);
+      const queued = await store.createTask("acme", { prompt: "exit 0", maxSteps: 50, timeLimit: 60, model: "deepseek-flash" });
+      await store.close();
+      const holder = createServer().listen(0, "127.0.0.1");
+      await once(holder, "listening");
+      opened.push(() => new Promise((done) => holder.close(done)));
+      const held = (holder.address() as AddressInfo).port;
+      const [internal, api] = await freePorts();
+      let closed = 0;
+      const runner = Object.assign(new FakeRunner(), { close: async () => void closed++ });
+      const config: Config = {
+        port: taken === "port" ? held : api,
+        internal: { port: internal },
+        ...(taken === "metrics" && { metrics: { port: held } }),
+        database,
+        dataDir: join(dir, "data"),
+        gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
+        tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }],
+      };
+      await assert.rejects(startService(config, { secret: SECRET, runner }), /EADDRINUSE/);
+      assert.deepEqual([runner.started, closed], [[], 1]);
+      assert.ok(await free(internal), "the internal listener is closed");
+      if (taken === "metrics") assert.ok(await free(api), "the API's listener is closed");
+      // The store is closed, and the task waits for the next start.
+      const after = await openStore(database);
+      opened.push(() => after.close());
+      assert.equal((await after.task(queued.id))!.status, "queued");
+      await after.putTenant({ id: "globex", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    });
+  }
+
+  it("warns that the local runner keeps no wall between tenants, and that a temp folder lets tasks write their records", async () => {
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = await tempDir("jig-service-");
+    const started = await startService(
+      { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)] }] },
+      { secret: SECRET, log },
+    );
+    services.push(started);
+    assert.ok(lines.some((line) => /^jig service: the local runner keeps no wall between tenants/.test(line)), lines.join("\n"));
+    assert.ok(lines.some((line) => /^jig service: dataDir or the database is in a temp folder/.test(line)), lines.join("\n"));
+  });
+
+  it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {
+    const api = pathToFileURL(join(import.meta.dirname, "..", "server", "api.ts")).href;
+    const { stderr } = await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(api)})`]);
+    assert.doesNotMatch(stderr, /SQLite/);
   });
 });

@@ -338,7 +338,7 @@ describe("the approvals' config", () => {
     assert.equal(problem({ internal: 8082 }), "The config's internal must be an object, {host, port}");
     assert.equal(problem({ internal: { port: 70000 } }), "The config's internal.port must be a whole number from 0 to 65535, not 70000");
     assert.equal(problem({ internalBaseUrl: "api:8082" }), 'The config\'s internalBaseUrl must be an http or https URL, not "api:8082"');
-    assert.equal(problem({ tenants: [{ ...ACME, approvalTimeout: 0 }] }), "The config's tenants[0].approvalTimeout must be a whole number from 1 up, not 0");
+    assert.equal(problem({ tenants: [{ ...ACME, approvalTimeout: 0 }] }), "The config's tenants[0].approvalTimeout must be a whole number from 1 to 2000000, not 0");
     assert.equal(problem({ tenants: [{ ...ACME, approvalWebhook: "https://hooks.example.com/jig" }] }), "The config's tenants[0].webhookSecretEnv is missing");
     assert.equal(problem({ tenants: [{ ...ACME, approvalWebhook: "hooks", webhookSecretEnv: "X" }] }), 'The config\'s tenants[0].approvalWebhook must be an http or https URL, not "hooks"');
     const unset = "JIG_TEST_A_VARIABLE_NOT_SET";
