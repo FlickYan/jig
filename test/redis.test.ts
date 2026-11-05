@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
-import { createServer, type Server, type Socket } from "node:net";
+import { readFile } from "node:fs/promises";
+import { type AddressInfo, createServer, type Server, type Socket } from "node:net";
+import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
+import { createServer as createTlsServer, type TLSSocket } from "node:tls";
 import { parseRedisUrl, parseReply, Redis, RedisError, type RedisReply, redisScript } from "../server/redis.ts";
 
 // server/redis.ts, the gateway's Redis client, against a stand-in server that speaks just enough RESP: it
 // reads commands with the client's own parser (a command is an array of bulk strings) and answers as each
 // test says.
+
+const FIXTURES = join(import.meta.dirname, "fixtures");
 
 const closing: (() => unknown)[] = [];
 afterEach(async () => {
@@ -173,6 +178,36 @@ describe("the Redis client", () => {
     sockets[0].write("*3\r\n$7\r\nmessage\r\n$8\r\nreleased\r\n$5\r\nother\r\n");
     await until(() => heard.length === 2, "the second message");
     assert.deepEqual(heard, ["released: acme", "released: other"]);
+  });
+
+  it("connects over TLS for rediss://, giving the server name only when it is a name", async () => {
+    // A server with a certificate for 127.0.0.1, which answers PONG to every command.
+    const cert = await readFile(join(FIXTURES, "k8s-api.crt"), "utf8");
+    const sockets = new Set<TLSSocket>();
+    const server = createTlsServer({ key: await readFile(join(FIXTURES, "k8s-api.key")), cert }, (socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      let buffer: Buffer = Buffer.alloc(0);
+      socket.on("data", (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        for (let parsed = parseReply(buffer); parsed; parsed = parseReply(buffer)) {
+          buffer = buffer.subarray(parsed[1]);
+          socket.write("+PONG\r\n");
+        }
+      });
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    closing.push(() => (sockets.forEach((socket) => socket.destroy()), new Promise((done) => server.close(done))));
+    // An IP address as the TLS server name is against RFC 6066, and Node warns of it (DEP0123).
+    const warnings: (Error & { code?: string })[] = [];
+    const warned = (warning: Error) => warnings.push(warning);
+    process.on("warning", warned);
+    closing.push(() => process.off("warning", warned));
+    const redis = new Redis(`rediss://127.0.0.1:${(server.address() as AddressInfo).port}`, { ca: cert });
+    closing.push(() => redis.close());
+    assert.equal(await redis.command(["PING"]), "PONG");
+    await new Promise((done) => setImmediate(done)); // a warning is emitted on the next tick
+    assert.deepEqual(warnings.filter((warning) => warning.code === "DEP0123"), []);
   });
 
   it("reads Redis URLs", () => {

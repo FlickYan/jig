@@ -9,7 +9,7 @@ import { afterEach, describe, it } from "node:test";
 import { costOf } from "../src/prices.ts";
 import { Breaker, type Gateway, type GatewayConfig, startGateway, withModel } from "../server/gateway.ts";
 import { Redis } from "../server/redis.ts";
-import { MemoryState, RedisState, utcDay } from "../server/state.ts";
+import { MemoryState, RedisState, SharedState, utcDay } from "../server/state.ts";
 import { mintToken, type TokenPayload, verifyToken } from "../server/token.ts";
 import { fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -320,6 +320,41 @@ describe("the gateway", () => {
     assert.deepEqual([spent.requests, spent.usage.input, spent.usage.output], [1, 10, 1]);
   });
 
+  it("breaks off a reply the provider stops sending, once nothing has come for idleMs", async () => {
+    // The provider sends its first event, 10 tokens in, then nothing, with the connection left open.
+    const reply = messagesReply([{ text: "Done." }]);
+    const provider = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(reply.slice(0, reply.indexOf("\n\n") + 2));
+    });
+    const gw = await gateway(provider.url, { failover: { idleMs: 200 } });
+    const response = await ask(gw, token({ task: "stalled" }));
+    assert.equal(response.status, 200);
+    let timer: NodeJS.Timeout | undefined;
+    const hung = new Promise<string>((done) => (timer = setTimeout(() => done("hung"), 3000)));
+    const outcome = await Promise.race([response.text().then(() => "ended", () => "broke off"), hung]).finally(() => clearTimeout(timer));
+    assert.equal(outcome, "broke off");
+    await until(async () => (await metric(gw, 'jig_gateway_inflight{tenant="acme"}')) === 0, "the request to give back its slot");
+    const spent = await (await fetch(`${gw.url}/usage/stalled`, { headers: { "x-api-key": token({ task: "stalled" }) } })).json();
+    assert.deepEqual([spent.requests, spent.usage.input], [1, 10]);
+  });
+
+  it("ends jig's reply only once it is counted, so the task's next request sees it", async () => {
+    // Counting that takes a while, as a write to Redis can.
+    const spend = MemoryState.prototype.spend;
+    MemoryState.prototype.spend = async function (this: MemoryState, ...args: Parameters<MemoryState["spend"]>) {
+      await new Promise((done) => setTimeout(done, 300));
+      return spend.apply(this, args);
+    };
+    closing.push(() => (MemoryState.prototype.spend = spend));
+    const provider = await fakeProvider();
+    const gw = await gateway(provider.url);
+    const credential = token({ task: "late" });
+    await (await ask(gw, credential)).text();
+    const spent = await (await fetch(`${gw.url}/usage/late`, { headers: { "x-api-key": credential } })).json();
+    assert.equal(spent.requests, 1);
+  });
+
   it("answers 402 once a task has spent its budget", async () => {
     const provider = await fakeProvider();
     const gw = await gateway(provider.url);
@@ -328,7 +363,10 @@ describe("the gateway", () => {
     assert.deepEqual([(await ask(gw, credential)).status, (await ask(gw, credential)).status], [200, 200]);
     const over = await ask(gw, credential);
     assert.equal(over.status, 402);
-    assert.equal((await over.json()).error.type, "billing_error");
+    const { error } = await over.json();
+    assert.equal(error.type, "billing_error");
+    // What it spent, not rounded down to look like the budget.
+    assert.match(error.message, /\$0\.00014 of \$0\.0001\b/);
     assert.equal(provider.seen.length, 2);
     // Another task of the tenant has its own budget, and so has another tenant's task of the same id.
     assert.equal((await ask(gw, token({ task: "fresh", budgetUsd: 0.0001 }))).status, 200);
@@ -347,7 +385,9 @@ describe("the gateway", () => {
     const provider = await fakeProvider();
     // Each reply costs $0.00007: two spend a quota of $0.0001, three one of $0.0002.
     const time = clock(Date.UTC(2026, 10, 29, 12));
-    const tenants = { daily: { dailyUsd: 0.0001 }, monthly: { monthlyUsd: 0.0002 }, both: { dailyUsd: 0.0001, monthlyUsd: 0.0001 } };
+    // Two replies spend these exactly: a quota spent to the cent is spent.
+    const exact = 2 * costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 })!;
+    const tenants = { daily: { dailyUsd: 0.0001 }, monthly: { monthlyUsd: 0.0002 }, both: { dailyUsd: 0.0001, monthlyUsd: 0.0001 }, exactDay: { dailyUsd: exact }, exactMonth: { monthlyUsd: exact } };
     const gw = await gateway(provider.url, { limits: { tenants } }, {}, time.now);
     const as = (tenant: string) => ask(gw, token({ tenant }));
     assert.deepEqual([await outcome(as("daily")), await outcome(as("daily"))], [[200, null], [200, null]]);
@@ -355,9 +395,14 @@ describe("the gateway", () => {
     assert.equal(over.status, 402);
     const { error } = await over.json();
     assert.equal(error.type, "billing_error");
-    assert.equal(error.message, "This tenant has spent its daily quota: $0.0001 of $0.0001 today (UTC). It resets at 2026-11-30T00:00:00Z.");
+    assert.equal(error.message, "This tenant has spent its daily quota: $0.00014 of $0.0001 today (UTC). It resets at 2026-11-30T00:00:00Z.");
     assert.equal(over.headers.get("retry-after"), String(12 * 60 * 60));
     assert.equal(provider.seen.length, 2);
+    for (const tenant of ["exactDay", "exactMonth"]) {
+      const statuses = [];
+      for (let i = 0; i < 3; i++) statuses.push((await outcome(as(tenant)))[0]);
+      assert.deepEqual(statuses, [200, 200, 402], tenant);
+    }
     // A tenant without quotas goes on as before; the next day, the daily one does too.
     assert.deepEqual(await outcome(as("acme")), [200, null]);
     time.set(Date.UTC(2026, 10, 30, 0, 0, 1));
@@ -370,7 +415,7 @@ describe("the gateway", () => {
     assert.deepEqual([await outcome(as("monthly")), await outcome(as("monthly"))], [[200, null], [200, null]]);
     const month = await as("monthly");
     assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(6 * 60 * 60)]);
-    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month \(UTC\)\. It resets at 2026-12-01T00:00:00Z\./);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.00021 of \$0\.0002 this month \(UTC\)\. It resets at 2026-12-01T00:00:00Z\./);
     time.set(Date.UTC(2026, 11, 1));
     assert.deepEqual(await outcome(as("monthly")), [200, null]);
     // With both spent, the month's is the one to wait for.
@@ -386,7 +431,17 @@ describe("the gateway", () => {
     // As with a budget, a quota needs a price to count against.
     const unpriced = await fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token({ tenant: "daily" }) }, body: body("hi", "claude-haiku-4-5") });
     assert.equal(unpriced.status, 400);
-    assert.equal(provider.seen.length, 10);
+    assert.equal(provider.seen.length, 14);
+  });
+
+  it("holds a tenant whose id every object has as a name to the defaults' quota, as any other", async () => {
+    const provider = await fakeProvider();
+    const gw = await gateway(provider.url, { limits: { tenantDefaults: { dailyUsd: 0.0001 }, tenants: { named: { concurrent: 5 } } } });
+    for (const tenant of ["constructor", "toString"]) {
+      const statuses = [];
+      for (let i = 0; i < 3; i++) statuses.push((await outcome(ask(gw, token({ tenant }))))[0]);
+      assert.deepEqual(statuses, [200, 200, 402], tenant);
+    }
   });
 
   it("says what is wrong with a quota before it starts", async () => {
@@ -422,9 +477,12 @@ describe("the gateway", () => {
     assert.deepEqual((await (await read("tenant=rival&from=2026-11-30&to=2026-11-30")).json()).total.requests, 1);
     // A leap year's 366 days are a range; 367 aren't.
     assert.deepEqual((await (await read("tenant=acme&from=2024-01-01&to=2024-12-31")).json()).days, []);
-    for (const query of ["tenant=acme&from=2024-01-01&to=2025-01-01", "from=2026-11-01&to=2026-11-30", "tenant=acme&from=2026-02-30&to=2026-03-01", "tenant=acme&from=2026-11-1&to=2026-11-30", "tenant=acme&to=2026-11-30", "tenant=acme&from=2026-11-30&to=2026-11-29"]) {
+    // Date.parse reads 2026-02-30 as 2026-03-02, so a `to` after that is what shows it refused as no day.
+    for (const query of ["tenant=acme&from=2024-01-01&to=2025-01-01", "from=2026-11-01&to=2026-11-30", "tenant=acme&from=2026-02-30&to=2026-03-05", "tenant=acme&from=2026-11-1&to=2026-11-30", "tenant=acme&to=2026-11-30", "tenant=acme&from=2026-11-30&to=2026-11-29"]) {
       const response = await read(query);
-      assert.deepEqual([response.status, (await response.json()).error.type], [400, "invalid_request_error"], query);
+      const { error } = await response.json();
+      assert.deepEqual([response.status, error.type], [400, "invalid_request_error"], query);
+      if (query.includes("02-30")) assert.match(error.message, /must be days/);
     }
     // Only to the admin token: a task's token reads its own task's, at /usage/<task>, as before.
     assert.equal((await read("tenant=acme&from=2026-11-01&to=2026-11-30", token())).status, 403);
@@ -501,16 +559,19 @@ describe("the gateway with several upstreams", () => {
     return fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": credential }, body: body("hi", model) });
   }
 
-  it("goes on to the next upstream when one is overloaded, failing, unreachable, slow or refuses its keys", async () => {
+  // A per-test timeout, so an upstream that never answers fails the test rather than hanging the run.
+  it("goes on to the next upstream when one is overloaded, failing, unreachable, slow or refuses its keys", { timeout: 15_000 }, async () => {
     const second = await fakeProvider();
     const firsts = {
       overloaded: await fakeProvider((_, res) => overloaded(res)),
       failing: await fakeProvider((_, res) => void res.writeHead(500).end("oops")),
       unreachable: { url: `http://127.0.0.1:${await deadPort()}`, seen: [] },
       slow: await fakeProvider(() => {}), // never answers
+      // Sends an error's headers, then never ends its body.
+      slowError: await fakeProvider((_, res) => void res.writeHead(529, { "content-type": "application/json" }).write('{"type":"err')),
       refusing: await fakeProvider((_, res) => void res.writeHead(401).end()),
     };
-    const reasons: Record<string, string> = { overloaded: "status_529", failing: "status_500", unreachable: "connect", slow: "timeout", refusing: "keys" };
+    const reasons: Record<string, string> = { overloaded: "status_529", failing: "status_500", unreachable: "connect", slow: "timeout", slowError: "timeout", refusing: "keys" };
     for (const [what, first] of Object.entries(firsts)) {
       const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { firstByteMs: 300 } });
       const credential = token({ task: what });
@@ -558,6 +619,8 @@ describe("the gateway with several upstreams", () => {
     const failed = await ask(both, token());
     assert.deepEqual([failed.status, failed.headers.get("x-jig-upstream")], [500, "second"]);
     assert.equal((await failed.json()).error.message, "second failed");
+    // The failed reply passed back is timed to its headers, as one that streams is.
+    assert.equal(await metric(both, 'jig_gateway_first_byte_seconds_count{upstream="second"}'), 1);
 
     const dead = `http://127.0.0.1:${await deadPort()}`;
     const none = await failover([{ name: "first", url: dead }, { name: "second", url: dead }]);
@@ -652,6 +715,52 @@ describe("the gateway with several upstreams", () => {
     assert.equal(await via(), "first");
   });
 
+  it("closes the circuit on a probe's 400, which is the upstream answering", async () => {
+    let mode: "fail" | "bad" | "ok" = "fail";
+    const first = await fakeProvider((_, res) => {
+      if (mode === "fail") return overloaded(res);
+      if (mode === "bad") return void res.writeHead(400, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}');
+      streamed(res);
+    });
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { failures: 1, openMs: 200 } });
+    await (await ask(gw, token())).text();
+    assert.equal(await metric(gw, 'jig_gateway_upstream_open{upstream="first"}'), 1);
+    await sleep(250);
+    mode = "bad";
+    const probe = await ask(gw, token());
+    assert.deepEqual([probe.status, probe.headers.get("x-jig-upstream")], [400, "first"]);
+    await probe.text();
+    mode = "ok";
+    const next = await ask(gw, token());
+    assert.equal(next.headers.get("x-jig-upstream"), "first");
+    await next.text();
+    assert.equal(await metric(gw, 'jig_gateway_upstream_open{upstream="first"}'), 0);
+    assert.equal(first.seen.length, 3);
+  });
+
+  it("frees the probe of a client that went away, so the next request probes", async () => {
+    let mode: "fail" | "hold" | "ok" = "fail";
+    const held: ServerResponse[] = [];
+    const first = await fakeProvider((_, res) => (mode === "fail" ? overloaded(res) : mode === "hold" ? void held.push(res) : streamed(res)));
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { failures: 1, openMs: 200 } });
+    await (await ask(gw, token())).text();
+    await sleep(250);
+    mode = "hold";
+    const client = new AbortController();
+    const probe = fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token() }, body: body("probe"), signal: client.signal });
+    await until(() => first.seen.length === 2, "the probe");
+    client.abort();
+    await assert.rejects(probe);
+    await until(() => held[0].closed, "the gateway to give up the probe");
+    mode = "ok";
+    const next = await ask(gw, token());
+    assert.equal(next.headers.get("x-jig-upstream"), "first");
+    await next.text();
+    assert.equal(first.seen.length, 3);
+  });
+
   it("lets one probe through at a time, and another once the probe's client went away", () => {
     const breaker = new Breaker(1, 100);
     assert.equal(breaker.take(0), "closed");
@@ -663,6 +772,16 @@ describe("the gateway with several upstreams", () => {
     assert.equal(breaker.take(100), "probe");
     assert.equal(breaker.succeeded(), true);
     assert.equal(breaker.take(100), "closed");
+  });
+
+  it("closes on any reply, a late one to a request sent before the circuit opened included", () => {
+    const breaker = new Breaker(1, 100);
+    assert.equal(breaker.take(0), "closed"); // its reply comes late
+    assert.equal(breaker.take(0), "closed");
+    assert.equal(breaker.failed("closed", 10), true);
+    assert.equal(breaker.take(20), undefined);
+    assert.equal(breaker.succeeded(), true);
+    assert.equal(breaker.take(20), "closed");
   });
 
   it("sends each model to the upstreams that serve it, under the provider's id, and refuses one none serves", async () => {
@@ -695,6 +814,30 @@ describe("the gateway with several upstreams", () => {
     assert.equal(anthropic.seen.length + deepseek.seen.length, 2);
   });
 
+  it("holds a budget or a quota to a model priced at every upstream that serves it, by jig's id or the provider's", async () => {
+    const provider = await fakeProvider();
+    const quota = { limits: { tenants: { capped: { dailyUsd: 1 } } } };
+    // An alias the upstream maps to a priced id is priced, so a budget and a quota can count it.
+    const aliased = await failover([{ name: "a", url: provider.url, models: { "my-alias": MODEL } }], quota);
+    const credential = token({ task: "alias", budgetUsd: 1 });
+    const response = await askFor(aliased, credential, "my-alias");
+    assert.equal(response.status, 200);
+    await response.text();
+    const spent = await (await fetch(`${aliased.url}/usage/alias`, { headers: { "x-api-key": credential } })).json();
+    assert.equal(spent.costUsd, costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }));
+    assert.equal((await outcome(askFor(aliased, token({ tenant: "capped" }), "my-alias")))[0], 200);
+    // An upstream that would send it on as it is, with no price, could be failed over to: refused.
+    const both = await failover([{ name: "a", url: provider.url, models: { "my-alias": MODEL } }, { name: "b", url: provider.url }], quota);
+    for (const credential of [token({ budgetUsd: 1 }), token({ tenant: "capped" })]) {
+      const refused = await askFor(both, credential, "my-alias");
+      assert.equal(refused.status, 400);
+      assert.match((await refused.json()).error.message, /with a price/);
+    }
+    // Nor is a name every object has a price.
+    assert.equal((await outcome(askFor(both, token({ budgetUsd: 1 }), "constructor")))[0], 400);
+    assert.equal(provider.seen.length, 2);
+  });
+
   it("sets only the top-level model of a body, the rest byte for byte", () => {
     const raw = '{"system":"a \\"}{ \\"model\\":\\"x\\"","messages":[{"role":"user","content":{"model":"x"}}], "model" : "a", "metadata":{"model":"y"}, "é":1}';
     assert.equal(withModel(Buffer.from(raw), "b").toString(), raw.replace('"model" : "a"', '"model" : "b"'));
@@ -710,6 +853,8 @@ describe("the gateway with several upstreams", () => {
     await assert.rejects(start({ upstreams: [{ name: "Big Name", ...one }] }), /upstreams\[0\]\.name/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one }, { name: "a", ...one }] }), /two upstreams are named a/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: { x: 1 as unknown as string } }] }), /models must map/);
+    // An empty map would serve no model at all.
+    await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: {} }] }), /models must map at least one/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, keyEnv: ["NOWHERE"] }] }), /No key in NOWHERE/);
     await assert.rejects(start({ upstream: one, failover: { failures: 0 } }), /failover.failures/);
   });
@@ -823,6 +968,17 @@ describe("the gateway's metrics and logs", () => {
     assert.equal(await metric(limited, 'jig_gateway_refused_total{tenant="slow",reason="rate"}'), 1);
   });
 
+  it("counts a call jig left before any reply as 499", async () => {
+    const provider = await fakeProvider(() => {}); // holds its reply
+    const gw = await gateway(provider.url);
+    const client = new AbortController();
+    const left = fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token() }, body: body(), signal: client.signal });
+    await until(() => provider.seen.length === 1, "the call to reach the provider");
+    client.abort();
+    await assert.rejects(left);
+    await until(async () => (await metric(gw, 'jig_gateway_requests_total{tenant="acme",upstream="none",status="499"}')) === 1, "the call to be counted as 499");
+  });
+
   it("answers with the client's x-request-id or a new one, which the provider never sees", async () => {
     const provider = await fakeProvider((_, res) => {
       res.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_provider", "x-request-id": "the-providers" });
@@ -849,9 +1005,12 @@ describe("the gateway's metrics and logs", () => {
   });
 
   it("writes JSON log lines, a model call's at debug with its request id and the provider's", async () => {
-    const provider = await fakeProvider((_, res) => {
+    const reply = messagesReply([{ text: "Done." }]);
+    const provider = await fakeProvider((seen, res) => {
       res.writeHead(200, { "content-type": "text/event-stream", "request-id": "req_upstream_1" });
-      res.end(messagesReply([{ text: "Done." }]));
+      // A reply that stops after its first event, 10 tokens in and 1 out, which jig then leaves.
+      if (seen.body.includes("half")) return void res.write(reply.slice(0, reply.indexOf("\n\n") + 2));
+      res.end(reply);
     });
     const dir = await tempDir("jig-gateway-");
     const config = join(dir, "gateway.json");
@@ -879,6 +1038,23 @@ describe("the gateway's metrics and logs", () => {
       { ts: undefined, level: "debug", component: "gateway", msg: "model call", request: "trace-7", tenant: "acme", task: "t7", upstream: "default", status: 200, ms: undefined, input: 10, output: 5, cost, upstream_request: "req_upstream_1" },
     );
     assert.ok(call.ms >= 0);
+    // A call jig leaves partway through its stream: its line has what the tokens sent so far cost, as the metrics do.
+    const client = new AbortController();
+    const half = await fetch(`${url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token({ task: "t8" }), "x-request-id": "trace-8" }, body: body("half"), signal: client.signal });
+    await half.body!.getReader().read();
+    client.abort();
+    await until(() => lines().some((line) => line.request === "trace-8"), "the left call's line");
+    const left = lines().find((line) => line.request === "trace-8");
+    assert.deepEqual([left.status, left.input, left.output, left.cost], [200, 10, 1, costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 1 })]);
+    // An error the gateway meets itself is logged with the request's id; fetch() can't send this target.
+    await new Promise<void>((done, failed) => {
+      const { hostname, port } = new URL(url);
+      const socket = connect(Number(port), hostname, () => socket.end("GET http://[x/ HTTP/1.1\r\nhost: gateway\r\nx-request-id: bad-1\r\nconnection: close\r\n\r\n"));
+      socket.on("data", () => {}).on("error", failed).on("close", () => done());
+    });
+    await until(() => lines().some((line) => line.request === "bad-1"), "the failed request's line");
+    const failed = lines().find((line) => line.request === "bad-1");
+    assert.deepEqual([failed.level, failed.msg, typeof failed.err?.message], ["error", "a request failed", "string"]);
     assert.ok(stderr.split("\n").filter(Boolean).every((line) => line.startsWith("{")), `only JSON lines: ${stderr}`);
     child.kill("SIGTERM");
     assert.equal(await exited, 0);
@@ -918,6 +1094,41 @@ describe("the gateway's state in memory", () => {
     state.prune(now + 401 * 86_400_000);
     assert.equal(state.size, 0);
   });
+
+  it("keeps a tenant's day and month from its last reply, by the clock they are counted by", async () => {
+    const DAY = 86_400_000;
+    const start = Date.UTC(2026, 10, 1, 12);
+    let time = start;
+    const state = new MemoryState({ now: () => time });
+    closing.push(() => state.close());
+    const spend = () => state.spend({ tenant: "acme", task: "t", exp: Math.floor(Date.now() / 1000) + 3600, budgetUsd: null }, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }, 0.01);
+    await spend();
+    time = start + 10 * DAY;
+    await spend();
+    time = start + 36 * DAY;
+    state.prune();
+    assert.deepEqual([await state.spentOn("acme", utcDay(start)), (await state.spentOn("acme", utcDay(start + 10 * DAY)))?.requests], [undefined, 1]);
+    // The month is kept 400 days from its last reply, not its first.
+    time = start + 405 * DAY;
+    state.prune();
+    assert.equal((await state.spentIn("acme", "2026-11"))?.requests, 2);
+    time = start + 411 * DAY;
+    state.prune();
+    assert.equal(await state.spentIn("acme", "2026-11"), undefined);
+  });
+
+  it("forgets tasks and rate buckets by the wall clock, whatever clock the days are counted by", async () => {
+    // A test's clock a month ahead: a task's token and a bucket's refill are in real time all the same.
+    const state = new MemoryState({ now: () => Date.now() + 30 * 86_400_000 });
+    closing.push(() => state.close());
+    await state.spend({ tenant: "acme", task: "live", exp: Math.floor(Date.now() / 1000) + 3600, budgetUsd: null }, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }, 0.01);
+    const limits = { tenant: { requestsPerMinute: 1, burst: 1 }, global: {} };
+    assert.equal(await state.admit("acme", "r1", limits), 0);
+    await state.release("acme");
+    state.prune();
+    assert.equal((await state.spent("acme", "live"))?.requests, 1);
+    assert.ok((await state.admit("acme", "r2", limits)) > 0, "the bucket is still empty");
+  });
 });
 
 describe("the gateway without its Redis", () => {
@@ -941,9 +1152,12 @@ describe("the gateway without its Redis", () => {
   it("holds a tenant to its quota by this replica's own counts when 'open'", async () => {
     const provider = await fakeProvider();
     const redis = `redis://127.0.0.1:${await deadPort()}/1`;
-    const gw = await gateway(provider.url, { state: { redis, onStateError: "open" }, limits: { tenantDefaults: { dailyUsd: 0.0001 } } });
+    // The month's quota is the one spent, so both the day's and the month's own counts are read.
+    const gw = await gateway(provider.url, { state: { redis, onStateError: "open" }, limits: { tenantDefaults: { dailyUsd: 1, monthlyUsd: 0.0001 } } });
     assert.deepEqual([await outcome(ask(gw, token())), await outcome(ask(gw, token()))], [[200, null], [200, null]]);
-    assert.equal((await ask(gw, token())).status, 402);
+    const over = await ask(gw, token());
+    assert.equal(over.status, 402);
+    assert.match((await over.json()).error.message, /monthly quota/);
     assert.equal(provider.seen.length, 2);
     // Closed, a quota that can't be read refuses the request.
     const closed = await gateway(provider.url, { state: { redis }, limits: { tenantDefaults: { dailyUsd: 1 } } });
@@ -953,6 +1167,46 @@ describe("the gateway without its Redis", () => {
   it("says what is wrong with its state's config before it starts", async () => {
     await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "http://cache:6379" } }), /state.redis must be a Redis URL/);
     await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", onStateError: "maybe" as "open" } }), /onStateError/);
+    // A lease of 0 or less would end as it is taken, which turns the concurrency limits off.
+    for (const leaseMs of [0, -1, 1.5, "x"]) {
+      await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", leaseMs: leaseMs as number } }), /state.leaseMs/, String(leaseMs));
+    }
+    await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", prefix: 5 as unknown as string } }), /state.prefix/);
+  });
+
+  it("says Redis went away as a warning, and that it is back as news", async () => {
+    let up = false;
+    const redis = { leaseMs: 1000, spentOn: async () => (up ? undefined : Promise.reject(new Error("refused"))), close() {} } as unknown as RedisState;
+    const said: [string, string][] = [];
+    const state = new SharedState(redis, { onStateError: "open", onError: () => {}, log: (line, level) => said.push([level, line]) });
+    closing.push(() => state.close());
+    await state.spentOn("acme", "2026-11-05");
+    up = true;
+    await state.spentOn("acme", "2026-11-05");
+    assert.deepEqual(said.map(([level, line]) => [level, line.split(";")[0]]), [["warn", "jig gateway: Redis can't be reached (refused)"], ["info", "jig gateway: Redis is back"]]);
+  });
+
+  it("lets go of its Redis when it can't listen, so a program that started it can end", async () => {
+    // A stand-in Redis that keeps every connection it is given, and a port already taken.
+    const open = new Set<Socket>();
+    const accepted: Socket[] = [];
+    const fake = createTcpServer((socket) => {
+      accepted.push(socket);
+      open.add(socket);
+      socket.on("error", () => {}).on("close", () => open.delete(socket));
+    });
+    await new Promise<void>((done) => fake.listen(0, "127.0.0.1", done));
+    closing.push(() => (accepted.forEach((socket) => socket.destroy()), new Promise((done) => fake.close(done))));
+    const taken = createServer();
+    await new Promise<void>((done) => taken.listen(0, "127.0.0.1", done));
+    closing.push(() => new Promise((done) => taken.close(done)));
+    const redis = `redis://127.0.0.1:${(fake.address() as AddressInfo).port}`;
+    await assert.rejects(gateway("http://127.0.0.1:9", { listen: { port: (taken.address() as AddressInfo).port }, state: { redis } }), /EADDRINUSE/);
+    // Its subscriber may still be connecting: give it the time to, then every connection must go.
+    await new Promise((done) => setTimeout(done, 200));
+    const start = Date.now();
+    await until(() => open.size === 0, "the gateway's connections to Redis to close");
+    assert.ok(Date.now() - start < 1000, `closed within a second (${Date.now() - start} ms)`);
   });
 });
 
@@ -1000,6 +1254,33 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     const [c, d] = [await gateway(provider.url, { state, limits: limited }), await gateway(provider.url, { state, limits: limited })];
     const statuses = await Promise.all([c, d, c].map(async (gw) => (await ask(gw, token({ tenant: "slow" }))).status));
     assert.deepEqual(statuses.sort(), [200, 200, 429]);
+  });
+
+  it("holds all tenants together to the global concurrency across two gateways", async () => {
+    const provider = await slowProvider(100);
+    const state = { redis: REDIS!, prefix: prefix() };
+    const limits = { maxWaitMs: 10_000, concurrent: 2 };
+    const [a, b] = [await gateway(provider.url, { state, limits }), await gateway(provider.url, { state, limits })];
+    // Each tenant's requests go through both gateways.
+    const responses = await Promise.all(Array.from({ length: 8 }, (_, i) => ask(i % 2 ? a : b, token({ tenant: i % 4 < 2 ? "acme" : "rival" }), `r${i}`)));
+    assert.deepEqual(responses.map((r) => r.status), Array(8).fill(200));
+    assert.equal(provider.most(), 2, "never more than 2 upstream at once, of both tenants, through both");
+  });
+
+  it("tells the other gateways at once when a slot is given back", async () => {
+    // Two states on one prefix, with no Limiter to poll: only the message on the channel is heard.
+    const shared = prefix();
+    const [a, b] = [new RedisState(REDIS!, { prefix: shared }), new RedisState(REDIS!, { prefix: shared })];
+    closing.push(() => (a.close(), b.close()));
+    let heard = 0;
+    a.onRelease(() => heard++);
+    const start = Date.now();
+    // Given back again until it is heard, as a's subscription may not be in place for the first.
+    await until(async () => {
+      await b.release("acme", "x");
+      return heard > 0;
+    }, "a to hear b give back a slot");
+    assert.ok(Date.now() - start < 1000, `heard within a second (${Date.now() - start} ms)`);
   });
 
   it("counts a task's spending once for all gateways, and keeps it through a restart", async () => {
@@ -1093,6 +1374,9 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     // A resting key's mark goes when its rest is over.
     const ttl = Number(await redis.command(["PTTL", names[0]]));
     assert.ok(ttl > 50_000 && ttl <= 60_000, `it expires with the rest: ${ttl} ms`);
+    // A gateway that has served nothing shows it resting too: its scrape reads the keys from Redis.
+    const c = await gateway(provider.url, { state, upstream });
+    assert.equal(await metric(c, 'jig_gateway_keys{upstream="default",state="resting"}'), 1);
   });
 
   it("keeps each key's mark for itself: a refused one for a day, and then, or once removed, it is tried again", async () => {
@@ -1151,7 +1435,7 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     assert.deepEqual([await outcome(as(b, "monthly")), await outcome(as(a, "monthly")), await outcome(as(b, "daily"))], [[200, null], [200, null], [200, null]]);
     const month = await as(a, "monthly");
     assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(12 * 60 * 60)]);
-    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month/);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.00021 of \$0\.0002 this month/);
     time.set(last + 12 * HOUR_MS);
     assert.deepEqual(await outcome(as(b, "monthly")), [200, null]);
 
