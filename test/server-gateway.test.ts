@@ -539,16 +539,19 @@ describe("the gateway with several upstreams", () => {
     return fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": credential }, body: body("hi", model) });
   }
 
-  it("goes on to the next upstream when one is overloaded, failing, unreachable, slow or refuses its keys", async () => {
+  // A per-test timeout, so an upstream that never answers fails the test rather than hanging the run.
+  it("goes on to the next upstream when one is overloaded, failing, unreachable, slow or refuses its keys", { timeout: 15_000 }, async () => {
     const second = await fakeProvider();
     const firsts = {
       overloaded: await fakeProvider((_, res) => overloaded(res)),
       failing: await fakeProvider((_, res) => void res.writeHead(500).end("oops")),
       unreachable: { url: `http://127.0.0.1:${await deadPort()}`, seen: [] },
       slow: await fakeProvider(() => {}), // never answers
+      // Sends an error's headers, then never ends its body.
+      slowError: await fakeProvider((_, res) => void res.writeHead(529, { "content-type": "application/json" }).write('{"type":"err')),
       refusing: await fakeProvider((_, res) => void res.writeHead(401).end()),
     };
-    const reasons: Record<string, string> = { overloaded: "status_529", failing: "status_500", unreachable: "connect", slow: "timeout", refusing: "keys" };
+    const reasons: Record<string, string> = { overloaded: "status_529", failing: "status_500", unreachable: "connect", slow: "timeout", slowError: "timeout", refusing: "keys" };
     for (const [what, first] of Object.entries(firsts)) {
       const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { firstByteMs: 300 } });
       const credential = token({ task: what });
@@ -690,6 +693,52 @@ describe("the gateway with several upstreams", () => {
     assert.equal(await via(), "first");
   });
 
+  it("closes the circuit on a probe's 400, which is the upstream answering", async () => {
+    let mode: "fail" | "bad" | "ok" = "fail";
+    const first = await fakeProvider((_, res) => {
+      if (mode === "fail") return overloaded(res);
+      if (mode === "bad") return void res.writeHead(400, { "content-type": "application/json" }).end('{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}');
+      streamed(res);
+    });
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { failures: 1, openMs: 200 } });
+    await (await ask(gw, token())).text();
+    assert.equal(await metric(gw, 'jig_gateway_upstream_open{upstream="first"}'), 1);
+    await sleep(250);
+    mode = "bad";
+    const probe = await ask(gw, token());
+    assert.deepEqual([probe.status, probe.headers.get("x-jig-upstream")], [400, "first"]);
+    await probe.text();
+    mode = "ok";
+    const next = await ask(gw, token());
+    assert.equal(next.headers.get("x-jig-upstream"), "first");
+    await next.text();
+    assert.equal(await metric(gw, 'jig_gateway_upstream_open{upstream="first"}'), 0);
+    assert.equal(first.seen.length, 3);
+  });
+
+  it("frees the probe of a client that went away, so the next request probes", async () => {
+    let mode: "fail" | "hold" | "ok" = "fail";
+    const held: ServerResponse[] = [];
+    const first = await fakeProvider((_, res) => (mode === "fail" ? overloaded(res) : mode === "hold" ? void held.push(res) : streamed(res)));
+    const second = await fakeProvider();
+    const gw = await failover([{ name: "first", url: first.url }, { name: "second", url: second.url }], { failover: { failures: 1, openMs: 200 } });
+    await (await ask(gw, token())).text();
+    await sleep(250);
+    mode = "hold";
+    const client = new AbortController();
+    const probe = fetch(`${gw.url}/anthropic/v1/messages`, { method: "POST", headers: { "x-api-key": token() }, body: body("probe"), signal: client.signal });
+    await until(() => first.seen.length === 2, "the probe");
+    client.abort();
+    await assert.rejects(probe);
+    await until(() => held[0].closed, "the gateway to give up the probe");
+    mode = "ok";
+    const next = await ask(gw, token());
+    assert.equal(next.headers.get("x-jig-upstream"), "first");
+    await next.text();
+    assert.equal(first.seen.length, 3);
+  });
+
   it("lets one probe through at a time, and another once the probe's client went away", () => {
     const breaker = new Breaker(1, 100);
     assert.equal(breaker.take(0), "closed");
@@ -701,6 +750,16 @@ describe("the gateway with several upstreams", () => {
     assert.equal(breaker.take(100), "probe");
     assert.equal(breaker.succeeded(), true);
     assert.equal(breaker.take(100), "closed");
+  });
+
+  it("closes on any reply, a late one to a request sent before the circuit opened included", () => {
+    const breaker = new Breaker(1, 100);
+    assert.equal(breaker.take(0), "closed"); // its reply comes late
+    assert.equal(breaker.take(0), "closed");
+    assert.equal(breaker.failed("closed", 10), true);
+    assert.equal(breaker.take(20), undefined);
+    assert.equal(breaker.succeeded(), true);
+    assert.equal(breaker.take(20), "closed");
   });
 
   it("sends each model to the upstreams that serve it, under the provider's id, and refuses one none serves", async () => {
@@ -733,6 +792,30 @@ describe("the gateway with several upstreams", () => {
     assert.equal(anthropic.seen.length + deepseek.seen.length, 2);
   });
 
+  it("holds a budget or a quota to a model priced at every upstream that serves it, by jig's id or the provider's", async () => {
+    const provider = await fakeProvider();
+    const quota = { limits: { tenants: { capped: { dailyUsd: 1 } } } };
+    // An alias the upstream maps to a priced id is priced, so a budget and a quota can count it.
+    const aliased = await failover([{ name: "a", url: provider.url, models: { "my-alias": MODEL } }], quota);
+    const credential = token({ task: "alias", budgetUsd: 1 });
+    const response = await askFor(aliased, credential, "my-alias");
+    assert.equal(response.status, 200);
+    await response.text();
+    const spent = await (await fetch(`${aliased.url}/usage/alias`, { headers: { "x-api-key": credential } })).json();
+    assert.equal(spent.costUsd, costOf(MODEL, { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }));
+    assert.equal((await outcome(askFor(aliased, token({ tenant: "capped" }), "my-alias")))[0], 200);
+    // An upstream that would send it on as it is, with no price, could be failed over to: refused.
+    const both = await failover([{ name: "a", url: provider.url, models: { "my-alias": MODEL } }, { name: "b", url: provider.url }], quota);
+    for (const credential of [token({ budgetUsd: 1 }), token({ tenant: "capped" })]) {
+      const refused = await askFor(both, credential, "my-alias");
+      assert.equal(refused.status, 400);
+      assert.match((await refused.json()).error.message, /with a price/);
+    }
+    // Nor is a name every object has a price.
+    assert.equal((await outcome(askFor(both, token({ budgetUsd: 1 }), "constructor")))[0], 400);
+    assert.equal(provider.seen.length, 2);
+  });
+
   it("sets only the top-level model of a body, the rest byte for byte", () => {
     const raw = '{"system":"a \\"}{ \\"model\\":\\"x\\"","messages":[{"role":"user","content":{"model":"x"}}], "model" : "a", "metadata":{"model":"y"}, "é":1}';
     assert.equal(withModel(Buffer.from(raw), "b").toString(), raw.replace('"model" : "a"', '"model" : "b"'));
@@ -748,6 +831,8 @@ describe("the gateway with several upstreams", () => {
     await assert.rejects(start({ upstreams: [{ name: "Big Name", ...one }] }), /upstreams\[0\]\.name/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one }, { name: "a", ...one }] }), /two upstreams are named a/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: { x: 1 as unknown as string } }] }), /models must map/);
+    // An empty map would serve no model at all.
+    await assert.rejects(start({ upstreams: [{ name: "a", ...one, models: {} }] }), /models must map at least one/);
     await assert.rejects(start({ upstreams: [{ name: "a", ...one, keyEnv: ["NOWHERE"] }] }), /No key in NOWHERE/);
     await assert.rejects(start({ upstream: one, failover: { failures: 0 } }), /failover.failures/);
   });

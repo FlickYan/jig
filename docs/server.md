@@ -504,10 +504,11 @@ verifies them. The gateway takes one in `x-api-key` or `Authorization: Bearer`, 
 constant time, and answers 401 to anything else, expired tokens included, without calling the provider.
 
 **Routes.** `POST /anthropic/v1/messages` goes to the provider's `/v1/messages`, with the query as it came.
-The body goes byte for byte, since prompt caching depends on it, and the headers as they came, but for the
-credentials and `accept-encoding`: the gateway asks for the reply uncompressed, so it can read the usage in
-it. A streamed reply comes back event by event as the provider sends it; if the provider breaks it off,
-the gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`, without a token,
+The body goes byte for byte, since prompt caching depends on it (but for its `model` where an upstream
+calls the model by another id: `models`, below), and the headers as they came, but for the credentials
+and `accept-encoding`: the gateway asks for the reply uncompressed, so it can read the usage in it.
+A streamed reply comes back event by event as the provider sends it; if the provider breaks it off, the
+gateway breaks off its own, so jig asks again at once. `GET /healthz` answers `ok`, without a token,
 so keep the gateway's address inside the cluster; the metrics are on a listener of their own (below).
 `GET /usage/<task>` gives what a task
 spent, `{task, tenant, requests, usage, costUsd, unpriced, upstreams, budgetUsd}` (`upstreams`: the
@@ -546,8 +547,10 @@ until a restart (with `state`, below, until its mark in Redis is gone), and one 
 rests for the reply's `retry-after` (30 seconds without one); either way the request goes again with
 another usable key, once each. With none left the provider's 429 goes back to jig
 as it came, and while every key rests the gateway answers 429 itself: it doesn't retry on its own, so a
-rate limit doesn't become a storm. Server errors go back as they came, and jig's SDK retries them; with
-`upstreams`, both first go on to the next provider (below).
+rate limit doesn't become a storm. Server errors go back as they came, and jig's SDK retries them, until
+`failover.failures` of them in a row open the upstream's circuit (below), with one upstream too: for
+`openMs` the gateway then answers 503 (`overloaded_error`) itself, with a `retry-after`, and a provider that
+can't be reached is a 503 too. With `upstreams`, both first go on to the next provider (below).
 
 **Provider failover.** One provider is a single point of failure: when it is down or overloaded, every
 task of every tenant fails at once, and jig's few retries help against a blip, not an outage. In place of
@@ -585,15 +588,20 @@ held in memory, so it can be sent again. When every
 upstream fails, the last failed reply goes back as it came (a 429 with its `retry-after`), or 503
 (`overloaded_error`) if none answered.
 
-Each upstream has a circuit breaker, each replica its own: `failures` failures in a row (those that send
-a request on, but not a 429 or a pool with every key resting or refused, since a rate-limited key rests
-for its own `retry-after` and no longer; a 400 that goes back to jig is the upstream answering) open it,
-and for `openMs` it is passed over, no request reaching it. Then one request at a time tries it; its reply closes the circuit,
-its failure opens it for another `openMs`. With every upstream for a model open, the gateway answers 503
-at once, with a `retry-after` for when one may be tried. The gateway says on stderr when an upstream is passed over and when it answers again.
+Each upstream has a circuit breaker, `upstream` alone too, each replica its own: `failures` failures in a
+row (those that send a request on, but not a 429 or a pool with every key resting or refused, since a
+rate-limited key rests for its own `retry-after` and no longer; a 400 that goes back to jig is the
+upstream answering) open it, and for `openMs` it is passed over, no request reaching it. Then one request
+at a time tries it; its reply closes the circuit (as does a late reply to a request sent before it
+opened), its failure opens it for another `openMs`. With every upstream for a model open, the gateway
+answers 503 at once, with a `retry-after` for when one may be tried. The gateway says on stderr when an
+upstream is passed over and when it answers again.
 
 Usage is priced by the model the reply names, or else the provider's id where `src/prices.ts` has a price
-for it, or else the model jig asked for; budgets hold as with one upstream.
+for it, or else the model jig asked for; budgets hold as with one upstream. A task with a budget, or a
+tenant with a quota, may use a model with a price, or one that every upstream serving it maps to a
+provider's id with a price (an alias such as `my-opus` for `claude-opus-5-5`), so no failover reaches an
+upstream whose replies can't be priced.
 
 **Metrics and logs.** With `"metrics": {"host": "127.0.0.1", "port": 9091}` (`host` defaults to
 127.0.0.1), a second listener answers only `GET /metrics`, in Prometheus's text format, and `GET /healthz`;

@@ -239,11 +239,11 @@ function retryAfterMs(header: string | string[] | undefined): number {
 
 /**
  * An upstream's circuit breaker, this replica's own: `limit` failures in a row open it, and it passes the
- * upstream over for `openMs`; then one request at a time goes as a probe, and the probe's reply closes it
- * or opens it again. Only failures that send a request on count, and not those of the keys (a rate limit,
- * or every key resting or refused): a resting key passes the upstream over for its own retry-after, no
- * longer, and a breaker opened by it would hold for `openMs`. A reply that goes back to jig, 4xx included,
- * is the upstream answering.
+ * upstream over for `openMs`; then one request at a time goes as a probe. Any reply closes it (the probe's,
+ * or a late one to a request sent before it opened), and the probe's failure opens it again. Only failures
+ * that send a request on count, and not those of the keys (a rate limit, or every key resting or refused):
+ * a resting key passes the upstream over for its own retry-after, no longer, and a breaker opened by it
+ * would hold for `openMs`. A reply that goes back to jig, 4xx included, is the upstream answering.
  */
 export class Breaker {
   private failures = 0;
@@ -276,7 +276,10 @@ export class Breaker {
     return Math.max(0, this.openUntil - now);
   }
 
-  /** The upstream answered; true when that closed the circuit. */
+  /**
+   * The upstream answered, to a probe or to any request, one sent before the circuit opened included: that
+   * closes it. True when that closed the circuit.
+   */
   succeeded(): boolean {
     const was = this.openUntil > 0;
     this.failures = 0;
@@ -424,8 +427,9 @@ function check(config: GatewayConfig, env: NodeJS.ProcessEnv): void {
       if (typeof name !== "string" || !/^[a-z0-9-]{1,32}$/.test(name)) throw new Error(`${where}.name must be 1 to 32 of a-z, 0-9 and -.`);
       if (seen.has(name)) throw new Error(`${where}.name: two upstreams are named ${name}.`);
       seen.add(name);
-      const mapped = models === undefined || (typeof models === "object" && models !== null && !Array.isArray(models) && Object.values(models).every((id) => typeof id === "string" && id));
-      if (!mapped) throw new Error(`${where}.models must map jig's model ids to the provider's.`);
+      // An empty map would serve no model at all.
+      const mapped = models === undefined || (typeof models === "object" && models !== null && !Array.isArray(models) && Object.keys(models).length > 0 && Object.values(models).every((id) => typeof id === "string" && id));
+      if (!mapped) throw new Error(`${where}.models must map at least one of jig's model ids to the provider's.`);
     }
     const base = upstream.baseUrl;
     if (typeof base !== "string" || !/^https?:\/\//.test(base)) throw new Error(`${where}.baseUrl must be an http or https URL.`);
@@ -581,6 +585,21 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     }
   });
   const admin = config.adminTokenEnv ? env[config.adminTokenEnv] : undefined;
+
+  /** The upstreams that serve `model`, in order. */
+  const servingOf = (model: string | undefined): Upstream[] => upstreams.filter((upstream) => !upstream.models || (model !== undefined && Object.hasOwn(upstream.models, model)));
+
+  /**
+   * A model whose replies the gateway can price, so a budget or a quota holds: one with a price, or one
+   * that every upstream serving it, any of which a request may fail over to, calls by an id with a price.
+   */
+  const priced = (model: string | undefined): boolean => {
+    if (model === undefined) return false;
+    if (Object.hasOwn(PRICES, model)) return true;
+    const serving = servingOf(model);
+    return serving.length > 0 && serving.every((upstream) => Object.hasOwn(PRICES, upstream.models?.[model] ?? ""));
+  };
+  const pricedModels = [...new Set([...Object.keys(PRICES), ...upstreams.flatMap((upstream) => Object.keys(upstream.models ?? {})).filter(priced)])].join(", ");
 
   const isAdmin = (given: string): boolean => {
     if (!admin || !given) return false;
@@ -820,7 +839,7 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     } catch {
       // the provider says what is wrong with it
     }
-    const serving = upstreams.filter((upstream) => !upstream.models || (model !== undefined && Object.hasOwn(upstream.models, model)));
+    const serving = servingOf(model);
     if (!serving.length) return fail(res, 400, "invalid_request_error", `No upstream of the gateway serves the model ${model ?? "(none named)"}.`);
     if (token.budgetUsd !== null) {
       // Nothing spent yet is $0, so a budget of 0 refuses the first request too.
@@ -830,8 +849,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         return fail(res, 402, "billing_error", `This task has spent its budget: $${usd(spentUsd)} of $${usd(token.budgetUsd)}.`);
       }
       // A budget the gateway can't price toward would not hold.
-      if (!model || !PRICES[model]) {
-        return fail(res, 400, "invalid_request_error", `A task with a budget can only use a model with a price (${Object.keys(PRICES).join(", ")}).`);
+      if (!priced(model)) {
+        return fail(res, 400, "invalid_request_error", `A task with a budget can only use a model with a price (${pricedModels}).`);
       }
     }
     // The tenant's quotas, before its request waits for a slot. Replies still going are counted when they
@@ -846,8 +865,8 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
         return fail(res, 402, "billing_error", message, { "retry-after": String(retryAfter) });
       }
       // As with a budget, a quota holds only where the gateway can price the reply.
-      if (!model || !PRICES[model]) {
-        return fail(res, 400, "invalid_request_error", `A tenant with a quota can only use a model with a price (${Object.keys(PRICES).join(", ")}).`);
+      if (!priced(model)) {
+        return fail(res, 400, "invalid_request_error", `A tenant with a quota can only use a model with a price (${pricedModels}).`);
       }
     }
     const client = new AbortController();
