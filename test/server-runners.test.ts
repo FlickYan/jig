@@ -9,7 +9,8 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { type Service, startService } from "../server/api.ts";
-import { WarmPool } from "../server/pool.ts";
+import { createLog } from "../server/log.ts";
+import { type Exited, WarmPool } from "../server/pool.ts";
 import type { JigEvent, Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import type { Task, Tenant } from "../server/store.ts";
@@ -215,7 +216,9 @@ describe("the Docker runner", () => {
   it("gives a task to a warm worker, whose jig starts without a docker run, well before a container could start", async () => {
     Object.assign(process.env, REAL);
     // A container takes 4 seconds to exist (its image being pulled, say): the warm one did so before the task came.
-    const { api, state, runner, dir } = await docker({ pool: { size: 1 }, runtime: "runsc", cpus: 2, memory: "3g" }, { delay: "4000" });
+    const lines: any[] = [];
+    const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
+    const { api, state, runner, dir } = await docker({ pool: { size: 1 }, runtime: "runsc", cpus: 2, memory: "3g", log }, { delay: "4000" });
     await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
     const [[name, warm]] = [...(await runs(state))];
     assert.match(name, /^jig-pool_[0-9a-f]{24}$/);
@@ -228,6 +231,10 @@ describe("the Docker runner", () => {
     const task = await ended(api, id);
     assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
     assert.equal(runner.pool!.stats().hits, 1);
+    // The worker keeps its own names, so the log says which container and folder are the task's.
+    const taken = lines.filter((line) => line.msg === "the task runs on a warm worker");
+    assert.deepEqual(taken.map(({ task, tenant, container, folder }) => ({ task, tenant, container, folder })), [{ task: id, tenant: "acme", container: name, folder: dir(id) }]);
+    assert.match(dir(id), /[/\\]tasks[/\\]pool_[0-9a-f]{24}$/);
 
     // No docker run for the task: it ran in the warm container, with its folder at /task.
     assert.ok(!(await runs(state)).has(`jig-${id}`));
@@ -269,6 +276,19 @@ describe("the Docker runner", () => {
     assert.ok((await runs(state)).has(`jig-${id}`), "its own docker run");
     await until(() => runner.pool!.stats().idle === 1, "the warm worker started meanwhile");
     assert.deepEqual([runner.pool!.stats().hits, runner.pool!.stats().misses], [0, 1]);
+  });
+
+  it("logs what a warm worker said when it exits before it claims, its folder gone", async () => {
+    const lines: any[] = [];
+    const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
+    // A pool URL the containers can't reach: each worker fails at its claim.
+    const { runner } = await docker({ pool: { size: 1, baseUrl: "http://127.0.0.1:1" }, log });
+    const warning = await until(() => lines.find((line) => line.level === "warn"), "the warning");
+    assert.equal(warning.msg, "a warm worker exited before it claimed a task; the next starts after a pause");
+    assert.equal(warning.exitCode, 1);
+    assert.match(warning.output, /socket hang up|ECONNREFUSED/);
+    assert.equal(warning.pauseMs, 1000);
+    assert.deepEqual(await readdir(join(runner.dir("none"), "..")), []);
   });
 
   it("cancels a task on a warm worker with docker kill, which ends everything in its container", async () => {
@@ -837,7 +857,9 @@ describe("the Kubernetes runner", () => {
 
   it("gives a task to a warm worker's Job, its deadline moved to the task's, with no Job made for the task", async () => {
     Object.assign(process.env, REAL);
-    const { cluster, runner, api } = await kubernetes({ pool: { size: 1, maxIdleSeconds: 300 }, runtimeClassName: "gvisor" });
+    const logged: any[] = [];
+    const log = createLog("service", { format: "json", write: (line) => logged.push(JSON.parse(line)) });
+    const { cluster, runner, api } = await kubernetes({ pool: { size: 1, maxIdleSeconds: 300 }, runtimeClassName: "gvisor", log });
     await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
     const [[name, warm]] = [...cluster.jobs];
     assert.match(name, /^jig-pool-[0-9a-f]{16}$/);
@@ -864,6 +886,9 @@ describe("the Kubernetes runner", () => {
     const task = await ended(api, id);
     assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
     assert.equal(runner.pool!.stats().hits, 1);
+    // The log says which Job took it: the pod keeps only the pool's label.
+    const taken = logged.filter((line) => line.msg === "the task runs on a warm worker");
+    assert.deepEqual(taken.map(({ task, tenant, job }) => ({ task, tenant, job })), [{ task: id, tenant: "acme", job: name }]);
     // No Job of its own: the warm one's deadline is the task's time limit and the grace, from now, and it has the task's labels.
     const since = cluster.requests.slice(before);
     const made = since.filter((request) => request.method === "POST" && request.path.endsWith("/jobs")).map((request) => request.body.metadata.name);
@@ -1008,21 +1033,34 @@ describe("the worker a task's pod runs", () => {
 describe("the warm pool", () => {
   /** A pool whose workers are records the test claims with and ends, its claims served on a listener. */
   async function pool(config: ConstructorParameters<typeof WarmPool>[0]) {
-    const workers: { ticket: string; stopped: boolean; exit: () => void }[] = [];
-    const warm = new WarmPool<number>(config, async (ticket) => {
-      let exit!: () => void;
-      const exited = new Promise<void>((done) => (exit = done));
-      const worker = { ticket, stopped: false, exit };
-      workers.push(worker);
-      // Stopped, it exits when the test says: a container takes a moment to go.
-      return { slot: workers.length, exited, stop: () => void (worker.stopped = true) };
-    });
+    const workers: { ticket: string; stopped: boolean; exit: (why?: Exited) => void }[] = [];
+    // The pool's log, as JSON lines.
+    const lines: any[] = [];
+    const log = createLog("service", { format: "json", level: "debug", write: (line) => lines.push(JSON.parse(line)) });
+    const warm = new WarmPool<number>(
+      config,
+      async (ticket) => {
+        let exit!: (why?: Exited) => void;
+        const exited = new Promise<Exited | void>((done) => (exit = done));
+        const worker = { ticket, stopped: false, exit };
+        workers.push(worker);
+        // Stopped, it exits when the test says: a container takes a moment to go.
+        return { slot: workers.length, exited, stop: () => void (worker.stopped = true) };
+      },
+      log,
+    );
     const server = createHttpServer((req, res) => void warm.claim(req, res));
+    // Each setKeepAlive the pool makes on a claim's connection.
+    const keepalive: [boolean | undefined, number | undefined][] = [];
+    server.on("connection", (socket) => {
+      const set = socket.setKeepAlive.bind(socket);
+      socket.setKeepAlive = ((enable?: boolean, delay?: number) => (keepalive.push([enable, delay]), set(enable, delay))) as typeof socket.setKeepAlive;
+    });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
     const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/internal/pool/claim`;
     const claim = (ticket?: string, init: RequestInit = {}) => fetch(url, { method: "POST", headers: ticket ? { authorization: `Bearer ${ticket}` } : {}, ...init });
-    return { warm, workers, claim };
+    return { warm, workers, claim, lines, keepalive };
   }
 
   it("spends a ticket at its first claim, gives the worker one task, and starts another in its place", async () => {
@@ -1079,17 +1117,68 @@ describe("the warm pool", () => {
     await closing;
   });
 
-  it("starts a worker again only after a pause when one exits before it claims", async () => {
-    const { warm, workers } = await pool({ size: 1 });
+  it("starts a worker again only after a pause when one exits before it claims, and logs what it said", async () => {
+    const { warm, workers, lines } = await pool({ size: 1 });
     warm.open();
-    // Its image can't run, say: starting another at once would only loop.
-    workers[0].exit();
+    // Its image can't run, or the pool's URL is one its container can't reach: starting another at once would only loop.
+    workers[0].exit({ code: 1, said: "connect ECONNREFUSED 127.0.0.1:8082" });
     await new Promise((done) => setTimeout(done, 200));
     assert.equal(workers.length, 1);
+    const said = lines.filter((line) => line.level === "warn");
+    assert.deepEqual(said.map(({ msg, exitCode, output, pauseMs }) => ({ msg, exitCode, output, pauseMs })), [
+      { msg: "a warm worker exited before it claimed a task; the next starts after a pause", exitCode: 1, output: "connect ECONNREFUSED 127.0.0.1:8082", pauseMs: 1000 },
+    ]);
     await until(() => workers.length === 2, "a worker after the pause");
     const closing = warm.close();
     assert.ok(workers[1].stopped);
     workers[1].exit();
+    await closing;
+  });
+
+  it("counts a hit only once the worker has its task, and a hand-off that fails as a miss", async () => {
+    const { warm, workers, claim } = await pool({ size: 1 });
+    warm.open();
+    // A worker whose claim goes away once it is taken: the task starts cold.
+    const gone = new AbortController();
+    void claim(workers[0].ticket, { signal: gone.signal }).catch(() => {});
+    await until(() => warm.stats().idle === 1, "the claim held");
+    const taken = warm.take("task_1")!;
+    gone.abort();
+    await until(() => workers[0].stopped, "the first worker stopped");
+    assert.equal(taken.answer({ prompt: "the task" }), false);
+    assert.deepEqual([warm.stats().hits, warm.stats().misses], [0, 1]);
+    // One its runner stops before it answers (a Job that couldn't be patched): the task starts cold too.
+    const held = claim(workers[1].ticket);
+    await until(() => warm.stats().idle === 1, "the second claim held");
+    const stopped = warm.take("task_2")!;
+    stopped.stop();
+    stopped.stop();
+    assert.ok(workers[1].stopped);
+    assert.deepEqual([warm.stats().hits, warm.stats().misses], [0, 2]);
+    // One given its task is a hit, and stays one when its run is stopped.
+    workers[1].exit();
+    void held.catch(() => {});
+    const third = claim(workers[2].ticket);
+    await until(() => warm.stats().idle === 1, "the third claim held");
+    const given = warm.take("task_3")!;
+    assert.ok(given.answer({ prompt: "the task" }));
+    assert.equal((await third).status, 200);
+    given.stop();
+    assert.deepEqual([warm.stats().hits, warm.stats().misses], [1, 2]);
+    const closing = warm.close();
+    for (const worker of workers) worker.exit();
+    await closing;
+  });
+
+  it("keeps a held claim's connection alive with TCP keepalive, so a worker whose node died is found", async () => {
+    const { warm, workers, claim, keepalive } = await pool({ size: 1 });
+    warm.open();
+    const held = claim(workers[0].ticket);
+    await until(() => warm.stats().idle === 1, "the claim held");
+    assert.deepEqual(keepalive, [[true, 15_000]]);
+    const closing = warm.close();
+    assert.equal((await held).status, 410);
+    workers[0].exit();
     await closing;
   });
 });

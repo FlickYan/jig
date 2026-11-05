@@ -67,6 +67,9 @@ async function claim(baseUrl: string | undefined): Promise<PoolAnswer | undefine
   // node:http, which has no timeout of its own: the answer comes when a task does.
   const res = await new Promise<IncomingMessage>((done, fail) => {
     const req = (url.protocol === "https:" ? httpsRequest : httpRequest)(url, { method: "POST", headers: { authorization: `Bearer ${ticket}`, "content-length": 0 } }, done);
+    // The claim may wait many minutes: keepalive breaks it if the replica's node dies, and the worker exits
+    // rather than wait out its Job's deadline.
+    req.on("socket", (socket) => socket.setKeepAlive(true, 15_000));
     req.on("error", fail);
     req.end();
   });

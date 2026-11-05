@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { createLog } from "./log.ts";
+import { createLog, type Log } from "./log.ts";
 
 // Warm pools (docs/server.md): workers the Docker and Kubernetes runners start ahead of tasks, so a task
 // doesn't wait for a container or a pod to start. Each is given a one-time ticket (JIG_POOL_TICKET), which
@@ -18,11 +18,17 @@ export interface PoolConfig {
   baseUrl?: string;
 }
 
+/** How a worker exited, as far as its runner can tell: its exit code, and the last line it wrote. */
+export interface Exited {
+  code: number | null;
+  said?: string;
+}
+
 /** A worker as its runner started it: its container or Job (`slot`), and how to stop it. */
 export interface Started<S> {
   slot: S;
-  /** Settles once it has exited, or has been stopped. */
-  exited: Promise<unknown>;
+  /** Settles once it has exited, or has been stopped, with how it exited if its runner knows. */
+  exited: Promise<Exited | void>;
   /** Stops it, and everything it started; again is a no-op. */
   stop(): void;
 }
@@ -47,8 +53,6 @@ interface Worker<S> {
   timer?: NodeJS.Timeout;
 }
 
-const log = createLog("service");
-
 // The longest a pool waits before it starts workers again after ones that failed before claiming.
 const MAX_BACKOFF_MS = 60_000;
 
@@ -66,12 +70,14 @@ export class WarmPool<S> {
   private retry?: NodeJS.Timeout;
   private hits = 0;
   private misses = 0;
+  private log: Log;
 
-  /** `launch` starts a worker with its ticket. */
-  constructor({ size = 0, maxIdleSeconds = 600 }: PoolConfig, launch: (ticket: string) => Promise<Started<S>>) {
+  /** `launch` starts a worker with its ticket; `log` is where the pool's lines go. */
+  constructor({ size = 0, maxIdleSeconds = 600 }: PoolConfig, launch: (ticket: string) => Promise<Started<S>>, log = createLog("service")) {
     this.size = size;
     this.maxIdleMs = maxIdleSeconds * 1000;
     this.launch = launch;
+    this.log = log;
   }
 
   /** Starts filling the pool, once the listener the workers claim at is up. */
@@ -80,7 +86,7 @@ export class WarmPool<S> {
     this.fill();
   }
 
-  /** How many workers wait for a task, how many are starting, and how many tasks found one or didn't. */
+  /** How many workers wait for a task, how many are starting, and how many tasks one took or started cold. */
   stats(): { size: number; idle: number; starting: number; hits: number; misses: number } {
     const live = [...this.workers.values()].filter((worker) => !worker.retired);
     const idle = live.filter((worker) => worker.reply && worker.started).length;
@@ -95,15 +101,29 @@ export class WarmPool<S> {
       if (!started || !reply || worker.retired) continue;
       this.workers.delete(worker.hash);
       clearTimeout(worker.timer);
-      this.hits++;
       this.fill();
+      // A hit once the worker has its task: one that went away first, or that its runner stops before it
+      // answers (its Job couldn't be changed), leaves the task to start cold, a miss.
+      let settled = false;
+      const settle = (hit: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (hit) this.hits++;
+        else this.misses++;
+      };
       return {
         ...started,
+        stop: () => {
+          settle(false);
+          started.stop();
+        },
         answer: (body) => {
           if (!worker.reply) {
+            settle(false);
             started.stop();
             return false;
           }
+          settle(true);
           worker.reply(200, body);
           return true;
         },
@@ -111,7 +131,7 @@ export class WarmPool<S> {
     }
     this.misses++;
     const { idle, starting, hits, misses } = this.stats();
-    log.info(`no warm worker was waiting for the task, which starts cold (pool: ${idle} idle, ${starting} starting; ${hits} hits, ${misses} misses)`, { task });
+    this.log.info(`no warm worker was waiting for the task, which starts cold (pool: ${idle} idle, ${starting} starting; ${hits} hits, ${misses} misses)`, { task });
     return undefined;
   }
 
@@ -130,6 +150,9 @@ export class WarmPool<S> {
     if (worker.retired || Date.now() >= worker.expires) return reply(res, 410, { error: "The ticket has expired" });
     worker.spent = true;
     this.failures = 0;
+    // The claim may be held for many minutes: keepalive breaks it if the worker's node dies, where it would
+    // otherwise look open, and be given a task no one runs.
+    req.socket.setKeepAlive(true, 15_000);
     worker.reply = (status, body) => {
       worker.reply = undefined;
       reply(res, status, body);
@@ -168,10 +191,10 @@ export class WarmPool<S> {
       (started) => {
         worker.started = started;
         if (worker.retired) started.stop();
-        void started.exited.then(() => this.gone(worker));
+        void started.exited.then((exited) => this.gone(worker, exited || undefined));
       },
       (err: unknown) => {
-        log.error("couldn't start a warm worker", { err });
+        this.log.error("couldn't start a warm worker", { err });
         this.gone(worker);
       },
     );
@@ -189,19 +212,24 @@ export class WarmPool<S> {
     this.fill();
   }
 
-  /** A worker that exited, or couldn't be started, while in the pool. */
-  private gone(worker: Worker<S>): void {
+  /** A worker that exited (`exited`, how, if its runner knows), or couldn't be started, while in the pool. */
+  private gone(worker: Worker<S>, exited?: Exited): void {
     clearTimeout(worker.timer);
     if (this.workers.get(worker.hash) !== worker) return;
     this.workers.delete(worker.hash);
     if (worker.retired || worker.spent) return this.fill();
     // It went before it claimed: its image can't run, say. Starting it again at once would only loop.
     this.failures++;
-    if (this.closed || this.retry) return;
+    if (this.closed) return;
+    const pauseMs = this.retry ? undefined : Math.min(1000 * 2 ** (this.failures - 1), MAX_BACKOFF_MS);
+    // What it said last is the one sign of why (a pool URL its container can't reach, say): its folder,
+    // output and all, goes with it. One that couldn't be started was logged as such.
+    if (worker.started) this.log.warn("a warm worker exited before it claimed a task; the next starts after a pause", { exitCode: exited?.code, output: exited?.said, pauseMs });
+    if (pauseMs === undefined) return;
     this.retry = setTimeout(() => {
       this.retry = undefined;
       this.fill();
-    }, Math.min(1000 * 2 ** (this.failures - 1), MAX_BACKOFF_MS));
+    }, pauseMs);
   }
 }
 

@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { createLog, type Log } from "../log.ts";
 import { type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
@@ -50,6 +51,8 @@ export interface KubernetesRunnerConfig {
   pool?: PoolConfig;
   /** How often the Job and its pod are looked at, in milliseconds (default: 1000). */
   pollMs?: number;
+  /** Where the runner's pool and its warm hand-offs log (default: the service's log). */
+  log?: Log;
 }
 
 const ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -69,8 +72,9 @@ const SECRET_BYTES = 1024 * 1024;
 /** The longest a poll waits while a task's pod hasn't started yet, in milliseconds. */
 const PENDING_POLL_MS = 5000;
 
-/** A warm worker's Job: where it is, when it was made, and the selector its pod is found by. */
+/** A warm worker's Job: its name, where it is, when it was made, and the selector its pod is found by. */
 interface Slot {
+  job: string;
   ns: string;
   jobPath: string;
   created: number;
@@ -97,10 +101,12 @@ export class KubernetesRunner implements Runner {
   private ns: Promise<string> | undefined;
   /** Where the warm workers claim their tasks. */
   private poolUrl = "";
+  private log: Log;
 
   constructor(config: KubernetesRunnerConfig) {
     this.config = config;
-    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket));
+    this.log = config.log ?? createLog("service");
+    if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket), this.log);
   }
 
   warm(internalBaseUrl: string): void {
@@ -146,7 +152,7 @@ export class KubernetesRunner implements Runner {
    */
   private async startWarm(warm: Warm<Slot>, task: Task, tenant: Tenant): Promise<RunHandle | undefined> {
     const { graceSeconds } = this.config;
-    const { ns, jobPath, created, selector } = warm.slot;
+    const { job, ns, jobPath, created, selector } = warm.slot;
     // activeDeadlineSeconds counts from the Job's start, which is after `created`.
     const deadline = Math.ceil((Date.now() - created) / 1000) + task.spec.timeLimit + graceSeconds;
     try {
@@ -167,6 +173,8 @@ export class KubernetesRunner implements Runner {
       report: true,
     };
     if (!warm.answer(answer)) return undefined;
+    // The Job has the task's labels now, but its pod keeps the pool's: this says which pod is the task's.
+    this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, job });
     return { ...this.followed(ns, jobPath, selector, task), warm: true };
   }
 
@@ -196,7 +204,7 @@ export class KubernetesRunner implements Runner {
         .catch((err: unknown) => console.error(`jig service: couldn't delete the warm worker's Job ${name}:`, err instanceof Error ? err.message : err))
         .finally(gone);
     };
-    return { slot: { ns, jobPath, created, selector: `${POOL_LABEL}=${id}` }, exited, stop };
+    return { slot: { job: name, ns, jobPath, created, selector: `${POOL_LABEL}=${id}` }, exited, stop };
   }
 
   /** Makes the Secret the Job `name` owns, so it is deleted with it; the Job is deleted if it can't be made. */
