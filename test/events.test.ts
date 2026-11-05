@@ -80,6 +80,26 @@ describe("--events", () => {
     }
   });
 
+  it("prices each step as the end: by the model the reply names, so a gateway's alias's steps add up to its end", async () => {
+    // claude-fast is an alias jig has no price for; the gateway's replies say claude-opus-5-5 served them.
+    const api = await fakeMessagesApi((request) => ({
+      blocks: (request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*.py" } }] : [{ text: "Done." }],
+      model: "claude-opus-5-5",
+    }));
+    try {
+      const { code, output } = await runJig(["--no-sandbox", "--yes", "--model", "claude-fast", "--events", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      const events = await read();
+      const costs = ofType(events, "step").map((step) => step.cost);
+      // 10 tokens in and 5 out at claude-opus-5-5's $4 and $20 a million, each.
+      assert.deepEqual(costs, [0.00014, 0.00014]);
+      const end = events.at(-1)!;
+      assert.ok(Math.abs((end.cost as number) - (costs as number[]).reduce((sum, cost) => sum + cost, 0)) < 1e-12, String(end.cost));
+    } finally {
+      api.close();
+    }
+  });
+
   it("ends with the stop and the exit code of a run stopped by --max-steps or --time-limit, the wrap-up as its text", async () => {
     const api = await fakeMessagesApi((request) => {
       if (request.tool_choice) return [{ text: "Listed the files; the fix is left." }];
@@ -293,6 +313,24 @@ describe("Events", () => {
     assert.equal(await endOf("claude-opus-5-5", ["m"]), 6);
     assert.equal(await endOf("claude-fast", ["m"]), null);
     assert.equal(await endOf("claude-fast", ["constructor"]), null);
+  });
+  it("prices a step by the model its reply names when that has a price, else by jig's own or the escalation's", () => {
+    const usage = { input_tokens: 1_000_000, output_tokens: 100_000, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+    const stepOf = (jigs: string, reply: { served?: string; model?: string }) => {
+      const got: Written[] = [];
+      const ui = new Events((event) => got.push(event), jigs).ui({ toolCall() {}, toolResult() {}, notice() {} } as AgentUI);
+      ui.step!(1, { text: "", usage, ...reply } as Parameters<NonNullable<AgentUI["step"]>>[1]);
+      return got[0].cost;
+    };
+    // $4 for the 1M in and $2 for the 100k out at claude-opus-5-5's price; $2 and $1 at claude-sonnet-5-5's.
+    assert.equal(stepOf("claude-fast", { served: "claude-opus-5-5" }), 6);
+    assert.equal(stepOf("claude-opus-5-5", { served: "m" }), 6);
+    assert.equal(stepOf("claude-fast", { served: "m" }), null);
+    assert.equal(stepOf("claude-fast", { served: "constructor" }), null);
+    assert.equal(stepOf("claude-fast", { served: "m", model: "claude-sonnet-5-5" }), 3);
+    assert.equal(stepOf("claude-fast", { served: "claude-opus-5-5", model: "claude-sonnet-5-5" }), 6);
+    // A library's loop that names no served model: priced as before.
+    assert.equal(stepOf("claude-opus-5-5", {}), 6);
   });
 });
 

@@ -10,10 +10,13 @@ import { join } from "node:path";
 /** A text block, or a tool call. Input given as a string is streamed as it is, so it can be malformed JSON. */
 export type Block = { text: string } | { tool: string; input: object | string; id?: string };
 
-/** A streamed Messages API reply made of text and tool calls; `stop` gives its stop reason, if not the usual one. */
-export function messagesReply(blocks: Block[], stop?: string): string {
+/**
+ * A streamed Messages API reply made of text and tool calls; `stop` gives its stop reason, if not the usual one,
+ * and `model` the model it names, if not "m".
+ */
+export function messagesReply(blocks: Block[], stop?: string, model = "m"): string {
   const event = (type: string, data: object) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
-  let body = event("message_start", { message: { id: "m", type: "message", role: "assistant", model: "m", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } });
+  let body = event("message_start", { message: { id: "m", type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, output_tokens: 1 } } });
   blocks.forEach((block, index) => {
     if ("text" in block) {
       body += event("content_block_start", { index, content_block: { type: "text", text: "" } });
@@ -39,8 +42,8 @@ export interface FakeApi {
   close(): void;
 }
 
-/** A reply's blocks, or its blocks and the stop reason it ends with (a refusal, say). */
-export type Reply = Block[] | { blocks: Block[]; stop: string };
+/** A reply's blocks, or its blocks with the stop reason it ends with (a refusal, say) or the model it names. */
+export type Reply = Block[] | { blocks: Block[]; stop?: string; model?: string };
 
 /** A local Messages API that answers each request with what `answer` returns for it. */
 export async function fakeMessagesApi(answer: (request: Record<string, unknown>) => Reply): Promise<FakeApi> {
@@ -53,7 +56,7 @@ export async function fakeMessagesApi(answer: (request: Record<string, unknown>)
       requests.push(request);
       res.writeHead(200, { "content-type": "text/event-stream" });
       const reply = answer(request);
-      res.end(Array.isArray(reply) ? messagesReply(reply) : messagesReply(reply.blocks, reply.stop));
+      res.end(Array.isArray(reply) ? messagesReply(reply) : messagesReply(reply.blocks, reply.stop, reply.model));
     });
   });
   await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));

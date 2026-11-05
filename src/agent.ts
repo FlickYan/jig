@@ -29,9 +29,10 @@ export interface AgentUI {
   notice(text: string): void;
   /**
    * A step's model call has replied, before its tool calls run: its text (none for a refusal, which isn't an
-   * answer) and tokens, and `model` once --escalate's has taken over. For --events; the terminal streamed it.
+   * answer) and tokens, `model` once --escalate's has taken over, and `served`, the model the reply names
+   * (a gateway's alias's names the model behind it). For --events; the terminal streamed it.
    */
-  step?(step: number, reply: { text: string; usage: Anthropic.Beta.BetaUsage; model?: string }): void;
+  step?(step: number, reply: { text: string; usage: Anthropic.Beta.BetaUsage; model?: string; served?: string }): void;
 }
 
 /** How a run of the loop is set up: the model, the tools, and the checks every tool call goes through. */
@@ -287,7 +288,7 @@ export async function runAgent(conversation: Conversation, opts: AgentOptions, s
     const ms = Date.now() - began;
     addUsage(usage, reply.usage);
     if (escalated) addUsage(escalated.usage, reply.usage);
-    opts.ui.step?.(step, { text: reply.stop_reason === "refusal" ? "" : replyText(reply), usage: reply.usage, ...(escalated && { model: escalated.model }) });
+    opts.ui.step?.(step, { text: reply.stop_reason === "refusal" ? "" : replyText(reply), usage: reply.usage, ...(escalated && { model: escalated.model }), ...(typeof reply.model === "string" && { served: reply.model }) });
 
     // A safety classifier declined, even after the fallback model. Whatever was streamed before the
     // decline is not a real answer, so it stays out of the history.

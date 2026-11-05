@@ -497,7 +497,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | type | fields |
 |------|--------|
 | `start` | `task`, `cwd`, `model`, `version`, `limits: {maxSteps, timeLimit}` |
-| `step` | `step`, `usage: {input, cacheRead, cacheWrite, output}`, `cost` (null for an unpriced model) |
+| `step` | `step`, `usage: {input, cacheRead, cacheWrite, output}`, `cost` (priced as the end's calls are, below; null if neither model has a price) |
 | `text` | `step`, `text`: each reply's text as a whole |
 | `tool_call` | `step`, `id`, `name`, `description` (at most 4,000 characters, cut from the middle), `truncated` |
 | `tool_result` | `step`, `id`, `isError`, `output` (at most 4,000 characters, cut from the middle), `truncated` |

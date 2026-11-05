@@ -100,7 +100,9 @@ export class Events {
         this.step = step;
         const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
         addUsage(usage, reply.usage);
-        this.write("step", { step, usage: inOrder(usage), cost: costOf(reply.model ?? this.model, usage) ?? null });
+        // Priced as meter prices the call for the end, so the steps' costs add up to the end's.
+        const cost = (reply.served !== undefined ? costOf(reply.served, usage) : undefined) ?? costOf(reply.model ?? this.model, usage);
+        this.write("step", { step, usage: inOrder(usage), cost: cost ?? null });
         if (reply.text.trim()) this.text(reply.text);
       },
       toolCall: (name, description, id) => {

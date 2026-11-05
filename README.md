@@ -154,8 +154,9 @@ output on stderr). Each line is `{"v":1,"seq":n,"ts":"<ISO time>","type":...}` w
 cut) and its `tool_result` (`isError`, and the `output`, cut the same way), each `notice` jig prints (errors
 included), and last `end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and
 `cost` of every model call in the task (subagents', the reviewer's, compactions' and the wrap-up's included;
-the wrap-up's report is a `text` after the last step). A cost is in US dollars, or null for a model
-`src/prices.ts` has no price for. Every string goes through the redaction `jig sessions export` uses. A reader
+the wrap-up's report is a `text` after the last step). A cost is in US dollars: each call is priced by the
+model its reply names (a gateway's alias names the model behind it) when `src/prices.ts` has a price for
+it, else by the one jig asked for, and is null when neither has. Every string goes through the redaction `jig sessions export` uses. A reader
 should pass over a type it doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
 file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
 written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP,
