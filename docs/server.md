@@ -361,7 +361,12 @@ no privilege escalation, no capabilities, a read-only root, seccomp's `RuntimeDe
 token and `runtimeClassName` if one is set (`gvisor`, with `deploy/k8s/runtimeclass.yaml`); the Job's
 `activeDeadlineSeconds` is the task's time limit and the grace, and `ttlSecondsAfterFinished` (600) how long
 it stays after. A Secret the Job owns, so deleted with it, holds the task's token, which jig gets as its
-key, and the prompt and workspace.
+key, and the prompt and workspace. A Secret holds at most 1 MiB, so a task whose prompt and workspace, with
+the token, come to more is refused (an `error` that says so) before a Job is made for it: keep
+`maxBodyBytes` at its default with this runner. The Job is labelled with its task's id (`jig.dev/task`) and its tenant's
+(`jig.dev/tenant`); a tenant id that can't be a label's value (over 63 characters, or with characters
+other than letters, digits, `-`, `_` and `.`) is labelled `h-` and 40 hex digits of its SHA-256 instead,
+and the id itself is in the Job's `jig.dev/tenant` annotation.
 
 ```json
 "runner": "kubernetes",
@@ -370,7 +375,7 @@ key, and the prompt and workspace.
 ```
 
 A pod's files are on its node, out of the service's reach, so the events come in its log: the pod runs
-`node server/worker.ts`, which makes the workspace (writing the files, or cloning the repository there),
+`node server/worker.ts`, which makes `HOME` and the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events
 it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) and
@@ -378,7 +383,16 @@ takes the exit code from the pod, the stats from that line and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
 says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
 reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
-and Secret with it.
+and Secret with it, asked again every few seconds if the API server fails it. While a pod hasn't started,
+it is looked at less and less often, up to every 5 seconds. The log is read only as fast as the events
+are stored, the rest waiting on the API server's side. Read again after the kubelet rotated it (at 10 MiB
+by default), the log may lack events: a `notice` event in place of the first says which.
+
+As on Docker, jig runs with `--no-sandbox`, the pod being the wall. Its commands run as the same user as
+the worker, the pod's first process, so they can write the pod's log too and make up events, and one with
+a higher `seq` than jig's hides jig's events after it, the `end` included. The task's status still comes
+from the pod's exit code, and what it spends from the gateway; only the stop, usage and cost reported come
+from the `end` event.
 
 `deploy/k8s/networkpolicy.yaml` lets the task pods reach only the gateway, the service's internal listener
 (`jig-api-internal`, on its own port) and the cluster's DNS, where the
