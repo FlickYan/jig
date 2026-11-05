@@ -1,8 +1,9 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
@@ -104,6 +105,8 @@ export interface Config {
 type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl" | "log";
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
+/** The longest time limit or approval timeout, in seconds: under jig's 24 days, and a timer's 2^31 ms. */
+const MAX_SECONDS = 2_000_000;
 const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 /** How long what the metrics read from the store is used for, however many scrape meanwhile. */
@@ -125,7 +128,7 @@ export interface Service {
 }
 
 /** A request as the service logs it: its id, and its tenant once it is known. */
-interface Request {
+interface ServedRequest {
   id: string;
   log: Log;
   tenant?: string;
@@ -133,11 +136,12 @@ interface Request {
 
 /**
  * Checks the config, opens the store, puts the config's tenants in it and shuts out those it no longer
- * lists, ends the tasks of replicas that are gone, and listens, on the internal and metrics listeners too.
+ * lists, listens, on the internal and metrics listeners too, and only then ends the tasks of replicas that
+ * are gone and starts what is queued.
  * The runner is the local one unless one is given (a test's); `webhookRetryMs` is the pause before a
- * webhook's first retry; `now` is the clock the quotas' days and months, and the usage report's default
- * range, are read from; `log` is where its lines go (createLog's, by default); `countsMs`, how long the
- * metrics' reads of the store are used for.
+ * webhook's first retry; `now` is the clock the quotas' days and months, the tasks' creation times they
+ * count, and the usage report's default range, are read from; `log` is where its lines go (createLog's, by
+ * default); `countsMs`, how long the metrics' reads of the store are used for.
  */
 export async function startService(
   config: Config,
@@ -153,6 +157,8 @@ export async function startService(
   checkConfig(config);
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
+  // A Bearer is read up to the first whitespace, so a key with some could never be given.
+  if (adminKey && /\s/.test(adminKey)) throw new Error(`${config.adminKeyEnv} holds whitespace (a trailing newline?): the admin key can't hold any`);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
@@ -162,13 +168,13 @@ export async function startService(
    * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
    */
   const handler =
-    (serve: (req: IncomingMessage, res: ServerResponse, request: Request) => Promise<void>, api = false) =>
+    (serve: (req: IncomingMessage, res: ServerResponse, request: ServedRequest) => Promise<void>, api = false) =>
     (req: IncomingMessage, res: ServerResponse) => {
       const began = performance.now();
       const given = req.headers["x-request-id"];
       const id = typeof given === "string" && REQUEST_ID.test(given) ? given : randomUUID();
       res.setHeader("x-request-id", id);
-      const request: Request = { id, log: log.with({ request: id }) };
+      const request: ServedRequest = { id, log: log.with({ request: id }) };
       const path = URL.parse(req.url ?? "/", "http://service")?.pathname ?? "/";
       res.once("close", () => {
         const seconds = (performance.now() - began) / 1000;
@@ -200,7 +206,29 @@ export async function startService(
         reply(res, 404, { error: "Not found: this listener serves GET /metrics and GET /healthz" });
       }),
     );
-  let scheduler: Scheduler;
+  // The API listens before the scheduler starts, so a port that is taken stops the start before any task is
+  // claimed; a request that comes in meanwhile waits for the scheduler.
+  let started!: (context: Context) => void;
+  let failed!: (err: unknown) => void;
+  const ready = new Promise<Context>((done, fail) => ((started = done), (failed = fail)));
+  ready.catch(() => {});
+  const server = createServer(handler(async (req, res, request) => handle(req, res, await ready, request), true));
+  let scheduler: Scheduler | undefined;
+  const close = async () => {
+    // No task is claimed from here on: one posted while the runner closes stays queued, rather than start
+    // cold and be stopped as an error.
+    scheduler?.pause();
+    webhooks.close();
+    // The idle workers first, their claims answered while the internal listener is still up.
+    await runner?.close?.();
+    const listeners = [server, internal, ...(metricsServer ? [metricsServer] : [])].filter((listener) => listener.listening);
+    for (const listener of listeners) listener.closeAllConnections();
+    await Promise.all(listeners.map((listener) => new Promise((done) => listener.close(done))));
+    await answers.close();
+    await scheduler?.close();
+    await store.close();
+  };
+  let url: string;
   let internalUrl: string;
   let metricsUrl: string | undefined;
   try {
@@ -213,21 +241,24 @@ export async function startService(
     if (retired) log.warn(`${retired} queued task(s) of tenants no longer in the config cancelled`);
     // Before any task starts, as their jig asks for approvals there.
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
+    url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
+    if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
+    if (runner instanceof LocalRunner) for (const warning of localRisks(config)) log.warn(warning);
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
     scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval, metrics, log });
     const expired = await scheduler.start();
     if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
-    await runner?.close?.();
-    if (internal.listening) await new Promise((done) => internal.close(done));
-    await store.close();
+    // Its port is taken, say: what has started stops.
+    failed(err);
+    await close();
     throw err;
   }
   collect(metrics, { store, runner, tenants: config.tenants.map((tenant) => tenant.id), countsMs });
-  const context = {
+  started({
     store,
     scheduler,
     answers,
@@ -238,29 +269,35 @@ export async function startService(
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
     now,
     metrics,
-  };
-  const server = createServer(handler((req, res, request) => handle(req, res, context, request), true));
-  const close = async () => {
-    webhooks.close();
-    // The idle workers first, their claims answered while the internal listener is still up.
-    await runner!.close?.();
-    const listeners = [server, internal, ...(metricsServer ? [metricsServer] : [])];
-    for (const listener of listeners) listener.closeAllConnections();
-    await Promise.all(listeners.map((listener) => new Promise((done) => listener.close(done))));
-    await answers.close();
-    await scheduler.close();
-    await store.close();
-  };
-  let url: string;
-  try {
-    url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
-    if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
-  } catch (err) {
-    // Its port is taken, say: what has started stops.
-    await close();
-    throw err;
-  }
+  });
   return { url, internalUrl, metricsUrl, metrics, server, store, scheduler, close };
+}
+
+/**
+ * What the local runner's tasks could do to the service: jig's sandbox lets their commands read the whole
+ * machine, other tenants' task folders and the database among them, and write the temp folders.
+ */
+function localRisks(config: Config): string[] {
+  const temps = ["/tmp", "/var/tmp", tmpdir()].flatMap((dir) => [dir, realOrSame(dir)]);
+  const inTemp = (path: string) =>
+    temps.some((dir) => {
+      const rel = relative(dir, resolve(path));
+      return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+    });
+  const files = [config.dataDir, ...(config.database === ":memory:" || /^postgres(ql)?:\/\//.test(config.database) ? [] : [config.database])];
+  return [
+    ...(config.tenants.length > 1 ? ["the local runner keeps no wall between tenants: a task's commands can read the others' task folders and the database (the docker and kubernetes runners keep them apart)"] : []),
+    ...(files.some(inTemp) ? ["dataDir or the database is in a temp folder, which a local task's commands can write: its events, usage and cost, and the database, are only as trustworthy as the tasks"] : []),
+  ];
+}
+
+/** The path with its links resolved, or as it is if it isn't there. */
+function realOrSame(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
 }
 
 /**
@@ -344,8 +381,8 @@ function configProblem(config: Config): string | undefined {
     value === undefined ? (required ? `${name} is missing` : undefined) : typeof value === "string" && value ? undefined : `${name} must be a string that isn't empty`;
   const whole = (name: string, value: unknown, least: number, most = Number.MAX_SAFE_INTEGER) =>
     value === undefined || (Number.isInteger(value) && (value as number) >= least && (value as number) <= most) ? undefined : `${name} must be a whole number from ${least}${most < Number.MAX_SAFE_INTEGER ? ` to ${most}` : " up"}, not ${JSON.stringify(value)}`;
-  const positive = (name: string, value: unknown, zero = false) =>
-    value === undefined || (typeof value === "number" && Number.isFinite(value) && (zero ? value >= 0 : value > 0)) ? undefined : `${name} must be a number over ${zero ? "or at " : ""}0, not ${JSON.stringify(value)}`;
+  const positive = (name: string, value: unknown, zero = false, most = Infinity) =>
+    value === undefined || (typeof value === "number" && Number.isFinite(value) && (zero ? value >= 0 : value > 0) && value <= most) ? undefined : `${name} must be a number over ${zero ? "or at " : ""}0${most < Infinity ? `, up to ${most}` : ""}, not ${JSON.stringify(value)}`;
   const strings = (name: string, value: unknown) =>
     value === undefined || (Array.isArray(value) && value.length && value.every((item) => typeof item === "string" && item)) ? undefined : `${name} must be a list of strings`;
   const http = (name: string, value: unknown) =>
@@ -353,7 +390,13 @@ function configProblem(config: Config): string | undefined {
   const poolProblem = (block: string, pool: unknown) =>
     pool === undefined ? undefined
     : !isObject(pool) ? `${block}.pool must be an object, {size, maxIdleSeconds}`
-    : (whole(`${block}.pool.size`, pool.size, 0) ?? positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ?? http(`${block}.pool.baseUrl`, pool.baseUrl));
+    : (whole(`${block}.pool.size`, pool.size, 0) ??
+      // A replica runs at most concurrency tasks at once, and a typo would start thousands of workers.
+      ((pool.size as number) > (config.concurrency ?? 4) ? `${block}.pool.size must be at most concurrency, ${config.concurrency ?? 4}: idle workers past it are never used` : undefined) ??
+      positive(`${block}.pool.maxIdleSeconds`, pool.maxIdleSeconds) ??
+      http(`${block}.pool.baseUrl`, pool.baseUrl));
+  // Only an absent runner is the local one: null is a wrong value, as it is for every other field.
+  const runner = config.runner === undefined ? "local" : config.runner;
   const problem =
     (config.region === undefined || (typeof config.region === "string" && /^[a-z0-9]{1,16}$/.test(config.region)) ? undefined : `region must be 1 to 16 lowercase letters and digits, not ${JSON.stringify(config.region)}`) ??
     text("database", config.database, true) ??
@@ -368,14 +411,19 @@ function configProblem(config: Config): string | undefined {
     http("internalBaseUrl", config.internalBaseUrl) ??
     whole("concurrency", config.concurrency, 1) ??
     text("model", config.model, false) ??
-    positive("graceSeconds", config.graceSeconds, true) ??
+    // A time limit and its grace stay under a timer's 2^31 ms, past which it fires at once.
+    positive("graceSeconds", config.graceSeconds, true, 86_400) ??
     strings("jig", config.jig) ??
     strings("gitProtocols", config.gitProtocols) ??
     whole("maxBodyBytes", config.maxBodyBytes, 1) ??
-    positive("heartbeatSeconds", config.heartbeatSeconds) ??
+    positive("heartbeatSeconds", config.heartbeatSeconds, false, 3_600) ??
     text("replicaId", config.replicaId, false) ??
-    positive("leaseSeconds", config.leaseSeconds) ??
+    positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
+    // Checked here, so a runner that can't start is refused before the store is changed.
+    (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
+    (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
+    (runner === "kubernetes" ? text("kubernetes.image", config.kubernetes?.image, true) : undefined) ??
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
@@ -399,10 +447,10 @@ function configProblem(config: Config): string | undefined {
       (Array.isArray(tenant.keys) ? undefined : `${at}.keys must be a list of the SHA-256 hashes of its API keys, in hex`) ??
       whole(`${at}.concurrency`, tenant.concurrency, 0) ??
       whole(`${at}.maxSteps`, tenant.maxSteps, 1) ??
-      whole(`${at}.timeLimit`, tenant.timeLimit, 1) ??
+      whole(`${at}.timeLimit`, tenant.timeLimit, 1, MAX_SECONDS) ??
       (tenant.budgetUsd === null ? undefined : positive(`${at}.budgetUsd`, tenant.budgetUsd)) ??
       whole(`${at}.maxQueued`, tenant.maxQueued, 0) ??
-      whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1) ??
+      whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1, MAX_SECONDS) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
       text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
       (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
@@ -438,7 +486,7 @@ interface Context {
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest();
 
-async function handle(req: IncomingMessage, res: ServerResponse, context: Context, request: Request): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse, context: Context, request: ServedRequest): Promise<void> {
   const url = new URL(req.url ?? "/", "http://service");
   if (url.pathname === "/healthz") return reply(res, 200, { ok: true, region: context.region });
   const key = /^Bearer (\S+)$/i.exec(req.headers.authorization ?? "")?.[1];
@@ -554,6 +602,9 @@ async function usage(res: ServerResponse, url: URL, { store, now }: Context, sco
   const params = url.searchParams;
   const unknown = [...params.keys()].find((name) => !["from", "to", "group", "format", ...allowed].includes(name));
   if (unknown) return reply(res, 400, { error: `Unknown parameter: ${unknown}` });
+  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
+  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
+  if (twice) return reply(res, 400, { error: `${twice} may be given once` });
   const today = now();
   const from = params.get("from") ?? isoDay(periods(today).monthStart);
   const to = params.get("to") ?? isoDay(today);
@@ -587,7 +638,8 @@ function totalOf(rows: UsageRow[]): Omit<UsageRow, "tenant" | "day" | "model"> {
 function csv(res: ServerResponse, rows: UsageRow[], keys: string[]): void {
   const columns = [...keys, ...SUMMED];
   const field = (value: unknown) => {
-    const text = String(value ?? "");
+    // Numbers in plain digits, as a spreadsheet reads them: String gives 1e-7 for a tiny cost.
+    const text = typeof value === "number" && !Number.isInteger(value) ? value.toFixed(9).replace(/0+$/, "").replace(/\.$/, "") : String(value ?? "");
     return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
   };
   const lines = [columns.join(","), ...rows.map((row) => columns.map((column) => field(row[column as keyof UsageRow])).join(","))];
@@ -708,7 +760,7 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
  * (SQLite, or a lost connection to Postgres), the store is read again every second.
  */
-async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: Request): Promise<void> {
+async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;
@@ -762,6 +814,26 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   await reading;
 }
 
+/**
+ * Makes the config's paths absolute, from `base`, the config's folder: the database's file, dataDir, and
+ * those of jig's entries that start with ./ or ../ (a program's name, or an absolute path, is left alone).
+ * jig is started in each task's workspace, where a relative path would lead nowhere.
+ */
+export function resolvePaths(config: Config, base: string): void {
+  if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
+  config.dataDir = resolve(base, config.dataDir);
+  if (config.jig) config.jig = config.jig.map((entry) => (/^\.\.?\//.test(entry) ? resolve(base, entry) : entry));
+}
+
+/**
+ * The URL with its host in brackets if it is an IPv6 address without them: Kubernetes gives a pod's IPv6
+ * address bare, so http://$(POD_IP):8082 comes out as http://fd00::1:8082, which isn't a URL.
+ */
+export function bracketHost(url: string): string {
+  const [, scheme, host, port, rest = ""] = /^(https?:\/\/)([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*):(\d+)(\/.*)?$/.exec(url) ?? [];
+  return host ? `${scheme}[${host}]:${port}${rest}` : url;
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({ options: { config: { type: "string" } } });
   if (!values.config) throw new Error("Usage: node server/api.ts --config <file>");
@@ -772,12 +844,9 @@ async function main(): Promise<void> {
   if (process.env.JIG_DATABASE_URL) config.database = process.env.JIG_DATABASE_URL;
   // Replicas share the config, but each one's warm workers claim at its own address (its pod's, say).
   const pool = config.runner === "docker" ? config.docker?.pool : config.runner === "kubernetes" ? config.kubernetes?.pool : undefined;
-  if (isObject(pool) && process.env.JIG_POOL_BASE_URL) pool.baseUrl = process.env.JIG_POOL_BASE_URL;
+  if (isObject(pool) && process.env.JIG_POOL_BASE_URL) pool.baseUrl = bracketHost(process.env.JIG_POOL_BASE_URL);
   checkConfig(config);
-  // Paths in the config are relative to it.
-  const base = dirname(resolve(values.config));
-  if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
-  config.dataDir = resolve(base, config.dataDir);
+  resolvePaths(config, dirname(resolve(values.config)));
   const log = createLog("service");
   const service = await startService(config, { secret, log });
   log.info(`listening on ${service.url}`, { internal: service.internalUrl, metrics: service.metricsUrl });

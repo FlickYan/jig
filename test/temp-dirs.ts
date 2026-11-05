@@ -14,7 +14,10 @@ export async function tempDir(prefix: string): Promise<string> {
   return dir;
 }
 
-/** Removes the directories tempDir made, with everything in them. */
+/**
+ * Removes the directories tempDir made, with everything in them. A process a test stopped may still be
+ * writing in one (a fake docker's kill), so a removal that meets ENOTEMPTY or EBUSY is tried again.
+ */
 export async function removeTempDirs(): Promise<void> {
-  await Promise.all(made.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  await Promise.all(made.splice(0).map((dir) => rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })));
 }

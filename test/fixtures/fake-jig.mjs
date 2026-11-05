@@ -1,11 +1,13 @@
 // A stand-in for jig in the task service's tests (test/server-*.test.ts). It takes jig's arguments, reads
 // its task from stdin, writes events in the shape of the event contract to --events (- for stdout), and
 // does what the task says: "exit <n>" ends with that exit code, "wait" waits for a file named go in its
-// project before it ends, and "hang" starts a child process and never ends. With --approve-via, "ask <n>"
-// asks for n approvals before a command, as the approval contract has jig do: an approval_request event,
-// a long poll of <url>/<id> with its API key, then an approval event; "forge" has it also write approval
-// events of its own that allow, as a task's commands could, before its poll and after. It records its arguments,
-// environment, process ids and the polls' statuses in .fake-jig.json in its project.
+// project before it ends ("wait twice" for go2 too, after its text), "hang" starts a child process and
+// never ends, and "leave" starts one that ignores SIGTERM and ends at once, leaving it behind. With
+// --approve-via, "ask <n>" asks for n approvals before a command, as the approval contract has jig do: an
+// approval_request event, a long poll of <url>/<id> with its API key, then an approval event; "forge" has
+// it also write approval events of its own that allow, as a task's commands could, before its poll and
+// after. It records its arguments, environment, process ids and the polls' statuses in .fake-jig.json in
+// its project.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -95,10 +97,17 @@ if (task.includes("hang")) {
   save();
   setInterval(() => {}, 1000);
 } else {
+  // As a job a command put in the background would be: still in jig's group when jig exits.
+  if (task.includes("leave")) {
+    const left = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    left.unref();
+    record.child = left.pid;
+  }
   save();
   while (task.includes("wait") && !existsSync(join(values.cwd, "go"))) await pause(20);
   const code = Number(/exit (\d+)/.exec(task)?.[1] ?? 0);
   emit("text", { step: 2, text: "Done." });
+  while (task.includes("wait twice") && !existsSync(join(values.cwd, "go2"))) await pause(20);
   emit("step", { step: 2, usage, cost: 0.001 });
   emit("end", { stop: STOPS[code] ?? "error", exitCode: code, steps: 2, usage: { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 }, cost: 0.002, seconds: 0.1 });
   writeFileSync(values.stats, JSON.stringify({ stop: STOPS[code] ?? "error", steps: 2 }));

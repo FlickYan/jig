@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { TLSSocket } from "node:tls";
-import { Connection, parseUrl, Pool, Scram } from "../server/pg.ts";
+import { Connection, parseUrl, Pool, redactUrl, Scram } from "../server/pg.ts";
 import { openStore } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, POSTGRES_URL, postgresDatabase } from "./postgres.ts";
 
@@ -131,9 +131,62 @@ describe("the Postgres client", () => {
     assert.deepEqual(parseUrl("postgresql://jig@[::1]/"), { host: "::1", port: 5432, user: "jig", password: "", database: "jig", tls: false, options: undefined });
     assert.deepEqual(parseUrl("postgres://jig:x@h/db?sslmode=require").tls, { ca: undefined });
     assert.throws(() => parseUrl("mysql://jig@h/db"), /must start postgres:\/\//);
-    assert.throws(() => parseUrl("postgres://jig@h/db?sslmode=prefer"), /sslmode must be disable or require/);
+    assert.throws(() => parseUrl("postgres://jig@h/db?sslmode=prefer"), /^Error: sslmode must be disable, require or verify-full \(both check the certificate\), not prefer$/);
+    assert.deepEqual(parseUrl("postgres://jig:x@h/db?sslmode=verify-full").tls, { ca: undefined });
     assert.throws(() => parseUrl("postgres://jig@h/db?connect_timeout=5"), /connect_timeout isn't one this client knows/);
     assert.throws(() => parseUrl("postgres://h/db"), /names no user/);
+  });
+
+  it("hides a URL's password however it is written, a / or @ in it included", async () => {
+    assert.equal(redactUrl("postgres://jig:secret@db:5432/jig?sslmode=require"), "postgres://jig:***@db:5432/jig?sslmode=require");
+    assert.equal(redactUrl("postgres://jig:pa/ss@db/jig"), "postgres://jig:***@db/jig");
+    assert.equal(redactUrl("postgres://jig:p@ss@db/jig"), "postgres://jig:***@db/jig");
+    assert.equal(redactUrl("postgres://jig@db/jig"), "postgres://jig@db/jig");
+    assert.equal(redactUrl("data/jig.db"), "data/jig.db");
+    for (const url of ["postgres://jig:pa/ss@127.0.0.1:1/x", "postgres://jig:p@ss@127.0.0.1:1/x"]) {
+      await assert.rejects(openStore(url), (err: Error) => {
+        assert.ok(err.message.startsWith("Couldn't open the database postgres://jig:***@127.0.0.1:1/x: "), err.message);
+        for (const part of ["pa/ss", "p@ss", "ss@"]) assert.ok(!err.message.includes(part), err.message);
+        return true;
+      });
+    }
+  });
+
+  it("refuses a SCRAM login that the server ends without proving it knows the password", async () => {
+    // A server that asks for SCRAM, answers the first message, then says the login is done without its proof.
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+      let buffer = Buffer.alloc(0);
+      let started = false;
+      socket.on("data", (chunk: Buffer) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        for (;;) {
+          if (!started) {
+            if (buffer.length < 4 || buffer.length < buffer.readInt32BE(0)) return;
+            buffer = buffer.subarray(buffer.readInt32BE(0));
+            started = true;
+            socket.write(message("R", Buffer.concat([int32(10), Buffer.from("SCRAM-SHA-256\0\0")])));
+            continue;
+          }
+          if (buffer.length < 5 || buffer.length < buffer.readInt32BE(1) + 1) return;
+          const body = buffer.subarray(5, buffer.readInt32BE(1) + 1);
+          buffer = buffer.subarray(body.length + 5);
+          const text = body.toString("latin1");
+          const nonce = /r=([^,]+)/.exec(text)?.[1] ?? "";
+          if (text.startsWith("SCRAM-SHA-256")) socket.write(message("R", Buffer.concat([int32(11), Buffer.from(`r=${nonce}server,s=${Buffer.from("salt").toString("base64")},i=4096`)])));
+          else socket.write(Buffer.concat([message("R", int32(0)), message("K", int32(1234, 5678)), message("Z", Buffer.from("I"))]));
+        }
+      });
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    closers.push(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((done) => server.close(done));
+    });
+    const { port } = server.address() as { port: number };
+    await assert.rejects(Connection.connect(parseUrl(`postgres://jig:secret@127.0.0.1:${port}/jig`)), /^Error: The database ended the SCRAM login without proving it knows the password$/);
   });
 
   it("logs in with md5 and with a cleartext password, and says when the password is wrong", async () => {
@@ -235,6 +288,28 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     assert.equal((await db.query("SELECT 2 AS two")).rows[0].two, 2);
     // The server stopped it too.
     await until(async () => (await admin.query("SELECT count(*) AS n FROM pg_stat_activity WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid()", [`%${mark}%`])).rows[0].n === 0, "the server to stop the query");
+  });
+
+  it("has the server end a transaction left idle, so a replica that froze holding the claims' lock lets it go", async () => {
+    assert.equal((await pool(url).query("SHOW idle_in_transaction_session_timeout")).rows[0].idle_in_transaction_session_timeout, "1min");
+    const key = randomInt(2 ** 40);
+    const frozen = pool(url, { idleInTransactionMs: 500 });
+    let thaw!: () => void;
+    const thawed = new Promise<void>((done) => (thaw = done));
+    let locked = false;
+    const holding = frozen.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock($1)", [key]);
+      locked = true;
+      await thawed;
+    });
+    holding.catch(() => {});
+    await until(() => locked, "the lock to be taken");
+    const began = Date.now();
+    await pool(url, { queryTimeoutMs: 5000 }).transaction((tx) => tx.query("SELECT pg_advisory_xact_lock($1)", [key]));
+    assert.ok(Date.now() - began < 3000, `waited ${Date.now() - began} ms`);
+    // The frozen one's transaction is gone: it can't commit what it did.
+    thaw();
+    await assert.rejects(holding);
   });
 
   it("listens again after its connection is lost, and hears what comes after", async () => {

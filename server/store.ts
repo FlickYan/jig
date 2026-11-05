@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "node:sqlite";
 
 // The task service's state: tenants and their API keys, tasks, each task's events and the approvals its jig
 // asked for. Two stores keep to
@@ -231,8 +231,6 @@ export interface Store {
   inStatus(status: TaskStatus): Promise<Task[]>;
   /** The tenants with tasks queued, by id. */
   queuedTenants(): Promise<string[]>;
-  /** How many of a tenant's tasks are queued. */
-  queuedCount(tenant: string): Promise<number>;
   /**
    * Moves the tenant's oldest queued task to running, leased to `terms.owner`, unless as many tasks as
    * `terms.concurrency` run already ("full"), or as many of the tenant's as its own ("tenant full"); the
@@ -329,6 +327,8 @@ const MIGRATIONS = [
    CREATE INDEX tasks_by_created ON tasks (tenant, created);`,
   // The replicas up, each until its heartbeat runs out, which the metrics count.
   `CREATE TABLE replicas (id TEXT PRIMARY KEY, seen_until TEXT NOT NULL);`,
+  // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
+  `CREATE INDEX usage_by_day ON usage (day);`,
 ];
 
 type Row = Record<string, unknown>;
@@ -350,6 +350,9 @@ class SqliteStore implements Store {
     try {
       // A fresh checkout has no folder for the file yet.
       if (path !== ":memory:" && path !== "") mkdirSync(dirname(path), { recursive: true });
+      // Loaded here rather than imported, so a service on Postgres doesn't print Node's warning that
+      // SQLite is experimental.
+      const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
       this.db = new DatabaseSync(path);
     } catch (err) {
       throw new Error(`Couldn't open the database ${path}: ${err instanceof Error ? err.message : String(err)}`);
@@ -409,16 +412,22 @@ class SqliteStore implements Store {
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
   createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
   async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
-    if (caps) return this.admit(tenant, spec, caps);
+    return caps ? this.admit(tenant, spec, caps) : this.insert(tenant, spec, new Date());
+  }
+
+  /** Adds the task, created at `created`. */
+  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
     const id = newTaskId(this.region);
     const { prompt, ...rest } = spec;
-    this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), new Date().toISOString());
+    this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), created.toISOString());
     return (await this.task(id))!;
   }
 
   /**
    * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here waits
-   * (createTask inserts before its first await), so no other statement of this process's runs inside it.
+   * (insert inserts before its first await), so no other statement of this process's runs inside it. The
+   * task is created at the caps' `now`, the clock the quotas' days are read from, so it is counted on the
+   * day they say.
    */
   private admit(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal> {
     return this.atomically(() => {
@@ -430,7 +439,7 @@ class SqliteStore implements Store {
         : cap === "usdPerDay" ? one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?", day)
         : one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?", isoDay(monthStart), isoDay(nextMonth)),
       );
-      return refused ? Promise.resolve(refused) : this.createTask(tenant, spec);
+      return refused ? Promise.resolve(refused) : this.insert(tenant, spec, caps.now);
     }, "BEGIN IMMEDIATE");
   }
 
@@ -455,10 +464,6 @@ class SqliteStore implements Store {
   async queuedTenants(): Promise<string[]> {
     const rows = this.db.prepare("SELECT id FROM tenants WHERE EXISTS (SELECT 1 FROM tasks WHERE tasks.tenant = tenants.id AND status = 'queued') ORDER BY id").all() as Row[];
     return rows.map((row) => String(row.id));
-  }
-
-  async queuedCount(tenant: string): Promise<number> {
-    return Number((this.db.prepare("SELECT count(*) AS n FROM tasks WHERE tenant = ? AND status = 'queued'").get(tenant) as Row).n);
   }
 
   async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {

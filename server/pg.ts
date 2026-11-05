@@ -36,7 +36,7 @@ export function parseUrl(url: string): PgConfig {
   if (unknown) throw new Error(`The database URL's ${unknown} isn't one this client knows (sslmode, sslrootcert, options)`);
   const sslmode = query.sslmode ?? "disable";
   // require checks the certificate, as libpq's verify-full does: a TLS connection to anyone is no better than none.
-  if (!["disable", "require", "verify-full"].includes(sslmode)) throw new Error(`sslmode must be disable or require, not ${sslmode}`);
+  if (!["disable", "require", "verify-full"].includes(sslmode)) throw new Error(`sslmode must be disable, require or verify-full (both check the certificate), not ${sslmode}`);
   const user = decodeURIComponent(parsed.username);
   if (!user) throw new Error("The database URL names no user");
   return {
@@ -48,6 +48,18 @@ export function parseUrl(url: string): PgConfig {
     tls: sslmode === "disable" ? false : { ca: query.sslrootcert && readFileSync(query.sslrootcert, "utf8") },
     options: query.options,
   };
+}
+
+/**
+ * The URL with its password hidden, for a message: everything from the user's first ":" to the last "@",
+ * so a password with a raw "/" or "@" in it, which the URL parser misreads, stays out too.
+ */
+export function redactUrl(url: string): string {
+  const start = url.indexOf("://") + 3;
+  const at = url.lastIndexOf("@");
+  const colon = url.indexOf(":", start);
+  if (start < 3 || at < start || colon < 0 || colon > at) return url;
+  return `${url.slice(0, colon)}:***@${url.slice(at + 1)}`;
 }
 
 /** An error the server sent, with its SQLSTATE code. */
@@ -263,8 +275,8 @@ export class Connection extends EventEmitter {
     this.config = config;
   }
 
-  /** Connects, logs in and waits for the server to be ready. */
-  static async connect(config: PgConfig, timeoutMs = 10_000): Promise<Connection> {
+  /** Connects, logs in and waits for the server to be ready; `parameters` are settings for its session. */
+  static async connect(config: PgConfig, timeoutMs = 10_000, parameters: Record<string, string> = {}): Promise<Connection> {
     let socket = netConnect({ host: config.host, port: config.port });
     const timer = setTimeout(() => socket.destroy(new Error(`Couldn't connect to the database at ${config.host}:${config.port} within ${timeoutMs} ms`)), timeoutMs);
     try {
@@ -274,7 +286,7 @@ export class Connection extends EventEmitter {
       // A dead peer is noticed even on a connection that only listens.
       socket.setKeepAlive(true, 10_000);
       const connection = new Connection(socket, config);
-      await connection.startup();
+      await connection.startup(parameters);
       return connection;
     } catch (err) {
       socket.destroy();
@@ -284,7 +296,7 @@ export class Connection extends EventEmitter {
     }
   }
 
-  private startup(): Promise<void> {
+  private startup(settings: Record<string, string>): Promise<void> {
     const { user, password, database, options } = this.config;
     const socket = this.socket;
     socket.on("data", (chunk: Buffer) => this.read(chunk));
@@ -292,6 +304,7 @@ export class Connection extends EventEmitter {
     socket.on("close", () => this.lost());
     return new Promise<void>((done, fail) => {
       let scram: Scram | undefined;
+      let verified = false;
       const closed = () => fail(new Error(`${LOST} while logging in`));
       this.once("close", closed);
       this.starting = (type, body) => {
@@ -306,7 +319,11 @@ export class Connection extends EventEmitter {
         const reader = new In(body);
         const code = reader.i32();
         try {
-          if (code === 0) return; // logged in
+          // Logged in; but a SCRAM login isn't over until the server has proved it knows the password too.
+          if (code === 0) {
+            if (scram && !verified) throw new Error("The database ended the SCRAM login without proving it knows the password");
+            return;
+          }
           if (code === 3) return void socket.write(new Out().str(password).build("p"));
           if (code === 5) return void socket.write(new Out().str(md5Password(user, password, reader.bytes(4))).build("p"));
           if (code === 10) {
@@ -318,14 +335,18 @@ export class Connection extends EventEmitter {
             return void socket.write(new Out().str("SCRAM-SHA-256").i32(first.length).bytes(first).build("p"));
           }
           if (code === 11 && scram) return void socket.write(new Out().bytes(Buffer.from(scram.final(reader.rest().toString("utf8")))).build("p"));
-          if (code === 12 && scram) return scram.verify(reader.rest().toString("utf8"));
+          if (code === 12 && scram) {
+            scram.verify(reader.rest().toString("utf8"));
+            verified = true;
+            return;
+          }
           throw new Error(`The database wants a login this client can't do (authentication ${code})`);
         } catch (err) {
           fail(err);
         }
       };
       // The session's times in UTC and ISO, which the timestamps are decoded from.
-      const parameters = { user, database, client_encoding: "UTF8", TimeZone: "UTC", DateStyle: "ISO, MDY", application_name: "jig", ...(options && { options }) };
+      const parameters = { ...settings, user, database, client_encoding: "UTF8", TimeZone: "UTC", DateStyle: "ISO, MDY", application_name: "jig", ...(options && { options }) };
       const out = new Out().i32(196608);
       for (const [name, value] of Object.entries(parameters)) out.str(name).str(value);
       socket.write(out.str("").build());
@@ -512,6 +533,12 @@ export interface PoolOptions {
   /** How long a query may take before it is cancelled, in milliseconds (default 30 s; 0 for no limit). */
   queryTimeoutMs?: number;
   connectTimeoutMs?: number;
+  /**
+   * How long the server lets a transaction sit idle before it ends the session, in milliseconds (default
+   * twice queryTimeoutMs; 0 for no limit): a client that froze or was cut off mid-transaction lets go of
+   * its locks then, not when the server's TCP keepalive notices, hours later.
+   */
+  idleInTransactionMs?: number;
 }
 
 /** What a transaction's function gets: its connection's queries. */
@@ -534,7 +561,8 @@ export class Pool implements Client {
 
   constructor(url: string | PgConfig, options: PoolOptions = {}) {
     this.config = typeof url === "string" ? parseUrl(url) : url;
-    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs: 30_000, connectTimeoutMs: 10_000, ...options };
+    const queryTimeoutMs = options.queryTimeoutMs ?? 30_000;
+    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs, connectTimeoutMs: 10_000, idleInTransactionMs: 2 * queryTimeoutMs, ...options };
   }
 
   async query(text: string, params: unknown[] = []): Promise<Result> {
@@ -595,7 +623,8 @@ export class Pool implements Client {
   private async connect(): Promise<Connection> {
     this.open++;
     try {
-      return await Connection.connect(this.config, this.options.connectTimeoutMs);
+      const { connectTimeoutMs, idleInTransactionMs } = this.options;
+      return await Connection.connect(this.config, connectTimeoutMs, idleInTransactionMs > 0 ? { idle_in_transaction_session_timeout: String(idleInTransactionMs) } : {});
     } catch (err) {
       this.open--;
       throw err;

@@ -54,8 +54,14 @@ program and first arguments that start jig: this checkout's `src/cli.ts` by defa
 the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
 event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
-service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type) is
-refused at the start, with the field and what is wrong with it.
+service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
+runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
+`leaseSeconds` over 86,400, `heartbeatSeconds` over 3,600, a tenant's `timeLimit` or `approvalTimeout`
+over 2,000,000) is refused at the start, with the field and what is wrong with it, before the database is
+changed. The listeners are up before any queued task starts, so a port that is taken stops the start with
+nothing run. The config's paths are `database`, `dataDir` and those of `jig`'s entries that start with `./` or
+`../` (a program's name, or an absolute path, is used as it is). A tenant's `concurrency` 0 holds its tasks
+queued.
 
 ### The API
 
@@ -89,10 +95,9 @@ Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file'
 through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
 character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
-quotas (below). A cancel answers 200 for
-a queued task (it is cancelled at once), 202 for a running one (its jig and everything it started are
-killed, and the task ends `cancelled`) and 409 for one that has ended. A stream sends a comment every
-`heartbeatSeconds`, so proxies don't close it.
+quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
+(its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
+ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it.
 
 A task is `queued`, then `running`, then one of:
 
@@ -104,9 +109,10 @@ A task is `queued`, then `running`, then one of:
 | `cancelled` | cancelled through the API |
 | `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, or the service stopping while it ran |
 
-`stop` is how jig's run ended, from its `end` event (or its exit code, without one), and `usage` and `cost`
-come from that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is
-stored as U+FFFD.
+`stop` is how jig's run ended, from its `end` event (or its exit code, without one; a run stopped by a
+cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
+that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
+U+FFFD.
 
 ### Scheduling
 
@@ -124,10 +130,12 @@ replica (it crashed, was killed, or lost the database) and is marked `error` by 
 first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`.
-The replica that ends a crashed one's task stops what its runner can reach of the run (a Kubernetes Job, or
-a Docker container on its own daemon, below), which would otherwise go on spending; a local run a crashed
-service started can outlive it, until jig's own `--time-limit` stops it.
+out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
+the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
+for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
+reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
+go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
+it.
 
 ### Several replicas, on Postgres
 
@@ -146,10 +154,13 @@ tenants is each replica's own. A run's events are stored and announced (`NOTIFY 
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
-and it connects again. A replica that crashes leaves its runs going until another ends its tasks as
-`error`, once their leases run out, and stops their Jobs or containers (above); the others go on. SQLite
-takes several processes on one machine too, with no announcements: streams read it every second, and a
-cancel is found as leases are renewed.
+and it connects again. Each connection asks the server to end a transaction left idle for over a minute
+(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
+lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
+replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
+out, and stops their Jobs or containers (above); the others go on. SQLite takes several processes on one
+machine too, with no announcements: streams read it every second, and a cancel is found as leases are
+renewed.
 
 ### Approvals
 
@@ -176,10 +187,10 @@ has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer 
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
 `timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
-it times out as a deny. The answer jig is given is always the API's, though: on Docker and Kubernetes a
-task's commands can write its events, so the record of how jig acted is only as good as they are. An
-`approval` event that says the API answered when it didn't, or answered otherwise, is left out of the
-record (and logged), and a timeout is only ever a deny.
+it times out as a deny. The answer jig is given is always the API's, though: on every runner (on the
+local one when `dataDir` is in a temp folder) a task's commands can write its events, so the record of how
+jig acted is only as good as they are. An `approval` event that says the API answered when it didn't, or
+answered otherwise, is left out of the record (and logged), and a timeout is only ever a deny.
 
 jig waits on a second listener, `internal` (`{"host", "port"}`, 127.0.0.1:8082 by default), which serves
 only `GET /internal/approvals/<id>?wait=<seconds>` and `GET /healthz`. Its Bearer is the task's gateway
@@ -214,15 +225,18 @@ lock of the tenant's (Postgres's, or SQLite's write lock), so replicas can't bot
 task of the day; `maxQueued` is counted the same way. The USD quotas count only tasks that have ended, so
 the tasks running when one is reached can take the tenant past it by what they spend: the service only
 refuses new tasks, and spending is held as it happens by the gateway, which sees every model call (each
-task's `budgetUsd`, and its own limits, below).
+task's `budgetUsd`, and its own limits, below). And the ledger they add up holds only what the runs said
+they spent (below): a run killed or lost counts 0, and one whose commands forged its `end` event counts
+what that says. The gateway's own quotas (`dailyUsd`, `monthlyUsd`) and budgets are the hard limit.
 
 Each task that ends, however it ends (a cancel before it started, or a replica lost, too), writes a row of
 the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, `task`, `day` (the UTC day it
 ended, `YYYY-MM-DD`), `model`, `status`, `input`, `output`, `cache_read`, `cache_write`, `cost_usd` and
 `seconds` (from its start to its end; 0 if it never started). The tokens and cost are those of jig's `end`
 event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, and on
-Docker and Kubernetes a task's commands can write that event, so for what a tenant must pay the gateway's
-counts are the record. Tasks that ended before the ledger came have no row.
+every runner (on the local one when `dataDir` is in a temp folder) a task's commands can write that event,
+so for what a tenant must pay the gateway's counts are the record. Tasks that ended before the ledger came
+have no row.
 
 ```bash
 # The tenant's own usage, by UTC day, model or both (day,model), over from..to (both included; this month
@@ -237,9 +251,12 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -
 ```
 
 Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
-that isn't one is a 400. `/admin/usage` is there only with `adminKeyEnv` in the config, the environment
-variable that holds the admin key (which must be set); without it every `/admin` route is a 404. To bill a
-month, take the admin's CSV of it by model once it is over, or read the `usage` table, by `(tenant, day)`.
+that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
+the config, the environment variable that holds the admin key (which must be set, and may hold no
+whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
+`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
+month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
+them down by model or to check them against.
 
 ### Metrics and logs
 
@@ -262,11 +279,13 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
 The counters and histograms are the replica's own, a task counted by the replica that ended it (that
-started it, for its queue's seconds), so their sum over the replicas is the service's. The last two rows are
-read from the store at a scrape, at most every 5 seconds however many scrape, and are the whole store's: on
-Postgres each replica gives the same numbers, so take their max, not their sum. A replica is up while its
-heartbeat in the store, written every third of `leaseSeconds`, holds: it is forgotten as it stops, or a
-lease's length after it crashed.
+started it, for its queue's seconds), so their sum over the replicas is the service's. Queued tasks
+cancelled at the start because their tenant left the config aren't counted in
+`jig_service_tasks_ended_total`; the service logs how many. The last two rows are read from the store at
+a scrape, at most every 5 seconds however many scrape, and are the whole store's: on Postgres each
+replica gives the same numbers, so take their max, not their sum. A replica is up while its heartbeat in
+the store, written every third of `leaseSeconds`, holds: it is forgotten as it stops, or a lease's length
+after it crashed.
 
 Every response, from each listener, carries `x-request-id`: the client's, if it sent one of at most 128
 letters, digits, `_`, `.` and `-`, or else one of the service's own. It isn't passed to the runs. The
@@ -291,9 +310,9 @@ reach those ports (the tenants' API from anywhere, the internal listener and the
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
 there, or the repository cloned with `--depth 1`, no hooks and only `gitProtocols`), `home/`, its `HOME`
-and `JIG_HOME`, and beside them, outside the project where its commands can't write, the events and stats
-files and `output.log`, what jig printed. The folder is removed once the task has ended and its outcome
-is stored (unless `keepTaskDirs`), as the Docker runner's is. jig runs as
+and `JIG_HOME`, and beside them, outside the project, the events and stats files and `output.log`, what
+jig printed. The folder is removed once the task has ended and its outcome is stored (unless
+`keepTaskDirs`), as the Docker runner's is. jig runs as
 
 ```
 jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
@@ -308,6 +327,12 @@ environment is the service's `PATH`, `LANG`, `LC_ALL`, `TZ` and `TMPDIR`, and as
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
+
+The local runner is for one trusted tenant, or for development. jig's sandbox lets a task's commands read
+the whole machine, other tasks' folders and the database among them, and write the temp folders (`/tmp`,
+`/var/tmp` and `$TMPDIR`): with `dataDir` or the database there, they can write their own events (the
+`end` event's usage and cost, which go in the ledger) and the database too. The service warns at the start
+when the local runner serves several tenants, or has `dataDir` or the database in a temp folder.
 
 ### The Docker runner
 
@@ -431,7 +456,8 @@ Kubernetes the worker makes it, and the events come in the pod's log, its Job gi
 (from now) and labels with a merge patch (the Role in `deploy/k8s/rbac.yaml` allows `patch` on Jobs).
 With none waiting the task starts cold, as before, and the pool is filled behind it. A miss is logged,
 with the pool's idle workers, hits and misses so far; a worker that went away before it was given the
-task counts as a miss too, its task starting cold.
+task counts as a miss too, its task starting cold. `size` is at most the replica's `concurrency`: a
+replica never runs more tasks at once, so a worker past it would never be used.
 
 A task run on a warm worker keeps the worker's names: on Docker the container `jig-pool_<hex>`, with only
 the `jig.pool` label, and the folder `dataDir/tasks/pool_<hex>`; on Kubernetes the Job `jig-pool-<hex>`,
@@ -457,7 +483,7 @@ send TCP keepalives on, so one whose other end's node died breaks rather than st
 is that replica's internal listener as its workers reach it, the service's `internalBaseUrl` by default; on
 Kubernetes that is a Service in front of every replica, so each replica takes its pod's own address from
 `JIG_POOL_BASE_URL`, which `deploy/k8s/api.yaml` sets (`http://$(POD_IP):8082`) and which takes the
-config's place.
+config's place; an IPv6 address there is put in brackets.
 
 ## Events
 
@@ -552,7 +578,9 @@ within its tenant. `GET /usage?tenant=<id>&from=YYYY-MM-DD&to=YYYY-MM-DD`, to th
 tenant's spending by UTC day, for billing: `{tenant, from, to, days: [{day, requests, input, output,
 cacheRead, cacheWrite, costUsd}], total}`, both days in, the days with nothing spent left out. A range is
 366 days at most, and a day that isn't one (`2026-02-30`), or `from` after `to`, is a 400; days are kept
-35 days (below), so an older one reads as nothing spent.
+35 days (below), so an older one reads as nothing spent. On Kubernetes only the pods in the `jig`
+namespace reach the gateway's port (`deploy/k8s/networkpolicy.yaml`), so a billing job runs there, or
+gets a rule of its own in the `jig-gateway` policy.
 
 **Limits.** Each tenant has a rate (`requestsPerMinute`, a token bucket refilled continuously, holding
 `burst` requests, by default a minute's worth) and a number of requests in flight (`concurrent`, a
@@ -806,3 +834,7 @@ sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its 
 as a lone gateway's restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one
 gateway, with a Redis that keeps its data in a volume, so a restart of either forgets nothing.
+
+Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sha256sum`) in place of the
+placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
+refuses to start with it.

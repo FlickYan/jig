@@ -164,6 +164,8 @@ export class Webhooks {
   private retryMs: number;
   private pending = new Set<AbortController>();
   private log: Log;
+  /** Set by close: a run still draining as the service stops may ask after it, and is posted nothing. */
+  private closed = false;
 
   /** `log` is where a webhook that keeps failing is said (the service's). */
   constructor(hooks: Map<string, Webhook>, retryMs = 1000, log = createLog("service")) {
@@ -174,7 +176,7 @@ export class Webhooks {
 
   send(task: Task, approval: Approval): void {
     const hook = this.hooks.get(task.tenant);
-    if (!hook) return;
+    if (!hook || this.closed) return;
     const body = JSON.stringify({ task: task.id, approval });
     const headers = { "content-type": "application/json", "x-jig-signature": `sha256=${createHmac("sha256", hook.secret).update(body).digest("hex")}` };
     const stop = new AbortController();
@@ -197,8 +199,9 @@ export class Webhooks {
     })().finally(() => this.pending.delete(stop));
   }
 
-  /** Stops the POSTs still being tried. */
+  /** Stops the POSTs still being tried, and sends no more. */
   close(): void {
+    this.closed = true;
     for (const stop of this.pending) stop.abort();
   }
 }

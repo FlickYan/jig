@@ -53,7 +53,8 @@ spec:
                   name: jig-database
                   key: url
             # A warm worker claims its task from the replica that started it, at this pod's own address
-            # rather than the Service in front of both (docs/server.md, Warm pools).
+            # rather than the Service in front of both (docs/server.md, Warm pools). An IPv6 POD_IP comes
+            # without brackets; the service adds them.
             - name: POD_IP
               valueFrom:
                 fieldRef:

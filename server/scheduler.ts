@@ -67,6 +67,8 @@ export class Scheduler {
   private ticking: Promise<void> | undefined;
   private again = false;
   private closed = false;
+  /** Set once the service starts to stop: no task is claimed from then on. */
+  private paused = false;
   /** The tenant that got the last slot: the next round starts after it. */
   private lastTenant = "";
   private timer?: NodeJS.Timeout;
@@ -161,9 +163,14 @@ export class Scheduler {
       this.abandoning.add(abandoned);
       void abandoned.finally(() => this.abandoning.delete(abandoned));
     }
-    // Rare (a replica is gone), so each is read again for its tenant and start, to be counted.
+    // Rare (a replica is gone), so each is read again for its tenant and start, to be counted. They are
+    // ended already: one that can't be read goes uncounted, and the rest are counted all the same.
     for (const id of expired) {
-      const task = await this.store.task(id);
+      const task = await this.store.task(id).catch((err: unknown) => {
+        this.metrics.storeErrors.inc();
+        this.log.error("couldn't read an expired task to count it", { task: id, err });
+        return undefined;
+      });
       if (task) this.ended(task, "error", task.started && task.ended ? Date.parse(task.ended) - Date.parse(task.started) : undefined);
     }
     return expired;
@@ -224,11 +231,21 @@ export class Scheduler {
     return (await this.store.task(task.id))!.status;
   }
 
+  /**
+   * Claims no more tasks, while the runs going on go on (their leases renewed): what is queued, or posted
+   * meanwhile, stays queued for another replica or the next start.
+   */
+  pause(): void {
+    this.paused = true;
+  }
+
   /** Stops every run, marking it an error, and starts no more. */
   async close(): Promise<void> {
-    this.closed = true;
+    this.closed = this.paused = true;
     clearInterval(this.timer);
     this.store.changes.off("cancel", this.cancelled);
+    // A claim in flight starts its run: that one is stopped with the rest.
+    await this.ticking;
     for (const run of this.runs.values()) {
       run.stopping ??= "shutdown";
       run.handle?.cancel();
@@ -250,7 +267,7 @@ export class Scheduler {
   // whose turn it is, never reading the whole queue: a poke must stay cheap however much one tenant has
   // queued.
   private async fill(): Promise<void> {
-    if (this.runs.size >= this.concurrency) return;
+    if (this.paused || this.runs.size >= this.concurrency) return;
     // The tenants in order, from the one after the last to get a slot.
     const ids = await this.store.queuedTenants();
     const order = [...ids.filter((id) => id > this.lastTenant), ...ids.filter((id) => id <= this.lastTenant)];
@@ -258,10 +275,10 @@ export class Scheduler {
     for (const id of order) tenants.set(id, await this.store.tenant(id));
     /** Tenants whose queue has run dry, or that are at their cap. */
     const done = new Set<string>();
-    for (let progress = true; progress && this.runs.size < this.concurrency && !this.closed; ) {
+    for (let progress = true; progress && this.runs.size < this.concurrency && !this.paused; ) {
       progress = false;
       for (const id of order) {
-        if (this.runs.size >= this.concurrency || this.closed) break;
+        if (this.runs.size >= this.concurrency || this.paused) break;
         const tenant = tenants.get(id);
         if (!tenant || done.has(id) || this.running(id) >= tenant.limits.concurrency) continue;
         const terms = { owner: this.replicaId, leaseMs: this.leaseMs, concurrency: this.concurrency, tenantConcurrency: tenant.limits.concurrency };
@@ -387,7 +404,8 @@ export class Scheduler {
 export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"]): Outcome {
   const status = stopping === "shutdown" || stopping === "lost" ? "error" : stopping === "cancelled" ? "cancelled" : failure ? "error" : statusFor(exit!);
   const exitCode = exit?.exitCode ?? null;
-  const stop = typeof end?.stop === "string" ? end.stop : exit?.timedOut ? "time_limit" : exit ? stopFor(exitCode) : null;
+  // A run that was stopped and wrote no end of its own (jig, sent SIGTERM, exits 143 without one) was interrupted.
+  const stop = typeof end?.stop === "string" ? end.stop : stopping ? "interrupted" : exit?.timedOut ? "time_limit" : exit ? stopFor(exitCode) : null;
   const error =
     stopping === "shutdown" ? SHUTDOWN : stopping === "lost" ? LOST : failure ?? (status === "error" ? `jig exited with ${exitCode ?? "a signal"}${exit?.message ? `: ${exit.message}` : ""}` : null);
   return {
