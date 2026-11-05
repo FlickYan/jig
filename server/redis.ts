@@ -8,7 +8,7 @@
 //   redis://[[username]:password@]host[:port][/db], or rediss:// for TLS
 
 import { createHash } from "node:crypto";
-import { connect as netConnect, type Socket } from "node:net";
+import { connect as netConnect, isIP, type Socket } from "node:net";
 import { connect as tlsConnect } from "node:tls";
 
 /** An error reply from Redis: its text, as Redis gave it ("ERR ...", "NOSCRIPT ...", "WRONGPASS ..."). */
@@ -107,6 +107,8 @@ export interface RedisOptions {
   timeoutMs?: number;
   /** A message on a channel this client subscribed to. */
   onMessage?(channel: string, message: string): void;
+  /** For rediss://, the certificate authorities to trust in place of Node's own (PEM). */
+  ca?: string;
 }
 
 interface Pending {
@@ -123,6 +125,7 @@ export class Redis {
   private readonly url: RedisUrl;
   private readonly timeoutMs: number;
   private readonly onMessage?: (channel: string, message: string) => void;
+  private readonly ca?: string;
   private state: "idle" | "connecting" | "ready" | "down" | "closed" = "idle";
   private socket?: Socket;
   private buffer: Buffer = Buffer.alloc(0);
@@ -139,6 +142,7 @@ export class Redis {
     this.url = parseRedisUrl(url);
     this.timeoutMs = options.timeoutMs ?? 2000;
     this.onMessage = options.onMessage;
+    this.ca = options.ca;
   }
 
   /** Sends a command; resolves with its reply, or rejects with a RedisError reply or a connection's failure. */
@@ -189,7 +193,9 @@ export class Redis {
   private connect(): void {
     this.state = "connecting";
     const { host, port, tls } = this.url;
-    const socket = tls ? tlsConnect({ host, port, servername: host }) : netConnect({ host, port });
+    // The certificate is checked against the host either way; an address as the server name is against
+    // RFC 6066, and Node warns of it.
+    const socket = tls ? tlsConnect({ host, port, servername: isIP(host) ? undefined : host, ca: this.ca }) : netConnect({ host, port });
     this.socket = socket;
     socket.setNoDelay(true);
     socket.on(tls ? "secureConnect" : "connect", () => this.handshake(socket));

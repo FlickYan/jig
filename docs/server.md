@@ -562,7 +562,7 @@ task of every tenant fails at once, and jig's few retries help against a blip, n
   { "name": "deepseek", "baseUrl": "https://api.deepseek.com/anthropic", "keyEnv": ["DEEPSEEK_API_KEY"],
     "models": { "deepseek-flash": "deepseek-flash", "deepseek-v4-pro": "deepseek-v4-pro" } }
 ],
-"failover": { "firstByteMs": 60000, "failures": 5, "openMs": 30000 }
+"failover": { "firstByteMs": 60000, "idleMs": 120000, "failures": 5, "openMs": 30000 }
 ```
 
 `name` (`a-z`, `0-9` and `-`, 32 at most, each its own) is what the reply's `x-jig-upstream` header,
@@ -578,7 +578,10 @@ sends no reply's headers within `firstByteMs`, answers 500, 502, 503, 504 or 529
 with no key of its pool left to try, or has every key refused; all of these before any of a reply has
 gone to jig. A reply that breaks off once it streams is jig's to retry, as with one upstream, since what
 jig has seen can't be taken back; and a 400, 404, 413 or other 4xx goes back as it came, since a bad
-request is bad everywhere. The body is already held in memory, so it can be sent again. When every
+request is bad everywhere. A reply that has started and then sends nothing for `idleMs` (120 seconds; a
+stream's pings count) is broken off the same way, one upstream or several, so a provider that stalls on a
+live connection can't hold the request and its slot for as long as jig would wait. The body is already
+held in memory, so it can be sent again. When every
 upstream fails, the last failed reply goes back as it came (a 429 with its `retry-after`), or 503
 (`overloaded_error`) if none answered.
 
@@ -642,15 +645,17 @@ behind one Service act as one gateway, and a restart forgets nothing:
 ```
 
 `redis` is `redis://[[username]:password@]host:port[/db]` (`rediss://` for TLS); `server/redis.ts` is a
-small client of its own, with no dependency. Each check and change is one Lua script, run atomically by
+small client of its own, with no dependency. It must be a single Redis (a primary, with replicas for
+failover if you like), not Redis Cluster or a managed Redis in cluster mode: each script works on several
+keys, which a cluster refuses across slots, and `server/redis.ts` does not follow cluster redirects. Each check and change is one Lua script, run atomically by
 Redis on its own clock. A tenant's and the global rate buckets and requests in flight hold across all
 replicas; a request in flight is a lease that its gateway renews every `leaseMs`/3 while the reply goes
-on, so the slots of a replica that died come back within `leaseMs` (60 seconds). The queue that takes the
+on, so the slots of a replica that died come back within `leaseMs` (60 seconds; 100 ms at least). The queue that takes the
 tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
 the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
 week after its token expires, a tenant's day for 35 days and its month for 400 (a hash each,
 `<prefix>day:<tenant>:<YYYY-MM-DD>` and `<prefix>month:<tenant>:<YYYY-MM>`, added to in the same script); a key the provider refused or rate-limited is
-passed over by every replica (Redis has its SHA-256, never the key), a rate-limited one until its rest is
+passed over by every replica (Redis has only a hash of it, never the key), a rate-limited one until its rest is
 over, and a refused one for a day after it was last refused, restarts or not. Each key's mark is its own
 Redis key, `<prefix>key:<id>`, `id` being the first 16 hex digits of the key's SHA-256. To have the
 replicas try a key you put right before the day is over, delete its mark:
@@ -662,7 +667,10 @@ When Redis can't be reached (a command waits 2 seconds at most), `onStateError` 
 `closed`, the default, answers each request 503 with `retry-after: 1` (jig's SDK tries again), and the
 spending of replies still in flight goes uncounted; `open` goes on with this replica's own limits and
 counts until Redis is back, so for that while each replica holds a tenant to its limits alone, and budgets
-and quotas count only what went through it. Either way the gateway says so once on stderr and counts each failure in
+and quotas count only what went through that replica during the outage: each replica starts from nothing,
+so a task that had already spent its budget can spend it again on each replica, and what is spent while
+Redis is down is never written to Redis, so it is missing from `/usage` and from the billing days once
+Redis is back. Choose `open` only where availability matters more than holding budgets and billing exactly. Either way the gateway says so once on stderr and counts each failure in
 `jig_gateway_state_errors_total`.
 
 ## Several regions
@@ -746,6 +754,6 @@ the service's config; the gateway's config (`jig-gateway-config`) is beside the 
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
 are yours to make. The service runs two replicas on that database. The gateway runs two replicas too,
 sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts,
-as a lone gateway's restart would. For spending that must last, use a managed Redis instead, or give that
+as a lone gateway's restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one
 gateway, with a Redis that keeps its data in a volume, so a restart of either forgets nothing.

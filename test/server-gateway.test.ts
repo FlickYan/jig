@@ -320,6 +320,41 @@ describe("the gateway", () => {
     assert.deepEqual([spent.requests, spent.usage.input, spent.usage.output], [1, 10, 1]);
   });
 
+  it("breaks off a reply the provider stops sending, once nothing has come for idleMs", async () => {
+    // The provider sends its first event, 10 tokens in, then nothing, with the connection left open.
+    const reply = messagesReply([{ text: "Done." }]);
+    const provider = await fakeProvider((_, res) => {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(reply.slice(0, reply.indexOf("\n\n") + 2));
+    });
+    const gw = await gateway(provider.url, { failover: { idleMs: 200 } });
+    const response = await ask(gw, token({ task: "stalled" }));
+    assert.equal(response.status, 200);
+    let timer: NodeJS.Timeout | undefined;
+    const hung = new Promise<string>((done) => (timer = setTimeout(() => done("hung"), 3000)));
+    const outcome = await Promise.race([response.text().then(() => "ended", () => "broke off"), hung]).finally(() => clearTimeout(timer));
+    assert.equal(outcome, "broke off");
+    await until(async () => (await metric(gw, 'jig_gateway_inflight{tenant="acme"}')) === 0, "the request to give back its slot");
+    const spent = await (await fetch(`${gw.url}/usage/stalled`, { headers: { "x-api-key": token({ task: "stalled" }) } })).json();
+    assert.deepEqual([spent.requests, spent.usage.input], [1, 10]);
+  });
+
+  it("ends jig's reply only once it is counted, so the task's next request sees it", async () => {
+    // Counting that takes a while, as a write to Redis can.
+    const spend = MemoryState.prototype.spend;
+    MemoryState.prototype.spend = async function (this: MemoryState, ...args: Parameters<MemoryState["spend"]>) {
+      await new Promise((done) => setTimeout(done, 300));
+      return spend.apply(this, args);
+    };
+    closing.push(() => (MemoryState.prototype.spend = spend));
+    const provider = await fakeProvider();
+    const gw = await gateway(provider.url);
+    const credential = token({ task: "late" });
+    await (await ask(gw, credential)).text();
+    const spent = await (await fetch(`${gw.url}/usage/late`, { headers: { "x-api-key": credential } })).json();
+    assert.equal(spent.requests, 1);
+  });
+
   it("answers 402 once a task has spent its budget", async () => {
     const provider = await fakeProvider();
     const gw = await gateway(provider.url);
@@ -328,7 +363,10 @@ describe("the gateway", () => {
     assert.deepEqual([(await ask(gw, credential)).status, (await ask(gw, credential)).status], [200, 200]);
     const over = await ask(gw, credential);
     assert.equal(over.status, 402);
-    assert.equal((await over.json()).error.type, "billing_error");
+    const { error } = await over.json();
+    assert.equal(error.type, "billing_error");
+    // What it spent, not rounded down to look like the budget.
+    assert.match(error.message, /\$0\.00014 of \$0\.0001\b/);
     assert.equal(provider.seen.length, 2);
     // Another task of the tenant has its own budget, and so has another tenant's task of the same id.
     assert.equal((await ask(gw, token({ task: "fresh", budgetUsd: 0.0001 }))).status, 200);
@@ -355,7 +393,7 @@ describe("the gateway", () => {
     assert.equal(over.status, 402);
     const { error } = await over.json();
     assert.equal(error.type, "billing_error");
-    assert.equal(error.message, "This tenant has spent its daily quota: $0.0001 of $0.0001 today (UTC). It resets at 2026-11-30T00:00:00Z.");
+    assert.equal(error.message, "This tenant has spent its daily quota: $0.00014 of $0.0001 today (UTC). It resets at 2026-11-30T00:00:00Z.");
     assert.equal(over.headers.get("retry-after"), String(12 * 60 * 60));
     assert.equal(provider.seen.length, 2);
     // A tenant without quotas goes on as before; the next day, the daily one does too.
@@ -370,7 +408,7 @@ describe("the gateway", () => {
     assert.deepEqual([await outcome(as("monthly")), await outcome(as("monthly"))], [[200, null], [200, null]]);
     const month = await as("monthly");
     assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(6 * 60 * 60)]);
-    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month \(UTC\)\. It resets at 2026-12-01T00:00:00Z\./);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.00021 of \$0\.0002 this month \(UTC\)\. It resets at 2026-12-01T00:00:00Z\./);
     time.set(Date.UTC(2026, 11, 1));
     assert.deepEqual(await outcome(as("monthly")), [200, null]);
     // With both spent, the month's is the one to wait for.
@@ -953,6 +991,34 @@ describe("the gateway without its Redis", () => {
   it("says what is wrong with its state's config before it starts", async () => {
     await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "http://cache:6379" } }), /state.redis must be a Redis URL/);
     await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", onStateError: "maybe" as "open" } }), /onStateError/);
+    // A lease of 0 or less would end as it is taken, which turns the concurrency limits off.
+    for (const leaseMs of [0, -1, 1.5, "x"]) {
+      await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", leaseMs: leaseMs as number } }), /state.leaseMs/, String(leaseMs));
+    }
+    await assert.rejects(gateway("http://127.0.0.1:9", { state: { redis: "redis://cache", prefix: 5 as unknown as string } }), /state.prefix/);
+  });
+
+  it("lets go of its Redis when it can't listen, so a program that started it can end", async () => {
+    // A stand-in Redis that keeps every connection it is given, and a port already taken.
+    const open = new Set<Socket>();
+    const accepted: Socket[] = [];
+    const fake = createTcpServer((socket) => {
+      accepted.push(socket);
+      open.add(socket);
+      socket.on("error", () => {}).on("close", () => open.delete(socket));
+    });
+    await new Promise<void>((done) => fake.listen(0, "127.0.0.1", done));
+    closing.push(() => (accepted.forEach((socket) => socket.destroy()), new Promise((done) => fake.close(done))));
+    const taken = createServer();
+    await new Promise<void>((done) => taken.listen(0, "127.0.0.1", done));
+    closing.push(() => new Promise((done) => taken.close(done)));
+    const redis = `redis://127.0.0.1:${(fake.address() as AddressInfo).port}`;
+    await assert.rejects(gateway("http://127.0.0.1:9", { listen: { port: (taken.address() as AddressInfo).port }, state: { redis } }), /EADDRINUSE/);
+    // Its subscriber may still be connecting: give it the time to, then every connection must go.
+    await new Promise((done) => setTimeout(done, 200));
+    const start = Date.now();
+    await until(() => open.size === 0, "the gateway's connections to Redis to close");
+    assert.ok(Date.now() - start < 1000, `closed within a second (${Date.now() - start} ms)`);
   });
 });
 
@@ -1000,6 +1066,33 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     const [c, d] = [await gateway(provider.url, { state, limits: limited }), await gateway(provider.url, { state, limits: limited })];
     const statuses = await Promise.all([c, d, c].map(async (gw) => (await ask(gw, token({ tenant: "slow" }))).status));
     assert.deepEqual(statuses.sort(), [200, 200, 429]);
+  });
+
+  it("holds all tenants together to the global concurrency across two gateways", async () => {
+    const provider = await slowProvider(100);
+    const state = { redis: REDIS!, prefix: prefix() };
+    const limits = { maxWaitMs: 10_000, concurrent: 2 };
+    const [a, b] = [await gateway(provider.url, { state, limits }), await gateway(provider.url, { state, limits })];
+    // Each tenant's requests go through both gateways.
+    const responses = await Promise.all(Array.from({ length: 8 }, (_, i) => ask(i % 2 ? a : b, token({ tenant: i % 4 < 2 ? "acme" : "rival" }), `r${i}`)));
+    assert.deepEqual(responses.map((r) => r.status), Array(8).fill(200));
+    assert.equal(provider.most(), 2, "never more than 2 upstream at once, of both tenants, through both");
+  });
+
+  it("tells the other gateways at once when a slot is given back", async () => {
+    // Two states on one prefix, with no Limiter to poll: only the message on the channel is heard.
+    const shared = prefix();
+    const [a, b] = [new RedisState(REDIS!, { prefix: shared }), new RedisState(REDIS!, { prefix: shared })];
+    closing.push(() => (a.close(), b.close()));
+    let heard = 0;
+    a.onRelease(() => heard++);
+    const start = Date.now();
+    // Given back again until it is heard, as a's subscription may not be in place for the first.
+    await until(async () => {
+      await b.release("acme", "x");
+      return heard > 0;
+    }, "a to hear b give back a slot");
+    assert.ok(Date.now() - start < 1000, `heard within a second (${Date.now() - start} ms)`);
   });
 
   it("counts a task's spending once for all gateways, and keeps it through a restart", async () => {
@@ -1151,7 +1244,7 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     assert.deepEqual([await outcome(as(b, "monthly")), await outcome(as(a, "monthly")), await outcome(as(b, "daily"))], [[200, null], [200, null], [200, null]]);
     const month = await as(a, "monthly");
     assert.deepEqual([month.status, month.headers.get("retry-after")], [402, String(12 * 60 * 60)]);
-    assert.match((await month.json()).error.message, /monthly quota: \$0\.0002 of \$0\.0002 this month/);
+    assert.match((await month.json()).error.message, /monthly quota: \$0\.00021 of \$0\.0002 this month/);
     time.set(last + 12 * HOUR_MS);
     assert.deepEqual(await outcome(as(b, "monthly")), [200, null]);
 
