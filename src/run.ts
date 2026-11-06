@@ -424,7 +424,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   let researchTools = researchFrom(extensions);
   const metered = (callModel: CallModel, subagent = false, share?: Share) => {
     const counted = stats?.meter(callModel, { subagent, share }) ?? callModel;
-    return events?.meter(counted, share?.model ?? model) ?? counted;
+    // Those of a subagent or the reviewer are no step's: the events say whose they are.
+    return events?.meter(counted, share?.model ?? model, subagent ? (share?.kind === "reviewed" ? "review" : "subagent") : undefined) ?? counted;
   };
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });

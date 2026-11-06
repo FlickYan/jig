@@ -10,7 +10,7 @@ import type { AgentUI } from "../src/agent.ts";
 import { withContext } from "../src/context.ts";
 import { type Event as Written, Events, FLUSH_SECONDS, type Io, Lines } from "../src/events.ts";
 import type { CallModel } from "../src/model.ts";
-import { type FakeApi, fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
+import { type FakeApi, fakeMessagesApi, messagesReply, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // --events: the JSON lines a backend reads to follow a one-shot task, in place of the terminal's output.
@@ -111,12 +111,12 @@ describe("--events", () => {
       const steps = await runJig(["--model", "claude-haiku-4-5", "--no-sandbox", "--yes", "--max-steps", "1", "--events", file, "Fix the parser."], { api, cwd: project });
       assert.equal(steps.code, 2, steps.output);
       const events = await read();
-      assert.deepEqual(types(events), ["start", "step", "tool_call", "tool_result", "notice", "text", "notice", "end"]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "tool_result", "notice", "call", "text", "notice", "end"]);
       assert.deepEqual(
         ofType(events, "notice").map((event) => event.text),
         ["Out of steps: asking the model where the work stands.", "Stopped after 1 steps (raise the limit with --max-steps)."],
       );
-      assert.deepEqual([events[5].step, events[5].text], [1, "Listed the files; the fix is left."]);
+      assert.deepEqual([events[6].step, events[6].text], [1, "Listed the files; the fix is left."]);
       const end = events.at(-1)!;
       // A model without a price has no cost.
       assert.deepEqual([end.stop, end.exitCode, end.steps, end.cost, (end.usage as { input: number }).input], ["max_steps", 2, 1, null, 20]);
@@ -499,6 +499,94 @@ describe("--events", () => {
     }
   });
 
+  it("with -, on SIGTERM while it waits for a slow reader at a normal end, exits with the end's code within 60 s", async () => {
+    // A reader that takes 4 KiB every half second never leaves jig 5 s without progress: at a normal end jig
+    // waited for it to take everything, minutes here, and the SIGTERM's handler ran only after that.
+    const long = "All work and no play. ".repeat(80_000);
+    let waiting!: () => void;
+    const second = new Promise<void>((done) => (waiting = done));
+    const api = await fakeMessagesApi((request) => {
+      if ((request.messages as unknown[]).length === 1) return [{ text: long }, { tool: "glob", input: { pattern: "*" } }];
+      waiting();
+      return [{ text: "Done." }];
+    });
+    const reader = spawn(process.execPath, ["-e", SLOW_READER], { stdio: ["pipe", "ignore", "ignore"] });
+    const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+    const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1" };
+    const child = spawn(process.execPath, [cli, ...args, "--events", "-", "Fix the parser."], { cwd: project, env, stdio: ["ignore", reader.stdin, "pipe"] });
+    reader.stdin.destroy(); // jig holds the pipe's end now
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 80_000);
+    try {
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+      await Promise.race([second, exited]);
+      const asked = Date.now();
+      await new Promise((done) => setTimeout(done, 1_500));
+      child.kill("SIGTERM");
+      assert.equal(await exited, 0, stderr.slice(-1_000));
+      const took = Date.now() - asked;
+      assert.ok(took >= 59_000 && took < 66_000, `exited ${took} ms after the last request`);
+      // What it said last may still be on its way when it has exited.
+      if (child.stderr.readable) await new Promise((done) => child.stderr.on("close", done));
+      assert.match(stderr.slice(-1_000), /The --events reader didn't take them all in the 60 s jig gives it at a normal end: \d+ events? (weren't|wasn't) written\./);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      reader.kill("SIGKILL");
+      api.close();
+    }
+  });
+
+  it("writes each model call that isn't a step's as a call, so the steps' and the calls' costs and tokens add up to the end's", async () => {
+    // The end counted the wrap-up, subagents, compaction and the reviewer, the steps only the loop's own calls.
+    const sumsUp = (events: Event[]) => {
+      const parts = events.filter((event) => event.type === "step" || event.type === "call");
+      const end = events.at(-1)!;
+      const usage = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 };
+      for (const part of parts) for (const key of Object.keys(usage) as (keyof typeof usage)[]) usage[key] += (part.usage as typeof usage)[key];
+      assert.deepEqual(usage, end.usage);
+      const cost = parts.reduce((sum, part) => sum + (part.cost as number), 0);
+      assert.ok(Math.abs((end.cost as number) - cost) < 1e-12, `${end.cost} against ${cost}`);
+    };
+    const first = (request: Record<string, unknown>) => JSON.stringify((request.messages as { content: unknown }[])[0].content);
+    const last = (request: Record<string, unknown>) => (request.messages as { content: unknown }[]).at(-1)!.content;
+    const api = await fakeMessagesApi((request) => {
+      if (first(request).includes("Another agent was given the task")) return [{ text: "APPROVED" }];
+      if (systemText(request as { system?: string }).includes("You are a subagent")) return [{ text: "parse is in parser.py." }];
+      if (String(last(request)).startsWith("You have run out of steps")) return [{ text: "Found the parser; the fix is left." }];
+      if (String(last(request)).startsWith("The conversation so far is about to be replaced")) return [{ text: "Listed the files." }];
+      if (first(request).includes("was compacted")) return [{ text: "Done." }];
+      if (first(request).includes("Find the parser")) return [{ tool: "subagent", input: { description: "find it", prompt: "Where is parse?" } }];
+      return [{ tool: "glob", input: { pattern: "*" } }];
+    });
+    try {
+      // Out of steps after a subagent's research: the subagent's call, then the wrap-up.
+      const wrapped = await runJig([...args, "--max-steps", "1", "--events", file, "Find the parser."], { api, cwd: project });
+      assert.equal(wrapped.code, 2, wrapped.output);
+      const events = await read();
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "call", "tool_result", "notice", "call", "text", "notice", "end"]);
+      assert.deepEqual(
+        ofType(events, "call").map((call) => ({ ...call, seq: 0, ts: "" })),
+        ["subagent", "wrap-up"].map((what) => ({ v: 1, seq: 0, ts: "", type: "call", for: what, step: 1, usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 }, cost: 0.00014 })),
+      );
+      sumsUp(events);
+
+      // A compaction before the second step, then a reviewer on a model of its own price when the model stops.
+      const reviewed = await runJig([...args, "--compact-at", "1", "--reviewer", "claude-sonnet-5-5", "--events", file, "Fix the parser."], { api, cwd: project });
+      assert.equal(reviewed.code, 0, reviewed.output);
+      const again = await read();
+      assert.deepEqual(
+        ofType(again, "call").map((call) => [call.for, call.step]),
+        [["compaction", 1], ["review", 2]],
+      );
+      assert.notEqual(ofType(again, "call")[1].cost, 0.00014, "the reviewer's call is priced by its model");
+      sumsUp(again);
+    } finally {
+      api.close();
+    }
+  });
+
   it("with -, goes on with the task when the events' reader is gone, and says so once", async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
     try {
@@ -674,6 +762,20 @@ describe("Events", () => {
       assert.equal(slow.io.now(), 20_000);
       assert.equal(slow.got(), "x".repeat(12));
       assert.deepEqual(told, ["The --events reader didn't take them all in the 20 s jig gives it after a signal: 2 events weren't written."]);
+    });
+  });
+
+  it("at a normal end waits 60 s at most in all, though the reader takes some every few seconds", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      let next = 0;
+      const slow = pipe((now) => (now < next ? 0 : ((next = now + 4000), 2)));
+      const events = new Events("-", "claude-opus-5-5", slow.io);
+      events.notice("x".repeat(100));
+      assert.equal(events.end("end_turn", 0)?.exitCode, 0);
+      assert.equal(slow.io.now(), 60_000);
+      assert.equal(slow.got().length, 32);
+      assert.deepEqual(told, ["The --events reader didn't take them all in the 60 s jig gives it at a normal end: 2 events weren't written."]);
     });
   });
 

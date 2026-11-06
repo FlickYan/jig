@@ -2,13 +2,14 @@
 // rather than in the terminal's output. One object a line, each written as it happens, with what the
 // terminal shows (the steps, the tool calls and their results, the notices) and how the task ended.
 // Where an approver answers in the terminal's place (--approve-via's service, or a library's), the calls put
-// to it and its answers too.
+// to it and its answers too. Each model call that isn't a step's (the wrap-up, a compaction, a subagent's, the
+// reviewer's) is a call event, so the steps' and the calls' costs add up to the end's.
 // The fields are a contract (version 1): a reader ignores a type it doesn't know, and a field may be added.
 // A library's task (lib.ts) gets the same objects, handed to its listener instead of written.
 
 import { closeSync, openSync, renameSync, rmSync, writeSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { addUsage, type AgentUI, type Usage } from "./agent.ts";
+import { addUsage, type AgentUI, type Usage, WRAP_UP } from "./agent.ts";
 import { redact } from "./export.ts";
 import type { CallModel } from "./model.ts";
 import { costOf } from "./prices.ts";
@@ -55,8 +56,8 @@ export interface Start {
  * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is written as
  * it happens, so a crash loses at most the line being written; one a pipe on stdout has no room for waits in
  * jig (see Lines), and at the end jig waits for the reader to take it, up to FLUSH_SECONDS without
- * progress (and SIGNAL_FLUSH_SECONDS in all after a signal). Every string goes through the redaction
- * `jig sessions export` uses.
+ * progress, and END_FLUSH_SECONDS in all (SIGNAL_FLUSH_SECONDS after a signal). Every string goes through
+ * the redaction `jig sessions export` uses.
  */
 export class Events {
   private readonly fd: number | undefined; // undefined: stdout, or the listener
@@ -73,7 +74,7 @@ export class Events {
   /** The end's exit code, once it is written: a signal after it doesn't change how jig exits. */
   endedWith: number | undefined;
 
-  constructor(path: string | ((event: Event) => void), model: string) {
+  constructor(path: string | ((event: Event) => void), model: string, io?: Io) {
     this.model = model;
     this.cost = costOf(model, this.usage) ?? null;
     if (typeof path === "function") this.listener = path;
@@ -84,12 +85,12 @@ export class Events {
       // rather than blocking jig in the kernel, where no signal handler can run. Made here (ui.ts has made it
       // already) and never written to: a file or a terminal on fd 1 stays blocking, and takes each line at once.
       void process.stdout;
-      this.lines = new Lines(1);
+      this.lines = new Lines(1, io);
       return;
     }
     if (/^\/(dev|proc)\//.test(path)) {
       this.fd = openSync(path, "a");
-      this.lines = new Lines(this.fd);
+      this.lines = new Lines(this.fd, io);
       return;
     }
     const temp = `${path}.${randomBytes(4).toString("hex")}.tmp`;
@@ -101,7 +102,7 @@ export class Events {
       rmSync(temp, { force: true });
       throw error;
     }
-    this.lines = new Lines(this.fd);
+    this.lines = new Lines(this.fd, io);
   }
 
   start(start: Start): void {
@@ -136,10 +137,17 @@ export class Events {
     };
   }
 
-  /** The same model, its usage and cost added to the end's: `model` is whose calls they are. */
-  meter(callModel: CallModel, model: string): CallModel {
+  /**
+   * The same model, its usage and cost added to the end's: `model` is whose calls they are. The task's own
+   * model's calls (and --escalate's) are steps, which ui writes, but for those that summarize: the wrap-up,
+   * known by its request, and a compaction. Those and every call of a subagent's or the reviewer's model
+   * (`kind`) are written here as calls, with what they were for and the main loop's step they came in, or
+   * the last before them.
+   */
+  meter(callModel: CallModel, model: string, kind?: "subagent" | "review"): CallModel {
     return async (messages, signal, options) => {
       const turn = await callModel(messages, signal, options);
+      const what = kind ?? (!options?.summarize ? undefined : messages.at(-1)?.content === WRAP_UP ? "wrap-up" : "compaction");
       const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
       addUsage(usage, turn.message.usage);
       addUsage(this.usage, turn.message.usage);
@@ -152,6 +160,7 @@ export class Events {
       this.metered = true;
       // One call of a model without a price leaves the whole without one.
       this.cost = before === null || cost === undefined ? null : before + cost;
+      if (what) this.write("call", { for: what, step: this.step, usage: inOrder(usage), cost: cost ?? null });
       return turn;
     };
   }
@@ -193,12 +202,14 @@ export class Events {
     // it waits, a second Ctrl+C, SIGTERM or SIGHUP would end jig by the signal's default action where jig has
     // no handler left for it (Ctrl+C's goes with the task, SIGTERM's runs once), losing the end without a word.
     // Each is ignored until that wait is over; jig then exits as the first signal had it. Only that wait: at
-    // another end a reader that keeps reading has no bound in all, and Ctrl+C must still stop jig at once.
+    // another end Ctrl+C must still stop jig at once. A SIGTERM there is acted on once the wait is over, so it
+    // has a bound in all too, END_FLUSH_SECONDS, however steadily the reader reads.
     const interrupted = stop === "interrupted";
     const ignore = () => {};
     if (this.lines && interrupted) for (const signal of SIGNALS) process.on(signal, ignore);
     try {
-      this.lines?.flush(interrupted ? SIGNAL_FLUSH_SECONDS : undefined);
+      if (interrupted) this.lines?.flush(SIGNAL_FLUSH_SECONDS, "after a signal");
+      else this.lines?.flush(END_FLUSH_SECONDS, "at a normal end");
     } finally {
       for (const signal of SIGNALS) process.off(signal, ignore);
     }
@@ -225,6 +236,12 @@ export const FLUSH_SECONDS = 5;
  * 30 s Kubernetes gives a pod between SIGTERM and SIGKILL. jig's own cleanup is done before (see run.ts).
  */
 export const SIGNAL_FLUSH_SECONDS = 20;
+/**
+ * How long in all jig waits for the reader at an end no signal brought: long enough for a slow reader of a
+ * normal run, while a SIGTERM that comes in the wait, whose handler can't run until it is over, isn't put off
+ * for good.
+ */
+export const END_FLUSH_SECONDS = 60;
 /** The most of the lines jig holds for a reader that is behind: past it, events are dropped (not the end). */
 export const HELD_BYTES = 64 * 1024 * 1024;
 // While the reader is behind, how often jig tries again to write the lines it holds.
@@ -286,10 +303,10 @@ export class Lines {
 
   /**
    * At the end: waits for the reader to take what is held, as long as it takes some every FLUSH_SECONDS (and,
-   * given `total`, for that many seconds at most), then gives up on the rest, saying so. Returns how many lines
-   * weren't written whole (the first of them perhaps in part).
+   * given `total`, for that many seconds at most, the end being `when`), then gives up on the rest, saying so.
+   * Returns how many lines weren't written whole (the first of them perhaps in part).
    */
-  flush(total?: number): number {
+  flush(total?: number, when = "after a signal"): number {
     clearTimeout(this.timer);
     let written = this.written;
     const begun = this.io.now();
@@ -299,7 +316,7 @@ export class Lines {
       const now = this.io.now();
       if (this.written > written) [written, since] = [this.written, now];
       else if (now - since >= FLUSH_SECONDS * 1000) why = `took nothing for ${FLUSH_SECONDS} s`;
-      if (total !== undefined && now - begun >= total * 1000) why = `didn't take them all in the ${total} s jig gives it after a signal`;
+      if (total !== undefined && now - begun >= total * 1000) why = `didn't take them all in the ${total} s jig gives it ${when}`;
       if (why) break;
       this.io.wait(5);
     }

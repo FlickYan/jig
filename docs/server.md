@@ -502,6 +502,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `tool_call` | `step`, `id`, `name`, `description` (at most 4,000 characters, cut from the middle), `truncated` |
 | `tool_result` | `step`, `id`, `isError`, `output` (at most 4,000 characters, cut from the middle), `truncated` |
 | `notice` | `text`: what jig told the user |
+| `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
@@ -511,8 +512,9 @@ goes to stdout: the terminal's output goes to stderr. What the pipe can't take w
 waits in jig, in order, and jig goes on: a stopped reader holds the events, not jig, so a signal still ends
 it. It holds 64 MiB at most, and drops later events (not the `end`; a smaller one past a dropped one may still fit), saying how many on stderr and, with room,
 in a `notice` before the `end`. At its end, on every path a signal included, jig writes what it holds,
-waiting while the reader takes some every 5 s (after a signal, 20 s at most in all, its commands killed
-first, a second signal ignored; otherwise Ctrl+C still ends the wait at once), and otherwise gives up on the
+waiting while the reader takes some every 5 s, 60 s at most in all (a SIGTERM in it is acted on when it is
+over; after a signal, 20 s, its commands killed first, a second signal ignored; otherwise Ctrl+C still ends
+the wait at once), and otherwise gives up on the
 rest, saying how many events on stderr; the last line it wrote may then be cut off, so a reader drops a last
 line without a newline. Once the reader has closed the pipe, or a write jig tries again has failed, jig writes
 no more events and goes on with the task. `/dev/stdout` is not `-`: jig opens it as a file, whose writes may

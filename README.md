@@ -152,9 +152,10 @@ output on stderr). Each line is `{"v":1,"seq":n,"ts":"<ISO time>","type":...}` w
 `step` (its number, its call's `usage` and `cost`), the model's `text`, each `tool_call` (`id`, `name` and the
 `description` the terminal shows, cut from the middle to 4,000 characters, with `"truncated":true` when
 cut) and its `tool_result` (`isError`, and the `output`, cut the same way), each `notice` jig prints (errors
-included), and last `end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and
-`cost` of every model call in the task (subagents', the reviewer's, compactions' and the wrap-up's included;
-the wrap-up's report is a `text` after the last step). A cost is in US dollars: each call is priced by the
+included), a `call` for each model call that isn't a step's (`for`: `wrap-up`, `compaction`, `subagent` or
+`review`; the main loop's `step` it came in, or the last before it; its `usage` and `cost`), and last `end`:
+the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and `cost` of every model call in
+the task, so the steps' and the calls' add up to it (the wrap-up's report is a `text` after the last step). A cost is in US dollars: each call is priced by the
 model its reply names (a gateway's alias names the model behind it) when `src/prices.ts` has a price for
 it, else by the one jig asked for, and is null when neither has. Every string goes through the redaction `jig sessions export` uses. A reader
 should pass over a type it doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
@@ -166,8 +167,9 @@ reader is behind waits in jig, each later line behind it, and jig goes on with t
 reading holds the events, not jig, which still acts on a signal. jig holds 64 MiB of them at most: past that
 it drops new events (not the `end`; not always in a row, as a smaller one may still fit), and says how many on stderr and, where there is room by then, in a
 `notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
-long as it takes some every 5 s, and after a signal 20 s at most in all, once its commands are killed; a
-second signal in that wait doesn't cut it short (at any other end, Ctrl+C still does). If it gives up, it
+long as it takes some every 5 s, 60 s at most in all (a SIGTERM in that wait ends jig when it is over), and
+after a signal 20 s at most, once its commands are killed; a second signal in that wait doesn't cut it
+short (at any other end, Ctrl+C still does). If it gives up, it
 says on stderr how many events it couldn't write, and exits: the last line it wrote may then be cut off, so
 a reader should drop a last line without a newline. So a reader that is behind but reads loses no line, the
 `end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
