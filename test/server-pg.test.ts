@@ -273,10 +273,11 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     const db = pool(url, { max: 1 });
     const admin = pool(url);
     const mark = marker();
-    const sleeping = db.query(`SELECT pg_sleep(30), '${mark}'`);
+    // Caught at once: the query can fail while the terminate is still being answered, before it is awaited.
+    const sleeping = db.query(`SELECT pg_sleep(30), '${mark}'`).then(() => undefined, (err: Error) => err);
     const pid = await backendOf(admin, mark);
     await admin.query("SELECT pg_terminate_backend($1)", [pid]);
-    await assert.rejects(sleeping, /terminating connection|connection to the database was lost/);
+    assert.match(String((await sleeping)?.message), /terminating connection|connection to the database was lost/);
     assert.notEqual((await db.query("SELECT pg_backend_pid() AS pid")).rows[0].pid, pid);
   });
 
