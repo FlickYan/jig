@@ -316,10 +316,12 @@ to `approve`, and its answer, are `approval_request` and `approval` events, as `
 `approve` rejects, the call doesn't run (its result tells the model the permission check failed, with the
 error's message), its `approval_request` gets no `approval` event, and the task goes on. `exitCode` is what
 `jig` would exit with. A failure ends the task with `stop: "error"` and says what failed in `error`, as
-does an `onEvent` that throws; only options that are wrong, before it starts, and an `onEvent` that throws
-at the end event reject. A signal aborted while the task is still starting (connecting MCP servers, taking
-its snapshot) stops it once that is done. A task prints nothing, and leaves the process's signal handlers,
-exit code and working directory alone. Several can run at once in one process, each with its own project,
+does an `onEvent` that throws: a call whose `approval_request` or `approval` it threw at doesn't run, nor
+do a subagent's calls after it threw at that subagent's `call`. Only options that are wrong, before it
+starts, and an `onEvent` that throws at the end event reject. A signal aborted while the task is still
+starting (connecting MCP servers, taking its snapshot) stops it once that is done. A task prints nothing,
+and leaves the process's signal handlers, exit code and working directory alone. Several can run at once
+in one process, each with its own project,
 jig directory, model and API, and each sees only its own events, permissions, memories, sessions and stats:
 what the CLI leaves to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but
 for the skills in your home directory's `.agents/skills` and `.claude/skills`, `~/` in hiddenPaths and the

@@ -446,7 +446,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     sandbox,
     hooks,
     count,
-    ui: ui.subagentUI,
+    // Their tool calls write no events, but stop at a listener's error from their model's calls.
+    ui: events ? (label) => events.checked(ui.subagentUI(label)) : ui.subagentUI,
   };
   // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
   const newReviewer = (): Reviewer | undefined => {
