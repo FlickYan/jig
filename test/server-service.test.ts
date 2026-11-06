@@ -1040,6 +1040,25 @@ describe("the service's start", () => {
     assert.match(String(logged?.stderr), new RegExp(`127\\.0\\.0\\.1:${port}`));
   });
 
+  it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", async () => {
+    // git's curl reads what is before the `@` as userinfo, and would connect to the inside server; URL reads
+    // the backslash as a slash, so the host checked is localhost, and that is the host git is given.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["localhost"], gitProtocols: ["http"] });
+    const git = `http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`;
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } });
+    assert.equal(posted.status, 201);
+    const task = await statusOf(limited, posted.body.id, "error");
+    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {
     const api = pathToFileURL(join(import.meta.dirname, "..", "server", "api.ts")).href;
     const { stderr } = await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(api)})`]);

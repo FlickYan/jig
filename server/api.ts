@@ -752,7 +752,7 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
 
 /**
  * A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. A
- * repository to clone must be on one of `gitHosts`, if there are any.
+ * repository to clone must be on one of `gitHosts`, if there are any, and is then kept as URL reads it.
  */
 export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, gitHosts?: string[]): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
@@ -790,9 +790,12 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
   // The local runner clones on the service's own network, which a tenant would otherwise reach any host on.
-  if (typeof git === "string" && gitHosts && !gitHosts.some((host) => host.toLowerCase() === URL.parse(git)?.hostname.toLowerCase())) return `workspace.git must be on one of the config's gitHosts: ${gitHosts.join(", ")}`;
+  // git is then given the URL as it was read here: git's curl reads `https://ok.host\@inside/` as userinfo
+  // before the `@`, where URL reads the backslash as a slash, so the raw string could reach another host.
+  const url = typeof git === "string" && gitHosts ? URL.parse(git) : undefined;
+  if (typeof git === "string" && gitHosts && !gitHosts.some((host) => host.toLowerCase() === url?.hostname.toLowerCase())) return `workspace.git must be on one of the config's gitHosts: ${gitHosts.join(", ")}`;
   if (ref !== undefined && (git === undefined || typeof ref !== "string" || !/^[\w./-]{1,200}$/.test(ref) || ref.startsWith("-"))) return "workspace.ref must be a branch or tag of workspace.git";
-  return { prompt, workspace: { files, git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
+  return { prompt, workspace: { files, git: url?.href ?? git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

@@ -363,8 +363,9 @@ when the service starts with `--config`; a program that calls `startService` its
 path as `configFile`.
 
 The workspace's clone is the service's own, outside the sandbox and on the machine's network, though the
-tasks' commands have none: list the hosts tenants may clone from in `gitHosts`. A redirect is never
-followed, and a clone that fails is `git clone failed (exit N)` to the tenant, with what git said (the
+tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (git is then given the URL
+as it was checked, in its normal form, so `https://allowed.host\@inside/` is cloned from `allowed.host`).
+A redirect is never followed, and a clone that fails is `git clone failed (exit N)` to the tenant, with what git said (the
 hosts and ports it tried, and how they answered) in the service's log alone.
 
 The service warns at the start of what the tasks' commands can still read and connect to, of clones
