@@ -191,7 +191,7 @@ export class Events {
     };
   }
 
-  /** Throws what a listener threw at a call event, if it did (see meter). */
+  /** Throws what a listener threw at a call event (see meter), or at approval_request or approval (see kept), if it did. */
   check(): void {
     if (this.failed) throw this.failed.error;
   }
