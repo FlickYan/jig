@@ -11,7 +11,8 @@ instruction worded the way a user would ask, hidden tests, and a reference solut
 
 For each attempt the runner:
 1. copies the task's project to a temporary directory and commits it to a fresh git repository;
-2. runs jig on the instruction (`--yes`, with a step limit and a timeout);
+2. runs jig on the instruction (`--yes`, with a step limit and a timeout, and `--no-wrap-up` in versions
+   that have it, so an attempt that hits the limit makes no extra call);
 3. copies in the hidden tests, which the agent never saw, and runs them. Passing means solved.
 
 It records whether each attempt passed, plus steps, tool calls, failed tool calls (by tool), tokens,
@@ -212,8 +213,11 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
 - [`eval/jig_agent.py`](../eval/jig_agent.py) is jig's Harbor adapter. It installs Node and jig from this
   checkout in each task's container, runs `jig --yes --add-dir / --stats …` on the instruction (the
   container is the sandbox, so the whole file system is the project), and reads the turns and tokens back
-  from the stats file. The API key stays on the host: jig in the container gets a token of the run, and
-  its requests go through [`eval/key_proxy.py`](../eval/key_proxy.py), which puts the key in (milestone 25).
+  from the stats file. jig runs on nvm's Node by its path, and nvm stays off the PATH of the model's
+  commands: they find the image's own node, if it has one, as the hidden tests do (in milestone 30 the model
+  tested make-mips-interpreter's work with nvm's Node 24, and the tests ran it with Debian's). The API key
+  stays on the host: jig in the container gets a token of the run, and its requests go through
+  [`eval/key_proxy.py`](../eval/key_proxy.py), which puts the key in (milestone 25).
   With `run_reviewer` (milestone 29), once jig is done the adapter commits the task's container, starts a
   copy of it with no network and none of Harbor's mounts, and runs `jig review` on the host, its commands
   going into the copy; the problems a fresh copy shows again go back to jig (`--continue`) in the time
@@ -235,6 +239,15 @@ python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json 
   sometimes fetched them, so [`eval/report.py`](../eval/report.py) checks every command of every trial, and an
   attempt that fetched anything from the benchmark's repositories counts as failed, whatever the verifier
   said. The numbers here are all counted that way; before milestone 10, this section counted those passes.
+- **A trial the verifier couldn't grade doesn't count either way.** One whose verifier ran out of disk and
+  wrote no result (`ctrf.json`), or of a task listed with `--skip-tasks` because its verifier can't run on
+  the machine (a task a line, why after a `#`: `eval/skip-tasks.txt` is the machine's own, kept out of git,
+  and tbcheck uses it), is unscorable: marked apart and left out of the pass rates, their intervals and the
+  differences. Milestone 30 counted six such trials as failures. A result is a grade, whatever the output
+  says, and no result alone is not a sign: an agent that left dpkg locked or removed curl stops the tests
+  too, so that trial fails, as does one whose verifier never started (jig's install or the adapter failed
+  first) or whose tests ran out of time. An agent that filled the disk itself looks like the machine's
+  fault, so tbcheck gives no verdict while any trial outside the list is unscorable, on either side.
 
 ### Results
 
@@ -326,6 +339,7 @@ What the runs and their logs showed:
   after a limit. That holds for every agent, so the comparison is fair, but a pass right at the limit
   may owe something to it. Each agent had three, on the same tasks (`tune-mjcf` twice and
   `cobol-modernization` once); counting them as failures gives 38/60 against 41/60, the same gap.
+  (Since then, the adapter gives jig the limit, less 30 seconds, as `--time-limit`, and jig stops there.)
 - **The evaluation found six problems in jig, now fixed.** File tools confined to the project could not
   touch `/etc` or `/var` in a container (`--add-dir`); there was no way to get turns and tokens out
   (`--stats`); during a DeepSeek outage jig waited 10 minutes per attempt in silence (now 2 minutes, with

@@ -1,0 +1,10 @@
+{
+  "listen": { "host": "0.0.0.0", "port": 8081 },
+  "upstream": { "baseUrl": "https://api.deepseek.com/anthropic", "keyEnv": ["DEEPSEEK_API_KEY"] },
+  "limits": {
+    "concurrent": 64,
+    "maxWaitMs": 30000,
+    "tenantDefaults": { "requestsPerMinute": 120, "concurrent": 8 }
+  },
+  "state": { "redis": "redis://redis:6379/0" }
+}

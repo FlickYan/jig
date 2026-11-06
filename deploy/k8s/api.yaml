@@ -1,0 +1,117 @@
+# The task service: two replicas sharing one Postgres database, whose URL (with its password) comes from
+# the jig-database Secret, yours to make:
+#   kubectl -n jig create secret generic jig-database --from-literal=url='postgres://jig:...@postgres.example.com:5432/jig?sslmode=require'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jig-api
+  namespace: jig
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jig
+        app.kubernetes.io/component: api
+      # Prometheus finds the pods by these (deploy/observability/prometheus.yml): the metrics listener's port.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9180"
+    spec:
+      serviceAccountName: jig-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: registry.example.com/jig-server:0.1.0
+          command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
+          ports:
+            - containerPort: 8080
+            # The internal listener, where the task pods ask for approvals.
+            - containerPort: 8082
+            # The metrics listener, which only the monitoring namespace reaches (networkpolicy.yaml).
+            - containerPort: 9180
+              name: metrics
+          env:
+            - name: JIG_GATEWAY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jig-secrets
+                  key: gateway-secret
+            - name: JIG_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: jig-database
+                  key: url
+            # A warm worker claims its task from the replica that started it, at this pod's own address
+            # rather than the Service in front of both (docs/server.md, Warm pools). An IPv6 POD_IP comes
+            # without brackets; the service adds them.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: JIG_POOL_BASE_URL
+              value: "http://$(POD_IP):8082"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jig
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/jig
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: jig-config
+        # The Kubernetes runner keeps nothing of a task's here: the state is in the database.
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-api
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: api
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+# The internal listener, a Service of its own: the task pods may reach it (networkpolicy.yaml), not the
+# tenants' API. Any replica answers, as they hear each other's answers through the database.
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-api-internal
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: api
+  ports:
+    - port: 8082
+      targetPort: 8082

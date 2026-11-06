@@ -32,6 +32,38 @@ jobs:
       - name: Tests (the sandbox tests run on both systems)
         run: npm test
 
+  services:
+    # The task service's and the gateway's tests against a real Postgres and Redis of the job's own: without
+    # JIG_TEST_POSTGRES_URL and JIG_TEST_REDIS_URL those halves are skipped.
+    runs-on: ubuntu-latest
+    # The tests take about a minute; a test that hangs fails at its own timeout, and the job at this.
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: jig
+          POSTGRES_PASSWORD: jigtest
+          POSTGRES_DB: jig
+        ports:
+          - 5432:5432
+        options: --health-cmd "pg_isready -U jig" --health-interval 2s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+    env:
+      JIG_TEST_POSTGRES_URL: postgres://jig:jigtest@127.0.0.1:5432/jig
+      JIG_TEST_REDIS_URL: redis://127.0.0.1:6379/1
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node --test --test-timeout=120000 test/server-*.test.ts test/redis.test.ts
+
   benchmark-tasks:
     # Every task must be solvable (the reference solutions pass) and not already solved (doing nothing
     # fails). No model is called.
@@ -66,3 +98,14 @@ jobs:
       - run: npm pack
       - run: npm install -g ./*.tgz
       - run: jig --version && jig --help
+      - name: Import runTask from the package, installed in a project of its own, and type-check a use of it
+        run: |
+          mkdir "$RUNNER_TEMP/uses-jig" && cp ./*.tgz "$RUNNER_TEMP/uses-jig/"
+          cd "$RUNNER_TEMP/uses-jig" && npm init -y && npm install ./*.tgz
+          node -e "import('jig-agent').then(({ runTask }) => { if (typeof runTask !== 'function') throw new Error('runTask is ' + typeof runTask) })"
+          # Its types, as a strict program sees them: a missing or broken declaration fails here. They use
+          # Node's, which a TypeScript program on Node has from @types/node.
+          npm install --no-save typescript @types/node
+          printf '%s\n' 'import { runTask, type TaskResult } from "jig-agent";' 'const result: Promise<TaskResult> = runTask({ prompt: "x", cwd: "." });' 'export const text: Promise<string> = result.then((r) => r.text);' > uses.mts
+          printf '%s\n' '{ "compilerOptions": { "module": "nodenext", "moduleResolution": "nodenext", "strict": true, "noEmit": true }, "files": ["uses.mts"] }' > tsconfig.json
+          npx tsc -p .

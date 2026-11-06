@@ -5,8 +5,10 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import { readFileSync } from "node:fs";
 import type { ChatCompletionFunctionTool, ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import { WRAP_UP } from "./agent.ts";
 import { toChatMessages } from "./openai.ts";
 import { redactSecrets } from "./secrets.ts";
+import { answerOpenToolCalls } from "./session.ts";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 
@@ -27,14 +29,16 @@ export interface ExportedSession {
 /**
  * A saved session as a training example: its system prompt and tools (as the session recorded them), and
  * every message in order, tool calls and their results included, up to the model's last finished reply.
- * The file keeps the whole history even where the conversation was compacted, so that is what's used.
+ * The report jig asks for once the steps run out (WRAP_UP) isn't one: the work it reports on wasn't done.
+ * The file keeps the whole history even where the conversation was compacted, so that is what's used. A
+ * call a crash left open is answered as jig answered it when the session was continued (see SessionFile.load).
  * Thinking is left out (it isn't part of the format), and so is anything that looks like a secret.
  * Undefined if the model never finished a reply.
  */
 export function exportSession(path: string): ExportedSession | undefined {
   let system = "";
   let tools: Anthropic.Beta.BetaTool[] | undefined;
-  const messages: MessageParam[] = [];
+  let messages: MessageParam[] = [];
   for (const line of readFileSync(path, "utf8").split("\n")) {
     let entry: { type: string; message?: MessageParam; system?: string; tools?: Anthropic.Beta.BetaTool[] };
     try {
@@ -45,7 +49,8 @@ export function exportSession(path: string): ExportedSession | undefined {
     if (entry.type === "start") ({ system = "", tools } = entry);
     else if (entry.type === "message" && entry.message) messages.push(entry.message);
   }
-  const last = messages.findLastIndex((message) => message.role === "assistant" && !hasToolCalls(message));
+  messages = answerOpenToolCalls(messages);
+  const last = messages.findLastIndex((message, i) => message.role === "assistant" && !hasToolCalls(message) && messages[i - 1]?.content !== WRAP_UP);
   if (last === -1) return undefined;
   const chat = toChatMessages(system, messages.slice(0, last + 1))
     .filter((message) => message.role !== "system" || system)
@@ -96,8 +101,8 @@ function hasToolCalls(message: MessageParam): boolean {
   return typeof message.content !== "string" && message.content.some((block) => block.type === "tool_use");
 }
 
-/** Every string in a value, redacted (strings, not the JSON text, so escapes can't be cut in half). */
-function redact<T>(value: T): { value: T; count: number } {
+/** Every string in a value, redacted (strings, not the JSON text, so escapes can't be cut in half). --events' too. */
+export function redact<T>(value: T): { value: T; count: number } {
   let count = 0;
   const walk = (item: unknown): unknown => {
     if (typeof item === "string") {

@@ -17,14 +17,20 @@ export interface Trial {
   output?: number;
   /** What eval/report.py priced the trial at (saved from milestone 24 on: a reviewer's calls are at its prices). */
   cost?: number | null;
+  /** Why the verifier couldn't grade the trial, if it couldn't (eval/report.py): it is neither passed nor failed. */
+  unscorable?: string | null;
 }
 
 /** Prices of deepseek-flash per token, as eval/report.py has them: uncached input, cached input, output. */
 const PRICE = { input: 0.3e-6, cached: 0.006e-6, output: 1.2e-6 };
 
-/** Trials as the referee compares attempts: a look-up is a failure, and the cost comes from the tokens. */
+/**
+ * Trials as the referee compares attempts: a look-up is a failure, a trial the verifier couldn't grade isn't
+ * an attempt at all (in milestone 30, six such failures turned a 3-point loss into a 3-point gain), and the
+ * cost comes from the tokens.
+ */
 export function attemptsOf(trials: Trial[]): Attempt[] {
-  return trials.map((trial) => {
+  return trials.filter((trial) => !trial.unscorable).map((trial) => {
     const cached = trial.cached ?? 0;
     const cost = trial.cost !== undefined ? trial.cost : trial.input === undefined ? null : (trial.input - cached) * PRICE.input + cached * PRICE.cached + (trial.output ?? 0) * PRICE.output;
     return { task: trial.task, passed: trial.passed && !trial.looked_up, cost };
@@ -54,6 +60,32 @@ export function terminalBenchVerdict(candidate: Attempt[], baseline: Attempt[]):
   return behind >= 0.8
     ? { comparison, behind, rejected: true, reason: `solved fewer Terminal-Bench tasks (${scores}, behind in ${rate(behind)} of resamples)` }
     : { comparison, behind, rejected: false, reason: `no worse on Terminal-Bench (${scores}, behind in ${rate(behind)} of resamples)` };
+}
+
+/**
+ * Why these trials can't give a verdict, if they can't. A trial the verifier couldn't grade drops out of the
+ * comparison, and it may have been the agent's doing (one that fills the disk leaves the mark the machine's
+ * own shortage does), so any such trial outside the tasks this machine skips stops the verdict, on either
+ * side and even when the task keeps a graded trial: a candidate that broke the tests on some trials would
+ * otherwise be scored on the rest. With every task out, the comparison comes out even, "no worse", whatever
+ * the candidate did (both of milestone 30's pytorch-model-recovery trials without the notes ran out of disk).
+ * A person runs those trials again or skips the task.
+ */
+export function noVerdict(candidate: Trial[], baseline: Trial[], skipped: Set<string>): string | null {
+  const ungraded = [...candidate, ...baseline].filter((trial) => trial.unscorable && !skipped.has(trial.task));
+  if (ungraded.length) {
+    const tasks = [...new Set(ungraded.map((trial) => trial.task))].sort().join(", ");
+    const trials = ungraded.length === 1 ? "a trial" : `${ungraded.length} trials`;
+    return `the verifier couldn't grade ${trials} of ${tasks}, so the comparison would leave ${ungraded.length === 1 ? "it" : "them"} out`;
+  }
+  const byBaseline = new Set(attemptsOf(baseline).map((attempt) => attempt.task));
+  if (!attemptsOf(candidate).some((attempt) => byBaseline.has(attempt.task))) return "no task was graded on both sides";
+  return null;
+}
+
+/** The tasks in a list of tasks to skip (eval/skip-tasks.txt), as eval/report.py reads it: one a line, why after a "#". */
+export function skipList(text: string): Set<string> {
+  return new Set(text.split("\n").map((line) => line.split("#")[0].trim()).filter(Boolean));
 }
 
 /**

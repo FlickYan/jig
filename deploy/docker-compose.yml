@@ -1,0 +1,62 @@
+# One machine: the task service and the gateway in containers, and each task in a container of its own,
+# which the service starts through the host's Docker (docs/server.md, Deploying). Build the worker image
+# first (deploy/Dockerfile.worker), adapt gateway.json beside this file (the gateway's config), then:
+#   JIG_GATEWAY_SECRET=... DEEPSEEK_API_KEY=... docker compose -f deploy/docker-compose.yml up
+name: jig
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    command: ["node", "server/gateway.ts", "--config", "/etc/jig/gateway.json"]
+    environment:
+      - JIG_GATEWAY_SECRET
+      - ANTHROPIC_API_KEY
+      - DEEPSEEK_API_KEY
+    volumes:
+      - ./gateway.json:/etc/jig/gateway.json:ro
+    # On tasks too, the only other thing there, where the tasks reach it as gateway.
+    networks:
+      - default
+      - tasks
+    depends_on:
+      - redis
+  # The gateway's counts (gateway.json's "state"), so a restart of the gateway forgets nothing; only on the
+  # default network, out of the tasks' reach.
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis:/data
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.server
+    command: ["node", "server/api.ts", "--config", "/etc/jig/service.json"]
+    # The docker socket is root's, and whoever holds it is root on the host anyway.
+    user: root
+    environment:
+      - JIG_GATEWAY_SECRET
+    ports:
+      - "127.0.0.1:8080:8080"
+    # The daemon binds each task's folder by its path on the host: the data is at the same path in here.
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Put your tenants' key hashes (printf %s "$KEY" | sha256sum) in place of the placeholder in
+      # service.docker.json first: the service refuses to start with it.
+      - ./service.docker.json:/etc/jig/service.json:ro
+      - /var/lib/jig:/var/lib/jig
+    depends_on:
+      - gateway
+    # On tasks too, where the tasks reach its internal listener as api:8082, to ask for approvals. Its
+    # tenants' API is there as well, but takes only tenants' keys, which no task holds.
+    networks:
+      - default
+      - tasks
+networks:
+  # Internal: no way out but to the gateway.
+  tasks:
+    name: jig-tasks
+    internal: true
+volumes:
+  redis:

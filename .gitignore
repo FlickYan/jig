@@ -7,6 +7,7 @@ bench/logs/
 bench/dataset/
 eval/.venv/
 eval/jobs/
+eval/skip-tasks.txt
 dist/
 *.tgz
 .bench-homes/

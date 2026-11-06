@@ -14,6 +14,7 @@ const tools = [
   { name: "crash", description: "Makes the server exit.", inputSchema: object() },
   { name: "pid", description: "The server's process id.", inputSchema: object(), annotations: { readOnlyHint: true } },
   { name: "slow", description: "Answers after a second.", inputSchema: object() },
+  { name: "env", description: "The server's HOME.", inputSchema: object(), annotations: { readOnlyHint: true } },
 ];
 const PAGE = 2; // tools/list is paginated, to check that the client follows nextCursor
 
@@ -35,10 +36,11 @@ createInterface({ input: process.stdin }).on("line", (line) => {
   if (method === "tools/call") {
     const { name, arguments: args } = params;
     if (name === "add") return reply(text(args.a + args.b));
-    if (name === "fail") return reply({ ...text("the database is locked"), isError: true });
+    if (name === "fail") return reply({ ...text(`the ${process.env.DATABASE ?? "database"} is locked`), isError: true }); // which server answered
     if (name === "crash") process.exit(1);
     if (name === "pid") return reply(text(process.pid));
     if (name === "slow") return void setTimeout(() => reply(text("done")), 1000);
+    if (name === "env") return reply(text(process.env.HOME)); // whose environment the server got
   }
   send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unknown method ${method}` } });
 });

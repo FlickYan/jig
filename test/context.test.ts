@@ -1,17 +1,28 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { beforeEach, describe, it } from "node:test";
-import type Anthropic from "@anthropic-ai/sdk";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import { afterEach, beforeEach, describe, it } from "node:test";
+import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
 import { runAgent, type AgentOptions } from "../src/agent.ts";
 import { compact } from "../src/compact.ts";
 import { Conversation } from "../src/conversation.ts";
-import type { CallModel, ModelTurn } from "../src/model.ts";
+import { loadMemories } from "../src/memory.ts";
+import { type CallModel, type ModelTurn, tooLong } from "../src/model.ts";
+import { overview, overviewLimits, type Part } from "../src/overview.ts";
+import { projectKey } from "../src/paths.ts";
 import { loadInstructions, systemPrompt } from "../src/prompt.ts";
 import { SessionFile } from "../src/session.ts";
+import { Snapshots } from "../src/snapshots.ts";
+import { searchLimits } from "../src/tools/files.ts";
 import { TOOLS } from "../src/tools/index.ts";
+import { readTool } from "../src/tools/read.ts";
+import { FileVersions } from "../src/tools/util.ts";
+import { writeTool } from "../src/tools/write.ts";
+import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 type Block = Anthropic.Beta.BetaContentBlock;
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -42,9 +53,10 @@ function fakeModel(replies: ModelTurn[], summaries: MessageParam[][] = []): Call
 
 let dir: string;
 beforeEach(async () => {
-  dir = await mkdtemp(join(tmpdir(), "jig-context-"));
+  dir = await tempDir("jig-context-");
   process.env.JIG_HOME = join(dir, "home");
 });
+afterEach(removeTempDirs);
 
 const options = (callModel: CallModel, compactAt: number): AgentOptions => ({
   callModel,
@@ -88,12 +100,247 @@ describe("compaction", () => {
     assert.equal(result.usage.output, 30, "the summary call is counted too");
   });
 
+  it("doesn't end the task when the summary fails: it goes on as it is and compacts again a few steps later", async () => {
+    const conversation = new Conversation(undefined, [{ role: "user", content: "do it" }]);
+    const replies = [1, 2, 3, 4].map((i) => reply([toolUse(`t${i}`, "bash", { command: `echo ${i}` })], 4000));
+    let calls = 0;
+    const summarizedAfter: number[] = [];
+    const callModel: CallModel = async (_messages, _signal, options) => {
+      if (options?.summarize) {
+        summarizedAfter.push(calls);
+        // The first summary comes back empty; the next one is fine.
+        return reply(summarizedAfter.length === 1 ? [] : [text("SUMMARY: echoed 1 to 4.")]);
+      }
+      calls++;
+      return replies.shift() ?? reply([text("Done.")]);
+    };
+    const notices: string[] = [];
+    const events: string[] = [];
+    const result = await runAgent(conversation, { ...options(callModel, 1000), ui: { toolCall() {}, toolResult() {}, notice: (n) => notices.push(n) }, count: (event) => events.push(event) });
+
+    assert.deepEqual([result.stop, result.text], ["end_turn", "Done."]);
+    assert.deepEqual(summarizedAfter, [1, 4], "tried before step 2, then again before step 5");
+    assert.deepEqual(events, ["compaction.failed", "compaction"]);
+    assert.ok(notices.includes("Compaction failed (the model wrote no summary), so the conversation goes on as it is; compacting again from step 5."), notices.join("\n"));
+    assert.equal(conversation.messages.length, 2);
+    assert.match(String(conversation.messages[0].content), /SUMMARY: echoed 1 to 4\./);
+  });
+
+  it("restates the task word for word after a summary mid-task, with what was done for it", async () => {
+    const conversation = new Conversation(undefined, [{ role: "user", content: "<skill>Be brief.</skill>\n\nrename foo to bar" }]);
+    conversation.pin("skill:brief", "<skill>Be brief.</skill>");
+    const model = fakeModel([reply([toolUse("t1", "bash", { command: "echo renamed" })], 4000), reply([toolUse("t2", "bash", { command: "echo again" })], 4000), reply([text("Done.")])]);
+    await runAgent(conversation, options(model, 1000));
+
+    const summary = String(conversation.messages[0].content);
+    assert.match(summary, /SUMMARY: fixed the parser, tests pass\.\n\nThe task you are working on, word for word:\n\n\[this part follows word for word below, under "Still in effect from before the summary"\]\n\nrename foo to bar\n\n/);
+    // Twice compacted: the log still has the command from before the first summary.
+    assert.match(summary, /What you did for it before the summary, from your tool calls[^\n]*:\n\n\$ echo renamed\n {2}→ exit 0, last line: renamed\n\$ echo again\n {2}→ exit 0, last line: again\n\nStill in effect from before the summary:\n\n<skill>Be brief\.<\/skill>\n\nContinue the task from where it stopped\.$/);
+    assert.equal(summary.split("<skill>").length, 2, "a skill's instructions the task holds are kept once");
+  });
+
+  it("restates the user's words even with a large skill, and a long task's start and end", async () => {
+    const summaryAfterOneStep = async (task: string, skill?: string) => {
+      const conversation = new Conversation(undefined, [{ role: "user", content: task }]);
+      if (skill) conversation.pin("skill:big", skill);
+      await runAgent(conversation, options(fakeModel([reply([toolUse("t1", "bash", { command: "echo hi" })], 4000), reply([text("Done.")])]), 1000));
+      return String(conversation.messages[0].content);
+    };
+    // A /<skill> task whose skill alone is longer than the restatement may be: the skill is kept once, and
+    // the request after it is still there.
+    const skill = `<skill_content name="big">\n${"Keep each slide to one idea.\n".repeat(1000)}</skill_content>`;
+    const withSkill = await summaryAfterOneStep(`${skill}\n\nfix the parser in src/parse.ts`, skill);
+    assert.equal(withSkill.split(skill).length, 2, "the skill is there once");
+    assert.equal(withSkill.split("fix the parser in src/parse.ts").length, 2, "and so are the user's words");
+    assert.doesNotMatch(withSkill, /left out/);
+
+    // A long piped task keeps its start and its end, where the ask often is.
+    const piped = `Here is the build log:\n${"x".repeat(30_000)}\nFix what made it fail.`;
+    const summary = await summaryAfterOneStep(piped);
+    assert.match(summary, new RegExp(`word for word:\\n\\nHere is the build log:\\nx+\\n\\[… ${piped.length - 20_000} characters of the task left out …\\]\\nx+\\nFix what made it fail\\.\\n\\n`));
+    assert.ok(summary.length < 21_000, "and no more than 20,000 characters of it");
+  });
+
+  it("keeps or restates the task as the loop was given it, not its message, which --overview's files lengthen", async () => {
+    // As the CLI sends a task with --overview: the files' text before it, which says they count as read.
+    const files = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)\napp.py:\n     1\tx = 1";
+    const atStart = new Conversation(undefined, [
+      { role: "user", content: "fix the parser" },
+      { role: "assistant", content: [text("Done.")] },
+      { role: "user", content: `${files}\n\nnow change app.py` },
+    ]);
+    atStart.tokens = 9000;
+    await runAgent(atStart, { ...options(fakeModel([reply([text("Changed.")])]), 5000), task: "now change app.py" });
+    // The compaction forgot what was read, so the model is no longer told that the files count as read.
+    assert.deepEqual(atStart.messages[1], { role: "user", content: "now change app.py" });
+
+    const midTask = new Conversation(undefined, [{ role: "user", content: `${files}\n\nchange app.py` }]);
+    const model = fakeModel([reply([toolUse("t1", "bash", { command: "echo hi" })], 4000), reply([text("Done.")])]);
+    await runAgent(midTask, { ...options(model, 1000), task: "change app.py" });
+    const summary = String(midTask.messages[0].content);
+    assert.match(summary, /word for word:\n\nchange app\.py\n\n/);
+    assert.doesNotMatch(summary, /count as read|x = 1/);
+  });
+
+  it("keeps the task once when the API rejects the request after a compaction before the first step", async () => {
+    // Compacted again, the request kept the first time is the task's message: it stays after the summary, and
+    // isn't restated in it too.
+    const files = "(Note from jig: the files the task below names, as read_file shows them.)\napp.py:\n     1\tx = 1";
+    const conversation = new Conversation(undefined, [
+      { role: "user", content: "fix the parser" },
+      { role: "assistant", content: [text("Done.")] },
+      { role: "user", content: `${files}\n\nnow change app.py` },
+    ]);
+    conversation.tokens = 9000;
+    let calls = 0;
+    const callModel: CallModel = async (messages, signal, options) => {
+      if (!options?.summarize && ++calls === 1) throw TOO_LONG;
+      return fakeModel([reply([text("Changed.")])])(messages, signal, options);
+    };
+    const result = await runAgent(conversation, { ...options(callModel, 5000), task: "now change app.py" });
+    assert.equal(result.text, "Changed.");
+    const [summary, request, answer] = conversation.messages;
+    assert.doesNotMatch(String(summary.content), /now change app\.py/);
+    assert.deepEqual(request, { role: "user", content: "now change app.py" });
+    assert.equal(answer.role, "assistant");
+  });
+
   it("forgets which files were read, so they are read again before editing", async () => {
     const conversation = new Conversation(undefined, [{ role: "user", content: "hi" }]);
     await writeFile(join(dir, "a.txt"), "x");
     await conversation.versions.record(join(dir, "a.txt"));
     await compact(conversation, fakeModel([]));
     await assert.rejects(conversation.versions.assertCurrent(join(dir, "a.txt"), "a.txt"), /haven't read/);
+  });
+});
+
+/** An error as each SDK makes it of an API's error response. */
+const anthropicError = (status: number, message: string) =>
+  Anthropic.APIError.generate(status, { type: "error", error: { type: status === 429 ? "rate_limit_error" : "invalid_request_error", message } }, undefined, new Headers());
+const openaiError = (status: number, message: string, code: string | null = null) =>
+  OpenAI.APIError.generate(status, { error: { message, type: "invalid_request_error", code, param: null } }, undefined, new Headers());
+const TOO_LONG = anthropicError(400, "prompt is too long: 40312 tokens > 32768 maximum");
+
+describe("a conversation too long for the model", () => {
+  /** A finished task whose tool result is long, then a new request; and a model that sees it all. */
+  function setup(answer: (call: number) => ModelTurn, written = "SUMMARY: the build fails at the link step.") {
+    const output = `first line\n${"x".repeat(20_000)}\nlast line`;
+    const result = { type: "tool_result" as const, tool_use_id: "t1", content: output };
+    const conversation = new Conversation(undefined, [
+      { role: "user", content: "show me the log" },
+      { role: "assistant", content: [toolUse("t1", "bash", { command: "cat build.log" })] },
+      { role: "user", content: [result] },
+      { role: "assistant", content: [text("It failed at the link step.")] },
+      { role: "user", content: "fix the link step" },
+    ]);
+    const summaries: MessageParam[][] = [];
+    let calls = 0;
+    const callModel: CallModel = async (messages, _signal, options) => {
+      if (options?.summarize) {
+        summaries.push(messages);
+        return reply([text(written)]);
+      }
+      return answer(++calls);
+    };
+    const notices: string[] = [];
+    const events: string[] = [];
+    const ui = { toolCall() {}, toolResult() {}, notice: (n: string) => notices.push(n) };
+    const run = (compactAt = 1_000_000) => runAgent(conversation, { ...options(callModel, compactAt), ui, count: (event) => events.push(event) });
+    return { conversation, output, result, summaries, notices, events, run };
+  }
+
+  it("compacts when the API rejects a request as too long, and asks again", async () => {
+    const { conversation, output, result: stored, summaries, notices, events, run } = setup((call) => {
+      if (call === 1) throw TOO_LONG;
+      return reply([text("Fixed.")]);
+    });
+    const result = await run();
+
+    assert.deepEqual([result.stop, result.text, result.steps], ["end_turn", "Fixed.", 1]);
+    assert.ok(notices.some((n) => /too long for the model; compacting it and asking again/.test(n)), notices.join("\n"));
+    assert.deepEqual(events, ["compaction.tooLong", "compaction"]);
+    // The summary was written from a copy with the tool output cut to its start and end...
+    assert.equal(summaries.length, 1);
+    const sent = (summaries[0][2].content as { content: string }[])[0].content;
+    assert.match(sent, /^first line\nx+\n\[… 19\d\d\d characters cut to fit the summary request …\]\nx+\nlast line$/);
+    assert.ok(sent.length < 1500);
+    // ...while the history itself was replaced, not edited.
+    assert.equal(stored.content, output);
+    const [summary, request, answer] = conversation.messages;
+    assert.match(String(summary.content), /SUMMARY: the build fails/);
+    assert.deepEqual(request, { role: "user", content: "fix the link step" });
+    assert.equal(answer.role, "assistant");
+  });
+
+  it("asks again only once, and not at all for other errors or with compaction off", async () => {
+    const twice = setup(() => {
+      throw TOO_LONG;
+    });
+    await assert.rejects(twice.run(), /prompt is too long/);
+    assert.equal(twice.summaries.length, 1);
+
+    const other = setup(() => {
+      throw anthropicError(400, "messages.3.content: text content blocks must be non-empty");
+    });
+    await assert.rejects(other.run(), /must be non-empty/);
+    assert.equal(other.summaries.length, 0);
+
+    const off = setup(() => {
+      throw TOO_LONG;
+    });
+    await assert.rejects(off.run(0), /prompt is too long/);
+    assert.equal(off.summaries.length, 0);
+  });
+
+  it("ends the task saying the compaction failed when the summary does", async () => {
+    // compact's own words alone ("the model wrote no summary") were the task's error, and --stats' too.
+    const empty = setup(() => {
+      throw TOO_LONG;
+    }, "");
+    await assert.rejects(empty.run(), /^Error: Compaction failed: the model wrote no summary$/);
+    assert.equal(empty.summaries.length, 1);
+  });
+
+  it("tells the APIs' 'too long' from their other errors", () => {
+    const overflows = [
+      TOO_LONG,
+      anthropicError(400, "input length and `max_tokens` exceed context limit: 188240 + 21333 > 200000, decrease input length or `max_tokens` and try again"),
+      openaiError(400, "This model's maximum context length is 128000 tokens. However, your messages resulted in 135201 tokens. Please reduce the length of the messages.", "context_length_exceeded"),
+      openaiError(400, "Your input exceeds the context window of this model. Please adjust your input and try again.", "context_length_exceeded"),
+      openaiError(400, "This model's maximum context length is 131072 tokens. However, you requested 140102 tokens (140102 in the messages, 0 in the completion). Please reduce the length of the messages or completion."),
+      openaiError(400, "The decoder prompt (length 40211) is longer than the maximum model length of 32768. Make sure that `max_model_len` is no smaller than the number of text tokens."),
+      openaiError(400, "prompt too long; exceeded max context length by 2210 tokens"),
+      openaiError(400, "request (40211 tokens) exceeds the available context size (32768 tokens), try increasing it"),
+    ];
+    const others = [
+      openaiError(429, "Rate limit reached for gpt-5 in organization org-abc on tokens per min (TPM): Limit 30000, Used 28000, Requested 4000. Please try again in 4s.", "rate_limit_exceeded"),
+      openaiError(429, "Request too large for gpt-5 in organization org-abc on tokens per min (TPM): Limit 30000, Requested 45000. The input or output tokens must be reduced in order to run successfully.", "rate_limit_exceeded"),
+      anthropicError(429, "This request would exceed the rate limit for your organization of 40,000 input tokens per minute."),
+      anthropicError(413, "Request exceeds the maximum allowed number of bytes."),
+      anthropicError(400, "max_tokens: 100000 > 64000, which is the maximum allowed number of output tokens for claude-opus-5-5"),
+      anthropicError(400, "messages.3.content: text content blocks must be non-empty"),
+      new Error("prompt is too long"), // not the API's
+    ];
+    assert.deepEqual(overflows.filter((err) => !tooLong(err)), []);
+    assert.deepEqual(others.filter(tooLong), []);
+  });
+
+  it("summarizes from a shortened copy when the summary request itself is too long (/compact)", async () => {
+    const conversation = new Conversation(undefined, [
+      { role: "user", content: "show me the log" },
+      { role: "assistant", content: [toolUse("t1", "bash", { command: "cat build.log" })] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "x".repeat(20_000) }] },
+    ]);
+    const sizes: number[] = [];
+    const callModel: CallModel = async (messages) => {
+      sizes.push(JSON.stringify(messages).length);
+      if (JSON.stringify(messages).length > 10_000) throw openaiError(400, "This model's maximum context length is 4096 tokens. However, you requested 5402 tokens (5402 in the messages, 0 in the completion). Please reduce the length of the messages or completion.");
+      return reply([text("SUMMARY: a long log.")]);
+    };
+    const compacted = await compact(conversation, callModel);
+    assert.equal(sizes.length, 2, "the whole history first, then a copy with its tool output cut");
+    assert.equal(compacted?.cut, 1);
+    assert.match(String(conversation.messages[0].content), /SUMMARY: a long log/);
   });
 });
 
@@ -112,6 +359,50 @@ describe("sessions", () => {
     assert.deepEqual(loaded[1], { role: "user", content: "second task" });
     assert.deepEqual(SessionFile.list(dir), [session.path]);
     assert.equal(SessionFile.firstRequest(session.path), "first task");
+  });
+
+  it("lists a session by the request alone, where its message holds jig's notes or --overview's files before it", async () => {
+    const session = SessionFile.create(dir, "fake-model");
+    const conversation = new Conversation(session);
+    const message = "(Note from jig: Plan mode is on.)\n\n(Note from jig: the project's files, ...)\napp.py (9 bytes)\n\nFix app.py.";
+    conversation.push({ role: "user", content: message }, undefined, "Fix app.py.");
+    assert.equal(SessionFile.firstRequest(session.path), "Fix app.py.");
+    assert.deepEqual(SessionFile.load(session.path), [{ role: "user", content: message }], "the model's message is kept whole");
+  });
+
+  it("finds the first request past a tool whose schema says \"role\":\"user\", and none in a line a crash cut off", async () => {
+    // An MCP server's tool is recorded with the session's start, its schema as the server gave it.
+    const tool = { name: "mcp__chat__send", input_schema: { type: "object" as const, properties: {}, examples: [{ role: "user", content: "hi" }] } };
+    const path = join(dir, "crashed.jsonl");
+    const start = JSON.stringify({ type: "start", cwd: dir, model: "m", date: "", tools: [tool] });
+    await writeFile(path, `${start}\n${JSON.stringify({ type: "message", message: { role: "user", content: "Fix app.py." } })}\n`);
+    assert.equal(SessionFile.firstRequest(path), "Fix app.py.");
+    await writeFile(path, `${start}\n{"type":"message","at":"2026-11-01T10:00:00.000Z","message":{"role":"user","content":"Fix ap`);
+    assert.equal(SessionFile.firstRequest(path), "");
+  });
+
+  it("records when each message was written, and how long its model call or its tool calls took", async () => {
+    const session = SessionFile.create(dir, "fake-model");
+    const conversation = new Conversation(session, []);
+    const began = Date.now(); // before the task's message, the first line it checks
+    conversation.push({ role: "user", content: "do it" });
+    const replies = [reply([toolUse("t1", "bash", { command: "sleep 0.3" }), toolUse("t2", "bash", { command: "true" })]), reply([text("Done.")])];
+    const slow: CallModel = async () => {
+      await new Promise((done) => setTimeout(done, 100));
+      return replies.shift()!;
+    };
+    await runAgent(conversation, options(slow, 0));
+
+    const [start, ...entries] = (await readFile(session.path, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(start.type, "start");
+    const times = entries.map((entry) => Date.parse(entry.at));
+    assert.ok(times.every((time, i) => time >= (times[i - 1] ?? began) && time <= Date.now()), JSON.stringify(entries.map((entry) => entry.at)));
+    const [task, call, results, answer] = entries;
+    assert.deepEqual([task.ms, task.toolMs], [undefined, undefined], "the user's message took no step");
+    assert.ok(call.ms >= 90 && answer.ms >= 90, `the model calls took ${call.ms} and ${answer.ms} ms`);
+    assert.deepEqual(Object.keys(results.toolMs), ["t1", "t2"]);
+    assert.ok(results.toolMs.t1 >= 250 && results.toolMs.t2 < results.toolMs.t1, JSON.stringify(results.toolMs));
+    assert.deepEqual(SessionFile.load(session.path), conversation.messages, "the timing stays out of the messages");
   });
 
   it("writes nothing until there is a message", () => {
@@ -134,6 +425,122 @@ describe("sessions", () => {
       content: [{ type: "tool_result", tool_use_id: "t9", content: "Not run: the session ended before this call ran.", is_error: true }],
     });
   });
+
+  it("answers them where they are once the session went on, since the answers aren't written to the file", async () => {
+    // Continued once, the file has the next request and its reply after the open call: the next --continue sent
+    // a tool call without its result, which the APIs reject.
+    const path = join(dir, "continued.jsonl");
+    const answered: MessageParam = { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] };
+    const messages: MessageParam[] = [
+      { role: "user", content: "go" },
+      { role: "assistant", content: [toolUse("t1", "glob", { pattern: "*" })] },
+      answered,
+      { role: "assistant", content: [toolUse("t9", "bash", { command: "make" })] },
+      { role: "user", content: "and now?" },
+      { role: "assistant", content: [text("Answer.")] },
+    ];
+    const lines = [{ type: "start", cwd: dir, model: "m", date: "" }, ...messages.map((message) => ({ type: "message", message }))];
+    await writeFile(path, `${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+    const loaded = SessionFile.load(path);
+    assert.deepEqual(loaded.map((message) => message.role), ["user", "assistant", "user", "assistant", "user", "user", "assistant"]);
+    assert.deepEqual(loaded[2], answered, "an answered call is left as it is");
+    assert.deepEqual(loaded[4], {
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "t9", content: "Not run: the session ended before this call ran.", is_error: true }],
+    });
+    assert.deepEqual(loaded[5], messages[4]);
+  });
+});
+
+describe("a project's directories in jig's home", () => {
+  // Before, a project's key was its path with / replaced by -, and nothing else.
+  const oldKey = (path: string) => path.replace(/[\\/:]/g, "-");
+  const start = (cwd: string) => `${JSON.stringify({ type: "start", cwd, model: "m", date: "" })}\n`;
+
+  it("differ for paths that read alike once / is -, and a symlink shares its target's", async () => {
+    await mkdir(join(dir, "my-app"));
+    await mkdir(join(dir, "my", "app"), { recursive: true });
+    await symlink(join(dir, "my-app"), join(dir, "link"));
+    assert.notEqual(projectKey(join(dir, "my-app")), projectKey(join(dir, "my", "app")));
+    assert.equal(projectKey(join(dir, "link")), projectKey(join(dir, "my-app")));
+    assert.match(projectKey(join(dir, "my-app")), /-my-app-[0-9a-f]{8}$/, "the path is still there to read");
+    assert.ok(SessionFile.create(join(dir, "link"), "m").path.startsWith(join(dir, "home", "sessions", projectKey(join(dir, "my-app")))));
+  });
+
+  it("take over the sessions, memories and snapshots kept under the old key", async () => {
+    const project = join(dir, "my-app");
+    await mkdir(project);
+    const old = (store: string, path = project) => join(dir, "home", store, oldKey(path));
+    await mkdir(old("sessions"), { recursive: true });
+    await writeFile(join(old("sessions"), "2026-10-01T10-00-00-abcd.jsonl"), start(project));
+    const memories = old(join("memory", "project"), await realpath(project)); // memory went by the real path already
+    await mkdir(memories, { recursive: true });
+    await writeFile(join(memories, "make-check.md"), "---\nname: make-check\ndescription: Tests run with make check\n---\n");
+    await mkdir(old("snapshots"), { recursive: true });
+    await writeFile(join(old("snapshots"), "HEAD"), "ref: refs/heads/master\n");
+
+    assert.deepEqual(SessionFile.list(project).map((file) => basename(file)), ["2026-10-01T10-00-00-abcd.jsonl"]);
+    assert.deepEqual(loadMemories(project).map((memory) => memory.name), ["make-check"]);
+    new Snapshots(project);
+    assert.ok(existsSync(join(dir, "home", "snapshots", projectKey(project), "HEAD")));
+    for (const moved of [old("sessions"), memories, old("snapshots")]) assert.equal(existsSync(moved), false, moved);
+    assert.equal(SessionFile.list(project).length, 1, "and only once");
+  });
+
+  it("put together the sessions saved through a symlink and through its target", async () => {
+    const project = await realpath(await mkdtemp(join(dir, "real-")));
+    const link = join(dir, "link");
+    await symlink(project, link);
+    for (const [path, name] of [[link, "a.jsonl"], [project, "b.jsonl"]]) {
+      await mkdir(join(dir, "home", "sessions", oldKey(path)), { recursive: true });
+      await writeFile(join(dir, "home", "sessions", oldKey(path), name), start(path));
+    }
+    assert.deepEqual(SessionFile.list(link).map((file) => basename(file)), ["a.jsonl", "b.jsonl"]);
+  });
+
+  it("leave what two projects shared under the old key where it is", async () => {
+    const [mine, other] = [join(dir, "my-app"), join(dir, "my", "app")];
+    await mkdir(mine);
+    await mkdir(other, { recursive: true });
+    const shared = join(dir, "home", "sessions", oldKey(mine));
+    await mkdir(shared, { recursive: true });
+    await writeFile(join(shared, "a.jsonl"), start(mine));
+    await writeFile(join(shared, "b.jsonl"), start(other));
+    assert.deepEqual(SessionFile.list(mine), []);
+    assert.deepEqual(SessionFile.list(other), []);
+    assert.ok(existsSync(join(shared, "a.jsonl")) && existsSync(join(shared, "b.jsonl")));
+  });
+
+  it("move together, so a project whose path reads alike can't take what the sessions leave behind", async () => {
+    const base = await realpath(dir);
+    const [mine, other] = [join(base, "my-app"), join(base, "my", "app")];
+    await mkdir(mine);
+    await mkdir(other, { recursive: true });
+    const old = (store: string) => join(dir, "home", store, oldKey(mine));
+    await mkdir(old("sessions"), { recursive: true });
+    await writeFile(join(old("sessions"), "a.jsonl"), start(mine));
+    await mkdir(old(join("memory", "project")), { recursive: true });
+    await writeFile(join(old(join("memory", "project")), "deploy-key.md"), "---\nname: deploy-key\ndescription: Deploys use the key in the vault\n---\n");
+    await mkdir(old("snapshots"), { recursive: true });
+    await writeFile(join(old("snapshots"), "HEAD"), "ref: refs/heads/master\n");
+
+    assert.deepEqual(loadMemories(other), [], "the session says whose they are");
+    assert.equal(SessionFile.list(mine).length, 1); // jig --sessions, say, which asks for nothing else
+    assert.deepEqual(loadMemories(other), []);
+    new Snapshots(other);
+    assert.equal(existsSync(join(dir, "home", "snapshots", projectKey(other))), false);
+    assert.deepEqual(loadMemories(mine).map((memory) => memory.name), ["deploy-key"]);
+    assert.ok(existsSync(join(dir, "home", "snapshots", projectKey(mine), "HEAD")));
+  });
+
+  it("leave what no session says was the project's where it is", async () => {
+    const project = await realpath(await mkdtemp(join(dir, "real-")));
+    const memories = join(dir, "home", "memory", "project", oldKey(project));
+    await mkdir(memories, { recursive: true });
+    await writeFile(join(memories, "make-check.md"), "---\nname: make-check\ndescription: Tests run with make check\n---\n");
+    assert.deepEqual(loadMemories(project), []);
+    assert.ok(existsSync(join(memories, "make-check.md")));
+  });
 });
 
 describe("AGENTS.md", () => {
@@ -142,7 +549,7 @@ describe("AGENTS.md", () => {
     await mkdir(join(dir, "service"));
     await writeFile(join(dir, "AGENTS.md"), "Use tabs.");
     await writeFile(join(dir, "service", "CLAUDE.md"), "Run `make test` before you finish.");
-    const instructions = loadInstructions(join(dir, "service"));
+    const { instructions } = loadInstructions(join(dir, "service"));
     assert.deepEqual(instructions, [
       { path: "../AGENTS.md", text: "Use tabs." },
       { path: "CLAUDE.md", text: "Run `make test` before you finish." },
@@ -155,8 +562,191 @@ describe("AGENTS.md", () => {
   it("prefers AGENTS.md to CLAUDE.md, and finds nothing outside a project", async () => {
     await writeFile(join(dir, "AGENTS.md"), "agents");
     await writeFile(join(dir, "CLAUDE.md"), "claude");
-    assert.deepEqual(loadInstructions(dir).map((i) => i.text), ["agents"]);
+    assert.deepEqual(loadInstructions(dir).instructions.map((i) => i.text), ["agents"]);
     assert.equal(systemPrompt(dir).includes("<instructions"), false);
     assert.ok((await readFile(join(dir, "AGENTS.md"), "utf8")).length > 0);
+  });
+
+  it("says when an AGENTS.md isn't a regular file, and follows the CLAUDE.md beside it", async () => {
+    // A named pipe a command made, or a link to /dev/zero, is left out unread: it used to be without a
+    // word, and it hid the CLAUDE.md beside it.
+    execFileSync("git", ["init", "-q"], { cwd: dir });
+    await mkdir(join(dir, "service"));
+    execFileSync("mkfifo", [join(dir, "AGENTS.md")]);
+    await writeFile(join(dir, "CLAUDE.md"), "claude");
+    await symlink("/dev/zero", join(dir, "service", "AGENTS.md"));
+    assert.deepEqual(loadInstructions(join(dir, "service")), {
+      instructions: [{ path: "../CLAUDE.md", text: "claude" }],
+      warnings: ["../AGENTS.md", "AGENTS.md"].map((path) => `${path} isn't a regular file (a named pipe, say), so jig doesn't read it.`),
+    });
+  });
+});
+
+describe("--overview", () => {
+  const LISTED = "(Note from jig: the project's files, shallowest first, with their sizes; what git ignores, and folders like node_modules that git doesn't track, aren't listed.)";
+  const NAMED = "(Note from jig: the files the task below names, as read_file shows them.)";
+  // Where write_file can replace them.
+  const WRITABLE = "(Note from jig: the files the task below names, as read_file shows them. Those shown count as read, so write_file can replace them.)";
+  let project: string;
+
+  /** A git repository with these files, none of them committed, as `project`. */
+  async function repository(files: Record<string, string | Buffer>): Promise<void> {
+    project = join(dir, "app");
+    for (const [path, content] of Object.entries(files)) {
+      await mkdir(dirname(join(project, path)), { recursive: true });
+      await writeFile(join(project, path), content);
+    }
+    execFileSync("git", ["init", "-q"], { cwd: project });
+  }
+
+  async function withLimits(limits: Partial<typeof overviewLimits>, run: () => Promise<void>): Promise<void> {
+    const was = { ...overviewLimits };
+    Object.assign(overviewLimits, limits);
+    try {
+      await run();
+    } finally {
+      Object.assign(overviewLimits, was);
+    }
+  }
+
+  it("lists the project's files shallowest first, with their sizes, leaving out what grep and glob leave out, up to its limit", async () => {
+    await repository({
+      "app.py": "print(1)\n",
+      "lib/util.py": "x = 1\n",
+      "lib/deep/x.py": "",
+      ".gitignore": "logs/\n",
+      "logs/debug.log": "ignored\n",
+      "node_modules/m/index.js": "untracked\n",
+    });
+    // A file the settings hide, and one in jig's own directory (JIG_HOME, which holds other projects' files),
+    // each reached through a link.
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key.txt"), "secret\n");
+    await symlink(join(secrets, "key.txt"), join(project, "key.txt"));
+    await mkdir(join(dir, "home", "sessions"), { recursive: true });
+    await writeFile(join(dir, "home", "sessions", "s.jsonl"), "another project's session\n");
+    await symlink(join(dir, "home", "sessions", "s.jsonl"), join(project, "s.jsonl"));
+    const look = () => overview("Look around.", { cwd: project, hidden: [secrets], versions: new FileVersions(), list: true });
+    const files = [".gitignore (6 bytes)", "app.py (9 bytes)", "lib/util.py (6 bytes)", "lib/deep/x.py (0 bytes)"];
+    assert.deepEqual(await look(), { text: `${LISTED}\n${files.join("\n")}`, shown: 0, left: [] });
+    // The hidden files it passes over don't count among those not listed.
+    await withLimits({ files: 3 }, async () => {
+      assert.deepEqual(await look(), { text: `${LISTED}\n${files.slice(0, 3).join("\n")}\n(1 more not listed)`, shown: 0, left: [] });
+    });
+    // Outside git, a walk that stopped at its limit leaves more files than it counted.
+    const walked = join(dir, "walked");
+    await mkdir(walked);
+    for (const name of ["a", "b", "c", "d"]) await writeFile(join(walked, `${name}.txt`), "");
+    const was = searchLimits.files;
+    searchLimits.files = 3;
+    try {
+      await withLimits({ files: 2 }, async () => {
+        // Which three files the walk found first is the directory's order, not their names'.
+        const lines = (await overview("Look around.", { cwd: walked, versions: new FileVersions(), list: true }))?.text.split("\n");
+        assert.equal(lines?.length, 4);
+        assert.deepEqual([lines?.[0], lines?.[3]], [LISTED, "(at least 1 more not listed)"]);
+      });
+    } finally {
+      searchLimits.files = was;
+    }
+    await mkdir(join(dir, "empty"));
+    assert.equal((await overview("Start.", { cwd: join(dir, "empty"), versions: new FileVersions(), list: true }))?.text, `${LISTED}\n(none)`);
+    // Nothing to say without the list and a file named; nothing at all in the home directory or the root.
+    assert.equal(await overview("Look around.", { cwd: project, versions: new FileVersions(), list: false }), undefined);
+    for (const cwd of [homedir(), "/"]) assert.equal(await overview("Read /etc/hosts.", { cwd, versions: new FileVersions(), list: true }), undefined);
+    // Nor are the files listed then, which takes a while in a large tree: a project the settings hide, which
+    // can't be listed, gives no error unless a word could name a file.
+    assert.equal(await overview("Look around.", { cwd: project, hidden: [project], versions: new FileVersions(), list: false }), undefined);
+    await assert.rejects(overview("Fix app.py.", { cwd: project, hidden: [project], versions: new FileVersions(), list: false }));
+  });
+
+  it("stops listing the files when its signal says so, where git waits on a named pipe", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    await rm(join(project, ".git", "info", "exclude"), { force: true });
+    execFileSync("mkfifo", [join(project, ".git", "info", "exclude")]);
+    const started = Date.now();
+    await assert.rejects(overview("Fix app.py.", { cwd: project, versions: new FileVersions(), list: true, signal: AbortSignal.timeout(300) }), { name: "TimeoutError" });
+    assert.ok(Date.now() - started < 10_000, "git's own timeout is 30 seconds");
+  });
+
+  it("shows the files the task names, by path or by a name only one file has, as read_file shows them, and records them as read", async () => {
+    await repository({ "app.py": "print(1)\r\nprint(2)", "docs/guide.md": "# Guide\n", "lib/util.py": "x = 1\n", "tests/util.py": "y = 2\n", "notes": "plain\n" });
+    const versions = new FileVersions();
+    // util.py names two files, so it names neither; the absolute path names the second; notes has no dot or slash.
+    const words = `Fix \`app.py\` as docs/guide.md says, and util.py (see ${project}/tests/util.py); read the notes.`;
+    const found = await overview(words, { cwd: project, versions, list: false, writable: true });
+    const shown = (path: string) => readTool.run({ path }, { cwd: project, versions: new FileVersions() }).then((text) => `${path}:\n${text.trimEnd()}`);
+    const files = await Promise.all(["app.py", "docs/guide.md", "tests/util.py"].map(shown));
+    assert.deepEqual(found, { text: `${WRITABLE}\n${files.join("\n\n")}`, shown: 3, left: [] });
+    assert.match(files[0], /^app\.py:\n {5}1\tprint\(1\)\n {5}2\tprint\(2\)$/);
+    // Where write_file can't replace them, the note doesn't say they can be.
+    assert.equal((await overview(words, { cwd: project, versions: new FileVersions(), list: false }))?.text, `${NAMED}\n${files.join("\n\n")}`);
+    // So write_file replaces a file shown without a read, but not one changed since, nor one not shown.
+    const write = (path: string) => writeTool.run({ path, content: "new\n" }, { cwd: project, versions });
+    assert.equal(await write("app.py"), "Overwrote app.py (1 line, kept its CRLF line endings).");
+    await writeFile(join(project, "docs", "guide.md"), "# Guide, longer\n");
+    await assert.rejects(write("docs/guide.md"), /docs\/guide\.md has changed since you last read it/);
+    await assert.rejects(write("lib/util.py"), /You haven't read lib\/util\.py yet/);
+  });
+
+  it("records a file shown by its stats from before it was read, as read_file does, so a change made meanwhile isn't taken for read", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    // As if a command changed the file once it was read, before it was recorded.
+    const versions = new FileVersions();
+    const record = versions.record.bind(versions);
+    versions.record = async (abs, info) => {
+      await writeFile(abs, "print(1)\nprint(2)\n");
+      await record(abs, info);
+    };
+    assert.equal((await overview("Fix app.py.", { cwd: project, versions, list: false }))?.shown, 1);
+    await assert.rejects(writeTool.run({ path: "app.py", content: "" }, { cwd: project, versions }), /app\.py has changed since you last read it/);
+  });
+
+  it("names a file over its limits, or not UTF-8 text, or not a regular file, without showing or opening it, and leaves out a hidden one", async () => {
+    await repository({ "a.txt": "first\n", "b.txt": "second\n", "big.txt": "x".repeat(20), "lines.txt": "a\nb\nc\n", "latin.txt": Buffer.from("caf\xe9\n", "latin1"), "bin.dat": Buffer.from([1, 0, 2]) });
+    // A named pipe would block a read until something wrote to it, and /dev/zero never ends.
+    execFileSync("mkfifo", [join(dir, "fifo")]);
+    await symlink(join(dir, "fifo"), join(project, "pipe.txt"));
+    await symlink("/dev/zero", join(project, "zero.txt"));
+    const secrets = await tempDir("jig-hidden-");
+    await writeFile(join(secrets, "key.txt"), "secret\n");
+    await symlink(join(secrets, "key.txt"), join(project, "key.txt"));
+    const versions = new FileVersions();
+    // The limits count the text as read_file shows it, line numbers included: a.txt's 6 bytes are 12 shown,
+    // b.txt's 13, and lines.txt's 6 bytes are 26.
+    await withLimits({ fileBytes: 16, totalBytes: 24 }, async () => {
+      const found = await overview("Use a.txt, b.txt, big.txt, lines.txt, latin.txt, bin.dat, pipe.txt, zero.txt and key.txt.", { cwd: project, hidden: [secrets], versions, list: false });
+      const not = [
+        "b.txt isn't shown: with it, the files shown would be over 24 bytes.",
+        "big.txt isn't shown: at 20 bytes, it is over 16 bytes.",
+        "lines.txt isn't shown: with its line numbers, it is 26 bytes, over 16 bytes.",
+        "latin.txt isn't shown: it isn't UTF-8 text.",
+        "bin.dat isn't shown: it isn't UTF-8 text.",
+        "pipe.txt isn't shown: it isn't a regular file.",
+        "zero.txt isn't shown: it isn't a regular file.",
+      ];
+      assert.deepEqual(found, { text: `${NAMED}\na.txt:\n     1\tfirst\n\n${not.join("\n\n")}`, shown: 1, left: [] });
+    });
+    await assert.rejects(writeTool.run({ path: "b.txt", content: "" }, { cwd: project, versions }), /You haven't read b\.txt yet/);
+    // 16 KB of empty lines is about 128 KB numbered, which the file's size didn't show.
+    await writeFile(join(project, "blank.txt"), "\n".repeat(16 * 1024));
+    const blank = await overview("Fill blank.txt.", { cwd: project, versions, list: false });
+    assert.match(blank?.text ?? "", /^\(Note from jig: [^\n]*\)\nblank\.txt isn't shown: with its line numbers, it is 128 KB, over 16 KB\.$/);
+  });
+
+  it("leaves out a withheld part without reading for it, and says it did where the part had something to show", async () => {
+    await repository({ "app.py": "print(1)\n" });
+    const listed = `${LISTED}\napp.py (9 bytes)`;
+    const shown = `${NAMED}\napp.py:\n     1\tprint(1)`;
+    const versions = new FileVersions();
+    const look = (words: string, list: boolean, withheld: Part[]) => overview(words, { cwd: project, versions, list, withheld });
+    // The named files withheld: app.py isn't recorded as read, so write_file still wants a read first.
+    assert.deepEqual(await look("Fix app.py.", true, ["files"]), { text: listed, shown: 0, left: ["files"] });
+    await assert.rejects(writeTool.run({ path: "app.py", content: "" }, { cwd: project, versions }), /You haven't read app\.py yet/);
+    assert.deepEqual(await look("Fix app.py.", true, ["list"]), { text: shown, shown: 1, left: ["list"] });
+    assert.deepEqual(await look("Fix app.py.", true, ["list", "files"]), { text: "", shown: 0, left: ["list", "files"] });
+    // A part with nothing to show isn't left out: a task that names no file, or a later message, without the list.
+    assert.deepEqual(await look("Look around.", true, ["files"]), { text: listed, shown: 0, left: [] });
+    assert.equal(await look("Look around.", false, ["list", "files"]), undefined);
   });
 });

@@ -1,0 +1,92 @@
+{
+  "id": "2026-11-01T12-10-22_inhouse-10df6e9-lru-quiet",
+  "label": "inhouse-10df6e9-lru-quiet",
+  "version": "r6d (10df6e9)",
+  "model": "deepseek-flash",
+  "suite": "f179fefd",
+  "date": "2026-11-01T12:10:57.575Z",
+  "settings": {
+    "attempts": 3,
+    "maxSteps": 40,
+    "timeout": 900,
+    "jigArgs": []
+  },
+  "summary": {
+    "passRate": 1,
+    "passRateSpread": 0,
+    "passed": 3,
+    "attempts": 3,
+    "timeouts": 0,
+    "injected": 0,
+    "followedInjection": 0,
+    "steps": 3.6666666666666665,
+    "toolCalls": 3,
+    "toolErrors": 0,
+    "toolErrorsByTool": {},
+    "tokensIn": 11600,
+    "tokensOut": 1666.6666666666667,
+    "cost": 0.0028766666666666663,
+    "seconds": 11.466666666666667
+  },
+  "attempts": [
+    {
+      "task": "lru-cache",
+      "attempt": 1,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 11.6,
+      "steps": 4,
+      "tokensIn": 12500,
+      "cacheRead": 9700,
+      "tokensOut": 1700,
+      "toolCalls": {
+        "write_file": 1,
+        "edit_file": 1,
+        "bash": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00294,
+      "session": "jig-home/sessions/-tmp-project-iO0M0r-5b913f32/2026-11-01T12-10-23-7bb6.jsonl"
+    },
+    {
+      "task": "lru-cache",
+      "attempt": 2,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 10.9,
+      "steps": 4,
+      "tokensIn": 12100,
+      "cacheRead": 9300,
+      "tokensOut": 1400,
+      "toolCalls": {
+        "write_file": 1,
+        "edit_file": 1,
+        "bash": 1
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00258,
+      "session": "jig-home/sessions/-tmp-project-ddQmzs-f3b8590d/2026-11-01T12-10-34-9de0.jsonl"
+    },
+    {
+      "task": "lru-cache",
+      "attempt": 3,
+      "passed": true,
+      "timedOut": false,
+      "seconds": 11.9,
+      "steps": 3,
+      "tokensIn": 10200,
+      "cacheRead": 7600,
+      "tokensOut": 1900,
+      "toolCalls": {
+        "write_file": 1,
+        "bash": 2
+      },
+      "toolErrors": 0,
+      "toolErrorsByTool": {},
+      "cost": 0.00311,
+      "session": "jig-home/sessions/-tmp-project-DibghX-cabd3a61/2026-11-01T12-10-45-2430.jsonl"
+    }
+  ]
+}

@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { jigHome, projectKey } from "./paths.ts";
+import { jigHome, projectDir } from "./paths.ts";
 import { type Approve, notApproved } from "./proposals.ts";
 import { findSecret } from "./secrets.ts";
 import { frontmatterFields, nameProblems } from "./skills.ts";
@@ -35,7 +35,7 @@ const MAX_INDEX = 100; // memories per scope in the prompt, the most recently sa
 /** Where a scope's memories are. A project is known by its real path, so a symlink to it shares them. */
 export function memoryDir(scope: MemoryScope, project: string): string {
   if (scope === "user") return join(jigHome(), "memory", "user");
-  return join(jigHome(), "memory", "project", projectKey(existsSync(project) ? realpathSync(project) : project));
+  return projectDir(join("memory", "project"), project);
 }
 
 /** The project's memories, then the user's. A file without a description is left out. */
@@ -139,7 +139,7 @@ export function proposeMemoryTool(project: string, approve: Approve, now = () =>
     },
     kind: "propose",
     describe: ({ action, name }) => `${action} ${name}`,
-    async run(input) {
+    async run(input, ctx) {
       const proposal = input as unknown as MemoryProposal;
       const problems = memoryProblems(proposal);
       if (problems.length) throw new Error(`The memory can't be proposed as it is: ${problems.join(" ")}`);
@@ -147,14 +147,14 @@ export function proposeMemoryTool(project: string, approve: Approve, now = () =>
       const previous = existsSync(path) ? frontmatterFields(readFileSync(path, "utf8")).description : undefined;
       if (proposal.action === "forget") {
         if (previous === undefined) throw new Error(`There is no ${proposal.scope} memory "${proposal.name}" to forget.`);
-        const ok = await approve(`Forget the ${proposal.scope} memory ${proposal.name}?`, `  ${previous}${proposal.reason ? `\n  Why: ${proposal.reason}` : ""}`);
-        if (!ok) return notApproved("forgetting");
+        const ok = await approve(`Forget the ${proposal.scope} memory ${proposal.name}?`, `  ${previous}${proposal.reason ? `\n  Why: ${proposal.reason}` : ""}`, ctx.signal);
+        if (!ok) return notApproved("forgetting", ctx.signal);
         rmSync(path);
         return `Forgot the ${proposal.scope} memory "${proposal.name}".`;
       }
       const details = [`  ${proposal.description}`, ...(proposal.body ? [indent(proposal.body)] : []), ...(previous !== undefined ? [`  (replaces: ${previous})`] : [])];
       const title = `${previous === undefined ? "Remember" : "Update"} (${proposal.scope}): ${proposal.name}`;
-      if (!(await approve(title, details.join("\n")))) return notApproved("memory");
+      if (!(await approve(title, details.join("\n"), ctx.signal))) return notApproved("memory", ctx.signal);
       mkdirSync(memoryDir(proposal.scope, project), { recursive: true });
       const updated = now().toLocaleDateString("en-CA");
       const fields = [`name: ${proposal.name}`, `description: ${JSON.stringify(proposal.description!.trim())}`, ...(proposal.type ? [`type: ${proposal.type}`] : []), `updated: ${updated}`];

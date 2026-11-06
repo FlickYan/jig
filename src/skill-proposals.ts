@@ -2,7 +2,9 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, sep } from "node:path";
 import { findSecret } from "./secrets.ts";
 import type { SkillEval } from "./skill-evals.ts";
+import { assertInProject } from "./skill-store.ts";
 import { descriptionProblems, nameProblems, userSkillsDir } from "./skills.ts";
+import { whyStopped } from "./tools/bash.ts";
 import type { Tool, ToolInput } from "./tools/index.ts";
 import * as ui from "./ui.ts";
 
@@ -21,8 +23,11 @@ export interface SkillProposal {
 /** Where a proposed skill goes: the project's skills, the user's, the proposals folder, or nowhere. */
 export type Decision = "project" | "user" | "proposal" | null;
 
-/** Puts a proposal to the user. The default asks in the terminal; tests answer for them. */
-export type Approver = (proposal: SkillProposal, files: Map<string, string>) => Promise<Decision>;
+/**
+ * Puts a proposal to the user. The default asks in the terminal; tests answer for them. The task's signal
+ * stopping (at --time-limit) closes the question unanswered.
+ */
+export type Approver = (proposal: SkillProposal, files: Map<string, string>, signal?: AbortSignal) => Promise<Decision>;
 
 const MAX_BYTES = 1_000_000;
 
@@ -57,12 +62,17 @@ export function proposeSkillTool(approve: Approver = askInTerminal): Tool {
     async run(input, ctx) {
       const proposal = toProposal(input);
       const files = skillFiles(proposal);
-      const decision = await approve(proposal, files);
+      const decision = await approve(proposal, files, ctx.signal);
+      if (!decision && ctx.signal?.aborted) return `Nothing was saved: ${whyStopped(ctx.signal, "the user stopped the task")}.`;
       if (!decision) return "The user didn't keep this skill. If it isn't clear why, ask them what to change.";
       const target =
         decision === "user" ? join(userSkillsDir(), proposal.name)
         : decision === "project" ? join(ctx.cwd, ".jig", "skills", proposal.name)
         : join(ctx.cwd, ".jig", "proposals", "skills", proposal.name);
+      // jig writes it itself, outside the sandbox, so in the project it is checked as jig skills add checks
+      // a skill's folder: a symlink a command made (.jig, say) mustn't take the files, or the removal of an
+      // earlier version, out of the project, or into a submodule's git directory in place of its config.
+      if (decision !== "user") await assertInProject(ctx.cwd, target, ctx.hidden, [], ctx.gitLocked);
       writeSkill(target, files);
       if (decision === "proposal") {
         return `Nobody could approve the skill now, so it was saved as a proposal in ${target}. The user can read it and install it with: jig skills add ${target}`;
@@ -82,6 +92,9 @@ function toProposal(input: ToolInput): SkillProposal {
     const clean = normalize(path);
     if (isAbsolute(path) || clean.startsWith("..") || clean.split(sep).includes("..")) problems.push(`The file ${path} isn't inside the skill's folder.`);
     else if (clean === "SKILL.md" || clean === join("evals", "evals.json")) problems.push(`${path} is written from the other fields; leave it out of files.`);
+    // Ignoring case, as the check on the folder does: jig writes these files itself, outside the sandbox,
+    // and a .git among them made the folder a repository whose config names programs for git to run.
+    else if (clean.toLowerCase().split(sep).includes(".git")) problems.push(`${path} would be git's own file; a skill has no .git.`);
     if (typeof content !== "string") problems.push(`The content of ${path} isn't text.`);
   }
   if (!Array.isArray(evals) || evals.some((item) => typeof item?.prompt !== "string")) problems.push("Each eval needs a prompt.");
@@ -116,7 +129,7 @@ function writeSkill(dir: string, files: Map<string, string>): void {
 }
 
 /** The default approver: shows the skill and asks where to keep it. With no terminal, it becomes a proposal. */
-export async function askInTerminal(proposal: SkillProposal, files: Map<string, string>): Promise<Decision> {
+export async function askInTerminal(proposal: SkillProposal, files: Map<string, string>, signal?: AbortSignal): Promise<Decision> {
   if (!process.stdin.isTTY) return "proposal";
   ui.println();
   ui.println(`${ui.bold(`Proposed skill: ${proposal.name}`)}`);
@@ -124,7 +137,7 @@ export async function askInTerminal(proposal: SkillProposal, files: Map<string, 
   for (const [path, content] of files) ui.println(ui.dim(`  ${path} (${content.split("\n").length} lines)`));
   for (const item of proposal.evals ?? []) ui.println(ui.dim(`  eval: ${item.prompt.replace(/\s+/g, " ").slice(0, 100)}`));
   for (;;) {
-    const answer = await ui.ask("Keep it? [p]roject (.jig/skills) / [u]ser (every project) / [v]iew / [n]o: ");
+    const answer = await ui.ask("Keep it? [p]roject (.jig/skills) / [u]ser (every project) / [v]iew / [n]o: ", signal);
     const choice = answer?.trim().toLowerCase() ?? "n";
     if (choice.startsWith("p")) return "project";
     if (choice.startsWith("u")) return "user";

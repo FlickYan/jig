@@ -5,6 +5,8 @@
     python3 eval/report.py eval/results/*.json                   # the report again, from the summaries
     python3 eval/report.py --only eval/ablation-subset.txt eval/results/tb-jig.json eval/results/abl-*.json
                                                                  # only the tasks in a list
+    python3 eval/report.py --skip-tasks eval/skip-tasks.txt eval/jobs/tb-*
+                                                                 # leave out the tasks in a list (or --skip-task <name>)
 
 Cost comes from the token counts and one price table, the same for every agent: mini-swe-agent's own
 cost tracking doesn't know every model, and jig's is computed the same way in its adapter.
@@ -12,6 +14,12 @@ cost tracking doesn't know every model, and jig's is computed the same way in it
 Terminal-Bench's tasks, with their tests and reference solutions, are public on GitHub, and the task
 containers can reach the internet. A trial in which the agent fetched anything from the benchmark's
 repositories counts as failed, whatever the verifier said: both agents did it now and then.
+
+A trial the verifier couldn't grade is "unscorable", neither passed nor failed: it is left out of the pass
+rates, their intervals and the differences between runs. That is one whose verifier ran out of disk and wrote
+no result (see unscorable), or one of a task whose verifier can't run on the machine, in the list that
+--skip-tasks names: a task a line, with why after a "#". eval/skip-tasks.txt is the machine's own list, kept
+out of git, and tbcheck uses it when it is there. --save keeps the mark, so the summaries leave out the same.
 """
 
 import json
@@ -19,6 +27,7 @@ import random
 import re
 import statistics
 import sys
+from collections import Counter
 from pathlib import Path
 
 # The benchmark's own repositories: Terminal-Bench 1 (laude-institute, now harbor-framework) and 2.
@@ -38,6 +47,10 @@ def trials(job: Path) -> list[dict]:
         agent = result.get("agent_result") or {}
         model = ((result.get("agent_info") or {}).get("model_info") or {}).get("name", "")
         exception = (result.get("exception_info") or {}).get("exception_type")
+        # jig stops itself just before the agent's time limit (--time-limit), in either of its runs (see the
+        # adapter's populate_context_post_run): a time-out all the same.
+        if not exception and (agent.get("metadata") or {}).get("time_limit"):
+            exception = "AgentTimeoutError"
         execution = result.get("agent_execution") or {}
         found.append({
             "task": result["task_name"],
@@ -58,7 +71,36 @@ def trials(job: Path) -> list[dict]:
             # Milestone 29's review, which ran the work, and the hidden tests on the work it saw (review_before.py).
             "run_review": (agent.get("metadata") or {}).get("run_review"),
             "before": before_fix(path.parent),
+            "unscorable": unscorable(path.parent),
         })
+    return found
+
+
+def unscorable(trial: Path) -> str | None:
+    """Why the verifier couldn't grade a trial, if there is a sign it couldn't: it ran out of disk installing
+    what the tests need and wrote no result (Terminal-Bench's tests write ctrf.json), as pytorch-model-recovery's
+    did twice in milestone 30. A verifier that wrote a result graded the work, whatever its output says: pytest
+    prints what each test captured, and the agent's own program may have run out of disk. A missing result
+    alone is no sign either: an agent that left dpkg locked or removed curl stops the tests the same way, and
+    Harbor grades that a failure, as it does a verifier that never started (jig's install failed first) or
+    tests that ran out of time. An agent that filled the disk looks like the machine's fault, so tbcheck leaves
+    any unscorable trial to a person. Nor is an HTTP error in a test taken for the verifier's failure, since a
+    task's own server may fail that way: a verifier refused its download on this machine is a task to skip."""
+    if (trial / "verifier" / "ctrf.json").exists():
+        return None
+    output = trial / "verifier" / "test-stdout.txt"
+    if output.exists() and "No space left on device" in output.read_text(errors="replace"):
+        return "its verifier ran out of disk"
+    return None
+
+
+def skip_list(path: Path) -> dict[str, str]:
+    """The tasks in a list (eval/skip-tasks.txt, say), one a line, each with why after a "#"."""
+    found = {}
+    for line in path.read_text().splitlines():
+        task, _, why = line.partition("#")
+        if task.strip():
+            found[task.strip()] = why.strip() or f"listed in {path.name}"
     return found
 
 
@@ -140,10 +182,15 @@ def label(job: Path) -> str:
     return f"{name}{f' ({settings})' if settings else ''}"
 
 
+def scorable(found: list[dict]) -> list[dict]:
+    """The trials the verifier could grade: the others are neither passed nor failed."""
+    return [trial for trial in found if not trial.get("unscorable")]
+
+
 def pass_rates(found: list[dict]) -> dict[str, float]:
-    """The share of each task's attempts that passed (without looking up the benchmark)."""
+    """The share of each task's scorable attempts that passed (without looking up the benchmark)."""
     tasks: dict[str, list[bool]] = {}
-    for trial in found:
+    for trial in scorable(found):
         tasks.setdefault(trial["task"], []).append(solved(trial))
     return {task: sum(results) / len(results) for task, results in tasks.items()}
 
@@ -184,45 +231,66 @@ def load(arg: str) -> tuple[str, str, list[dict]]:
 
 def main(args: list[str]) -> None:
     save = only = None
-    while args[:1] in (["--save"], ["--only"]):
+    skipped: dict[str, str] = {}
+    while args[:1] in (["--save"], ["--only"], ["--skip-task"], ["--skip-tasks"]):
         if args[0] == "--save":
             save = Path(args[1])
-        else:
+        elif args[0] == "--only":
             only = {line.strip() for line in Path(args[1]).read_text().splitlines() if line.strip() and not line.startswith("#")}
+        elif args[0] == "--skip-task":
+            skipped[args[1]] = "--skip-task"
+        else:
+            skipped |= skip_list(Path(args[1]))
         args = args[2:]
     jobs = args or [str(p) for p in sorted(Path("eval/jobs").iterdir()) if (p / "config.json").exists()]
     runs = [load(arg) for arg in jobs]
     if only:
         runs = [(name, agent, [t for t in found if t["task"] in only]) for name, agent, found in runs]
+    for _, _, found in runs:
+        for trial in found:
+            if not trial.get("unscorable") and trial["task"] in skipped:
+                trial["unscorable"] = f"skipped ({skipped[trial['task']]})"
     if save:
         save.mkdir(parents=True, exist_ok=True)
         for name, agent, found in runs:
             summary = {"name": name, "agent": agent, "trials": [trial | {"cost": cost(trial)} for trial in found]}
             (save / f"{name}.json").write_text(json.dumps(summary, indent=1) + "\n")
-    print("| job | agent | passed | 95% CI | looked up | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
-    print("|-----|-------|--------|--------|-----------|-----------|--------------|-------|-----------|------------|------|------------|")
+    print("| job | agent | passed | 95% CI | unscorable | looked up | timed out | other errors | turns | tokens in | tokens out | cost | agent time |")
+    print("|-----|-------|--------|--------|------------|-----------|-----------|--------------|-------|-----------|------------|------|------------|")
     for job, name, found in runs:
         if not found:
             continue
-        passed = sum(solved(trial) for trial in found)
+        scored = scorable(found)
+        passed = sum(solved(trial) for trial in scored)
+        result = "- | -"
+        if scored:
+            low, high = interval(list(pass_rates(found).values()))
+            result = f"{passed}/{len(scored)} ({passed / len(scored):.0%}) | {low:.0%}–{high:.0%}"
         looked = [trial for trial in found if trial.get("looked_up")]
         looked_up = f"{len(looked)} ({sum(t['passed'] for t in looked)} passed)" if looked else "0"
         timeouts = sum(trial["error"] == "AgentTimeoutError" for trial in found)
         others = sum(bool(trial["error"]) and trial["error"] != "AgentTimeoutError" for trial in found)
-        low, high = interval(list(pass_rates(found).values()))
         print(
-            f"| {job} | {name} | {passed}/{len(found)} ({passed / len(found):.0%}) | {low:.0%}–{high:.0%} | {looked_up} | {timeouts} | {others} "
+            f"| {job} | {name} | {result} | {len(found) - len(scored)} | {looked_up} | {timeouts} | {others} "
             f"| {fmt(mean([t['turns'] for t in found]), 'num')} | {fmt(mean([t['input'] for t in found]), 'tokens')} "
             f"| {fmt(mean([t['output'] for t in found]), 'tokens')} | {fmt(mean([cost(t) for t in found]), 'money')} "
             f"| {fmt(mean([t['seconds'] for t in found]), 'time')} |"
         )
-    print("\nAverages are per attempt. The 95% interval resamples tasks (each task's share of passed attempts).")
+    print("\nAverages are per attempt, unscorable ones too. The 95% interval resamples tasks (each task's share of passed attempts).")
     print("\"Looked up\": attempts that fetched the benchmark's own files from GitHub; they count as failed.")
+    print("\"Unscorable\": attempts the verifier couldn't grade, neither passed nor failed: left out of \"passed\", its interval and the differences.")
+    unscored: dict[tuple[str, str], list[str]] = {}
+    for job, _, found in runs:
+        for trial in found:
+            if trial.get("unscorable"):
+                unscored.setdefault((trial["task"], trial["unscorable"]), []).append(job)
+    for (task, why), jobs in sorted(unscored.items()):
+        print(f"- {task}, {why}: " + ", ".join(f"{count} in {job}" for job, count in Counter(jobs).items()))
     named = [(job, found) for job, _, found in runs if found]
     if len(named) > 1:
         first_job, first = named[0]
         base = pass_rates(first)
-        print("\nDifferences, paired by task (only tasks both runs attempted):\n")
+        print("\nDifferences, paired by task (only tasks both runs have scorable attempts at):\n")
         for job, found in named[1:]:
             rates = pass_rates(found)
             common = sorted(set(base) & set(rates))
@@ -232,7 +300,7 @@ def main(args: list[str]) -> None:
             diffs = [rates[task] - base[task] for task in common]
             low, high = interval(diffs)
             print(f"- {job} minus {first_job}: {statistics.mean(diffs) * 100:+.0f} points (95% CI {low * 100:+.0f} to {high * 100:+.0f}), over {len(common)} tasks")
-    print("\nPer task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error, ⊘ looked up the benchmark):\n")
+    print("\nPer task (✓ passed, ✗ failed, ⏱ hit the time limit, ! agent error, ⊘ looked up the benchmark, ? unscorable):\n")
     tasks = sorted({trial["task"] for _, _, found in runs for trial in found})
     print("| task | " + " | ".join(job for job, _, _ in runs) + " |")
     print("|------|" + "|".join("---" for _ in runs) + "|")
@@ -242,7 +310,7 @@ def main(args: list[str]) -> None:
             marks = []
             for trial in (t for t in found if t["task"] == task):
                 error = trial["error"]
-                marks.append("⊘" if trial.get("looked_up") else "✓" if trial["passed"] else "⏱" if error == "AgentTimeoutError" else "!" if error else "✗")
+                marks.append("?" if trial.get("unscorable") else "⊘" if trial.get("looked_up") else "✓" if trial["passed"] else "⏱" if error == "AgentTimeoutError" else "!" if error else "✗")
             cells.append("".join(marks) or " ")
         print(f"| {task} | " + " | ".join(cells) + " |")
     reviews(runs)

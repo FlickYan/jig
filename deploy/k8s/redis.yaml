@@ -1,0 +1,83 @@
+# The gateway's shared state (docs/server.md, Several replicas): one Redis, reached only by the gateway's
+# pods. It keeps nothing on disk, so its restart forgets the limits' and the spending's counts; for
+# spending that must last, use a managed Redis instead, or give this one a volume and --appendonly yes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jig-redis
+  namespace: jig
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jig
+        app.kubernetes.io/component: redis
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["--save", "", "--appendonly", "no"]
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-redis
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: redis
+  ports:
+    - port: 6379
+      targetPort: 6379
+---
+# Only the gateway reaches it: the counts are the gateway's to change.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jig-redis
+  namespace: jig
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: redis
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: jig
+              app.kubernetes.io/component: gateway
+      ports:
+        - protocol: TCP
+          port: 6379

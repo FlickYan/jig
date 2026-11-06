@@ -1,0 +1,76 @@
+# The model gateway, which holds the provider keys. Two replicas, acting as one: they keep the tenants'
+# limits and spending in Redis (redis.yaml, named in jig-gateway-config's "state").
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jig-gateway
+  namespace: jig
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: jig
+      app.kubernetes.io/component: gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: jig
+        app.kubernetes.io/component: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9181"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: registry.example.com/jig-server:0.1.0
+          command: ["node", "server/gateway.ts", "--config", "/etc/jig/gateway.json"]
+          ports:
+            - containerPort: 8081
+            - containerPort: 9181
+              name: metrics
+          env:
+            - name: JIG_GATEWAY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jig-secrets
+                  key: gateway-secret
+          envFrom:
+            - secretRef:
+                name: jig-provider-keys
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/jig
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: jig-gateway-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jig-gateway
+  namespace: jig
+spec:
+  selector:
+    app.kubernetes.io/name: jig
+    app.kubernetes.io/component: gateway
+  ports:
+    - port: 8081
+      targetPort: 8081

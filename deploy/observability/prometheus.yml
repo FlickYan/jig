@@ -1,0 +1,53 @@
+# Prometheus's config for jig's three parts (docs/server.md, Metrics and logs): the task service, the model
+# gateway and the router, each scraped at its metrics listener (`metrics` in its config), which serves only
+# GET /metrics and GET /healthz. Two ways to find them: the pods on Kubernetes that ask to be scraped
+# (deploy/k8s puts prometheus.io/scrape and prometheus.io/port on them), or addresses written down. Keep
+# the one that fits and adapt it. Every series gets a `component` label: api, gateway or router.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  # On Kubernetes: Prometheus in the monitoring namespace (deploy/k8s/networkpolicy.yaml lets only that
+  # namespace reach the metrics ports), with a service account that may list the pods in jig's.
+  - job_name: jig
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: ["jig"]
+    relabel_configs:
+      - source_labels: ["__meta_kubernetes_pod_annotation_prometheus_io_scrape"]
+        action: keep
+        regex: "true"
+      # The pod's address, at the port its annotation names rather than the first it declares.
+      - source_labels: ["__address__", "__meta_kubernetes_pod_annotation_prometheus_io_port"]
+        action: replace
+        regex: "([^:]+)(?::\\d+)?;(\\d+)"
+        replacement: "$1:$2"
+        target_label: __address__
+      - source_labels: ["__meta_kubernetes_pod_label_app_kubernetes_io_component"]
+        target_label: component
+      - source_labels: ["__meta_kubernetes_pod_name"]
+        target_label: pod
+      - source_labels: ["__meta_kubernetes_namespace"]
+        target_label: namespace
+
+  # Anywhere else: each replica's metrics listener by its address, with the region it serves as a label of
+  # its own, so one Prometheus (or one per region, federated) tells them apart. Set each part's
+  # `metrics.host` to an address Prometheus reaches and the tasks don't: on Docker, not on the tasks' network.
+  - job_name: jig-static
+    static_configs:
+      - targets: ["api-1.eu.example.com:9180", "api-2.eu.example.com:9180"]
+        labels:
+          component: api
+          region: eu
+      - targets: ["gateway-1.eu.example.com:9181", "gateway-2.eu.example.com:9181"]
+        labels:
+          component: gateway
+          region: eu
+      - targets: ["router-1.example.com:9182", "router-2.example.com:9182"]
+        labels:
+          component: router

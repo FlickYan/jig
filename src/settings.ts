@@ -1,23 +1,36 @@
 // Settings, the user's (~/.jig/settings.json) and a project's (.jig/settings.json): which commands run
-// without asking and which never run, the sandbox and the network, hooks and MCP servers. A project's
-// settings could run programs, so apart from its deny rules they apply only once the user trusts the file.
+// without asking and which never run, the sandbox and the network, hidden paths, hooks and MCP servers. A
+// project's settings could run programs, so apart from its deny rules and hidden paths they apply only once
+// the user trusts the file.
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { jigHome } from "./paths.ts";
+import { readRegularFile } from "./tools/util.ts";
 
-export const HOOK_EVENTS = ["PreToolUse", "PostToolUse"] as const;
+export const HOOK_EVENTS = ["PreToolUse", "PostToolUse", "Stop"] as const;
 export type HookEvent = (typeof HOOK_EVENTS)[number];
 
-/** A command the settings run before or after tool calls (see hooks.ts). */
+/** A command the settings run before or after tool calls, or before a task ends (see hooks.ts). */
 export interface Hook {
   event: HookEvent;
-  /** Tool names it applies to, as a regular expression like "edit_file|write_file" (default: all). */
+  /**
+   * Tool names it applies to, as a regular expression like "edit_file|write_file" (default, or "*": all).
+   * A Stop hook has no tool, so it has no use for one.
+   */
   matcher?: string;
-  /** Shell command; gets the tool call as JSON on stdin. */
+  /** Shell command; gets the tool call (or, for Stop, the task and the answer) as JSON on stdin. */
   command: string;
+}
+
+/**
+ * A hook's matcher as a regular expression for whole tool names. "*" means every tool, as in Claude Code,
+ * whose settings people copy: as a regular expression it is invalid, and threw on every tool call.
+ */
+export function hookMatcher(matcher?: string): RegExp {
+  return !matcher || matcher === "*" ? /^/ : new RegExp(`^(?:${matcher})$`);
 }
 
 /** An MCP server, started as a program that speaks MCP over stdio. */
@@ -39,8 +52,8 @@ export interface Settings {
   network?: boolean;
   /**
    * Paths sandboxed commands can't read: secrets (~/.ssh, ~/.aws), or answers a benchmark keeps on the
-   * same machine. Absolute, or starting with ~/. jig's own file tools only reach the project and --add-dir
-   * directories in any case.
+   * same machine. Absolute, or starting with ~/. jig's own file tools refuse them too, even through a
+   * symlink in the project.
    */
   hiddenPaths: string[];
   hooks: Hook[];
@@ -57,21 +70,29 @@ export interface ProjectSettings {
 
 const empty = (): Settings => ({ allow: [], deny: [], hiddenPaths: [], hooks: [], mcpServers: {} });
 
-/** The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one. */
-export function readSettings(root: string): { user: Settings; project?: ProjectSettings } {
+/**
+ * The user's settings (~/.jig/settings.json), and the project's (.jig/settings.json) if it has one; and
+ * what in them jig left out, for the user.
+ */
+export function readSettings(root: string): { user: Settings; project?: ProjectSettings; warnings: string[] } {
+  const warnings: string[] = [];
   const userFile = join(jigHome(), "settings.json");
-  const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile) : empty();
+  const user = existsSync(userFile) ? parse(readFileSync(userFile, "utf8"), userFile, warnings) : empty();
   const projectFile = join(root, ".jig", "settings.json");
-  if (!existsSync(projectFile)) return { user };
-  const text = readFileSync(projectFile, "utf8");
-  return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings: parse(text, projectFile) } };
+  if (!existsSync(projectFile)) return { user, warnings };
+  // A command can put a named pipe in its place, which jig would wait on forever. It is refused rather than
+  // left out, which would drop its deny rules without a word.
+  const text = readRegularFile(projectFile);
+  if (text === undefined) throw new Error(`${projectFile} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
+  const settings = parse(text, projectFile, warnings);
+  return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings }, warnings };
 }
 
 /**
  * The parts of a project's settings that could run code or weaken jig's safety, described for the
  * user. A repository you just cloned could otherwise start programs (hooks, MCP servers) or switch the
- * sandbox off the moment jig runs in it, so these need the user's trust. Deny rules only restrict, so
- * they always apply.
+ * sandbox off the moment jig runs in it, so these need the user's trust. Deny rules and hidden paths only
+ * restrict, so they always apply.
  */
 export function needsTrust(settings: Settings): string[] {
   const asks: string[] = [];
@@ -118,7 +139,7 @@ export function trust(root: string, project: ProjectSettings): void {
   writeFileSync(trustFile(), `${JSON.stringify(trusted, null, 2)}\n`);
 }
 
-function parse(text: string, file: string): Settings {
+function parse(text: string, file: string, warnings: string[]): Settings {
   let data: Record<string, unknown>;
   try {
     data = JSON.parse(text);
@@ -148,11 +169,21 @@ function parse(text: string, file: string): Settings {
   }
   const hooks = (data.hooks ?? {}) as Record<string, unknown>;
   for (const [event, list] of Object.entries(hooks)) {
-    if (!HOOK_EVENTS.includes(event as HookEvent)) fail(`unknown hook event "${event}" (use ${HOOK_EVENTS.join(" or ")})`);
+    // Settings written for Claude Code can hook events jig doesn't have (SessionStart, UserPromptSubmit):
+    // those hooks are left out, not the whole file.
+    if (!HOOK_EVENTS.includes(event as HookEvent)) {
+      warnings.push(`${file}: jig has no hook event "${event}", so those hooks don't run (it has ${HOOK_EVENTS.join(", ")}).`);
+      continue;
+    }
     if (!Array.isArray(list)) fail(`"hooks.${event}" must be a list of {"matcher", "command"}`);
     for (const hook of list as Record<string, unknown>[]) {
       if (typeof hook?.command !== "string") fail(`every hook in "hooks.${event}" needs a "command"`);
       if (hook.matcher !== undefined && typeof hook.matcher !== "string") fail(`a hook's "matcher" must be a string`);
+      try {
+        hookMatcher(hook.matcher as string | undefined);
+      } catch (err) {
+        fail(`the hook matcher "${hook.matcher}" is not a valid regular expression (${(err as Error).message})`);
+      }
       settings.hooks.push({ event: event as HookEvent, matcher: hook.matcher as string | undefined, command: hook.command as string });
     }
   }

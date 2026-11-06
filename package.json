@@ -15,6 +15,13 @@
   "license": "MIT",
   "author": "FlickYan",
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "default": "./dist/lib.js"
+    },
+    "./package.json": "./package.json"
+  },
   "bin": {
     "jig": "dist/cli.js"
   },

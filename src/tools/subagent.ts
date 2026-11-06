@@ -1,5 +1,5 @@
 import type Anthropic from "@anthropic-ai/sdk";
-import { addUsage, runAgent, type AgentOptions, type Usage } from "../agent.ts";
+import { addUsage, AFTER_EMPTY, runAgent, type AgentOptions, type RunResult, type Usage } from "../agent.ts";
 import { Conversation } from "../conversation.ts";
 import type { Tool } from "./index.ts";
 
@@ -42,11 +42,15 @@ export function subagentTool(setup: SubagentSetup): Tool {
       const result = await runAgent(conversation, { ...setup, ui: setup.ui(description) }, signal);
       if (usage) addUsage(usage, asApiUsage(result.usage)); // the task's cost includes its subagents'
       let answer = result.text.trim();
-      if (result.stop === "max_steps") {
-        // Out of steps in the middle of its research: get what it found so far, rather than nothing.
-        const { message } = await setup.callModel(withRequest(conversation.messages, OUT_OF_STEPS), signal, { summarize: true });
+      if (result.stop === "max_steps" || result.stop === "loop" || result.stop === "empty") {
+        // Out of steps in the middle of its research, stopped for repeating itself, or for replying twice with
+        // nothing: get what it found so far, rather than nothing. A report with no text leaves the run's own,
+        // which after two empty replies can be that of a reply cut off at the output limit.
+        const request = `${stoppedBecause(result.stop)}. Don't call any more tools: reply now with what you found so far, and what you didn't get to.`;
+        const { message } = await setup.callModel(withRequest(conversation.messages, request), signal, { summarize: true });
         if (usage) addUsage(usage, message.usage);
-        answer = message.content.map((block) => (block.type === "text" ? block.text : "")).join("").trim();
+        const report = message.content.map((block) => (block.type === "text" ? block.text : "")).join("").trim();
+        answer = report || answer;
       }
       answer ||= "(The subagent gave no answer.)";
       return result.stop === "end_turn" ? answer : `${answer}\n\n(The subagent stopped early: ${result.stop}.)`;
@@ -54,11 +58,25 @@ export function subagentTool(setup: SubagentSetup): Tool {
   };
 }
 
-const OUT_OF_STEPS = "You have run out of steps. Don't call any more tools: reply now with what you found so far, and what you didn't get to.";
+/**
+ * Why a run that stopped without an answer (a subagent's or a reviewer's) is asked for one with no more
+ * tools, as the request's first words; only `jig review` asks one interrupted, at its time limit. Stopped
+ * for repeating itself, it would only have used its steps up, so it is told it has; after two empty replies
+ * it hasn't, and isn't told so.
+ */
+export function stoppedBecause(stop: RunResult["stop"]): string {
+  if (stop === "empty") return "Two of your replies were empty";
+  return `You have run out of ${stop === "interrupted" ? "time" : "steps"}`;
+}
 
-/** The messages with a request added to the last user turn (it holds tool results, and turns must alternate). */
+/**
+ * The messages with a request added to the last user turn (it holds tool results, and turns must alternate).
+ * The loop's note after an empty reply, if it is last, gives way to the request: it asked the model to go on,
+ * which the request takes back, and the model never answered it.
+ */
 export function withRequest(messages: Anthropic.Beta.BetaMessageParam[], request: string): Anthropic.Beta.BetaMessageParam[] {
   const last = messages.at(-1)!;
+  if (typeof last.content === "string" && AFTER_EMPTY.includes(last.content)) return withRequest(messages.slice(0, -1), request);
   const content = typeof last.content === "string" ? [{ type: "text" as const, text: last.content }] : last.content;
   return [...messages.slice(0, -1), { role: "user", content: [...content, { type: "text", text: request }] }];
 }
