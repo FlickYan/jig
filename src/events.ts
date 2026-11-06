@@ -71,7 +71,7 @@ export class Events {
   private cost: number | null;
   private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
-  // What a listener threw at a call event, until the task fails with it (see meter).
+  // What a listener threw at a call or an approval event, until the task fails with it (see meter, kept).
   private failed: { error: unknown } | undefined;
   /** The end's exit code, once it is written: a signal after it doesn't change how jig exits. */
   endedWith: number | undefined;
@@ -143,14 +143,27 @@ export class Events {
   }
 
   /**
+   * A subagent's or the reviewer's UI, whose tool calls are no events: what a listener threw at a call event
+   * (see meter) stops them too, before any of a call runs, its hooks included.
+   */
+  checked(base: AgentUI): AgentUI {
+    return {
+      ...base,
+      toolCall: (name, description, id) => (this.check(), base.toolCall(name, description, id)),
+      toolResult: (output, isError, id) => (this.check(), base.toolResult(output, isError, id)),
+    };
+  }
+
+  /**
    * The same model, its usage and cost added to the end's: `model` is whose calls they are. The task's own
    * model's calls (and --escalate's) are steps, which ui writes, but for those that summarize: the wrap-up,
    * known by its request, and a compaction. Those and every call of a subagent's or the reviewer's model
    * (`kind`) are written here as calls, with what they were for and the main loop's step they came in, or
    * the last before them. A listener that throws there doesn't fail the call: each caller takes a failed call
    * its own way (a subagent's is its tool's result, a wrap-up's is left out), and the task would go on. Its
-   * error is kept, and thrown at the next model call, step, tool call or result, or by check once the loop is
-   * over, so the task ends with it, as it does when the listener throws at any other event.
+   * error is kept, and thrown at the next model call, step, tool call or result (a subagent's or the
+   * reviewer's too, see checked), or by check once the loop is over, so the task ends with it, as it does when
+   * the listener throws at any other event.
    */
   meter(callModel: CallModel, model: string, kind?: "subagent" | "review"): CallModel {
     return async (messages, signal, options) => {
@@ -196,12 +209,12 @@ export class Events {
   approvalRequest(request: { step: number; id: string; tool: string; description: string }): void {
     const { step, id, tool } = request;
     const [description, truncated] = cut(request.description, APPROVAL_DESCRIPTION_CHARS);
-    this.write("approval_request", { step, id, tool, description, ...(truncated && { truncated }) });
+    this.kept("approval_request", { step, id, tool, description, ...(truncated && { truncated }) });
   }
 
   /** The approver's answer, or the timeout's deny, as the call goes on with it. */
   approval(answer: { id: string; decision: "allow" | "deny"; always: boolean; by: "api" | "timeout" }): void {
-    this.write("approval", { ...answer });
+    this.kept("approval", { ...answer });
   }
 
   /** How the task ended, and the code jig exits with. Only the first end is written, and returned. */
@@ -233,6 +246,20 @@ export class Events {
     }
     if (this.fd !== undefined) closeSync(this.fd);
     return end;
+  }
+
+  /**
+   * A write in a tool call's permission check, which the loop takes, if it throws, for a failed check: the
+   * call's result would say so, and the task go on. The call still doesn't run, and what the listener threw
+   * is kept too, so the call's result throws it again and the task ends with it (see meter).
+   */
+  private kept(type: string, fields: Record<string, unknown>): void {
+    try {
+      this.write(type, fields);
+    } catch (error) {
+      this.failed ??= { error };
+      throw error;
+    }
   }
 
   private write(type: string, fields: Record<string, unknown>): void {

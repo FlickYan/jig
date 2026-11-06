@@ -319,6 +319,57 @@ describe("runTask", () => {
     }
   });
 
+  it("runs no more of a subagent's tool calls once the listener threw at its call event", async () => {
+    // The subagent's first reply calls bash: the listener has thrown at that reply's call event by then.
+    const api = await fakeMessagesApi((request) => {
+      const first = (request.messages as unknown[]).length === 1;
+      if (systemText(request as { system: string }).includes("You are a subagent")) return first ? [{ tool: "bash", input: { command: "ls" } }] : [{ text: "In parser.py." }];
+      return first ? [{ tool: "subagent", input: { description: "find", prompt: "Where is the parser?" } }] : [{ text: "Done." }];
+    });
+    try {
+      const { project, home, events, options } = await setUp(api, { yes: true });
+      // ls writes nothing, so hooks around the call say whether any of it ran.
+      const hooks = { PreToolUse: [{ matcher: "bash", command: "touch checked" }], PostToolUse: [{ matcher: "bash", command: "touch ran" }] };
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks }));
+      const onEvent = (event: Event) => {
+        events.push(event);
+        if (event.type === "call") throw new Error("listener bug at call");
+      };
+      const result = await runTask({ ...options, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(["checked", "ran"].map((name) => existsSync(join(project, name))), [false, false]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "call", "notice", "end"]);
+      // With a listener that doesn't throw, the hooks run.
+      assert.equal((await runTask(options)).stop, "end_turn");
+      assert.deepEqual(["checked", "ran"].map((name) => existsSync(join(project, name))), [true, true]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with a listener's error when it throws at an approval request or an approval, and doesn't run the call", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "touch made" } }] : [{ text: "Done." }]));
+    try {
+      for (const type of ["approval_request", "approval"]) {
+        const asked: unknown[] = [];
+        const { project, events, options } = await setUp(api, { approve: async (request) => (asked.push(request), { decision: "allow" }) });
+        const onEvent = (event: Event) => {
+          events.push(event);
+          if (event.type === type) throw new Error(`listener bug at ${type}`);
+        };
+        const result = await runTask({ ...options, onEvent });
+        assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, `listener bug at ${type}`], type);
+        assert.equal(existsSync(join(project, "made")), false, type);
+        // The approver isn't asked once the listener has failed at the request.
+        assert.equal(asked.length, type === "approval" ? 1 : 0, type);
+        const before = type === "approval" ? ["approval_request", "approval"] : ["approval_request"];
+        assert.deepEqual(types(events), ["start", "step", "tool_call", ...before, "notice", "end"], type);
+      }
+    } finally {
+      api.close();
+    }
+  });
+
   it("starts MCP servers with the task's environment, not the process's", async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "mcp__test__env", input: {} }] : [{ text: "Done." }]));
     try {
