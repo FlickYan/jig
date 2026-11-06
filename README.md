@@ -171,13 +171,14 @@ it drops new events (not the `end`; not always in a row, as a smaller one may st
 on stderr and, where there is room by then, in a `notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
 long as it takes some every 5 s, 60 s at most in all (a SIGTERM in that wait ends jig when it is over), and
 after a signal 20 s at most, once its commands are killed; a second signal in that wait doesn't cut it
-short (at any other end, Ctrl+C still does). If it gives up, it says on stderr how many events it couldn't
-write, and exits: the last line it wrote may then be cut off, so a reader should drop a last line without a
-newline. So a reader that is behind but reads, and takes them all within those limits, loses no line, the
-`end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
-otherwise, jig says so on stderr, writes no more events, and goes on with the task. `--events /dev/stdout`
-isn't `-`: jig opens it as a file, whose writes can wait for the reader, signals with them, and the
-terminal's output goes there too.
+short (at any other end, Ctrl+C still does); `JIG_EVENTS_FLUSH_SECONDS`, set to a number of seconds, lowers
+both bounds (the service's Kubernetes runner sets it to fit its pods' grace). If it gives up, it says on
+stderr how many events it couldn't write, and exits: the last line it wrote may then be cut off, so a
+reader should drop a last line without a newline. So a reader that is behind but reads, and takes them all
+within those limits, loses no line, the `end` included, on Linux or macOS. If the reader closes the pipe,
+or a write jig tries again fails otherwise, jig says so on stderr, writes no more events, and goes on with
+the task. `--events /dev/stdout` isn't `-`: jig opens it as a file, whose writes can wait for the reader,
+signals with them, and the terminal's output goes there too.
 
 `--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
 task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the

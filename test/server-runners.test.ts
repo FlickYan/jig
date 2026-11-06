@@ -585,6 +585,10 @@ interface Script {
   startsAfterMs?: number;
   /** The log breaks after `lines`, the pod still running; read again, it has these instead (it was rotated). */
   again?: string[];
+  /** With `again`: the container exits this long after the log's first read, whether it is read again or not. */
+  exitsAfterMs?: number;
+  /** The pod is gone (evicted, or deleted at the Job's deadline) this long after its log's first read ends. */
+  goneAfterMs?: number;
 }
 
 interface Pod {
@@ -599,6 +603,8 @@ interface Pod {
   /** Its log was read this many times, and the last read all went to the service. */
   reads: number;
   flushed?: boolean;
+  /** Deleted, though its Job is not: the API server no longer has it, and no new one is made. */
+  gone?: boolean;
 }
 
 /** The API server's rule for a label's value. */
@@ -692,12 +698,12 @@ class FakeCluster {
     }
     if (req.method === "GET" && url.pathname === `/api/v1${ns}pods`) {
       const [key, value] = url.searchParams.get("labelSelector")!.split("=");
-      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod) => pod !== undefined);
+      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod): pod is Pod => pod !== undefined && !pod.gone);
       return reply(200, { kind: "PodList", items: items.map((pod) => ({ metadata: { name: pod.name }, status: statusOf(pod) })) });
     }
     if (req.method === "GET" && (match = new RegExp(`^/api/v1${ns}pods/([\\w-]+)(/log)?$`).exec(url.pathname))) {
       const pod = this.pods.get(match[1]);
-      if (!pod) return missing();
+      if (!pod || pod.gone) return missing();
       if (!match[2]) return reply(200, { metadata: { name: pod.name }, status: statusOf(pod) });
       assert.equal(url.searchParams.get("follow"), "true");
       await pod.claimed;
@@ -708,7 +714,9 @@ class FakeCluster {
       res.on("finish", () => (pod.flushed = true));
       res.write((again && read ? again : lines).map((line) => `${line}\n`).join(""));
       if (hold) return void pod.logs.push(res);
+      if (pod.script.goneAfterMs && !read) setTimeout(() => (pod.gone = true), pod.script.goneAfterMs);
       if (!again || read) this.end(pod);
+      else if (pod.script.exitsAfterMs) setTimeout(() => this.end(pod, 0), pod.script.exitsAfterMs);
       return void res.end();
     }
     reply(404, { kind: "Status", message: `no route ${req.method} ${url.pathname}`, code: 404 });
@@ -821,6 +829,7 @@ describe("the Kubernetes runner", () => {
     assert.equal(pod.serviceAccountName, "jig-task");
     assert.equal(pod.automountServiceAccountToken, false);
     assert.equal(pod.enableServiceLinks, false);
+    assert.equal(pod.terminationGracePeriodSeconds, 30);
     assert.deepEqual(pod.securityContext, { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: "RuntimeDefault" } });
     assert.equal(pod.containers.length, 1);
     const [container] = pod.containers;
@@ -832,6 +841,8 @@ describe("the Kubernetes runner", () => {
       { name: "HOME", value: "/task/home" },
       { name: "JIG_HOME", value: "/task/home/.jig" },
       { name: "NO_COLOR", value: "1" },
+      // jig's wait for the reader at its end, 5 s inside the pod's grace, so the end is in the log before SIGKILL.
+      { name: "JIG_EVENTS_FLUSH_SECONDS", value: "25" },
       { name: "ANTHROPIC_API_KEY", valueFrom: { secretKeyRef: { name: objectName(id), key: "token" } } },
     ]);
     assert.ok(!JSON.stringify(job).includes("the task, in the Secret"), "the task is in the Secret, not the Job");
@@ -895,16 +906,35 @@ describe("the Kubernetes runner", () => {
     assert.match(unscheduled[3], /DeadlineExceeded: .* the pod was Unschedulable: 0\/3 nodes are available: 3 Insufficient cpu/);
   });
 
-  it("reads the pod's log once, though the pod's status says the container has ended a moment after the log does", async () => {
+  it("reads the pod's log again until the pod's status says the container has ended, a moment after the log does, each event passed on once", async () => {
     // The kubelet ends the stream as the container exits, before the pod's status, which it updates after.
     const { cluster, api } = await kubernetes();
     const lines = logOf(0, "end_turn");
     cluster.script = () => ({ lines, exitSeenAfterMs: 300 });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
     const task = await ended(api, id);
-    assert.deepEqual([task.status, task.exitCode], ["succeeded", 0]);
-    assert.equal([...cluster.pods.values()][0].reads, 1);
+    assert.deepEqual([task.status, task.exitCode, task.stats], ["succeeded", 0, { stop: "end_turn", steps: 1 }]);
+    assert.ok([...cluster.pods.values()][0].reads > 1);
     assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
+  });
+
+  it("gives the pods the configured grace, and jig 5 s less for its events at its end", async () => {
+    const { cluster, runner } = await bare({ terminationGraceSeconds: 45 });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    const pod = cluster.jobs.get(objectName(task.id)).spec.template.spec;
+    assert.equal(pod.terminationGracePeriodSeconds, 45);
+    assert.deepEqual(pod.containers[0].env.find((variable: { name: string }) => variable.name === "JIG_EVENTS_FLUSH_SECONDS"), { name: "JIG_EVENTS_FLUSH_SECONDS", value: "40" });
+  });
+
+  it("waits for a pod's end past the deadline and its slack by the pods' grace, which the pod may take to end", async () => {
+    // A time limit a minute in the past leaves 2 s to the deadline's slack; the pods' grace is 30 s more.
+    const { cluster, runner } = await bare({ graceSeconds: 0, pollMs: 200 });
+    cluster.script = () => ({ lines: logOf(0, "end_turn"), exitSeenAfterMs: 3000 });
+    const [task, tenant] = aTask({ timeLimit: -58 });
+    const exit = await (await runner.start(task, tenant)).wait();
+    assert.deepEqual([exit.exitCode, exit.timedOut, exit.stats], [0, false, { stop: "end_turn", steps: 1 }]);
   });
 
   it("leaves out a line of the pod's log too long to read", async () => {
@@ -1000,7 +1030,8 @@ describe("the Kubernetes runner", () => {
     const again = [event(6, "text", { text: "six" }), event(7, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
     cluster.script = () => ({ lines: [event(1, "start"), event(2, "text", { text: "two" }), event(3, "text", { text: "three" })], again });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
-    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    // The second read ends as the container exits, while it ran: a third, after it ended, is the whole log.
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 3]);
     const stored = (await api.store.events(id)).map(({ event }) => event as JigEvent);
     assert.deepEqual(stored.map((event) => [event.seq, event.type]), [[1, "start"], [2, "text"], [3, "text"], [4, "notice"], [6, "text"], [7, "end"]]);
     assert.match(String(stored[3].text), /^Events 4 to 5 aren't in the pod's log: it was rotated before it was read again/);
@@ -1015,8 +1046,79 @@ describe("the Kubernetes runner", () => {
     const again = [event(1, "start"), event(2, "text", { text: "two" }), event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
     cluster.script = () => ({ lines, again });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
-    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    // The second read ends as the container exits, while it ran: a third, after it ended, is the whole log.
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 3]);
     assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+  });
+
+  it("reads the pod's log again when it ends on a worker-shaped line while the container runs, the stats only from a read after it ended", async () => {
+    // A task's commands can write a line like the worker's (through /proc/1/fd/1), and the stream can break
+    // right after it: the events after it, the end and approval requests among them, must still come.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), event(2, "text", { text: "two" }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    const again = [...lines, event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { stop: "end_turn", steps: 1 } })];
+    cluster.script = () => ({ lines, again, exitsAfterMs: 1000 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.equal(task.status, "succeeded");
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("reads the pod's log again when it ends on a worker-shaped line and the container exits before the pod is looked at", async () => {
+    // The stream breaks after a forged line, and the container has ended by the GET of the pod that follows:
+    // the read began while it ran, so it may lack what came after, and isn't the one that counts.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), event(2, "text", { text: "two" }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    const again = [...lines, event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { stop: "end_turn", steps: 1 } })];
+    cluster.script = () => ({ lines, again, exitsAfterMs: 1 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("takes no stats from a worker-shaped line in a read made while the container ran, when the last read has no worker's line", async () => {
+    // The container is killed (out of memory, say) before the worker writes its line: the forged line, in a
+    // read that began while it ran, is not the worker's.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const lines = [event(1, "start"), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    cluster.script = () => ({ lines, again: [event(1, "start"), event(2, "text", { text: "two" })], exitCode: 137, reason: "OOMKilled" });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.exitCode, task.stats], ["error", 137, null]);
+    assert.match(String(task.error), /out of memory/);
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when a cancel deletes the Job before the pod's status says the container ended", async () => {
+    // The cancel's DELETE takes the Job at once, while the kubelet's word on the container is still to come.
+    const { cluster, runner } = await bare({ pollMs: 200 });
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, exitSeenAfterMs: 2000 });
+    const [task, tenant] = aTask();
+    const handle = await runner.start(task, tenant);
+    const pod = `/api/v1/namespaces/jig/pods/${objectName(task.id)}-x7k2p`;
+    await until(() => cluster.requests.some((request) => request.path === pod), "the pod looked at after its log's read");
+    handle.cancel();
+    const exit = await handle.wait();
+    assert.deepEqual([exit.exitCode, exit.stats, exit.message], [143, { stop: "interrupted", steps: 1 }, "its Job was deleted"]);
+    const types: string[] = [];
+    for await (const event of handle.events) types.push(event.type);
+    assert.deepEqual(types, ["start", "tool_call", "step", "end"]);
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when the pod is gone before its status says the container ended", async () => {
+    // At the Job's deadline, or an eviction, the pod can be deleted while its status still lags its log.
+    const { cluster, runner } = await bare();
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, jobReason: "DeadlineExceeded", exitSeenAfterMs: 500, goneAfterMs: 60 });
+    const [task, tenant] = aTask();
+    const exit = await (await runner.start(task, tenant)).wait();
+    assert.deepEqual([exit.exitCode, exit.timedOut, exit.stats], [143, true, { stop: "interrupted", steps: 1 }]);
   });
 
   it("gives a tenant whose id is no label value a hashed one, the id in an annotation", async () => {

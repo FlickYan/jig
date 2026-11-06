@@ -1289,6 +1289,9 @@ describe("the service's config", () => {
     assert.equal(problem({ runner: "docker" }), "The config's docker.image is missing");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "" } }), "The config's kubernetes.image must be a string that isn't empty");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w" } }), undefined);
+    // jig gets 5 s less than a pod's grace to write its end, and needs 5 to give up on a reader that takes nothing.
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 5 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 up, not 5");
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 10 } }), undefined);
     // A replica never runs more than concurrency at once, so idle workers past it are never used.
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4000 } } }), "The config's docker.pool.size must be at most concurrency, 4: idle workers past it are never used");
     assert.equal(problem({ concurrency: 8, kubernetes: { image: "w", pool: { size: 8 } } }), undefined);
