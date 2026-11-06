@@ -294,8 +294,9 @@ export class PostgresStore implements Store {
     );
   }
 
-  async events(task: string, after = 0): Promise<{ seq: number; event: object }[]> {
-    const { rows } = await this.pool.query("SELECT seq, json FROM events WHERE task = $1 AND seq > $2 ORDER BY seq", [task, after]);
+  async events(task: string, after = 0, limit?: number): Promise<{ seq: number; event: object }[]> {
+    // LIMIT NULL is none.
+    const { rows } = await this.pool.query("SELECT seq, json FROM events WHERE task = $1 AND seq > $2 ORDER BY seq LIMIT $3", [task, after, limit ?? null]);
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
   }
 

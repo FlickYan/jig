@@ -4,7 +4,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, get, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -140,9 +140,14 @@ interface Frame {
 async function* sse(service: Service, path: string, headers: Record<string, string> = {}): AsyncGenerator<Frame> {
   const res = await fetch(service.url + path, { headers: { authorization: `Bearer ${KEYS.acme}`, ...headers } });
   assert.equal(res.headers.get("content-type"), "text/event-stream");
+  yield* framesOf(res.body as unknown as AsyncIterable<Uint8Array>);
+}
+
+/** The server-sent events in a response's body, frame by frame. */
+async function* framesOf(body: AsyncIterable<Uint8Array>): AsyncGenerator<Frame> {
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const chunk of body) {
     buffer += decoder.decode(chunk, { stream: true });
     for (let end; (end = buffer.indexOf("\n\n")) >= 0; buffer = buffer.slice(end + 2)) {
       const frame: Frame = { data: "" };
@@ -499,6 +504,81 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.equal(existsSync(join(api.dataDir, "tasks", id)), false);
     assert.equal((await api.store.events(id)).length, 7);
   });
+
+  it("streams a task's events at its client's pace, holding a page of them while the client reads none", { skip: name !== "SQLite" && "SQLite's: Postgres's pages are tested in server-pg.test.ts" }, async () => {
+    // 2,000 events of 256 KiB, 500 MB in all, stored before the stream starts.
+    const text = "y".repeat(256 * 1024);
+    let written!: () => void;
+    const stored = new Promise<void>((done) => (written = done));
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (let seq = 1; seq <= 2000; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "text", text };
+            written();
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const base = await tempDir("jig-service-");
+    const api = await startService(
+      { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+      { secret: SECRET, runner },
+    );
+    services.push(api);
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await stored;
+    await statusOf(api, id, "succeeded");
+    /** How long /healthz took to answer: Infinity if it failed. */
+    const healthz = async () => {
+      const began = performance.now();
+      const ok = await fetch(`${api.url}/healthz`).then(async (res) => (await res.text(), res.ok), () => false);
+      return ok ? performance.now() - began : Infinity;
+    };
+    assert.ok((await healthz()) < Infinity);
+
+    // The service answers others all along, from the request on.
+    const before = process.memoryUsage.rss();
+    let rss = before;
+    let slowest = 0;
+    let probing = true;
+    const probes = (async () => {
+      while (probing) {
+        slowest = Math.max(slowest, await healthz());
+        rss = Math.max(rss, process.memoryUsage.rss());
+        await new Promise((done) => setTimeout(done, 20));
+      }
+    })();
+    const res = await new Promise<IncomingMessage>((done, fail) => get(`${api.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
+    // The client reads the first chunk, then nothing for a second.
+    const first = await new Promise<Buffer>((done) =>
+      res.once("data", (chunk: Buffer) => {
+        res.pause();
+        done(chunk);
+      }),
+    );
+    await new Promise((done) => setTimeout(done, 1000));
+    probing = false;
+    await probes;
+    rss = Math.max(rss, process.memoryUsage.rss());
+    assert.ok(rss - before < 100 * 1024 * 1024, `the service's memory grew by ${Math.round((rss - before) / 1024 / 1024)} MB`);
+    assert.ok(slowest < 200, `/healthz took ${slowest === Infinity ? "forever: one failed" : `${Math.round(slowest)} ms`}`);
+
+    // Then it reads the rest: every event, once each, in order.
+    const ids: string[] = [];
+    let done: Frame | undefined;
+    for await (const frame of framesOf((async function* () {
+      yield first;
+      yield* res;
+    })())) {
+      if (frame.id) ids.push(frame.id);
+      else done = frame;
+    }
+    assert.deepEqual(ids, Array.from({ length: 2000 }, (_, i) => String(i + 1)));
+    assert.deepEqual(done, { event: "done", data: JSON.stringify({ status: "succeeded" }) });
+  });
 };
 
 for (const { name, skip } of BACKENDS) {
@@ -831,6 +911,48 @@ describe("a run's outcome", () => {
     assert.equal(outcomeOf({ exitCode: null, timedOut: true }, undefined, undefined, undefined).stop, "time_limit");
     assert.equal(outcomeOf(killed, undefined, undefined, undefined).stop, "error");
     assert.equal(outcomeOf(undefined, undefined, "the workspace couldn't be made", undefined).stop, null);
+  });
+});
+
+describe("the SQLite store's reads", () => {
+  const limits = { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+  const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+
+  it("reads a task's events a page at a time, and all of them without a limit", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const task = await store.createTask("a", spec);
+    for (let seq = 1; seq <= 250; seq++) await store.addEvent(task.id, seq, { v: 1, seq, ts: "", type: "text" });
+    const seqs = async (after: number, limit?: number) => (await store.events(task.id, after, limit)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100), Array.from({ length: 100 }, (_, i) => i + 1));
+    assert.deepEqual(await seqs(100, 100), Array.from({ length: 100 }, (_, i) => i + 101));
+    assert.deepEqual(await seqs(200, 100), Array.from({ length: 50 }, (_, i) => i + 201));
+    assert.equal((await seqs(0)).length, 250);
+  });
+
+  it("lists a tenant's tasks in an index's order, with no sort of them all", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    for (const id of ["a", "b"]) await store.putTenant({ id, limits }, []);
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await store.createTask(i % 2 ? "a" : "b", spec)).id);
+    // The plans of the statements the store prepares to list them, as it prepares them.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const prepare = DatabaseSync.prototype.prepare;
+    const plans: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (/ FROM tasks WHERE tenant = \?/.test(sql)) plans.push((prepare.call(this, `EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((row) => row.detail).join("; "));
+      return prepare.call(this, sql);
+    };
+    try {
+      assert.equal((await store.tasks("a", { limit: 5 })).length, 5);
+      assert.equal((await store.tasks("a", { limit: 5, before: ids.at(-1) })).length, 5);
+    } finally {
+      DatabaseSync.prototype.prepare = prepare;
+    }
+    assert.equal(plans.length, 2);
+    for (const plan of plans) assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
   });
 });
 

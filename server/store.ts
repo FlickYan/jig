@@ -253,8 +253,8 @@ export interface Store {
   finish(id: string, owner: string, outcome: Outcome): Promise<boolean>;
   /** Keeps one of a task's events; one with a seq already kept is ignored. */
   addEvent(task: string, seq: number, event: object): Promise<void>;
-  /** A task's events after seq `after`, in order. */
-  events(task: string, after?: number): Promise<{ seq: number; event: object }[]>;
+  /** A task's events after seq `after`, in order: the first `limit` of them, if it is given. */
+  events(task: string, after?: number, limit?: number): Promise<{ seq: number; event: object }[]>;
   /** Keeps an approval a task's jig asked for; undefined if the task has one with its id already. */
   addApproval(task: string, request: ApprovalRequest): Promise<Approval | undefined>;
   approval(task: string, id: string): Promise<Approval | undefined>;
@@ -329,6 +329,10 @@ const MIGRATIONS = [
   `CREATE TABLE replicas (id TEXT PRIMARY KEY, seen_until TEXT NOT NULL);`,
   // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
   `CREATE INDEX usage_by_day ON usage (day);`,
+  // A tenant's tasks, newest first (the list without a status), are read in this index's order: it holds
+  // each task's rowid after its tenant, as Postgres's tasks_by_tenant holds n. Without it, each page sorted
+  // all of the tenant's tasks.
+  `CREATE INDEX tasks_by_tenant_n ON tasks (tenant);`,
 ];
 
 type Row = Record<string, unknown>;
@@ -582,8 +586,9 @@ class SqliteStore implements Store {
     this.db.prepare("INSERT OR IGNORE INTO events (task, seq, json) VALUES (?, ?, ?)").run(task, seq, JSON.stringify(event));
   }
 
-  async events(task: string, after = 0): Promise<{ seq: number; event: object }[]> {
-    const rows = this.db.prepare("SELECT seq, json FROM events WHERE task = ? AND seq > ? ORDER BY seq").all(task, after) as Row[];
+  async events(task: string, after = 0, limit?: number): Promise<{ seq: number; event: object }[]> {
+    // SQLite takes a negative limit as none.
+    const rows = this.db.prepare("SELECT seq, json FROM events WHERE task = ? AND seq > ? ORDER BY seq LIMIT ?").all(task, after, limit ?? -1) as Row[];
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
   }
 

@@ -97,7 +97,9 @@ character (`\u0000`, which Postgres text can't hold, so no store takes it); with
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
 quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
-ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it.
+ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
+events 100 at a time, the next page only once the client has taken the last, so it goes at the client's
+pace, and a client that reads slowly or not at all holds a page of events in the service, not all of them.
 
 A task is `queued`, then `running`, then one of:
 
