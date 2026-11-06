@@ -1644,7 +1644,9 @@ describe("a one-shot run with --time-limit", () => {
     // The command starts a job that leaves its process group, so jig's kill misses it and its output stays open,
     // then presses Ctrl+C itself, inside the 1 second: jig waits a second for the job's last output, and the
     // deadline passes meanwhile.
-    const job = `python3 -c 'import os, time; os.setsid(); open("ready", "w").close(); time.sleep(3)' & until [ -e ready ]; do sleep 0.05; done; kill -INT $PPID; sleep 30`;
+    // perl, as it starts at once: python3 can take most of the second to start on macOS, and the deadline then
+    // comes first.
+    const job = `perl -e 'use POSIX; POSIX::setsid(); open(my $f, ">", "ready"); close $f; sleep 3' & until [ -e ready ]; do sleep 0.05; done; kill -INT $PPID; sleep 30`;
     const api = await fakeMessagesApi(() => [{ tool: "bash", input: { command: job } }]);
     try {
       const file = join(outside, "stats.json");

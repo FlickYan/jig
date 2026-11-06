@@ -1,16 +1,21 @@
 import { execFile, spawn } from "node:child_process";
 import { closeSync, constants, openSync } from "node:fs";
 import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
-// work/ is the project jig works in, home/ its HOME and JIG_HOME, and beside them the events and stats files
-// jig writes, outside the project. jig's sandbox lets its commands read the whole machine, other tasks'
-// folders and the database among them, and write the temp folders: with dataDir there, they can write
-// these files too. So this runner is for one trusted tenant, or for development.
+// work/ is the project jig works in, home/ its HOME and JIG_HOME, home/tmp its TMPDIR, and beside them the
+// events and stats files jig writes, outside the project. jig's sandbox lets its commands read the whole
+// machine and write the temp folders, so the runner gives each jig settings that hide the data directory from
+// them, all but the task's own project and home (see tools/util.ts's keptIn), and the database and the
+// service's config: another task's folder, the events and stats files and the database are out of their
+// reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so that is the
+// task's own: in a shared one, other tasks' commands could read them, and write them. What they still share is
+// the machine: its kernel, /tmp and /var/tmp by their paths, and on macOS its processes and localhost.
+// Without a sandbox (sandboxProblem), commands run directly on it.
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -28,10 +33,13 @@ export interface LocalRunnerConfig {
   internalBaseUrl?: string;
   /** How often the events file is read, in milliseconds. */
   pollMs?: number;
+  /** What else tasks' commands can't read, beside dataDir: the database's files and the service's config. */
+  hidden?: string[];
 }
 
 // The service's environment holds its own secrets (and maybe real provider keys): jig gets only these of it.
-const PASSED = ["PATH", "LANG", "LC_ALL", "TZ", "TMPDIR"];
+// Not its TMPDIR: each task has its own.
+const PASSED = ["PATH", "LANG", "LC_ALL", "TZ"];
 // After SIGTERM, how long jig has to stop its commands before the whole process group is killed.
 export const TERM_MS = 5_000;
 
@@ -58,12 +66,18 @@ export class LocalRunner implements Runner {
     const home = join(dir, "home");
     await rm(dir, { recursive: true, force: true });
     await mkdir(work, { recursive: true });
-    await mkdir(home);
+    await mkdir(join(home, ".jig"), { recursive: true });
+    await mkdir(join(home, "tmp"));
+    const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
+    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
     await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"]);
 
     const timeLimit = task.spec.timeLimit;
     const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
-    const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
+    // git, jig's and its commands', looks for a repository no further up than the task's folder: a workspace
+    // with none would otherwise take one dataDir lies in (the service run from a checkout) for its own, and
+    // jig's sandbox lets commands write the repository it finds.
+    const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), TMPDIR: join(home, "tmp"), GIT_CEILING_DIRECTORIES: resolve(dir), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
     for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
 
     const events = join(dir, "events.jsonl");

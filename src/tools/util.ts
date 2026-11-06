@@ -2,6 +2,7 @@ import { constants } from "node:buffer";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants as fsConstants, fstatSync, ftruncateSync, lstatSync, openSync, readSync, realpathSync, renameSync, rmSync, type Stats, statSync, writeFileSync } from "node:fs";
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { context } from "../context.ts";
 import { jigHome } from "../paths.ts";
@@ -65,36 +66,61 @@ export async function assertVisible(abs: string, path: string, hidden: string[] 
  */
 export type Hiding = "settings" | "own" | "skills";
 
+/** The session's own places, by real path: the project, then the --add-dir directories, and the home directory. */
+export interface Places {
+  roots: string[];
+  home?: string;
+}
+
+/**
+ * Those of the session's own places that a hidden path holds, which it doesn't hide: the roots in it, and
+ * the home directory only beside the project, in it too and holding no root, as the local runner's data
+ * directory holds a task's work/ and home/ (see server/runners/local.ts). A user who hides the folder
+ * holding their home directory meant all of it hidden, ~/.ssh too, the project elsewhere or in it (~/code,
+ * which alone is kept), and a folder added with --add-dir (~/notes) keeps only itself. One in another of
+ * them is left to that one, which shows what is in it as it was (a home directory in the project would
+ * otherwise be shown read-only).
+ */
+export function keptIn(path: string, { roots, home }: Places): string[] {
+  const inPath = (place: string) => place !== path && isInside(path, place);
+  const kept = roots.filter(inPath);
+  const [project] = roots;
+  if (project && home && inPath(project) && inPath(home) && !roots.some((root) => isInside(home, root))) kept.push(home);
+  return [...new Set(kept)].filter((place, _, all) => !all.some((other) => other !== place && isInside(other, place)));
+}
+
 /**
  * What hides a real path from the file tools, if anything, as the sandbox hides it from commands: the
- * paths the settings hide, and given the directories the tools work in (`roots`, the project and the
- * --add-dir ones), jig's own directory (see sandbox.ts's ownRules). Its sessions and snapshots hold copies
- * of other projects' files, and of hidden ones, and a link a command made in the project led read_file and
- * grep there. Its skills stay readable, as they do to commands, but a `change` there is refused, as
+ * paths the settings hide, but for the session's own places where one holds them (see keptIn), and given
+ * the directories the tools work in (`roots`, the project and the --add-dir ones), jig's own directory
+ * (see sandbox.ts's ownRules). Its sessions and snapshots hold copies of other projects' files, and of
+ * hidden ones, and a link a command made in the project led read_file and grep there. Its skills stay readable, as they do to commands, but a `change` there is refused, as
  * commands can't make one either: each skill is offered in every project, and in a home-directory project
  * write_file could plant one. Only where they really lie in it, though: the sandbox binds them read-only
  * at their place there, so skills linked out of it (to a dotfiles repository, say) are as writable to
  * commands as anything else where the link leads, and so to the file tools. The roots that lie in jig's
  * directory stay as they were (a project there is a skill being written, say). jig's own changes in the
- * project, which the user approves, give no roots (see skill-store.ts's assertInProject). Worked out once,
- * to check many files against (see firstVisible, and skills.ts's discoverSkills, which can't wait for it).
+ * project, which the user approves, go by the settings alone (see skill-store.ts's assertInProject).
+ * Worked out once, to check many files against (see firstVisible, and skills.ts's discoverSkills, which
+ * can't wait for it).
  */
 export function hiddenTest(hidden: string[], roots?: string[], change = false): (real: string) => Hiding | undefined {
   const reals = (list: string[]) => list.map((path) => realTargetSync(path)).filter((path) => path !== undefined);
-  const paths = reals(hidden);
+  const places = { roots: reals(roots ?? []), home: realTargetSync(homedir()) };
+  const paths = reals(hidden).map((path) => ({ path, kept: keptIn(path, places) }));
   const home = roots && realTargetSync(jigHome());
   const linked = home && realTargetSync(join(home, "skills"));
   const skills = home && linked && isInside(home, linked) ? linked : undefined;
   const inside = home ? reals(roots ?? []).filter((dir) => isInside(home, dir)) : [];
   return (real) => {
-    if (paths.some((path) => isInside(path, real))) return "settings";
+    if (paths.some(({ path, kept }) => isInside(path, real) && !kept.some((place) => isInside(place, real)))) return "settings";
     if (!home || inside.some((dir) => isInside(dir, real))) return undefined;
     if (skills && isInside(skills, real)) return change ? "skills" : undefined;
     return isInside(home, real) ? "own" : undefined;
   };
 }
 
-function hiddenError(path: string, hiding: Hiding): Error {
+export function hiddenError(path: string, hiding: Hiding): Error {
   if (hiding === "settings") return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
   if (hiding === "skills") {
     return new Error(`${path} leads into jig's own skills, which the file tools read but don't change, as commands can't: each is offered in every project. To save a skill, propose it with propose_skill if you have it, or ask the user.`);

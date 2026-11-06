@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 878 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 900 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -152,24 +152,28 @@ output on stderr). Each line is `{"v":1,"seq":n,"ts":"<ISO time>","type":...}` w
 `step` (its number, its call's `usage` and `cost`), the model's `text`, each `tool_call` (`id`, `name` and the
 `description` the terminal shows, cut from the middle to 4,000 characters, with `"truncated":true` when
 cut) and its `tool_result` (`isError`, and the `output`, cut the same way), each `notice` jig prints (errors
-included), and last `end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and
-`cost` of every model call in the task (subagents', the reviewer's, compactions' and the wrap-up's included;
-the wrap-up's report is a `text` after the last step). A cost is in US dollars: each call is priced by the
-model its reply names (a gateway's alias names the model behind it) when `src/prices.ts` has a price for
-it, else by the one jig asked for, and is null when neither has. Every string goes through the redaction `jig sessions export` uses. A reader
-should pass over a type it doesn't know: later versions may add some. It is only for a task given on the command line or stdin. The
+included), a `call` for each model call that isn't a step's (`for`: `wrap-up`, `compaction`, `subagent` or
+`review`; the main loop's `step` it came in, or the last before it, 0 before the first; its `usage` and
+`cost`), and last `end`: the stop reason, the `exitCode` jig exits with, the steps, and the `usage` and
+`cost` of every model call in the task, so the steps' and the calls' add up to it (the wrap-up's report is a
+`text` after the last step). A cost is in US dollars: each call is priced by the model its reply names (a
+gateway's alias names the model behind it) when `src/prices.ts` has a price for it, else by the one jig asked
+for, and is null when neither has. Every string goes through the redaction `jig sessions export` uses. A
+reader should pass over a type it doesn't know: later versions may add some. It is only for a task given on
+the command line or stdin. The
 file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
 written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP,
 a Ctrl+C before the task starts or a second one in it, jig still writes an `end`, its stop `interrupted` (and
 `error`, with exit code 1, after a failure nothing caught). With `-`, what the pipe can't take while its
 reader is behind waits in jig, each later line behind it, and jig goes on with the task: a reader that stops
 reading holds the events, not jig, which still acts on a signal. jig holds 64 MiB of them at most: past that
-it drops new events (not the `end`; not always in a row, as a smaller one may still fit), and says how many on stderr and, where there is room by then, in a
-`notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
-long as it takes some every 5 s, and after a signal 20 s at most in all, once its commands are killed; a
-second signal in that wait doesn't cut it short (at any other end, Ctrl+C still does). If it gives up, it
-says on stderr how many events it couldn't write, and exits: the last line it wrote may then be cut off, so
-a reader should drop a last line without a newline. So a reader that is behind but reads loses no line, the
+it drops new events (not the `end`; not always in a row, as a smaller one may still fit), and says how many
+on stderr and, where there is room by then, in a `notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
+long as it takes some every 5 s, 60 s at most in all (a SIGTERM in that wait ends jig when it is over), and
+after a signal 20 s at most, once its commands are killed; a second signal in that wait doesn't cut it
+short (at any other end, Ctrl+C still does). If it gives up, it says on stderr how many events it couldn't
+write, and exits: the last line it wrote may then be cut off, so a reader should drop a last line without a
+newline. So a reader that is behind but reads, and takes them all within those limits, loses no line, the
 `end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
 otherwise, jig says so on stderr, writes no more events, and goes on with the task. `--events /dev/stdout`
 isn't `-`: jig opens it as a file, whose writes can wait for the reader, signals with them, and the
@@ -312,10 +316,12 @@ to `approve`, and its answer, are `approval_request` and `approval` events, as `
 `approve` rejects, the call doesn't run (its result tells the model the permission check failed, with the
 error's message), its `approval_request` gets no `approval` event, and the task goes on. `exitCode` is what
 `jig` would exit with. A failure ends the task with `stop: "error"` and says what failed in `error`, as
-does an `onEvent` that throws; only options that are wrong, before it starts, and an `onEvent` that throws
-at the end event reject. A signal aborted while the task is still starting (connecting MCP servers, taking
-its snapshot) stops it once that is done. A task prints nothing, and leaves the process's signal handlers,
-exit code and working directory alone. Several can run at once in one process, each with its own project,
+does an `onEvent` that throws: a call whose `approval_request` or `approval` it threw at doesn't run, nor
+do a subagent's calls after it threw at that subagent's `call`. Only options that are wrong, before it
+starts, and an `onEvent` that throws at the end event reject. A signal aborted while the task is still
+starting (connecting MCP servers, taking its snapshot) stops it once that is done. A task prints nothing,
+and leaves the process's signal handlers, exit code and working directory alone. Several can run at once
+in one process, each with its own project,
 jig directory, model and API, and each sees only its own events, permissions, memories, sessions and stats:
 what the CLI leaves to the process is the task's own in a library ([`src/context.ts`](src/context.ts)), but
 for the skills in your home directory's `.agents/skills` and `.claude/skills`, `~/` in hiddenPaths and the
@@ -399,7 +405,8 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   name, since commands can write the lockfile; `update` says why it skips an entry it refuses or can't
   fetch, updates the rest, and exits non-zero. An entry can point anywhere, so its question names the URL
   or folder a skill would come from; it refuses a folder, or a file URL's repository, that the hidden paths
-  hide or that holds one, and, with paths hidden, has git read a file URL's repository in the sandbox,
+  hide or that holds one (but for the project's own skills, a folder in the project a hidden folder
+  holds), and, with paths hidden, has git read a file URL's repository in the sandbox,
   where there is one, which hides them from git too (a `.git` file in it can lead git elsewhere). `add`
   does the same, so it doesn't install what `update` would refuse, and both take only https, ssh and file
   URLs (git runs a program for some others, and http and git URLs don't check whom they reach). The
@@ -450,7 +457,11 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   hidden by their paths, so where one lies in a directory commands can write in (the project, say), they
   can't move aside that directory, nor one in it holding the path. Snapshots leave out those in the
   project, by where they really lead, and `/undo` leaves them as they are (with the project itself hidden,
-  `/undo` is off).
+  `/undo` is off). A hidden folder that holds the project or an `--add-dir` folder hides all in it but
+  those, and your home directory if it lies beside the project there, which stay as they were: the task
+  service's local runner hides its data folder from a task this way, but for the task's own project and
+  home. A hidden folder holding your home directory hides all of it, `~/.ssh` too, but for the project or
+  an `--add-dir` folder in it.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that
@@ -724,7 +735,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts), [`state.ts`](server/state.ts), [`redis.ts`](server/redis.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits and quotas, usage and budgets, in memory or in Redis for several replicas, and failover between providers |
 | [`server/router.ts`](server/router.ts) | The router in front of several regions ([docs/server.md](docs/server.md)): each tenant's requests to its home region, a task's to the region in its id, new tasks to another region while the home is down |
 | [`server/metrics.ts`](server/metrics.ts), [`log.ts`](server/log.ts), [`service-metrics.ts`](server/service-metrics.ts) | What the service, the gateway and the router say about themselves: metrics in Prometheus's text format, and logs as plain lines or JSON (`JIG_LOG_FORMAT=json`); the task service's metrics |
-| [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, Kubernetes manifests, and Prometheus, alert and Grafana files |
+| [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, Kubernetes manifests and a script to try them on kind, and Prometheus, alert and Grafana files |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 

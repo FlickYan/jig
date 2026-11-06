@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { lockedGitPaths, sandboxProblem } from "../src/sandbox.ts";
 import { evalFileTargets, testSkill } from "../src/skill-evals.ts";
 import { proposeSkillTool, type SkillProposal } from "../src/skill-proposals.ts";
-import { compareSkills, describeSkill, fetchSource, findSkills, installedSkills, installSkill, lockedSource, parseSource, readLock, removeSkill } from "../src/skill-store.ts";
+import { assertInProject, compareSkills, describeSkill, fetchSource, findSkills, installedSkills, installSkill, lockedSource, parseSource, readLock, removeSkill } from "../src/skill-store.ts";
 import { skillsCommand } from "../src/skills-cli.ts";
 import { BUILTIN_SKILLS, discoverSkills, frontmatter, skillProblems } from "../src/skills.ts";
 import { FileVersions } from "../src/tools/util.ts";
@@ -340,6 +340,62 @@ describe("changing installed skills", () => {
     await assert.rejects(jig("remove", "beta"), hidden);
     await assert.rejects(jig("add", source, "--project", "--force"), hidden);
     assert.deepEqual(await readdir(join(secrets, "beta")), ["work.txt"]);
+  });
+
+  it("are added, updated and removed in a project a hidden folder holds, which keeps the project", async () => {
+    // hiddenPaths ["~/clients"] with the project in ~/clients/acme: the sandbox and the file tools keep the
+    // project, but jig's own changes in it were refused as hidden, and a skill's folder in it as a source.
+    const clients = join(dir, "clients");
+    const acme = join(clients, "acme");
+    await writeSkill(join(acme, "tools"), "gamma");
+    await mkdir(join(clients, "other"));
+    await writeSkill(join(clients, "other"), "delta");
+    await mkdir(process.env.JIG_HOME!, { recursive: true });
+    await writeFile(join(process.env.JIG_HOME!, "settings.json"), JSON.stringify({ hiddenPaths: [clients] }));
+    const { stop } = collectNotices(...markers, "gamma", "delta");
+    const inAcme = (...args: string[]) => skillsCommand([...args, "-C", acme, "--yes"]);
+    try {
+      await inAcme("add", "./tools/gamma", "--project");
+      assert.ok(existsSync(join(acme, ".jig", "skills", "gamma", "SKILL.md")));
+      await inAcme("update", "gamma");
+      await inAcme("remove", "gamma");
+      assert.ok(!existsSync(join(acme, ".jig", "skills", "gamma")));
+      // Not into the user's skills, which every project's commands read, nor from the rest of the hidden folder.
+      await assert.rejects(inAcme("add", "./tools/gamma"), /is in a path the settings hide/);
+      await assert.rejects(inAcme("add", join(clients, "other", "delta"), "--project"), /is in a path the settings hide/);
+    } finally {
+      stop();
+    }
+    // AGENTS.md, for an edit the user approved, and the rest of the hidden folder still refused.
+    await assertInProject(acme, join(acme, "AGENTS.md"), [clients]);
+    await symlink(join(clients, "other"), join(acme, "other"));
+    await assert.rejects(assertInProject(acme, join(acme, "other", "AGENTS.md"), [clients]), /other\/AGENTS\.md is hidden by the user's settings/);
+  });
+
+  it("are added, updated and removed from the home directory, whose project lockfile is the user's", async () => {
+    // In ~ the project's .jig is jig's own directory: the project's changes are the user's, not ones into
+    // jig's directory to refuse, with no hidden paths and with some.
+    const was = process.env.HOME;
+    process.env.HOME = dir;
+    delete process.env.JIG_HOME;
+    const { notices, stop } = collectNotices(...markers, "gamma");
+    const inHome = (...args: string[]) => skillsCommand([...args, "-C", dir, "--yes"]);
+    try {
+      await inHome("add", source);
+      await inHome("update");
+      assert.match(notices.join("\n"), /beta: up to date/);
+      await inHome("remove", "beta");
+      assert.ok(!existsSync(join(dir, ".jig", "skills", "beta")));
+      await inHome("add", await writeSkill(join(dir, "source"), "gamma"), "--project");
+      assert.ok(existsSync(join(dir, ".jig", "skills", "gamma", "SKILL.md")));
+      await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: [outside] }));
+      await inHome("update", "gamma");
+      await inHome("remove", "gamma");
+      assert.ok(!existsSync(join(dir, ".jig", "skills", "gamma")));
+    } finally {
+      stop();
+      process.env.HOME = was;
+    }
   });
 
   it("are removed from the user's when the project's settings are broken, but not from the project's", async () => {
@@ -756,6 +812,16 @@ describe("proposing a skill", () => {
     );
     await assert.rejects(proposeSkillTool(async () => "project").run({ ...proposal, name: "gitdata", files }, session), /\.jig\/skills\/gitdata leads to \S+\/gitdata, which holds git's own files/);
     assert.deepEqual(await gitDir(), before);
+  });
+
+  it("is saved in a project a hidden folder holds, which keeps the project", async () => {
+    // hiddenPaths ["~/clients"] with the project in ~/clients/acme: refused as hidden, though the project isn't.
+    const clients = join(dir, "clients");
+    const acme = join(clients, "acme");
+    await mkdir(acme, { recursive: true });
+    const saved = await proposeSkillTool(async () => "project").run({ ...proposal }, { cwd: acme, versions: new FileVersions(), hidden: [clients] });
+    assert.match(saved, /Saved the skill "release-notes"/);
+    assert.deepEqual(skillProblems(join(acme, ".jig", "skills", "release-notes")), []);
   });
 
   it("isn't saved, nor an earlier version removed, in a folder the settings hide", async () => {

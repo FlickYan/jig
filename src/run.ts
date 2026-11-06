@@ -303,7 +303,6 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
       }
     : viaService;
   const events = (state.events = sink === undefined ? undefined : new Events(sink, model));
-  events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   // Ctrl+C before the first task starts (while the MCP servers connect, say) ends jig as it would without a
   // handler, but through the exit event, so the end is written and the cleanup below runs.
   const beforeTask = () => process.exit(130);
@@ -327,6 +326,9 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(events?.endedWith ?? 128 + constants.signals[signal]));
     process.on("SIGINT", beforeTask);
   }
+  // Only now, with the handlers above in place: a reader that sees the start may stop jig at once, and a signal
+  // jig has no handler for yet ends it at once, with no end written.
+  events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
   const dirs = values["add-dir"].map((dir) => resolve(dir));
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
@@ -424,7 +426,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   let researchTools = researchFrom(extensions);
   const metered = (callModel: CallModel, subagent = false, share?: Share) => {
     const counted = stats?.meter(callModel, { subagent, share }) ?? callModel;
-    return events?.meter(counted, share?.model ?? model) ?? counted;
+    // Those of a subagent or the reviewer are no step's: the events say whose they are.
+    return events?.meter(counted, share?.model ?? model, subagent ? (share?.kind === "reviewed" ? "review" : "subagent") : undefined) ?? counted;
   };
   const newSubagentModel = () => {
     const system = subagentPrompt(cwd, { instructions, sandboxLimits: sandbox?.limits, dirs, tools: named(researchTools) });
@@ -445,7 +448,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     sandbox,
     hooks,
     count,
-    ui: ui.subagentUI,
+    // Their tool calls write no events, but stop at a listener's error from their model's calls.
+    ui: events ? (label) => events.checked(ui.subagentUI(label)) : ui.subagentUI,
   };
   // With --reviewer, a subagent on that model reviews the work: the subagents' tools and rules, its own steps.
   const newReviewer = (): Reviewer | undefined => {
@@ -715,6 +719,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
         // The task is the message without the overview. A compaction before the first step keeps it in place
         // of the message, so jig's notes, which the model hasn't seen yet, stay in it.
         result = await runAgent(conversation, { ...agent, task: [...told, text].join("\n\n"), checkUntil, budgetNotes }, signal);
+        // A listener that threw at the wrap-up's call event, say, after which the loop called it no more.
+        events?.check();
       } finally {
         clearTimeout(timer);
       }

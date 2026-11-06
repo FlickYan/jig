@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
 import { type Service, startService } from "../server/api.ts";
@@ -12,6 +15,7 @@ import { Redis } from "../server/redis.ts";
 import { startRouter } from "../server/router.ts";
 import { mintToken } from "../server/token.ts";
 import { costOf } from "../src/prices.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { type Block, messagesReply } from "./fake-api.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -84,14 +88,14 @@ function redisPrefix(): string {
   return prefix;
 }
 
-async function stack(replies: Block[][], backends: Backends = {}): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
+async function stack(replies: Block[][], backends: Backends = {}, base?: string): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
   const upstream = await provider(replies);
   const gateway = await startGateway(
     { listen: { port: 0 }, upstream: { baseUrl: upstream.url, keyEnv: ["PROVIDER_KEY"] }, ...(backends.redis && { state: { redis: REDIS!, prefix: redisPrefix() } }) },
     { JIG_GATEWAY_SECRET: SECRET, PROVIDER_KEY },
   );
   closers.push(() => gateway.close());
-  const base = await tempDir("jig-e2e-");
+  base ??= await tempDir("jig-e2e-");
   const dataDir = join(base, "data");
   const service = await startService(
     {
@@ -200,6 +204,93 @@ describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gatewa
     assert.equal(task.status, "cancelled");
     assert.equal(task.stop, "interrupted");
     assert.ok(Date.now() - started < 15_000, "the cancel took too long");
+  });
+
+  it("keeps a task's commands out of the database, the other tasks' folders and its own records", { skip: sandboxProblem() }, async () => {
+    // A command that tries them all, from its project, dataDir/tasks/<id>/work, then does its own work.
+    const tries = [
+      "head -c 15 $DB; echo",
+      "ls ../..",
+      "cat ../../*/work/secret.txt ../../*/events.jsonl",
+      "echo forged >> ../events.jsonl",
+      "echo mine > out.txt && cat out.txt",
+    ];
+    const replies: Block[][] = [[{ text: "done" }], [{ tool: "bash", input: { command: tries.join("; ") } }], [{ text: "done" }]];
+    const { service, dataDir } = await stack(replies);
+    replies[1] = [{ tool: "bash", input: { command: tries.join("; ").replace("$DB", join(dirname(dataDir), "jig.db")) } }];
+    const first = await call(service, "POST", "/v1/tasks", { prompt: "keep this", workspace: { files: { "secret.txt": "the first task's secret\n" } }, maxSteps: 5 });
+    assert.equal((await ended(service, first.body.id)).status, "succeeded");
+
+    const second = await call(service, "POST", "/v1/tasks", { prompt: "look around", maxSteps: 5 });
+    const task = await ended(service, second.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    const output = (await events(service, task.id)).find((frame) => frame.data.type === "tool_result")!.data.output;
+    assert.doesNotMatch(output, /SQLite format/, "the database");
+    assert.doesNotMatch(output, new RegExp(first.body.id), "the other task's folder");
+    assert.doesNotMatch(output, /the first task's secret/, "the other task's work");
+    assert.doesNotMatch(output, /"seq"/, "the tasks' events");
+    assert.match(output, /^mine$/m, "its own work");
+    assert.doesNotMatch(await readFile(join(dataDir, "tasks", task.id, "events.jsonl"), "utf8"), /^forged$/m, "its own events");
+    assert.equal(await readFile(join(dataDir, "tasks", task.id, "work", "out.txt"), "utf8"), "mine\n");
+  });
+
+  it("keeps a task's commands and its git out of a repository that holds dataDir", { skip: sandboxProblem() }, async () => {
+    // The service run from a git checkout, dataDir in it. A workspace of files has no repository, so jig and
+    // git looked up from work/ and found the service's: the sandbox let commands write it, refs and objects,
+    // and a task's git add and commit went into it. Outside the temp directory, which commands can write anyway.
+    const base = await mkdtemp(join(homedir(), ".jig-e2e-repo-"));
+    closers.push(() => rm(base, { recursive: true, force: true }));
+    const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: base, encoding: "utf8" });
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "the service's own commit");
+    const before = git("for-each-ref") + git("rev-parse", "HEAD");
+    const index = await readFile(join(base, ".git", "index"));
+    const tries = [
+      "git log --oneline",
+      "git add -A && git -c user.name=t -c user.email=t@t commit -qm task && echo committed",
+      `echo planted > ${join(base, ".git", "planted")}`,
+      `echo ${"0".repeat(40)} > ${join(base, ".git", "refs", "heads", "evil")}`,
+      "echo mine > out.txt && cat out.txt",
+    ];
+    const { service } = await stack([[{ tool: "bash", input: { command: tries.join("; ") } }], [{ text: "done" }]], {}, base);
+    const posted = await call(service, "POST", "/v1/tasks", { prompt: "commit it", workspace: { files: { "a.txt": "a\n" } }, maxSteps: 5 });
+    const task = await ended(service, posted.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    const output = (await events(service, task.id)).find((frame) => frame.data.type === "tool_result")!.data.output;
+    assert.doesNotMatch(output, /the service's own commit/, "read the service's repository");
+    assert.doesNotMatch(output, /^committed$/m, "committed into it");
+    assert.match(output, /^mine$/m, "its own work");
+    for (const path of ["planted", join("refs", "heads", "evil")]) assert.equal(existsSync(join(base, ".git", path)), false, path);
+    assert.equal(git("for-each-ref") + git("rev-parse", "HEAD"), before);
+    assert.deepEqual(await readFile(join(base, ".git", "index")), index);
+  });
+
+  it("keeps a task's long outputs, which jig saves in its TMPDIR, out of the other tasks' reach", { skip: sandboxProblem() }, async () => {
+    // The first task prints its secret past what the model sees, so jig keeps the whole output in a file,
+    // and waits there; the second looks for it where a shared TMPDIR would have put it, and in the first's.
+    const secret = `TENANT-A-SECRET-${randomUUID()}`;
+    const prints = 'for i in $(seq 1 3000); do echo "line $i $(cat secret.txt)"; done; sleep 60';
+    const replies: Block[][] = [[{ tool: "bash", input: { command: prints } }], [{ text: "done" }], [{ text: "done" }]];
+    const { service, dataDir } = await stack(replies);
+    const first = (await call(service, "POST", "/v1/tasks", { prompt: "print it", workspace: { files: { "secret.txt": `${secret}\n` } }, maxSteps: 5 })).body.id;
+    // jig keeps it in the task's own temp folder, in its home.
+    const own = join(dataDir, "tasks", first, "home", "tmp");
+    await until(async () => {
+      const files = (await readdir(own).catch(() => [])).filter((name) => /^jig-output-\w+\.log$/.test(name));
+      for (const name of files) if ((await readFile(join(own, name), "utf8")).includes(secret)) return true;
+      return false;
+    }, "the first task's output file");
+
+    const where = [`${tmpdir()}/jig-output-*.log`, "/tmp/jig-output-*.log", "/var/tmp/jig-output-*.log", "$TMPDIR/jig-output-*.log", `${own}/jig-output-*.log`];
+    replies[1] = [{ tool: "bash", input: { command: `cat ${where.join(" ")} 2>/dev/null | grep -m1 TENANT-A-SECRET; echo probe-done` } }];
+    const second = await call(service, "POST", "/v1/tasks", { prompt: "look around", maxSteps: 5 });
+    const task = await ended(service, second.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    const output = (await events(service, task.id)).find((frame) => frame.data.type === "tool_result")!.data.output;
+    assert.match(output, /probe-done/);
+    assert.doesNotMatch(output, new RegExp(secret));
+    await call(service, "POST", `/v1/tasks/${first}/cancel`);
+    assert.equal((await ended(service, first)).status, "cancelled");
   });
 });
 

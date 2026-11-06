@@ -6,7 +6,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { createSandbox, execInSandbox, lockedGitPaths } from "./sandbox.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
-import { assertVisible, isInside, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
+import { hiddenError, hiddenTest, isInside, keptIn, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -235,7 +235,9 @@ export async function assertInProject(project: string, path: string, hidden: str
   const shown = relative(project, path);
   const real = await realTarget(path);
   if (!real) throw new Error(`${shown} leads through a broken symlink, so jig won't change it. A command may have put it there; if so, delete it.`);
-  await assertVisible(path, shown, hidden);
+  // The settings' hidden paths, but for the project that one holds, which the sandbox keeps (see keptIn).
+  // Not jig's own directory, as the file tools hide it: in ~, the project's lockfile is the user's, in it.
+  if (hidden.length && hiddenTest(hidden, [project, ...dirs])(real) === "settings") throw hiddenError(shown, "settings");
   const roots = await Promise.all([project, ...dirs].map((dir) => realTarget(dir)));
   if (!roots.some((root) => root && isInside(root, real))) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
   // Without case, as isGitControl: macOS's file systems usually ignore it.
@@ -330,25 +332,29 @@ export async function removeSkill(skill: Installed, project: string, hidden: str
  * The source of an installed skill, to fetch it again: the same repository folder at the same ref. The
  * project's lockfile is a file commands can write, so an entry may not be one jig wrote, and may name any
  * folder on this machine, or by a file URL any repository: one the settings hide is refused (see
- * assertShown). (fetchSource refuses the URLs jig doesn't fetch from. And git reads a file URL's
- * repository itself, where a .git file, the alternates or a link can lead it elsewhere: so fetchSource has
- * git do that in the sandbox, which hides those paths, if there is one.)
+ * assertShown; `project` for a skill of the project's). (fetchSource refuses the URLs jig doesn't fetch
+ * from. And git reads a file URL's repository itself, where a .git file, the alternates or a link can lead
+ * it elsewhere: so fetchSource has git do that in the sandbox, which hides those paths, if there is one.)
  */
-export function lockedSource(entry: LockEntry, hidden: string[] = []): SkillSource {
+export function lockedSource(entry: LockEntry, hidden: string[] = [], project?: string): SkillSource {
   const fields = [entry?.source, entry?.path, entry?.url ?? "", entry?.ref ?? ""];
   if (!fields.every((field) => typeof field === "string")) throw new Error("its lockfile entry doesn't say where to fetch it from.");
-  assertShown(entry, hidden);
+  assertShown(entry, hidden, project);
   return entry.url ? { spec: entry.source, url: entry.url, path: entry.path, ...(entry.ref && { ref: entry.ref }) } : { spec: entry.source, path: entry.path };
 }
 
 /**
  * Refuses a source in the settings' hidden paths (`hidden`), or holding one, by where it really leads: a
- * folder, or a file URL's repository. Its files would land where commands can read them. `jig skills add`
- * refuses what update does, or it would install a skill that every later update refuses.
+ * folder, or a file URL's repository. Its files would land where commands can read them. But for one in
+ * the `project` a hidden folder holds, which keeps it (see keptIn), for a skill of the project's: that
+ * lands in the project, which commands read already. Not one of the user's, which every project's commands
+ * read. `jig skills add` refuses what update does, or it would install a skill that every later update
+ * refuses.
  */
-export function assertShown(source: { url?: string; path: string }, hidden: string[]): void {
+export function assertShown(source: { url?: string; path: string }, hidden: string[], project?: string): void {
   const folders = !source.url ? [source.path] : source.url.startsWith("file://") ? fileUrlFolders(source.url) : [];
-  const reals = hidden.map((path) => realTargetSync(path));
+  const roots = (project ? [realTargetSync(project)] : []).filter((root) => root !== undefined);
+  const reals = hidden.flatMap((path) => realTargetSync(path) ?? []).map((path) => ({ path, kept: keptIn(path, { roots }) }));
   for (const folder of folders) {
     // By the system's realpath, as the files are read: Node's own drops link/.. before it follows the link.
     let real: string;
@@ -357,7 +363,7 @@ export function assertShown(source: { url?: string; path: string }, hidden: stri
     } catch {
       continue; // nothing there to read
     }
-    if (reals.some((path) => !!path && (isInside(path, real) || isInside(real, path)))) {
+    if (reals.some(({ path, kept }) => (isInside(path, real) && !kept.some((place) => isInside(place, real))) || isInside(real, path))) {
       throw new Error(`${source.url || source.path} is in a path the settings hide (hiddenPaths), or holds one, so jig won't copy it where commands can read it.`);
     }
   }

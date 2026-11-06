@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import { type Approval, type Event, runTask, type TaskOptions } from "../src/lib.ts";
-import { type FakeApi, fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
+import { type Block, type FakeApi, fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // jig as a library: runTask() runs a task in the calling program, as `jig --events` would, and several can
@@ -281,6 +281,90 @@ describe("runTask", () => {
       const result = await runTask({ ...options, onEvent: throwingAt("tool_call") });
       assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at tool_call"]);
       await assert.rejects(runTask({ ...options, onEvent: throwingAt("end") }), /^Error: listener bug at end$/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with a listener's error when it throws at a call event, which no caller takes for a failed call", async () => {
+    // The first step calls a subagent, or a glob with one step only, and a wrap-up follows: each makes a call event.
+    let first: Block[] = [];
+    const api = await fakeMessagesApi((request) => {
+      if (systemText(request as { system: string }).includes("You are a subagent")) return [{ text: "In parser.py." }];
+      return (request.messages as unknown[]).length === 1 ? first : [{ text: "Done." }];
+    });
+    try {
+      const { options } = await setUp(api, { yes: true });
+      const events: Event[] = [];
+      const onEvent = (event: Event) => {
+        events.push(event);
+        if (event.type === "call") throw new Error("listener bug at call");
+      };
+      // A subagent's failed call is its tool's result: the model would be told of it, and the task done.
+      first = [{ tool: "subagent", input: { description: "find", prompt: "Where is the parser?" } }];
+      let result = await runTask({ ...options, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "call", "notice", "end"]);
+      // A failed wrap-up is left out, its report with it, and the task ends out of steps.
+      events.length = 0;
+      first = [{ tool: "glob", input: { pattern: "*" } }];
+      result = await runTask({ ...options, maxSteps: 1, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "tool_result", "notice", "call", "notice", "end"]);
+      assert.equal(ofType(events, "call")[0].for, "wrap-up");
+      const notices = ofType(events, "notice").map((event) => event.text);
+      assert.deepEqual(notices, ["Out of steps: asking the model where the work stands.", "listener bug at call"]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("runs no more of a subagent's tool calls once the listener threw at its call event", async () => {
+    // The subagent's first reply calls bash: the listener has thrown at that reply's call event by then.
+    const api = await fakeMessagesApi((request) => {
+      const first = (request.messages as unknown[]).length === 1;
+      if (systemText(request as { system: string }).includes("You are a subagent")) return first ? [{ tool: "bash", input: { command: "ls" } }] : [{ text: "In parser.py." }];
+      return first ? [{ tool: "subagent", input: { description: "find", prompt: "Where is the parser?" } }] : [{ text: "Done." }];
+    });
+    try {
+      const { project, home, events, options } = await setUp(api, { yes: true });
+      // ls writes nothing, so hooks around the call say whether any of it ran.
+      const hooks = { PreToolUse: [{ matcher: "bash", command: "touch checked" }], PostToolUse: [{ matcher: "bash", command: "touch ran" }] };
+      await writeFile(join(home, "settings.json"), JSON.stringify({ hooks }));
+      const onEvent = (event: Event) => {
+        events.push(event);
+        if (event.type === "call") throw new Error("listener bug at call");
+      };
+      const result = await runTask({ ...options, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(["checked", "ran"].map((name) => existsSync(join(project, name))), [false, false]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "call", "notice", "end"]);
+      // With a listener that doesn't throw, the hooks run.
+      assert.equal((await runTask(options)).stop, "end_turn");
+      assert.deepEqual(["checked", "ran"].map((name) => existsSync(join(project, name))), [true, true]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with a listener's error when it throws at an approval request or an approval, and doesn't run the call", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "touch made" } }] : [{ text: "Done." }]));
+    try {
+      for (const type of ["approval_request", "approval"]) {
+        const asked: unknown[] = [];
+        const { project, events, options } = await setUp(api, { approve: async (request) => (asked.push(request), { decision: "allow" }) });
+        const onEvent = (event: Event) => {
+          events.push(event);
+          if (event.type === type) throw new Error(`listener bug at ${type}`);
+        };
+        const result = await runTask({ ...options, onEvent });
+        assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, `listener bug at ${type}`], type);
+        assert.equal(existsSync(join(project, "made")), false, type);
+        // The approver isn't asked once the listener has failed at the request.
+        assert.equal(asked.length, type === "approval" ? 1 : 0, type);
+        const before = type === "approval" ? ["approval_request", "approval"] : ["approval_request"];
+        assert.deepEqual(types(events), ["start", "step", "tool_call", ...before, "notice", "end"], type);
+      }
     } finally {
       api.close();
     }

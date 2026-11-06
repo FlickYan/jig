@@ -288,12 +288,13 @@ describe("the Docker runner", () => {
     const task = await ended(api, id);
     assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
     assert.equal(runner.pool!.stats().hits, 1);
-    // The worker keeps its own names, so the log says which container and folder are the task's.
+    // Its container is renamed for the task, as a cold one is named; its folder keeps the worker's name, which the log says.
+    assert.deepEqual(JSON.parse(await readFile(join(state, "renames.jsonl"), "utf8")), { from: name, to: `jig-${id}` });
     const taken = lines.filter((line) => line.msg === "the task runs on a warm worker");
-    assert.deepEqual(taken.map(({ task, tenant, container, folder }) => ({ task, tenant, container, folder })), [{ task: id, tenant: "acme", container: name, folder: dir(id) }]);
+    assert.deepEqual(taken.map(({ task, tenant, container, folder }) => ({ task, tenant, container, folder })), [{ task: id, tenant: "acme", container: `jig-${id}`, folder: dir(id) }]);
     assert.match(dir(id), /[/\\]tasks[/\\]pool_[0-9a-f]{24}$/);
 
-    // No docker run for the task: it ran in the warm container, with its folder at /task.
+    // No docker run for the task (that record is the run's, by the name it ran with): it ran in the warm container, with its folder at /task.
     assert.ok(!(await runs(state)).has(`jig-${id}`));
     assert.deepEqual(values(warm.args, "--mount"), [`type=bind,source=${dir(id)},target=/task`]);
     // With the isolation a cold container gets, the ticket by name in its environment, and no key.
@@ -348,18 +349,69 @@ describe("the Docker runner", () => {
     assert.deepEqual(await readdir(join(runner.dir("none"), "..")), []);
   });
 
+  it("kills a warm worker's container that a crashed replica left running, renamed for its task when given it", async () => {
+    const base = await tempDir("jig-docker-");
+    const state = join(base, "state");
+    await mkdir(state);
+    const database = join(base, "jig.db");
+    const replica = await crashingReplica(database);
+    // The crashed replica's runner, with a warm worker claiming at a listener of its own.
+    const crashed = new DockerRunner(options(base, state, { pool: { size: 1 } }));
+    const listener = createHttpServer((req, res) => void crashed.claim(req, res));
+    await new Promise<void>((done) => listener.listen(0, "127.0.0.1", done));
+    servers.push({ close: () => new Promise((done) => (listener.closeAllConnections(), listener.close(() => done()))) });
+    crashed.warm(`http://127.0.0.1:${(listener.address() as AddressInfo).port}`);
+    await until(() => crashed.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [pool] = [...(await runs(state)).keys()];
+    const task = await replica.claim();
+    const handle = await crashed.start(task, replica.tenant);
+    assert.equal(handle.warm, true);
+    const record = await until(async () => JSON.parse(await readFile(join(crashed.dir(task.id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
+    // Renamed as a cold container is named, so a replica that ends the task finds it.
+    assert.deepEqual(JSON.parse(await readFile(join(state, "renames.jsonl"), "utf8")), { from: pool, to: `jig-${task.id}` });
+    const worker = await pidOf(state, `jig-${task.id}`);
+    // The worker started in its place is stopped; the one with the task is left running, as a crash leaves it.
+    await crashed.close();
+    await replica.crash();
+    assert.ok([worker, record.pid, record.child].every(alive));
+
+    const api = await service(new DockerRunner(options(base, state)), "acme", database);
+    assert.equal((await api.store.task(task.id))!.status, "error");
+    await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
+    assert.deepEqual((await kills(state)).filter((kill) => kill.name === `jig-${task.id}`), [{ signal: "KILL", name: `jig-${task.id}` }]);
+    assert.equal((await handle.wait()).exitCode, 137);
+  });
+
   it("cancels a task on a warm worker with docker kill, which ends everything in its container", async () => {
     const { api, state, runner, dir } = await docker({ pool: { size: 1 } });
     await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
-    const [name] = [...(await runs(state)).keys()];
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
     const record = await until(async () => JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
-    const worker = await pidOf(state, name);
+    // Sent by the name it has since it was given the task.
+    const worker = await until(() => pidOf(state, `jig-${id}`).catch(() => 0), "the container renamed for the task");
     assert.ok(alive(worker) && alive(record.pid) && alive(record.child));
     assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
     assert.equal((await ended(api, id)).status, "cancelled");
-    assert.deepEqual((await kills(state)).filter((kill) => kill.name === name), [{ signal: "TERM", name }]);
+    assert.deepEqual(await kills(state), [{ signal: "TERM", name: `jig-${id}` }]);
     await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
+  });
+
+  it("cancels a task on a warm worker whose rename landed but whose docker rename was cut off, by either name", async () => {
+    const lines: any[] = [];
+    // docker rename renames, then doesn't return before the runner stops it, 5 seconds on.
+    const { api, state, runner } = await docker({ pool: { size: 1 }, log: logTo(lines) }, { "slow-rename": "60000" });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [pool] = [...(await runs(state)).keys()];
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    const warning = await until(() => lines.find((line) => line.msg.startsWith("couldn't rename")), "the warning");
+    assert.equal(warning.msg, "couldn't rename a warm worker's container for its task; if this replica crashes, the replica that ends the task may not find it, and the run goes on until its time limit");
+    assert.match(warning.err.message, /^docker rename was stopped \(SIGTERM\); it may have been renamed all the same/);
+    const worker = await pidOf(state, `jig-${id}`);
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+    // The old name first, which misses, then the new one.
+    assert.deepEqual(await kills(state), [{ signal: "TERM", name: pool }, { signal: "TERM", name: `jig-${id}` }]);
+    await until(() => !alive(worker), "the container's processes to be gone");
   });
 
   it("replaces a worker idle past maxIdleSeconds", async () => {
@@ -460,6 +512,10 @@ interface Script {
   jobReason?: string;
   hold?: boolean;
   pending?: { reason: string; message: string };
+  /** The pod is never scheduled: no node has room for it, as the scheduler's message says. */
+  unschedulable?: string;
+  /** The kubelet ends the log's stream as the container exits, and its status says so this much later. */
+  exitSeenAfterMs?: number;
   /** The pod is Pending this long before it runs. */
   startsAfterMs?: number;
   /** The log breaks after `lines`, the pod still running; read again, it has these instead (it was rotated). */
@@ -605,11 +661,11 @@ class FakeCluster {
       if (script.startsAfterMs) pod.startsAt = Date.now() + script.startsAfterMs;
       this.pods.set(name, pod);
       if (pool !== -1) pod.claimed = this.claim(pod, command[pool + 1], secret.stringData.ticket);
-      // A pod that never starts, which the Job's deadline ends.
-      if (script.pending) {
-        pod.status = { phase: "Pending", containerStatuses: [{ state: { waiting: script.pending } }] };
-        job.status = { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded", message: "Job was active longer than specified deadline" }] };
-      }
+      // A pod that never starts, which the Job's deadline ends: its container can't, or no node takes it,
+      // when it has no container yet.
+      if (script.pending) pod.status = { phase: "Pending", containerStatuses: [{ state: { waiting: script.pending } }] };
+      if (script.unschedulable) pod.status = { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: script.unschedulable }] };
+      if (script.pending || script.unschedulable) job.status = { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded", message: "Job was active longer than specified deadline" }] };
     }
     return this.pods.get(name);
   }
@@ -624,7 +680,8 @@ class FakeCluster {
     else this.end(pod);
   }
 
-  private end(pod: Pod): void {
+  private end(pod: Pod, after = pod.script.exitSeenAfterMs): void {
+    if (after) return void setTimeout(() => this.end(pod, 0), after);
     const { exitCode = 0, reason, jobReason } = pod.script;
     pod.status = { phase: exitCode ? "Failed" : "Succeeded", containerStatuses: [{ state: { terminated: { exitCode, reason: reason ?? (exitCode ? "Error" : "Completed") } } }] };
     const job = this.jobs.get(pod.job);
@@ -750,6 +807,7 @@ describe("the Kubernetes runner", () => {
       // The Job's deadline: jig got SIGTERM and printed no end.
       deadline: { lines: logOf(undefined, undefined), exitCode: 143, jobReason: "DeadlineExceeded" },
       "never starts": { pending: { reason: "ImagePullBackOff", message: 'Back-off pulling image "registry.example.com/jig-worker:1"' } },
+      "no node": { unschedulable: "0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod." },
     };
     cluster.script = (prompt) => scripts[prompt];
     const ids = new Map<string, string>();
@@ -766,6 +824,22 @@ describe("the Kubernetes runner", () => {
     const never = await outcome("never starts");
     assert.deepEqual(never.slice(0, 3), ["error", "error", null]);
     assert.match(never[3], /DeadlineExceeded: .* the pod was ImagePullBackOff: Back-off pulling image/);
+    // A pod no node has room for has no container yet: the scheduler's word says why.
+    const unscheduled = await outcome("no node");
+    assert.deepEqual(unscheduled.slice(0, 3), ["error", "error", null]);
+    assert.match(unscheduled[3], /DeadlineExceeded: .* the pod was Unschedulable: 0\/3 nodes are available: 3 Insufficient cpu/);
+  });
+
+  it("reads the pod's log once, though the pod's status says the container has ended a moment after the log does", async () => {
+    // The kubelet ends the stream as the container exits, before the pod's status, which it updates after.
+    const { cluster, api } = await kubernetes();
+    const lines = logOf(0, "end_turn");
+    cluster.script = () => ({ lines, exitSeenAfterMs: 300 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.exitCode], ["succeeded", 0]);
+    assert.equal([...cluster.pods.values()][0].reads, 1);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
   });
 
   it("leaves out a line of the pod's log too long to read", async () => {
@@ -865,6 +939,19 @@ describe("the Kubernetes runner", () => {
     const stored = (await api.store.events(id)).map(({ event }) => event as JigEvent);
     assert.deepEqual(stored.map((event) => [event.seq, event.type]), [[1, "start"], [2, "text"], [3, "text"], [4, "notice"], [6, "text"], [7, "end"]]);
     assert.match(String(stored[3].text), /^Events 4 to 5 aren't in the pod's log: it was rotated before it was read again/);
+  });
+
+  it("reads the pod's log again when it breaks after a worker-shaped line that isn't its last", async () => {
+    // A task's commands can write a line like the worker's (through /proc/1/fd/1): only the log's last counts.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), JSON.stringify({ jigWorker: 1, exitCode: 0 }), event(2, "text", { text: "two" })];
+    const again = [event(1, "start"), event(2, "text", { text: "two" }), event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
+    cluster.script = () => ({ lines, again });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
   });
 
   it("gives a tenant whose id is no label value a hashed one, the id in an annotation", async () => {
