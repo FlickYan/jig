@@ -4,7 +4,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
-import { createServer, get, type IncomingMessage } from "node:http";
+import { createServer, get, type IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -164,6 +164,84 @@ async function collect(frames: AsyncGenerator<Frame>): Promise<Frame[]> {
   const all: Frame[] = [];
   for await (const frame of frames) all.push(frame);
   return all;
+}
+
+/**
+ * A service whose tasks each write `count` events of 128 KiB, with a pause of a millisecond after every
+ * tenth: the first, then, once `go` has resolved, the rest.
+ */
+async function bigEvents(name: string, count: number, go: () => Promise<void>): Promise<Service> {
+  const text = "y".repeat(128 * 1024);
+  const runner: Runner = {
+    async start() {
+      return {
+        events: (async function* () {
+          yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "text", text };
+          await go();
+          for (let seq = 2; seq <= count; seq++) {
+            yield { v: 1, seq, ts: new Date().toISOString(), type: "text", text };
+            if (seq % 10 === 0) await new Promise((done) => setTimeout(done, 1));
+          }
+        })(),
+        wait: async () => ({ exitCode: 0, timedOut: false }),
+        cancel() {},
+      };
+    },
+  };
+  const base = await tempDir(`jig-service-${name}-`);
+  const api = await startService(
+    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+    { secret: SECRET, runner },
+  );
+  services.push(api);
+  return api;
+}
+
+/**
+ * Watches what event streams hold written for their clients, which the client (and the kernel) hasn't
+ * taken yet: `most` is the most one held, as it wrote. Until the test ends.
+ */
+function watchStreams(): { most: () => number } {
+  const write = ServerResponse.prototype.write as (...args: unknown[]) => boolean;
+  let most = 0;
+  ServerResponse.prototype.write = function (this: ServerResponse, ...args: unknown[]) {
+    const result = write.apply(this, args);
+    if (this.req.url?.endsWith("/events")) most = Math.max(most, this.writableLength);
+    return result;
+  } as typeof ServerResponse.prototype.write;
+  opened.push(async () => void (ServerResponse.prototype.write = write as typeof ServerResponse.prototype.write));
+  return { most: () => most };
+}
+
+/** A task's event stream whose client reads the first chunk, then nothing until it reads the frames. */
+async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame> }> {
+  const res = await new Promise<IncomingMessage>((done, fail) => get(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
+  const first = await new Promise<Buffer>((done) =>
+    res.once("data", (chunk: Buffer) => {
+      res.pause();
+      done(chunk);
+    }),
+  );
+  return {
+    frames: () =>
+      framesOf(
+        (async function* () {
+          yield first;
+          yield* res;
+        })(),
+      ),
+  };
+}
+
+/** The ids of a stream's events, and the frame it ended with. */
+async function idsAndEnd(frames: AsyncGenerator<Frame>): Promise<{ ids: string[]; done?: Frame }> {
+  const ids: string[] = [];
+  let done: Frame | undefined;
+  for await (const frame of frames) {
+    if (frame.id) ids.push(frame.id);
+    else done = frame;
+  }
+  return { ids, done };
 }
 
 const work = (service: { dataDir: string }, id: string) => join(service.dataDir, "tasks", id, "work");
@@ -506,30 +584,9 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
   });
 
   it("streams a task's events at its client's pace, holding a page of them while the client reads none", { skip: name !== "SQLite" && "SQLite's: Postgres's pages are tested in server-pg.test.ts" }, async () => {
-    // 2,000 events of 256 KiB, 500 MB in all, stored before the stream starts.
-    const text = "y".repeat(256 * 1024);
-    let written!: () => void;
-    const stored = new Promise<void>((done) => (written = done));
-    const runner: Runner = {
-      async start() {
-        return {
-          events: (async function* () {
-            for (let seq = 1; seq <= 2000; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "text", text };
-            written();
-          })(),
-          wait: async () => ({ exitCode: 0, timedOut: false }),
-          cancel() {},
-        };
-      },
-    };
-    const base = await tempDir("jig-service-");
-    const api = await startService(
-      { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
-      { secret: SECRET, runner },
-    );
-    services.push(api);
+    // 200 events of 128 KiB, 25 MB in all, stored before the stream starts.
+    const api = await bigEvents(name, 200, async () => {});
     const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
-    await stored;
     await statusOf(api, id, "succeeded");
     /** How long /healthz took to answer: Infinity if it failed. */
     const healthz = async () => {
@@ -538,46 +595,50 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       return ok ? performance.now() - began : Infinity;
     };
     assert.ok((await healthz()) < Infinity);
+    // The most JSON of the pages it reads from the store.
+    let page = 0;
+    const events = api.store.events.bind(api.store);
+    api.store.events = async (...args) => {
+      const read = await events(...args);
+      page = Math.max(page, read.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0));
+      return read;
+    };
+    const held = watchStreams();
 
     // The service answers others all along, from the request on.
-    const before = process.memoryUsage.rss();
-    let rss = before;
     let slowest = 0;
     let probing = true;
     const probes = (async () => {
       while (probing) {
         slowest = Math.max(slowest, await healthz());
-        rss = Math.max(rss, process.memoryUsage.rss());
         await new Promise((done) => setTimeout(done, 20));
       }
     })();
-    const res = await new Promise<IncomingMessage>((done, fail) => get(`${api.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
     // The client reads the first chunk, then nothing for a second.
-    const first = await new Promise<Buffer>((done) =>
-      res.once("data", (chunk: Buffer) => {
-        res.pause();
-        done(chunk);
-      }),
-    );
+    const stream = await pausedStream(api, id);
     await new Promise((done) => setTimeout(done, 1000));
     probing = false;
     await probes;
-    rss = Math.max(rss, process.memoryUsage.rss());
-    assert.ok(rss - before < 100 * 1024 * 1024, `the service's memory grew by ${Math.round((rss - before) / 1024 / 1024)} MB`);
-    assert.ok(slowest < 200, `/healthz took ${slowest === Infinity ? "forever: one failed" : `${Math.round(slowest)} ms`}`);
+    assert.ok(slowest < 2000, `/healthz took ${slowest === Infinity ? "forever: one failed" : `${Math.round(slowest)} ms`}`);
+    // It held at most an event and the socket's buffer, written for the client, and a page of 4 MiB.
+    assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
+    assert.ok(page < 4.5 * 1024 * 1024, `a page held ${Math.round(page / 1024)} KiB of events`);
 
     // Then it reads the rest: every event, once each, in order.
-    const ids: string[] = [];
-    let done: Frame | undefined;
-    for await (const frame of framesOf((async function* () {
-      yield first;
-      yield* res;
-    })())) {
-      if (frame.id) ids.push(frame.id);
-      else done = frame;
-    }
-    assert.deepEqual(ids, Array.from({ length: 2000 }, (_, i) => String(i + 1)));
-    assert.deepEqual(done, { event: "done", data: JSON.stringify({ status: "succeeded" }) });
+    assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
+  });
+
+  it("sends live events at its client's pace too, holding none of them while the client reads none", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    // The first event, then, once the client has stopped reading, 200 of 128 KiB.
+    let paused!: () => void;
+    const api = await bigEvents(name, 200, () => new Promise<void>((done) => (paused = done)));
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    const held = watchStreams();
+    const stream = await pausedStream(api, id);
+    paused();
+    await statusOf(api, id, "succeeded");
+    assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
+    assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
   });
 };
 
@@ -929,6 +990,23 @@ describe("the SQLite store's reads", () => {
     assert.deepEqual(await seqs(100, 100), Array.from({ length: 100 }, (_, i) => i + 101));
     assert.deepEqual(await seqs(200, 100), Array.from({ length: 50 }, (_, i) => i + 201));
     assert.equal((await seqs(0)).length, 250);
+  });
+
+  it("stops a page of a task's events once their JSON comes to the bytes asked for, in UTF-8", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const task = await store.createTask("a", spec);
+    // "é" is a character, and two bytes in UTF-8.
+    const event = (seq: number) => ({ v: 1, seq, ts: "", type: "text", text: "é".repeat(1000) });
+    for (let seq = 1; seq <= 10; seq++) await store.addEvent(task.id, seq, event(seq));
+    const size = Buffer.byteLength(JSON.stringify(event(1)));
+    const seqs = async (after: number, limit: number, bytes: number) => (await store.events(task.id, after, limit, bytes)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100, 3 * size), [1, 2, 3]);
+    assert.deepEqual(await seqs(0, 100, 3 * size + 1), [1, 2, 3, 4]);
+    assert.deepEqual(await seqs(2, 100, 1), [3]);
+    assert.deepEqual(await seqs(0, 2, 100 * size), [1, 2]);
+    assert.deepEqual(await seqs(7, 100, 100 * size), [8, 9, 10]);
   });
 
   it("lists a tenant's tasks in an index's order, with no sort of them all", async () => {

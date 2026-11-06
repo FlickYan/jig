@@ -98,8 +98,10 @@ over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queu
 quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
-events 100 at a time, the next page only once the client has taken the last, so it goes at the client's
-pace, and a client that reads slowly or not at all holds a page of events in the service, not all of them.
+events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
+the last. So it goes at the client's pace, and a client that reads slowly or not at all holds a page of
+events in the service, not all of them. Events that come as the task runs wait in the store too while
+the client is behind.
 
 A task is `queued`, then `running`, then one of:
 

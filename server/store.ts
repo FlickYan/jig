@@ -253,8 +253,11 @@ export interface Store {
   finish(id: string, owner: string, outcome: Outcome): Promise<boolean>;
   /** Keeps one of a task's events; one with a seq already kept is ignored. */
   addEvent(task: string, seq: number, event: object): Promise<void>;
-  /** A task's events after seq `after`, in order: the first `limit` of them, if it is given. */
-  events(task: string, after?: number, limit?: number): Promise<{ seq: number; event: object }[]>;
+  /**
+   * A task's events after seq `after`, in order: the first `limit` of them, if it is given. With `bytes`, it
+   * stops sooner, after the event that takes their JSON (as stored, in UTF-8) to `bytes`.
+   */
+  events(task: string, after?: number, limit?: number, bytes?: number): Promise<{ seq: number; event: object }[]>;
   /** Keeps an approval a task's jig asked for; undefined if the task has one with its id already. */
   addApproval(task: string, request: ApprovalRequest): Promise<Approval | undefined>;
   approval(task: string, id: string): Promise<Approval | undefined>;
@@ -586,10 +589,17 @@ class SqliteStore implements Store {
     this.db.prepare("INSERT OR IGNORE INTO events (task, seq, json) VALUES (?, ?, ?)").run(task, seq, JSON.stringify(event));
   }
 
-  async events(task: string, after = 0, limit?: number): Promise<{ seq: number; event: object }[]> {
-    // SQLite takes a negative limit as none.
-    const rows = this.db.prepare("SELECT seq, json FROM events WHERE task = ? AND seq > ? ORDER BY seq LIMIT ?").all(task, after, limit ?? -1) as Row[];
-    return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
+  async events(task: string, after = 0, limit?: number, bytes = Infinity): Promise<{ seq: number; event: object }[]> {
+    const events: { seq: number; event: object }[] = [];
+    let read = 0;
+    // SQLite takes a negative limit as none. Leaving the loop early stops the statement.
+    for (const row of this.db.prepare("SELECT seq, json FROM events WHERE task = ? AND seq > ? ORDER BY seq LIMIT ?").iterate(task, after, limit ?? -1) as Iterable<Row>) {
+      if (read >= bytes) break;
+      const json = String(row.json);
+      read += Buffer.byteLength(json);
+      events.push({ seq: Number(row.seq), event: JSON.parse(json) });
+    }
+    return events;
   }
 
   async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
