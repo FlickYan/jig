@@ -476,7 +476,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Approvals",
-      "description": "Approvals waiting for an answer, and how long they waited.",
+      "description": "Approvals waiting for an answer, how long they waited, and the approvals posted to webhooks, delivered or failed.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -522,6 +522,15 @@
           "expr": "histogram_quantile(0.9, sum by (le, decision) (rate(jig_service_approval_wait_seconds_bucket{region=~\"$region\"}[$__rate_interval])))",
           "legendFormat": "p90 wait (s), {{decision}}",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (increase(jig_service_webhook_deliveries_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "webhooks {{result}}",
+          "refId": "C"
         }
       ]
     },

@@ -228,7 +228,11 @@ A tenant with `approvalWebhook` (a URL) and `webhookSecretEnv` (the variable tha
 must be set) is told of each approval as it is stored: a POST of `{"task": <id>, "approval": {...}}`,
 signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
 2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
-it.
+it. A redirect is not followed but counted as a failed try, as it could send the signed POST anywhere the
+service can reach. Each approval is counted once in `jig_service_webhook_deliveries_total{tenant,result}`,
+`delivered` or `failed` (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's
+fail. One whose tries are cut off by the service stopping is counted neither way. Each tenant with a webhook
+starts at 0 for both, so the first failures show.
 
 ### Quotas and usage
 
@@ -292,11 +296,12 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | metric | what |
 |--------|------|
 | `jig_service_http_requests_total{route,status}`, `jig_service_http_request_seconds{route}` | the API's requests, and their seconds to the end of the response (an event stream's lasts as long as it is followed) |
-| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413) |
+| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413), each at 0 from the start |
 | `jig_service_tasks_ended_total{tenant,status}`, `jig_service_run_seconds{status}` | tasks ended, and their seconds from start to end |
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
+| `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total` | rounds of renewing the leases that failed, and reads and writes of the store that failed outside a request |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
@@ -323,12 +328,12 @@ error as `err`.
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
 `alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
-upstream's breaker open, a provider's keys used up, quota refusals, a region down, and the store's, the
-leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all three, by region. In
-`deploy/k8s/` the service's metrics listener is on port 9180 and the gateway's on 9181, the pods carry
-`prometheus.io/scrape` and `prometheus.io/port`, and NetworkPolicies let only the `monitoring` namespace
-reach those ports (the tenants' API from anywhere, the internal listener and the gateway from the pods in
-`jig`).
+upstream's breaker open, a provider's keys used up, quota refusals, approval webhooks failing, a region
+down, and the store's, the leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all
+three, by region. In `deploy/k8s/` the service's metrics listener is on port 9180 and the gateway's on
+9181, the pods carry `prometheus.io/scrape` and `prometheus.io/port`, and NetworkPolicies let only the
+`monitoring` namespace reach those ports (the tenants' API from anywhere, the internal listener and the
+gateway from the pods in `jig`).
 
 ### Clones and gitHosts
 
