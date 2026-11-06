@@ -133,6 +133,8 @@ const observeTests = () => {
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "" })).status, 400);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", "{")).status, 400);
     await until(async () => (await call(api, KEYS.acme, "GET", `/v1/tasks/${first}`)).body.status === "running", "the first to run");
+    // Running is stored as the run starts, a moment before its workspace is made: the test writes there below.
+    await until(() => readdir(join(api.dataDir, "tasks", first, "work")).then(() => true, () => false), "the first's workspace");
 
     // Queued and running, from the store: the config's tenants with none show 0.
     let { value } = await scrape(api);
