@@ -31,6 +31,8 @@ export interface LocalRunnerConfig {
   graceSeconds: number;
   /** The protocols a git workspace may be cloned over (default: https only). */
   gitProtocols?: string[];
+  /** Whether a clone follows a redirect on its first request, as git does by default (default: no, as with gitHosts). */
+  gitRedirects?: boolean;
   /** The service's internal listener, where a task with approvals asks for them. */
   internalBaseUrl?: string;
   /** How often the events file is read, in milliseconds. */
@@ -76,7 +78,7 @@ export class LocalRunner implements Runner {
     await mkdir(join(home, "tmp"));
     const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
     await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
-    await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }));
+    await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
 
     const timeLimit = task.spec.timeLimit;
     const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
@@ -136,9 +138,10 @@ export class LocalRunner implements Runner {
 
 /**
  * Writes a task's files into its (empty) workspace, or clones its repository there. What git says of a
- * clone that fails goes to `log`, and only that it failed to the task.
+ * clone that fails goes to `log`, and only that it failed to the task. With `redirects`, a redirect on the
+ * clone's first request is followed, as git does by default; without, none is.
  */
-export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log): Promise<void> {
+export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log, redirects = false): Promise<void> {
   for (const [path, contents] of Object.entries(workspace?.files ?? {})) {
     const problem = workspaceProblem(path);
     if (problem) throw new Error(`The workspace file ${JSON.stringify(path)} ${problem}.`);
@@ -147,14 +150,18 @@ export async function prepareWorkspace(work: string, workspace: Workspace | unde
   }
   if (!workspace?.git) return;
   // Shallow, with no hooks or templates (whose hooks a clone would run) and only the protocols allowed: git
-  // runs a program for some others (ext::). No redirect is followed: the tenant's URL, checked against the
-  // config's gitHosts, is the only host asked.
-  const args = ["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", "-c", "http.followRedirects=false", "clone", "--quiet", "--depth", "1", "--no-tags", ...(workspace.ref ? ["--branch", workspace.ref] : []), "--", workspace.git, work];
+  // runs a program for some others (ext::). With gitHosts, no redirect is followed: the tenant's URL, checked
+  // against them, is the only host asked. Without, any host may be named, so a redirect gets round nothing.
+  const args = ["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", ...(redirects ? [] : ["-c", "http.followRedirects=false"]), "clone", "--quiet", "--depth", "1", "--no-tags", ...(workspace.ref ? ["--branch", workspace.ref] : []), "--", workspace.git, work];
   const env = { PATH: process.env.PATH, HOME: dirname(work), GIT_ALLOW_PROTOCOL: protocols.join(":"), GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
   await promisify(execFile)("git", args, { env, timeout: 120_000 }).catch((err: { code?: unknown; signal?: string | null; stderr?: string; message: string }) => {
     // git names the hosts and ports it tried and how they answered: told to the tenant, a clone on the
     // service's network would scan it for them.
     log?.warn("git clone failed", { stderr: (err.stderr || err.message).trim() });
+    // That much is the tenant's to know, to give the URL the host redirects to: not where it redirects.
+    if (!redirects && /The requested URL returned error: 30[12378]\b/.test(err.stderr ?? "")) {
+      throw new Error("git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+    }
     throw new Error(`git clone failed (${typeof err.code === "number" ? `exit ${err.code}` : (err.signal ?? err.code ?? "no exit code")})`);
   });
 }

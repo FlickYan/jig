@@ -39,7 +39,7 @@ export interface KubernetesRunnerConfig {
   resources?: { requests?: Record<string, string>; limits?: Record<string, string> };
   /** How long a finished Job is kept, with its pod and log (default: 600 seconds). */
   ttlSecondsAfterFinished?: number;
-  /** How long a pod has between SIGTERM and SIGKILL (default: 30 seconds, 10 at least); jig gets 5 less to write its end. */
+  /** How long a pod has between SIGTERM and SIGKILL (default: 30 seconds, from 10 to 3600); jig gets 5 less to write its end. */
   terminationGraceSeconds?: number;
   /** The uid and gid jig runs as (10001, the image's jig user). */
   user?: number;
@@ -47,6 +47,8 @@ export interface KubernetesRunnerConfig {
   gatewaySecret: string;
   graceSeconds: number;
   gitProtocols?: string[];
+  /** Whether the worker's clone follows a redirect on its first request (default: no, as with gitHosts). */
+  gitRedirects?: boolean;
   /** The service's internal listener as the pods reach it (its Service): where tasks ask for approvals. */
   internalBaseUrl?: string;
   /** Workers started ahead of tasks (pool.ts): none unless `size` is set. */
@@ -147,7 +149,7 @@ export class KubernetesRunner implements Runner {
     const jobPath = `/apis/batch/v1/namespaces/${ns}/jobs/${name}`;
     const command = [...this.worker(), `${INPUT}/task.json`, ...this.jigCommand(task, tenant)];
     const env = [{ name: keyVariable(task.spec.model), valueFrom: { secretKeyRef: { name, key: "token" } } }];
-    const input: WorkerInput = { prompt: task.spec.prompt, workspace: task.spec.workspace, gitProtocols: this.config.gitProtocols ?? ["https"], work: `${TASK}/work`, stats: `${TASK}/stats.json` };
+    const input: WorkerInput = { prompt: task.spec.prompt, workspace: task.spec.workspace, gitProtocols: this.config.gitProtocols ?? ["https"], gitRedirects: this.config.gitRedirects ?? false, work: `${TASK}/work`, stats: `${TASK}/stats.json` };
     const data = { token: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds), "task.json": JSON.stringify(input) };
     // Checked before the Job is made, which the API server would otherwise make and the Secret then fail.
     const bytes = Object.values(data).reduce((sum, value) => sum + Buffer.byteLength(value), 0);
@@ -180,6 +182,7 @@ export class KubernetesRunner implements Runner {
       prompt: task.spec.prompt,
       workspace: task.spec.workspace,
       gitProtocols: this.config.gitProtocols ?? ["https"],
+      gitRedirects: this.config.gitRedirects ?? false,
       work: `${TASK}/work`,
       stats: `${TASK}/stats.json`,
       command: this.jigCommand(task, tenant),
@@ -376,7 +379,8 @@ export class KubernetesRunner implements Runner {
           const whole = Boolean(container?.terminated);
           const res = await this.send("GET", `/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}/log?container=jig&follow=true`, undefined, 0);
           // A stream that stays open with nothing on it is let go at the backstop.
-          const hang = setTimeout(() => res.destroy(), Math.max(0, backstop - Date.now()));
+          // A timer fires at once past 2^31 ms; the config keeps the backstop under it, and this keeps it so.
+          const hang = setTimeout(() => res.destroy(), Math.min(2 ** 31 - 1, Math.max(0, backstop - Date.now())));
           // The worker's line, written last, as this read has it. A task's commands can write such a line too
           // (through /proc/1/fd/1), so it counts only from a whole read.
           let last: typeof worker | undefined;

@@ -43,7 +43,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Put your tenants' key hashes (printf %s "$KEY" | sha256sum) in place of the placeholder in
-      # service.docker.json first: the service refuses to start with it.
+      # service.docker.json first: the service refuses to start with it. Its gitHosts are the hosts
+      # tenants may clone from, which the service does on this machine's network, not on jig-tasks.
       - ./service.docker.json:/etc/jig/service.json:ro
       - /var/lib/jig:/var/lib/jig
     depends_on:

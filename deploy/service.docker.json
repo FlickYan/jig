@@ -10,6 +10,7 @@
   "internalBaseUrl": "http://api:8082",
   "runner": "docker",
   "docker": { "image": "jig-worker", "network": "jig-tasks", "cpus": 1, "memory": "2g", "pidsLimit": 512 },
+  "gitHosts": ["github.com"],
   "tenants": [
     { "id": "example", "keys": ["<sha256 of the tenant's API key, in hex>"], "concurrency": 2, "timeLimit": 1800, "budgetUsd": 5, "approvalTimeout": 600 }
   ]

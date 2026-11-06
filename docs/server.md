@@ -40,6 +40,7 @@ local runner hides that whole folder from its tasks' commands.
   "concurrency": 8,
   "model": "deepseek-flash",
   "gatewayBaseUrl": "http://127.0.0.1:8081/anthropic",
+  "gitHosts": ["github.com"],
   "tenants": [
     { "id": "acme", "keys": ["<sha256 of acme's API key, in hex>"], "concurrency": 2, "maxSteps": 50, "timeLimit": 1800, "budgetUsd": 5 }
   ]
@@ -66,12 +67,12 @@ tasks store over time.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
-`leaseSeconds` over 86,400, `heartbeatSeconds` over 3,600, a tenant's `timeLimit` or `approvalTimeout`
-over 2,000,000) is refused at the start, with the field and what is wrong with it, before the database is
-changed. The listeners are up before any queued task starts, so a port that is taken stops the start with
-nothing run. The config's paths are `database`, `dataDir` and those of `jig`'s entries that start with `./` or
-`../` (a program's name, or an absolute path, is used as it is). A tenant's `concurrency` 0 holds its tasks
-queued.
+`leaseSeconds` over 86,400, `heartbeatSeconds` and `kubernetes.terminationGraceSeconds` over 3,600, a
+tenant's `timeLimit` or `approvalTimeout` over 2,000,000) is refused at the start, with the field and
+what is wrong with it, before the database is changed. The listeners are up before any queued task starts,
+so a port that is taken stops the start with nothing run. The config's paths are `database`, `dataDir` and
+those of `jig`'s entries that start with `./` or `../` (a program's name, or an absolute path, is used as
+it is). A tenant's `concurrency` 0 holds its tasks queued.
 
 ### The API
 
@@ -348,18 +349,29 @@ from in `gitHosts`, for either runner. The service warns at the start when one o
 
 `gitHosts` limits hostnames, not ports: any port on a listed host can be cloned from. Each entry is a
 hostname as it is in a URL: an IPv6 address in brackets (`[fd00::1]`), an international name in punycode
-(`xn--...`), and no trailing dot. Case doesn't matter. A listed name is cloned from whatever address it
-resolves to. git is given the URL as it was checked, in its normal form, so `https://allowed.host\@inside/`
-is cloned from `allowed.host`. A redirect is never followed. A clone that fails is `git clone failed (exit
-N)` to the tenant, with what git said (the hosts and ports it tried, and how they answered) in the
-service's log alone.
+(`xn--...`), and no trailing dot. Case doesn't matter. An entry with a scheme, a port or a path
+(`https://github.com`, `github.com:443`) would match no URL, so it is refused at the start. A listed name
+is cloned from whatever address it resolves to. git is given the URL as it was checked, in its normal
+form, so `https://allowed.host\@inside/` is cloned from `allowed.host`.
+
+With `gitHosts`, a redirect is not followed, as it could lead off them. A URL must then be the one the
+host serves the repository at: GitLab's needs its `.git`, and a renamed repository its new name. A clone
+the host redirects is `git clone failed: the git host answered with a redirect, which isn't followed; ...`
+to the tenant, which says no more of where. Without `gitHosts`, any host may be named, and git follows a
+redirect on the clone's first request, as it does by default.
+
+A clone may take 2 minutes. One that fails otherwise is `git clone failed (exit N)` to the tenant, or
+`git clone failed (SIGTERM)` when it ran past that. What git said (the hosts and ports it tried, and how
+they answered) goes only to the log of what ran the clone: the service's, on the local and Docker
+runners, and the task pod's on Kubernetes, which is deleted with its Job.
 
 `gitHosts` is checked when a task is posted, and again as it starts. A task queued before `gitHosts` was
 set, or before its host was taken out of it, is not cloned: it ends as an `error` that says so.
 
 The Kubernetes runner clones in the task's pod (`server/worker.ts`), on the pod's network, which
 `deploy/k8s/networkpolicy.yaml` limits: the git host needs a rule there too (below). `gitHosts` still
-applies there, checked by the service as above.
+applies there, checked by the service as above, and with it the worker follows no redirect. What git said
+of a clone that failed is a `worker` line in the pod's log, not in the service's.
 
 ### The local runner
 
@@ -476,7 +488,7 @@ say otherwise. The Job is named `jig-<task id>`; its pod runs once (`backoffLimi
 no privilege escalation, no capabilities, a read-only root, seccomp's `RuntimeDefault`, no service account
 token and `runtimeClassName` if one is set (`gvisor`, with `deploy/k8s/runtimeclass.yaml`); the Job's
 `activeDeadlineSeconds` is the task's time limit and `graceSeconds`, and `ttlSecondsAfterFinished` (600)
-how long it stays after. The pod has `terminationGraceSeconds` (30, 10 at least) between SIGTERM and
+how long it stays after. The pod has `terminationGraceSeconds` (30, from 10 to 3600) between SIGTERM and
 SIGKILL, and jig is given 5 s less to write its events at its end (`JIG_EVENTS_FLUSH_SECONDS`, below), so
 the `end`, which alone says what the task cost, is in the log before the SIGKILL. The service waits for the
 pod's end until a minute past the deadline and `terminationGraceSeconds`. A Secret the Job owns, so deleted
@@ -947,7 +959,8 @@ gateway, with a Redis that keeps its data in a volume, so a restart of either fo
 
 Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sha256sum`) in place of the
 placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
-refuses to start with it.
+refuses to start with it. Set its `gitHosts` to the hosts your tenants clone from: the service clones on
+the host's network, not on `jig-tasks` (see Clones and gitHosts).
 
 ### Trying it on kind
 
@@ -968,8 +981,8 @@ and Jobs' deadlines, took warm workers, and outlived a replica killed mid-task, 
 deleted; a tenant whose id has a space was labelled with its hash, the API server took a Secret of 1 MiB and
 refused one byte more, as the runner's check has it, and a log of 30 MB, rotated by the kubelet on the way,
 was read to its end. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
-metrics ports answered only the `monitoring` namespace, and Redis only the gateway. Two things the fake API
-server in the tests didn't show were fixed: the kubelet ends a log's stream a moment before the pod's
-status says the container has ended, so every log was read twice (now a stream that ends with the worker's
-line is taken as whole), and a pod no node had room for has no container to say why it waits (now the
-scheduler's reason is the task's error).
+metrics ports answered only the `monitoring` namespace, and Redis only the gateway. The fake API server in
+the tests didn't show two things. The kubelet ends a log's stream a moment before the pod's status says the
+container has ended, so a log followed while its container ran is read again once it has ended: only a read
+begun after that is taken as whole (above). And a pod no node had room for has no container to say why it
+waits, so now the scheduler's reason is the task's error.

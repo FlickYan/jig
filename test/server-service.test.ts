@@ -1326,6 +1326,10 @@ describe("the service's config", () => {
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
     assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
     assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
+    // An entry is matched to a URL's hostname: one with a scheme, port, path or trailing dot would match none.
+    const notHost = (host: string) => `The config's gitHosts must be hostnames as a URL has them (no scheme, port, path or trailing dot; IPv6 in brackets; punycode), not ${JSON.stringify(host)}`;
+    for (const host of ["https://github.com", "github.com:443", "github.com/org", "u@github.com", "github.com.", "bücher.de"]) assert.equal(problem({ gitHosts: ["example.com", host] }), notHost(host));
+    assert.equal(problem({ gitHosts: ["GitHub.com", "[fd00::1]", "xn--bcher-kva.de", "10.0.0.7"] }), undefined);
     assert.equal(problem({ local: [] }), "The config's local must be an object, {hiddenPaths}");
     assert.equal(problem({ local: { hiddenPaths: ["secrets"] } }), 'The config\'s local.hiddenPaths must be a list of absolute paths, not ["secrets"]');
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
@@ -1357,8 +1361,12 @@ describe("the service's config", () => {
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "" } }), "The config's kubernetes.image must be a string that isn't empty");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w" } }), undefined);
     // jig gets 5 s less than a pod's grace to write its end, and needs 5 to give up on a reader that takes nothing.
-    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 5 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 up, not 5");
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 5 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 to 3600, not 5");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 10 } }), undefined);
+    // It adds to the time limit and grace in the timer that lets a pod's log go: with them at their most,
+    // an hour keeps it under 2^31 ms.
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 3600 }, graceSeconds: 86_400, tenants: [{ id: "acme", keys: [], timeLimit: 2_000_000 }] }), undefined);
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 3601 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 to 3600, not 3601");
     // A replica never runs more than concurrency at once, so idle workers past it are never used.
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4000 } } }), "The config's docker.pool.size must be at most concurrency, 4: idle workers past it are never used");
     assert.equal(problem({ concurrency: 8, kubernetes: { image: "w", pool: { size: 8 } } }), undefined);
@@ -1482,13 +1490,14 @@ describe("the service's start", () => {
     assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
   });
 
-  it("clones only from gitHosts, follows no redirect, and tells the tenant only that the clone failed", async () => {
+  it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", async () => {
     const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["example.com"] });
     const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: "https://127.0.0.1:1/x.git" } });
     assert.deepEqual([posted.status, posted.body.error], [400, "workspace.git must be on one of the config's gitHosts: example.com"]);
 
-    // Without gitHosts, a redirect to a host inside the service's network is not followed, and what git
-    // said of the hosts it tried goes to the service's log alone: it would make the clone a scanner.
+    // With gitHosts, a redirect to a host inside the service's network is not followed, and what git said
+    // of the hosts it tried goes to the service's log alone: it would make the clone a scanner. The tenant
+    // is told it was a redirect, but not where to.
     const asked: string[] = [];
     const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
     const outside = createServer((req, res) => res.writeHead(302, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/internal${req.url}` }).end());
@@ -1499,17 +1508,35 @@ describe("the service's start", () => {
     const lines: Record<string, unknown>[] = [];
     const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
     const dir = await tempDir("jig-service-");
-    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], gitProtocols: ["http"], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], gitProtocols: ["http"], gitHosts: ["127.0.0.1"], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
     const started = await startService(config, { secret: SECRET, log });
     services.push(started);
     const port = (outside.address() as AddressInfo).port;
     const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${port}/x.git` } })).body;
     const task = await statusOf(started, id, "error");
     assert.deepEqual(asked, []);
-    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    assert.equal(task.error, "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
     const logged = lines.find((line) => line.msg === "git clone failed");
     assert.deepEqual([logged?.tenant, logged?.task], ["acme", id]);
     assert.match(String(logged?.stderr), new RegExp(`127\\.0\\.0\\.1:${port}`));
+    // A failure that isn't a redirect says only how git ended.
+    const refused = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/x.git` } })).body.id;
+    assert.match((await statusOf(started, refused, "error")).error, /^git clone failed \(exit \d+\)$/);
+  });
+
+  it("follows a redirect on a clone's first request without gitHosts, as git does, since any host may be named", async () => {
+    // GitLab redirects a project's URL without .git to the one with it.
+    const asked: string[] = [];
+    const moved = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const project = createServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(moved.address() as AddressInfo).port}/group/project.git${req.url!.slice("/group/project".length)}` }).end());
+    for (const server of [moved, project]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const api = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitProtocols: ["http"] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${(project.address() as AddressInfo).port}/group/project` } })).body;
+    assert.match((await statusOf(api, id, "error")).error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, ["/group/project.git/info/refs?service=git-upload-pack"]);
   });
 
   it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", async () => {
