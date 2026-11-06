@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -1102,7 +1102,7 @@ describe("the service's start", () => {
     assert.ok(!lines.some((line) => clones.test(line)), lines.join("\n"));
   });
 
-  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in", async () => {
+  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in, with an old git too", async () => {
     const dir = realpathSync(await tempDir("jig-service-"));
     const git = (cwd: string, ...args: string[]) => promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main", ...args], { cwd });
     const repo = async (path: string) => {
@@ -1114,13 +1114,23 @@ describe("the service's start", () => {
     await repo(join(dir, "lib"));
     await repo(join(dir, "super"));
     await git(join(dir, "super"), "submodule", "--quiet", "add", join(dir, "lib"), "sub");
-    for (const [checkout, holder] of [[join(dir, "tree"), join(dir, "main")], [join(dir, "super", "sub"), join(dir, "super")]]) {
-      const db = join(dir, `${holder.split("/").at(-1)}.db`);
-      const api = await service({ database: db }, checkout);
-      const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
-      await statusOf(api, id, "succeeded");
-      const settings = JSON.parse(await readFile(join(checkout, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
-      assert.deepEqual(settings.hiddenPaths, [join(checkout, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, checkout, holder]);
+    await repo(join(dir, "plain"));
+    // As git rev-parse before 2.31 (2.30 is Debian 11's) takes --path-format=absolute: it prints it back.
+    const real = (await promisify(execFile)("sh", ["-c", "command -v git"])).stdout.trim();
+    await mkdir(join(dir, "bin"));
+    await writeFile(join(dir, "bin", "git"), `#!/bin/sh\nfor a do shift; case $a in --path-format=*) echo "$a" ;; *) set -- "$@" "$a" ;; esac; done\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    for (const old of [false, true]) {
+      for (const [checkout, holder] of [[join(dir, "tree"), join(dir, "main")], [join(dir, "super", "sub"), join(dir, "super")], [join(dir, "plain")]]) {
+        const db = join(dir, `${checkout.split("/").at(-1)}-${old}.db`);
+        if (old) process.env.PATH = `${join(dir, "bin")}:${path}`;
+        const api = await service({ database: db }, checkout).finally(() => (process.env.PATH = path));
+        const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+        await statusOf(api, id, "succeeded");
+        const settings = JSON.parse(await readFile(join(checkout, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+        const hidden = [join(checkout, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, checkout, ...(holder ? [holder] : [])];
+        assert.deepEqual(settings.hiddenPaths, hidden, old ? "with a git before 2.31" : "");
+      }
     }
   });
 

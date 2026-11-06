@@ -431,10 +431,13 @@ function hiddenFolders(dataDir: string, configFile: string | undefined): HiddenF
   const folders = configFile ? [{ what: "the config's folder", path: dirname(resolve(configFile)) }] : [];
   try {
     mkdirSync(dataDir, { recursive: true });
-    // The superproject last, as git prints nothing for it outside a submodule.
-    const args = ["-c", "safe.directory=*", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--show-superproject-working-tree"];
+    // The superproject last, as git prints nothing for it outside a submodule. The common folder comes
+    // relative to dataDir unless it is elsewhere: --path-format=absolute would make it absolute, but a git
+    // before 2.31 (Debian 11 has 2.30) prints it back as if it were a path.
+    const args = ["-c", "safe.directory=*", "rev-parse", "--show-toplevel", "--git-common-dir", "--show-superproject-working-tree"];
     const said = execFileSync("git", args, { cwd: dataDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH, HOME: process.env.HOME } });
-    const [top, common, superproject] = said.split("\n");
+    const [top, relativeCommon, superproject] = said.split("\n");
+    const common = relativeCommon && realpathSync(resolve(realpathSync(dataDir), relativeCommon));
     if (top) folders.push({ what: "the git checkout dataDir is in", path: top });
     // A checkout's own common folder is its .git; a worktree's, its main checkout's; a submodule's, in its
     // superproject's .git/modules, so not a checkout's .git.
