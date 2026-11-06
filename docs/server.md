@@ -369,8 +369,8 @@ stopped, and keeps its slot until it has ended. A cancel or the time limit is `d
 sent again each second until it reaches the container (one whose image is still being pulled doesn't
 exist yet), then `docker kill` 5 seconds later, again each second until the run ends. A container a
 crashed replica left is killed (`docker kill --signal KILL jig-<id>`) by the replica that ends its task, if
-that replica's daemon runs it; one on another daemon, or a warm worker's, which is named for the worker and
-not the task, runs until jig's own `--time-limit`.
+that replica's daemon runs it (a warm worker's too, renamed for its task, below); one on another daemon runs
+until jig's own `--time-limit`.
 
 The network must reach only the gateway and the service's internal listener: an internal network (`docker
 network create --internal jig-tasks`) with the gateway and the service attached to it too (`docker network
@@ -462,11 +462,15 @@ with the pool's idle workers, hits and misses so far; a worker that went away be
 task counts as a miss too, its task starting cold. `size` is at most the replica's `concurrency`: a
 replica never runs more tasks at once, so a worker past it would never be used.
 
-A task run on a warm worker keeps the worker's names: on Docker the container `jig-pool_<hex>`, with only
-the `jig.pool` label, and the folder `dataDir/tasks/pool_<hex>`; on Kubernetes the Job `jig-pool-<hex>`,
-which is given the task's labels, while its pod keeps only `jig.dev/pool`. The service logs which worker
-took each task ("the task runs on a warm worker", with the task, its tenant and the container and folder,
-or the Job).
+A task run on a warm worker keeps some of the worker's names. On Docker the container `jig-pool_<hex>`, with
+only the `jig.pool` label, is renamed `jig-<id>` (`docker rename`) once given the task, the name a cold one
+would have, so a replica that ends the task after a crash finds it; if the rename fails, that is logged and
+the task runs all the same. If `docker rename` doesn't return within 5 seconds, it may have renamed the
+container anyway, so the replica's kills (a cancel, the time limit) try the old name and then the new. Its
+folder stays `dataDir/tasks/pool_<hex>`. On Kubernetes the Job
+`jig-pool-<hex>` is given the task's labels, while its pod keeps only `jig.dev/pool`. The service logs which
+worker took each task ("the task runs on a warm worker", with the task, its tenant and the container and
+folder, or the Job).
 
 A worker runs one task and exits: none is used again, so no tenant's files, memory or processes meet
 another's, and what tenants share is what cold tasks share, the image and the node. The worker takes the

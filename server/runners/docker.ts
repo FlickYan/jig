@@ -99,7 +99,7 @@ export class DockerRunner implements Runner {
 
   /**
    * Kills the container a gone replica left running for the task, if it is on this replica's daemon: a cold
-   * one is named for its task. A warm worker's isn't, and runs on until the task's time limit.
+   * one is named for its task, and a warm worker's is renamed for its task when given it (startWarm).
    */
   async abandon(id: string): Promise<void> {
     const { docker = ["docker"] } = this.config;
@@ -161,8 +161,16 @@ export class DockerRunner implements Runner {
     if (!warm.answer(answer)) return undefined;
     warm.slot.assigned = true;
     this.folders.set(task.id, dir);
-    // The container and folder keep the worker's names, not the task's: this says which are the task's.
-    this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, container: name, folder: dir });
+    // Named as a cold one would be, so a replica that ends the task after this one crashed finds it (abandon).
+    // Only once it has the task: a cold start of it would want the name. One not renamed runs all the same.
+    const renamed = `jig-${task.id}`;
+    await container.rename(renamed).then(
+      () => (warm.slot.name = renamed),
+      // A run that has already ended is gone, and needs no name.
+      (err: unknown) => container.exited() || this.log.warn("couldn't rename a warm worker's container for its task; if this replica crashes, the replica that ends the task may not find it, and the run goes on until its time limit", { task: task.id, container: name, err }),
+    );
+    // The folder keeps the worker's name, not the task's: this says which it is.
+    this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, container: warm.slot.name, folder: dir });
     return { ...this.handle(container, dir, task), warm: true };
   }
 
@@ -233,12 +241,39 @@ export class DockerRunner implements Runner {
       child.stdin!.end(stdin);
     }
 
-    /** Whether the signal reached the container. */
-    const kill = (signal: string) =>
+    // The names it may have now, tried in turn: a warm worker's is changed to its task's.
+    let names = [name];
+    /** Whether the signal reached the container by `target`. */
+    const killAs = (signal: string, target: string) =>
       new Promise<boolean>((done) => {
-        const killer = spawn(program, [...first, "kill", "--signal", signal, name], { env, stdio: "ignore", timeout: TERM_MS });
+        const killer = spawn(program, [...first, "kill", "--signal", signal, target], { env, stdio: "ignore", timeout: TERM_MS });
         killer.on("error", () => done(false));
         killer.on("exit", (code) => done(code === 0));
+      });
+    /** Whether the signal reached the container. */
+    const kill = async (signal: string) => {
+      for (const target of names) if (await killAs(signal, target)) return true;
+      return false;
+    };
+    // A kill sent by the old name as the rename lands misses, and is sent again, as one sent too soon is.
+    const rename = (to: string) =>
+      new Promise<void>((done, fail) => {
+        const from = names[0];
+        const renamer = spawn(program, [...first, "rename", from, to], { env: cliEnv(), stdio: ["ignore", "ignore", "pipe"], timeout: TERM_MS });
+        let started = false;
+        let said = "";
+        renamer.on("spawn", () => (started = true));
+        renamer.stderr!.on("data", (chunk) => (said += chunk));
+        renamer.on("error", fail);
+        renamer.on("close", (code, signal) => {
+          if (code === 0) return (names = [to]), done();
+          const why = code === null ? `docker rename was stopped (${signal})` : `docker rename exited with ${code}: ${said.trim().slice(-500)}`;
+          // The daemon said no, or the CLI didn't start: it keeps its name. Otherwise (the CLI cut off at its
+          // time limit, a slow daemon) the rename may have landed, or land later, so kills try both names.
+          if (!started || /error response from daemon/i.test(said)) return fail(new Error(why));
+          names = [from, to];
+          fail(new Error(`${why}; it may have been renamed all the same, so it is sent its signals by either name`));
+        });
       });
     let exited = false;
     let stopping = false;
@@ -271,7 +306,7 @@ export class DockerRunner implements Runner {
       // docker run exits with the container's code, or 125 to 127 when it couldn't run it.
       child.on("exit", (code) => end({ code }));
     });
-    return { exit, exited: () => exited, stop };
+    return { exit, exited: () => exited, stop, rename };
   }
 
   /** A task's run in the container, from now: its events read from the folder, and stopped at its time limit and the grace. */
@@ -294,9 +329,14 @@ interface Container {
   exited(): boolean;
   /** TERM, sent until it reaches the container, then KILL 5 seconds later until it has exited. */
   stop(): void;
+  /**
+   * Renames the container, which is sent its signals by the new name from then on; fails as docker rename
+   * does, and when that leaves it unknown whether the rename landed, by the old name and then the new.
+   */
+  rename(to: string): Promise<void>;
 }
 
-/** A warm worker's container, by its name, and folder; `assigned` once a task is given to it. */
+/** A warm worker's container, by its name (its task's once given one), and folder; `assigned` once a task is given to it. */
 interface Slot {
   name: string;
   dir: string;
