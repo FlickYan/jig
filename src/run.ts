@@ -307,10 +307,19 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   // Ctrl+C before the first task starts (while the MCP servers connect, say) ends jig as it would without a
   // handler, but through the exit event, so the end is written and the cleanup below runs.
   const beforeTask = () => process.exit(130);
+  // What jig cleans up as it exits (below, once there is something), before the end's events: the end waits for
+  // a reader that is behind, and the cleanup mustn't wait behind it, to be lost to an orchestrator's SIGKILL.
+  const atExit: Array<() => void> = [];
   if (!library) {
     // A task's end is written when it ends: jig exits before that only on a signal or a forced quit
     // (interrupted), or on a failure nothing caught (error), whatever it was doing then.
-    process.on("exit", (code) => events?.end(code >= 128 ? "interrupted" : "error", code));
+    process.on("exit", (code) => {
+      try {
+        for (const clean of atExit) clean();
+      } finally {
+        events?.end(code >= 128 ? "interrupted" : "error", code);
+      }
+    });
     // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
     // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
     // shell would give.
@@ -359,7 +368,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   if (!library) {
     // So too when jig exits before that, on a signal or a forced quit (a second Ctrl+C), and a command still
     // running is killed as Ctrl+C kills it: only bubblewrap's sandbox would otherwise take them down with jig.
-    process.on("exit", () => {
+    atExit.push(() => {
       killCommands();
       sandbox?.close?.();
       outputs.remove();

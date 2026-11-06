@@ -55,7 +55,8 @@ export interface Start {
  * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is written as
  * it happens, so a crash loses at most the line being written; one a pipe on stdout has no room for waits in
  * jig (see Lines), and at the end jig waits for the reader to take it, up to FLUSH_SECONDS without
- * progress. Every string goes through the redaction `jig sessions export` uses.
+ * progress (and SIGNAL_FLUSH_SECONDS in all after a signal). Every string goes through the redaction
+ * `jig sessions export` uses.
  */
 export class Events {
   private readonly fd: number | undefined; // undefined: stdout, or the listener
@@ -177,12 +178,26 @@ export class Events {
   /** How the task ended, and the code jig exits with. Only the first end is written, and returned. */
   end(stop: string, exitCode: number): End | undefined {
     if (this.ended) return undefined;
+    // The events dropped while the reader was too far behind, said before the end where there is room by now.
+    const dropped = this.lines?.dropped ?? 0;
+    if (dropped) this.notice(`${count(dropped)} written: the --events reader was too far behind.`);
     this.ended = true;
     const seconds = Math.round((Date.now() - this.started) / 100) / 10;
     const end = { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds };
     this.write("end", { ...end });
     // However jig ends, the end is written (by its exit handler, at worst): what Lines holds goes with it.
-    this.lines?.flush();
+    // While it waits for the reader, a second Ctrl+C, SIGTERM or SIGHUP would end jig by the signal's default
+    // action where jig has no handler left for it (Ctrl+C's goes with the task, SIGTERM's runs once), losing
+    // the end without a word. Each is ignored until the wait, which is bounded, is over; jig then exits as the
+    // first signal had it.
+    const ignore = () => {};
+    if (this.lines) for (const signal of SIGNALS) process.on(signal, ignore);
+    try {
+      // After a signal, an orchestrator's SIGKILL is coming: the reader gets SIGNAL_FLUSH_SECONDS in all.
+      this.lines?.flush(stop === "interrupted" ? SIGNAL_FLUSH_SECONDS : undefined);
+    } finally {
+      for (const signal of SIGNALS) process.off(signal, ignore);
+    }
     if (this.fd !== undefined) closeSync(this.fd);
     return end;
   }
@@ -193,12 +208,21 @@ export class Events {
     if (this.listener) return this.listener(event);
     // Not process.stdout.write: what the pipe couldn't take waited in Node, and the exit a signal brings
     // lost it, the end with it. What Lines holds, end writes before jig exits.
-    this.lines?.write(`${JSON.stringify(event)}\n`);
+    this.lines?.write(`${JSON.stringify(event)}\n`, type === "end");
   }
 }
 
+const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
 /** How long jig, at its end, waits for a reader that takes none of the events it holds before it gives up on them. */
 export const FLUSH_SECONDS = 5;
+/**
+ * How long in all jig waits for the reader at an end a signal brought, however steadily it reads: inside the
+ * 30 s Kubernetes gives a pod between SIGTERM and SIGKILL. jig's own cleanup is done before (see run.ts).
+ */
+export const SIGNAL_FLUSH_SECONDS = 20;
+/** The most of the lines jig holds for a reader that is behind: past it, events are dropped (not the end). */
+export const HELD_BYTES = 64 * 1024 * 1024;
 // While the reader is behind, how often jig tries again to write the lines it holds.
 const RETRY_MS = 10;
 
@@ -218,24 +242,34 @@ const system: Io = { write: (fd, data) => writeSync(fd, data), now: Date.now, wa
  * of it, waits here, every later line behind it, and is tried again every few milliseconds, on a timer that
  * doesn't keep jig alive. jig never waits for the reader while it runs, so it acts on a signal even when the
  * reader takes nothing: while a write waited, its signal handlers couldn't run. A file or a terminal takes
- * each line at once.
+ * each line at once. What is held is bounded: past `limit` bytes a new line is dropped whole, and counted, as
+ * otherwise a reader that takes nothing would have jig keep every event of the run.
  */
 export class Lines {
   private readonly held: Uint8Array[] = [];
+  private bytes = 0; // held
   private timer: NodeJS.Timeout | undefined;
   private written = 0; // bytes, to tell whether the reader took any
-  private gone = false; // the reader closed the pipe
+  private gone = false; // the reader closed the pipe, or a write tried again failed
   private readonly fd: number;
   private readonly io: Io;
+  private readonly limit: number;
+  /** The lines dropped past the limit. */
+  dropped = 0;
 
-  constructor(fd: number, io = system) {
+  constructor(fd: number, io = system, limit = HELD_BYTES) {
     this.fd = fd;
     this.io = io;
+    this.limit = limit;
   }
 
-  write(line: string): void {
+  /** Writes `line`, or holds it; past the limit drops it, unless it is the end (`always`). */
+  write(line: string, always = false): void {
     if (this.gone) return;
-    this.held.push(Buffer.from(line));
+    const data = Buffer.from(line);
+    if (!always && this.bytes + data.length > this.limit) return void this.dropped++;
+    this.held.push(data);
+    this.bytes += data.length;
     if (this.held.length === 1) this.drain();
   }
 
@@ -243,27 +277,52 @@ export class Lines {
   drain(): void {
     clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.take()) this.timer = setTimeout(() => this.drain(), RETRY_MS).unref();
+    if (!this.take()) this.timer = setTimeout(() => this.retry(), RETRY_MS).unref();
   }
 
   /**
-   * At the end: waits for the reader to take what is held, as long as it takes some every FLUSH_SECONDS, and
-   * then gives up on the rest, saying so. Returns how many lines weren't written whole (the first of them
-   * perhaps in part).
+   * At the end: waits for the reader to take what is held, as long as it takes some every FLUSH_SECONDS (and,
+   * given `total`, for that many seconds at most), then gives up on the rest, saying so. Returns how many lines
+   * weren't written whole (the first of them perhaps in part).
    */
-  flush(): number {
+  flush(total?: number): number {
     clearTimeout(this.timer);
     let written = this.written;
-    let since = this.io.now();
+    const begun = this.io.now();
+    let since = begun;
+    let why = "";
     while (!this.take()) {
-      if (this.written > written) [written, since] = [this.written, this.io.now()];
-      else if (this.io.now() - since >= FLUSH_SECONDS * 1000) break;
+      const now = this.io.now();
+      if (this.written > written) [written, since] = [this.written, now];
+      else if (now - since >= FLUSH_SECONDS * 1000) why = `took nothing for ${FLUSH_SECONDS} s`;
+      if (total !== undefined && now - begun >= total * 1000) why = `didn't take them all in the ${total} s jig gives it after a signal`;
+      if (why) break;
       this.io.wait(5);
     }
     const lost = this.held.length;
-    this.held.length = 0;
-    if (lost) notice(`The --events reader took nothing for ${FLUSH_SECONDS} s: ${lost === 1 ? "1 event wasn't" : `${lost} events weren't`} written.`);
+    this.lose();
+    if (lost) notice(`The --events reader ${why}: ${count(lost)} written.`);
+    const size = this.limit % 2 ** 20 ? `${this.limit} bytes` : `${this.limit / 2 ** 20} MiB`;
+    if (this.dropped) notice(`The --events reader was too far behind: ${count(this.dropped)} written, past the ${size} jig holds for it.`);
     return lost;
+  }
+
+  // The retry, on a timer: a write failing there with something other than EAGAIN or EPIPE (EIO, say) would
+  // be an exception nothing catches, so the reader counts as gone, as after EPIPE.
+  private retry(): void {
+    try {
+      this.drain();
+    } catch (error) {
+      this.gone = true;
+      this.lose();
+      notice(`The --events reader is gone (a write failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}): jig writes no more events, and goes on with the task.`);
+    }
+  }
+
+  /** Lets go of what is held. */
+  private lose(): void {
+    this.held.length = 0;
+    this.bytes = 0;
   }
 
   /** Writes held lines until the fd takes no more. Whether none is left. */
@@ -279,11 +338,12 @@ export class Lines {
         if (code !== "EPIPE") throw error;
         // The reader closed the pipe: no one follows the events now, but the task can still be done.
         this.gone = true;
-        this.held.length = 0;
+        this.lose();
         notice("The --events reader is gone (its pipe was closed): jig writes no more events, and goes on with the task.");
         return true;
       }
       this.written += taken;
+      this.bytes -= taken;
       if (taken < line.length) this.held[0] = line.subarray(taken);
       else this.held.shift();
     }
@@ -298,6 +358,11 @@ export class Lines {
 function cut(text: string, max: number): [string, boolean] {
   const whole = redact(text).value;
   return whole.length > max ? [truncate(whole, max - CUT_LINE), true] : [whole, false];
+}
+
+/** "1 event wasn't", or "n events weren't". */
+function count(events: number): string {
+  return events === 1 ? "1 event wasn't" : `${events} events weren't`;
 }
 
 /** Tokens in the contract's order of fields. */

@@ -3,7 +3,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, createServer as createNetServer, type Socket } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { AgentUI } from "../src/agent.ts";
@@ -375,6 +375,90 @@ describe("--events", () => {
     }
   });
 
+  it("with -, on SIGTERM kills its commands before it waits for a reader that is slow but reads, and waits 20 s at most", async () => {
+    // A reader that takes 4 KiB every half second never leaves jig 5 s without progress: jig waited for it to
+    // take everything, its command still running, until an orchestrator's SIGKILL.
+    const long = "All work and no play. ".repeat(80_000);
+    // The command connects here and runs on: its connection closes when it is killed.
+    let connected!: () => void;
+    const started = new Promise<void>((done) => (connected = done));
+    let killed = 0;
+    const sockets: Socket[] = [];
+    const server = createNetServer((socket) => {
+      sockets.push(socket);
+      connected();
+      socket.on("error", () => {}).on("close", () => (killed = Date.now()));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const command = `'${process.execPath}' -e 'require("node:net").connect(${(server.address() as AddressInfo).port}, "127.0.0.1")'`;
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ text: long }, { tool: "bash", input: { command } }] : [{ text: "Done." }]));
+    const reader = spawn(process.execPath, ["-e", SLOW_READER], { stdio: ["pipe", "ignore", "ignore"] });
+    const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+    const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1" };
+    const child = spawn(process.execPath, [cli, ...args, "--events", "-", "Fix the parser."], { cwd: project, env, stdio: ["ignore", reader.stdin, "pipe"] });
+    reader.stdin.destroy(); // jig holds the pipe's end now
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 40_000);
+    try {
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+      await Promise.race([started, exited]);
+      const sent = Date.now();
+      child.kill("SIGTERM");
+      assert.equal(await exited, 143, stderr);
+      const took = Date.now() - sent;
+      assert.ok(killed && killed - sent < 2_000, `the command was killed ${killed ? `${killed - sent} ms` : "never"} after SIGTERM, jig exiting ${took} ms after it`);
+      assert.ok(took >= 19_500 && took < 26_000, `exited ${took} ms after SIGTERM`);
+      assert.match(stderr, /The --events reader didn't take them all in the 20 s jig gives it after a signal: \d+ events? (weren't|wasn't) written\./);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      reader.kill("SIGKILL");
+      for (const socket of sockets) socket.destroy(); // and the command, if jig didn't kill it, ends
+      server.close();
+      api.close();
+    }
+  });
+
+  it("with -, a second Ctrl+C while it waits for the reader at the end doesn't kill it: it exits with 130, saying so", async () => {
+    // Once the task is over its Ctrl+C handler is gone, so a second Ctrl+C killed jig by the signal's default
+    // action as it waited for the reader: no word on stderr, and the end lost.
+    const long = "All work and no play. ".repeat(40_000);
+    let waiting!: () => void;
+    const second = new Promise<void>((done) => (waiting = done));
+    let calls = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      if (calls++ > 0) return waiting();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+    const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    try {
+      child.stdout.pause(); // the reader takes nothing
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+      await Promise.race([second, exited]);
+      const sent = Date.now();
+      child.kill("SIGINT");
+      await new Promise((done) => setTimeout(done, 200));
+      child.kill("SIGINT");
+      assert.equal(await exited, 130, stderr);
+      const took = Date.now() - sent;
+      assert.ok(took >= 4_500, `exited ${took} ms after the first Ctrl+C`);
+      assert.match(stderr, /The --events reader took nothing for 5 s: \d+ events? (weren't|wasn't) written\./);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      child.stdout.destroy();
+      api.close();
+    }
+  });
+
   it("with -, goes on with the task when the events' reader is gone, and says so once", async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
     try {
@@ -495,6 +579,63 @@ describe("Events", () => {
     });
   });
 
+  it("counts the reader gone when a retry's write fails otherwise (EIO, say), rather than throw from its timer", async () => {
+    const told: string[] = [];
+    await withContext({ silent: true, told: (text) => told.push(text) }, async () => {
+      let calls = 0;
+      const failing: Io = {
+        write: () => {
+          if (calls++ === 0) throw Object.assign(new Error("EAGAIN: resource temporarily unavailable, write"), { code: "EAGAIN" });
+          throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+        },
+        now: () => 0,
+        wait: () => {},
+      };
+      const lines = new Lines(1, failing);
+      lines.write("one\n"); // held, and tried again on the timer
+      await new Promise((done) => setTimeout(done, 100));
+      assert.equal(calls, 2);
+      assert.deepEqual(told, ["The --events reader is gone (a write failed: EIO): jig writes no more events, and goes on with the task."]);
+      lines.write("two\n");
+      assert.equal(lines.flush(), 0);
+      assert.equal(calls, 2);
+    });
+  });
+
+  it("after a signal waits 20 s at most in all, though the reader takes some every few seconds", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      let next = 0;
+      const slow = pipe((now) => (now < next ? 0 : ((next = now + 4000), 2)));
+      const lines = new Lines(1, slow.io);
+      lines.write(`${"x".repeat(99)}\n`);
+      lines.write("two\n");
+      assert.equal(lines.flush(20), 2);
+      assert.equal(slow.io.now(), 20_000);
+      assert.equal(slow.got(), "x".repeat(12));
+      assert.deepEqual(told, ["The --events reader didn't take them all in the 20 s jig gives it after a signal: 2 events weren't written."]);
+    });
+  });
+
+  it("holds lines up to its limit, drops the events past it but for the end, and says how many it dropped", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      const stopped = pipe();
+      const lines = new Lines(1, stopped.io, 10);
+      lines.write("one\n");
+      lines.write("two\n");
+      lines.write("three\n"); // 14 bytes held: dropped
+      lines.write("x\n"); // 10: held
+      lines.write("y\n");
+      assert.equal(lines.dropped, 2);
+      lines.write("end\n", true); // the end goes, however much is held
+      stopped.room(Infinity);
+      assert.equal(lines.flush(), 0);
+      assert.equal(stopped.got(), "one\ntwo\nx\nend\n");
+      assert.deepEqual(told, ["The --events reader was too far behind: 2 events weren't written, past the 10 bytes jig holds for it."]);
+    });
+  });
+
   it("blanks out a key before it cuts the output, so a key the cut falls in isn't left half there", () => {
     const { got, ui } = listen();
     const key = `sk-${"a1".repeat(20)}`;
@@ -597,3 +738,6 @@ function pipe(taking?: (now: number) => number) {
   };
   return { io, got: () => Buffer.from(bytes).toString(), room: (bytes: number) => void (room = bytes) };
 }
+
+/** Takes 4 KiB of its stdin every half second, until it ends: a reader that is slow, but reads. */
+const SLOW_READER = `const b = Buffer.alloc(4096), p = new Int32Array(new SharedArrayBuffer(4)); while (require("node:fs").readSync(0, b) > 0) Atomics.wait(p, 0, 0, 500);`;
