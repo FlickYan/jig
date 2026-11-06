@@ -69,6 +69,8 @@ export const ROLE_LABELS = { "app.kubernetes.io/name": "jig", "app.kubernetes.io
 const INPUT = "/task-input";
 const TASK = "/task";
 const SLACK_MS = 60_000;
+/** How long a task's pod has between SIGTERM and SIGKILL, by default. */
+const TERMINATION_GRACE_SECONDS = 30;
 /** The most a Secret's data may hold, in bytes. */
 const SECRET_BYTES = 1024 * 1024;
 /** The longest a poll waits while a task's pod hasn't started yet, in milliseconds. */
@@ -239,12 +241,13 @@ export class KubernetesRunner implements Runner {
    * asked again every few seconds until it is deleted or the run has ended otherwise.
    */
   private followed(ns: string, jobPath: string, selector: string, task: Task): RunHandle {
-    const { graceSeconds, pollMs = 1000 } = this.config;
+    const { graceSeconds, pollMs = 1000, terminationGraceSeconds = TERMINATION_GRACE_SECONDS } = this.config;
     const events = new Channel<JigEvent>();
     let cancelled = false;
     let finished = false;
     let retry: NodeJS.Timeout | undefined;
-    const backstop = Date.now() + (task.spec.timeLimit + graceSeconds) * 1000 + SLACK_MS;
+    // At the deadline the pod is sent SIGTERM, and may take its grace to end, its end still to be read.
+    const backstop = Date.now() + (task.spec.timeLimit + graceSeconds + terminationGraceSeconds) * 1000 + SLACK_MS;
     const exit = this.follow(ns, jobPath, selector, task.id, events, pollMs, backstop).finally(() => {
       finished = true;
       clearTimeout(retry);
@@ -282,7 +285,7 @@ export class KubernetesRunner implements Runner {
    * pod is. `input` mounts the task's input from the Secret named as the Job.
    */
   private job(name: string, labels: Record<string, string>, command: string[], env: object[], deadline: number, input: boolean, annotations?: Record<string, string>): object {
-    const { image, user = 10001, terminationGraceSeconds: grace = 30 } = this.config;
+    const { image, user = 10001, terminationGraceSeconds: grace = TERMINATION_GRACE_SECONDS } = this.config;
     const all = { ...ROLE_LABELS, ...labels };
     return {
       apiVersion: "batch/v1",
@@ -367,11 +370,15 @@ export class KubernetesRunner implements Runner {
         }
         if (!logged && (container?.running || container?.terminated)) {
           started = true;
+          // A read has the whole log only if the container had ended before it began. A stream can end while the
+          // container runs (it broke, or the kubelet ended it as the container exited, a moment before the pod's
+          // status says so); its last line may then be a task's, whatever the pod's status says by the GET after.
+          const whole = Boolean(container?.terminated);
           const res = await this.send("GET", `/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}/log?container=jig&follow=true`, undefined, 0);
           // A stream that stays open with nothing on it is let go at the backstop.
           const hang = setTimeout(() => res.destroy(), Math.max(0, backstop - Date.now()));
           // The worker's line, written last, as this read has it. A task's commands can write such a line too
-          // (through /proc/1/fd/1), so it counts only from a read that ended after the container did.
+          // (through /proc/1/fd/1), so it counts only from a whole read.
           let last: typeof worker | undefined;
           if (res.statusCode === 200) {
             for await (const line of lines(res)) {
@@ -396,14 +403,23 @@ export class KubernetesRunner implements Runner {
             seen = last;
           } else res.resume();
           clearTimeout(hang);
-          // Read to its end only once the container has ended (or the pod is gone): a stream that ended before is
-          // read again, after a poll, whatever its last line was. The kubelet ends it as the container exits, a
-          // moment before the pod's status says so, which costs a read more.
+          if (whole && res.statusCode === 200) {
+            logged = true;
+            if (last) worker = last;
+            continue;
+          }
+          // Otherwise the log is read again: at once if the container has ended by now, after a poll if not.
+          // Once the pod is gone no read can be made, and the latest read's worker's line is all there is; a
+          // log the API server won't give for a container that has ended is given up on.
           const after = await this.get(`/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}`);
-          if (after) pod = after;
-          logged = !after || Boolean(after.status?.containerStatuses?.[0]?.state?.terminated);
-          if (logged) worker = (after ? last : seen) ?? worker;
-          if (logged) continue;
+          if (!after) {
+            logged = true;
+            if (seen) worker = seen;
+            continue;
+          }
+          pod = after;
+          logged = whole;
+          if (logged || after.status?.containerStatuses?.[0]?.state?.terminated) continue;
         }
         const ended = job.status?.conditions?.find((condition) => ["Complete", "Failed"].includes(condition.type) && condition.status === "True");
         if (ended && (logged || !started)) {
