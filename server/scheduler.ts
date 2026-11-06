@@ -176,7 +176,7 @@ export class Scheduler {
     // ended already: one that can't be read goes uncounted, and the rest are counted all the same.
     for (const id of expired) {
       const task = await this.store.task(id).catch((err: unknown) => {
-        this.metrics.storeErrors.inc();
+        this.metrics.storeErrors.inc({ retried: "false" });
         this.log.error("couldn't read an expired task to count it", { task: id, err });
         return undefined;
       });
@@ -204,7 +204,7 @@ export class Scheduler {
       this.again = false;
       // A store that fails now may not later: the next poke tries again.
       await this.fill().catch((err: unknown) => {
-        this.metrics.storeErrors.inc();
+        this.metrics.storeErrors.inc({ retried: "false" });
         this.log.error("couldn't start queued tasks", { err });
       });
     }
@@ -316,7 +316,11 @@ export class Scheduler {
     let stored = 0;
     /** The bytes of the events stored, as JSON. */
     let bytes = 0;
-    let dropping = false;
+    /** The cap the run's events went past, as the notice gives it: once it is set, they are dropped. */
+    let past: string | undefined;
+    let noticed = false;
+    /** Past a cap, the run's latest event if it is an end: stored after the last event, unless one follows it. */
+    let held: JigEvent | undefined;
     // When jig asked for each approval this run stored, by its own clock, to time a timeout's wait.
     const asked = new Map<string, number>();
     try {
@@ -329,17 +333,22 @@ export class Scheduler {
         if (!stored) this.metrics.startSeconds.observe({ start }, (Date.now() - run.claimed) / 1000);
         if (event.type === "end") end = event;
         let kept = event;
-        // Past either cap, a run's events are dropped, but for its end, and one notice in place of the first
-        // dropped says so: a task's commands can't fill the store with one task, and the run goes on. Lines
-        // of up to 1 MiB are read, so the bytes are capped as well as the count.
-        if (event.type !== "end") {
-          if (dropping) continue;
+        // Past either cap, a run's events are dropped, but for its last event if that is an end (jig writes
+        // its own last), and one notice in place of the first dropped says so: a task's commands can't fill
+        // the store with one task, and the run goes on. Lines of up to 1 MiB are read, so the bytes are capped
+        // as well as the count. An end counts as any event does, as a task's commands may write ends too.
+        if (!past) {
           const size = Buffer.byteLength(JSON.stringify(event));
-          const past = stored >= this.maxEvents ? `${this.maxEvents}` : bytes + size > this.maxEventBytes ? `${this.maxEventBytes} bytes` : undefined;
-          if (past) {
-            dropping = true;
-            kept = { v: 1, seq: event.seq, ts: event.ts, type: "notice", text: `The run's events past ${past} aren't kept: the service drops them, but for the end.` };
-          } else bytes += size;
+          past = stored >= this.maxEvents ? `${this.maxEvents}` : bytes + size > this.maxEventBytes ? `${this.maxEventBytes} bytes` : undefined;
+          if (!past) bytes += size;
+        }
+        if (past) {
+          // An end held is dropped once another event comes; this one is held in its place if it is an end.
+          const dropped = held ?? (event.type === "end" ? undefined : event);
+          held = event.type === "end" ? event : undefined;
+          if (noticed || !dropped) continue;
+          noticed = true;
+          kept = { v: 1, seq: dropped.seq, ts: dropped.ts, type: "notice", text: `The run's events past ${past} aren't kept: the service drops them, but for its last event if it is an end.` };
         }
         // The approval first, so it can be answered by whoever sees its event; one past the cap isn't kept,
         // and jig's wait for it ends at its timeout, as a deny. Each write is tried again on a failure,
@@ -360,9 +369,14 @@ export class Scheduler {
           this.log.warn(`the run says the API answered ${answered.id} with ${said}, which it didn't: left out of the record`, { tenant: task.tenant, task: task.id });
         }
         // An answer through the API is counted as it is given (api.ts); a timeout, as jig records it.
-        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id, Date.parse(kept.ts) - (asked.get(answered.id) ?? NaN), run).catch(() => this.metrics.storeErrors.inc());
+        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id, Date.parse(kept.ts) - (asked.get(answered.id) ?? NaN), run).catch(() => this.metrics.storeErrors.inc({ retried: "false" }));
         this.updates.emit(task.id, { event: kept } satisfies Update);
         if (approval) this.onApproval?.(task, approval);
+      }
+      if (held) {
+        const last = held;
+        await this.retrying(() => this.store.addEvent(task.id, last.seq, last), run);
+        this.updates.emit(task.id, { event: last } satisfies Update);
       }
       exit = await run.handle.wait();
     } catch (err) {
@@ -413,14 +427,15 @@ export class Scheduler {
   /**
    * Runs `write`, and on a failure (a dropped connection, a failover) runs it again, waiting 100 ms and then
    * twice as long each time, up to 2 s, until half a lease has gone by since the first try began, or the run,
-   * still going, is being stopped; then its error is thrown. Half a lease from the first try's start, as a
-   * try can hang (up to the pool's query timeout) before it fails: an ended run's lease is no longer renewed,
-   * but was renewed a third of a lease or less before the run ended (when the renewals went through), so
-   * the run still holds it when the last try is begun. A try begun may end past the lease, which the store
-   * checks: an outcome stored after another replica ended the task isn't stored. An ended run's outcome is tried for all of that, however it was stopped, as it holds what the run
-   * spent. An error the database says is in the data (a value out of range, a constraint broken) is thrown
-   * at once, as it would fail every time. Each failure is counted. The write must be one that is kept once
-   * however often it is made, as one that failed may have been made.
+   * still going, is being stopped; then its error is thrown. Half a lease from the first try's start, as a try
+   * can hang (up to the pool's query timeout) before it fails: an ended run's lease is no longer renewed, but
+   * was renewed a third of a lease or less before the run ended (when the renewals went through), so the run
+   * still holds it when the last try is begun. A try begun may end past the lease, which the store checks: an
+   * outcome stored after another replica ended the task isn't stored. An ended run's outcome is tried for all
+   * of that, however it was stopped, as it holds what the run spent. An error the database says is in the data
+   * (a value out of range, a constraint broken) is thrown at once, as it would fail every time. Each failure
+   * is counted, as retried or as given up on. The write must be one that is kept once however often it is
+   * made, as one that failed may have been made.
    */
   private async retrying<T>(write: () => Promise<T>, run: Run): Promise<T> {
     const deadline = Date.now() + this.leaseMs / 2;
@@ -428,9 +443,10 @@ export class Scheduler {
       try {
         return await write();
       } catch (err) {
-        this.metrics.storeErrors.inc();
         const left = deadline - Date.now();
-        if (left <= 0 || (run.stopping && !run.ended) || permanent(err)) throw err;
+        const givenUp = left <= 0 || (run.stopping && !run.ended) || permanent(err);
+        this.metrics.storeErrors.inc({ retried: givenUp ? "false" : "true" });
+        if (givenUp) throw err;
         await new Promise((done) => setTimeout(done, Math.min(wait, left)));
       }
     }

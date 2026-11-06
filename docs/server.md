@@ -58,10 +58,11 @@ program and first arguments that start jig: this checkout's `src/cli.ts` by defa
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
 the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the most bytes of them, as JSON:
-past either they are dropped, but for the `end`, with one `notice` event in place of the first dropped, and
-the run goes on. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
-its events, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what tasks
-store over time.
+past either they are dropped, but for the run's last event if it is an `end` (jig writes its own last),
+with one `notice` event in place of the first dropped, and the run goes on. An `end` counts toward both
+like any event. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
+its events, `end`s too, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what
+tasks store over time.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
@@ -302,7 +303,7 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
-| `jig_service_lease_errors_total`, `jig_service_store_errors_total` | rounds of renewing the leases that failed, and reads and writes of the store that failed outside a request |
+| `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
@@ -330,10 +331,13 @@ and the router's metrics listeners (the Kubernetes pods that ask to be, or addre
 `alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
 upstream's breaker open, a provider's keys used up, quota refusals, approval webhooks failing, a region
 down, and the store's, the leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all
-three, by region. In `deploy/k8s/` the service's metrics listener is on port 9180 and the gateway's on
-9181, the pods carry `prometheus.io/scrape` and `prometheus.io/port`, and NetworkPolicies let only the
-`monitoring` namespace reach those ports (the tenants' API from anywhere, the internal listener and the
-gateway from the pods in `jig`).
+three, by region. Of the store's, `JigStoreErrors` (critical) is for reads and writes given up on, when
+tasks aren't started or a run's events or outcome aren't stored, and `JigStoreDegraded` (a warning) for
+every failed try, one a retry got through too, so it alone doesn't mean anything was lost. In
+`deploy/k8s/` the service's metrics listener is on port 9180 and the gateway's on 9181, the pods carry
+`prometheus.io/scrape` and `prometheus.io/port`, and NetworkPolicies let only the `monitoring` namespace
+reach those ports (the tenants' API from anywhere, the internal listener and the gateway from the pods
+in `jig`).
 
 ### Clones and gitHosts
 
