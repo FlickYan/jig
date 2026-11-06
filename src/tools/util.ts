@@ -99,8 +99,10 @@ export function keptIn(path: string, { roots, home }: Places): string[] {
  * write_file could plant one. Only where they really lie in it, though: the sandbox binds them read-only
  * at their place there, so skills linked out of it (to a dotfiles repository, say) are as writable to
  * commands as anything else where the link leads, and so to the file tools. The roots that lie in jig's
- * directory stay as they were (a project there is a skill being written, say). Worked out once,
- * to check many files against (see firstVisible, and skills.ts's discoverSkills, which can't wait for it).
+ * directory stay as they were (a project there is a skill being written, say). jig's own changes in the
+ * project, which the user approves, go by the settings alone (see skill-store.ts's assertInProject).
+ * Worked out once, to check many files against (see firstVisible, and skills.ts's discoverSkills, which
+ * can't wait for it).
  */
 export function hiddenTest(hidden: string[], roots?: string[], change = false): (real: string) => Hiding | undefined {
   const reals = (list: string[]) => list.map((path) => realTargetSync(path)).filter((path) => path !== undefined);
@@ -118,7 +120,7 @@ export function hiddenTest(hidden: string[], roots?: string[], change = false): 
   };
 }
 
-function hiddenError(path: string, hiding: Hiding): Error {
+export function hiddenError(path: string, hiding: Hiding): Error {
   if (hiding === "settings") return new Error(`${path} is hidden by the user's settings. Don't try to get around it.`);
   if (hiding === "skills") {
     return new Error(`${path} leads into jig's own skills, which the file tools read but don't change, as commands can't: each is offered in every project. To save a skill, propose it with propose_skill if you have it, or ask the user.`);

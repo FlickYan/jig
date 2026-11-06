@@ -6,7 +6,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { createSandbox, execInSandbox, lockedGitPaths } from "./sandbox.ts";
 import { frontmatterFields, listSkillFiles, nameProblems, skillProblems, userSkillsDir } from "./skills.ts";
-import { assertVisible, isInside, keptIn, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
+import { hiddenError, hiddenTest, isInside, keptIn, readRegularBytes, readRegularFile, realTarget, realTargetSync, writeAnew } from "./tools/util.ts";
 
 // Installing skills: from a folder, or from a folder in a git repository (GitHub shorthand, a GitHub page,
 // or any git URL), into the user's skills or the project's. A lockfile beside them records where each came
@@ -235,7 +235,9 @@ export async function assertInProject(project: string, path: string, hidden: str
   const shown = relative(project, path);
   const real = await realTarget(path);
   if (!real) throw new Error(`${shown} leads through a broken symlink, so jig won't change it. A command may have put it there; if so, delete it.`);
-  await assertVisible(path, shown, hidden, [project, ...dirs]); // a hidden folder holding the project keeps it
+  // The settings' hidden paths, but for the project that one holds, which the sandbox keeps (see keptIn).
+  // Not jig's own directory, as the file tools hide it: in ~, the project's lockfile is the user's, in it.
+  if (hidden.length && hiddenTest(hidden, [project, ...dirs])(real) === "settings") throw hiddenError(shown, "settings");
   const roots = await Promise.all([project, ...dirs].map((dir) => realTarget(dir)));
   if (!roots.some((root) => root && isInside(root, real))) throw new Error(`${shown} leads outside the project, to ${real}, so jig won't change it. A command may have put a link there.`);
   // Without case, as isGitControl: macOS's file systems usually ignore it.

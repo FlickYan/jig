@@ -372,6 +372,32 @@ describe("changing installed skills", () => {
     await assert.rejects(assertInProject(acme, join(acme, "other", "AGENTS.md"), [clients]), /other\/AGENTS\.md is hidden by the user's settings/);
   });
 
+  it("are added, updated and removed from the home directory, whose project lockfile is the user's", async () => {
+    // In ~ the project's .jig is jig's own directory: the project's changes are the user's, not ones into
+    // jig's directory to refuse, with no hidden paths and with some.
+    const was = process.env.HOME;
+    process.env.HOME = dir;
+    delete process.env.JIG_HOME;
+    const { notices, stop } = collectNotices(...markers, "gamma");
+    const inHome = (...args: string[]) => skillsCommand([...args, "-C", dir, "--yes"]);
+    try {
+      await inHome("add", source);
+      await inHome("update");
+      assert.match(notices.join("\n"), /beta: up to date/);
+      await inHome("remove", "beta");
+      assert.ok(!existsSync(join(dir, ".jig", "skills", "beta")));
+      await inHome("add", await writeSkill(join(dir, "source"), "gamma"), "--project");
+      assert.ok(existsSync(join(dir, ".jig", "skills", "gamma", "SKILL.md")));
+      await writeFile(join(dir, ".jig", "settings.json"), JSON.stringify({ hiddenPaths: [outside] }));
+      await inHome("update", "gamma");
+      await inHome("remove", "gamma");
+      assert.ok(!existsSync(join(dir, ".jig", "skills", "gamma")));
+    } finally {
+      stop();
+      process.env.HOME = was;
+    }
+  });
+
   it("are removed from the user's when the project's settings are broken, but not from the project's", async () => {
     // A command can write the project's settings, whose hidden paths matter only to the project's skills.
     await jig("add", source);
