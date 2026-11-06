@@ -465,7 +465,9 @@ replica never runs more tasks at once, so a worker past it would never be used.
 A task run on a warm worker keeps some of the worker's names. On Docker the container `jig-pool_<hex>`, with
 only the `jig.pool` label, is renamed `jig-<id>` (`docker rename`) once given the task, the name a cold one
 would have, so a replica that ends the task after a crash finds it; if the rename fails, that is logged and
-the task runs all the same. Its folder stays `dataDir/tasks/pool_<hex>`. On Kubernetes the Job
+the task runs all the same. If `docker rename` doesn't return within 5 seconds, it may have renamed the
+container anyway, so the replica's kills (a cancel, the time limit) try the old name and then the new. Its
+folder stays `dataDir/tasks/pool_<hex>`. On Kubernetes the Job
 `jig-pool-<hex>` is given the task's labels, while its pod keeps only `jig.dev/pool`. The service logs which
 worker took each task ("the task runs on a warm worker", with the task, its tenant and the container and
 folder, or the Job).

@@ -7,8 +7,9 @@
 // name only (its run's record keeps the name it ran with). A flag it doesn't know fails as
 // docker's do, with 125. Files in <state> change what it does: `delay` holds the milliseconds `run` takes
 // before the container exists (its image being pulled), a `deaf` container ignores TERM, as a jig whose
-// commands hold it up might, and `flood` holds the length of an event too long to read (a text of that
-// many x's) that the container's commands write in the events file before jig starts.
+// commands hold it up might, `flood` holds the length of an event too long to read (a text of that
+// many x's) that the container's commands write in the events file before jig starts, and `slow-rename`
+// holds the milliseconds `rename` takes to return once it has renamed (a daemon slow to answer).
 //
 // A warm worker's container (its command has --pool <url>) runs the real server/worker.ts, its claim passed
 // through a proxy here that turns the container's paths in the answer into the host's, and jig into the
@@ -97,6 +98,7 @@ if (command === "run") {
     process.exit(1);
   }
   renameSync(join(state, `${from}.pid`), join(state, `${to}.pid`));
+  if (existsSync(join(state, "slow-rename"))) await new Promise((done) => setTimeout(done, Number(readFileSync(join(state, "slow-rename"), "utf8"))));
 } else {
   console.error(`fake docker: no command ${command}`);
   process.exit(1);

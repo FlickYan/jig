@@ -396,6 +396,24 @@ describe("the Docker runner", () => {
     await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
   });
 
+  it("cancels a task on a warm worker whose rename landed but whose docker rename was cut off, by either name", async () => {
+    const lines: any[] = [];
+    // docker rename renames, then doesn't return before the runner stops it, 5 seconds on.
+    const { api, state, runner } = await docker({ pool: { size: 1 }, log: logTo(lines) }, { "slow-rename": "60000" });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [pool] = [...(await runs(state)).keys()];
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
+    const warning = await until(() => lines.find((line) => line.msg.startsWith("couldn't rename")), "the warning");
+    assert.equal(warning.msg, "couldn't rename a warm worker's container for its task; if this replica crashes, the replica that ends the task may not find it, and the run goes on until its time limit");
+    assert.match(warning.err.message, /^docker rename was stopped \(SIGTERM\); it may have been renamed all the same/);
+    const worker = await pidOf(state, `jig-${id}`);
+    assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
+    assert.equal((await ended(api, id)).status, "cancelled");
+    // The old name first, which misses, then the new one.
+    assert.deepEqual(await kills(state), [{ signal: "TERM", name: pool }, { signal: "TERM", name: `jig-${id}` }]);
+    await until(() => !alive(worker), "the container's processes to be gone");
+  });
+
   it("replaces a worker idle past maxIdleSeconds", async () => {
     const { state, runner } = await docker({ pool: { size: 1, maxIdleSeconds: 1 } });
     await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
