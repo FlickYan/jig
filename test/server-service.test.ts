@@ -879,7 +879,8 @@ const schedulerTests = () => {
       assert.deepEqual([ended.status, ended.error, ended.cost], ["succeeded", null, 1.25]);
       assert.deepEqual((await store.events(task.id)).map(({ seq }) => seq), [1, 2, 3]);
       assert.equal(await billed(store), 1.25);
-      assert.equal(metrics.storeErrors.get(), failures);
+      // Each failed try is counted as retried: nothing was given up on, so nothing was lost.
+      assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [failures, 0]);
       await scheduler.close();
       await store.close();
     });
@@ -1022,6 +1023,68 @@ const schedulerTests = () => {
     await store.close();
   });
 
+  it("counts a run's ends against maxEvents and maxEventBytes, and stores only its last end past them", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // A task's commands can write ends as well: 200 lines of 512 KiB, then jig's own end, last.
+    const text = "x".repeat(512 * 1024);
+    const usage = { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 };
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (let seq = 1; seq <= 200; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "end", stop: "error", usage, cost: 9, text };
+            yield { v: 1, seq: 201, ts: new Date().toISOString(), type: "end", stop: "end_turn", usage, cost: 0.5 };
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, maxEventBytes: 8 * 1024 * 1024 });
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.stop, ended.cost], ["succeeded", "end_turn", 0.5]);
+    const events = await store.events(task.id);
+    const kept = events.slice(0, -2);
+    assert.equal(kept.length, 15);
+    assert.ok(kept.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0) <= 8 * 1024 * 1024);
+    assert.deepEqual(events.slice(-2).map(({ seq, event }) => [seq, (event as { type: string }).type]), [[16, "notice"], [201, "end"]]);
+    await scheduler.close();
+    await store.close();
+  });
+
+  for (const [types, want] of [
+    [["start", "start", "end"], [[1, "start"], [2, "start"], [3, "end"]]],
+    [["start", "start", "end", "end"], [[1, "start"], [2, "start"], [3, "notice"], [4, "end"]]],
+    [["start", "start", "end", "start"], [[1, "start"], [2, "start"], [3, "notice"]]],
+    [["start", "start", "start", "end", "end"], [[1, "start"], [2, "start"], [3, "notice"], [5, "end"]]],
+  ] as const) {
+    it(`past maxEvents stores a run's last event only if it is an end, and a notice in place of the first dropped: ${types.join(", ")}`, async () => {
+      const store = await newStore();
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+      const runner: Runner = {
+        async start() {
+          return {
+            events: (async function* () {
+              for (const [i, type] of types.entries()) yield { v: 1, seq: i + 1, ts: new Date().toISOString(), type, stop: "end_turn" };
+            })(),
+            wait: async () => ({ exitCode: 0, timedOut: false }),
+            cancel() {},
+          };
+        },
+      };
+      const scheduler = newScheduler(store, runner, { concurrency: 4, maxEvents: 2 });
+      await scheduler.poke();
+      await endOf(store, task.id);
+      assert.deepEqual((await store.events(task.id)).map(({ seq, event }) => [seq, (event as { type: string }).type]), want);
+      await scheduler.close();
+      await store.close();
+    });
+  }
+
   it("frees a run's slot even when its outcome can't be stored", async () => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
@@ -1030,13 +1093,17 @@ const schedulerTests = () => {
     const failing = failingStore(store, "finish", () => true);
     const runner = new FakeRunner();
     const lines: string[] = [];
-    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, log: createLog("service", { write: (line) => lines.push(line) }) });
+    const metrics = serviceMetrics();
+    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
     await scheduler.start();
     await until(() => runner.active.size, "a0 to start");
     runner.active.values().next().value!.end();
     // a0's lease, no longer renewed, runs out: it ends as an error, and a1 takes the slot it had.
     await until(() => runner.started.length === 2, "a1 to start");
     assert.ok(lines.some((line) => line.includes("couldn't store how the task ended")), lines.join("\n"));
+    // The tries before the last are counted as retried, and the outcome given up on once.
+    assert.ok(metrics.storeErrors.get({ retried: "true" }) >= 1);
+    assert.equal(metrics.storeErrors.get({ retried: "false" }), 1);
     const [lost] = await store.inStatus("error");
     assert.equal(lost.spec.prompt, "a0");
     assert.match(lost.error!, /stopped renewing its lease/);
@@ -1146,7 +1213,7 @@ const schedulerTests = () => {
     const lines: string[] = [];
     const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
     assert.deepEqual(await scheduler.start(), [left.id]);
-    assert.equal(metrics.storeErrors.get(), 1);
+    assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [0, 1]);
     assert.ok(lines.some((line) => line.includes("couldn't read an expired task to count it")), lines.join("\n"));
     assert.equal((await store.task(left.id))!.status, "error");
     await scheduler.close();

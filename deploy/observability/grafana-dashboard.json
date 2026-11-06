@@ -626,7 +626,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Errors and replicas",
-      "description": "Failed reads and writes of the database, and the replicas whose heartbeat is in it.",
+      "description": "Failed tries of reads and writes of the database (retried true: tried again; false: given up on), failed lease renewals, and the replicas whose heartbeat is in it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -660,8 +660,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(jig_service_store_errors_total{region=~\"$region\"}[$__rate_interval]))",
-          "legendFormat": "store errors",
+          "expr": "sum by (retried) (increase(jig_service_store_errors_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "store errors, retried={{retried}}",
           "refId": "A"
         },
         {

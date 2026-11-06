@@ -364,7 +364,7 @@ function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: 
     read = { at: Date.now(), counts: reading };
     // A failed read is tried again at the next scrape; meanwhile the gauges stay as they were.
     reading.catch(() => {
-      metrics.storeErrors.inc();
+      metrics.storeErrors.inc({ retried: "false" });
       if (read?.counts === reading) read = undefined;
     });
     return reading;
@@ -928,7 +928,7 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
-        metrics.storeErrors.inc();
+        metrics.storeErrors.inc({ retried: "false" });
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
