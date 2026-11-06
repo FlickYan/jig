@@ -855,6 +855,10 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
+    assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
+    assert.equal(problem({ local: [] }), "The config's local must be an object, {hiddenPaths}");
+    assert.equal(problem({ local: { hiddenPaths: ["secrets"] } }), 'The config\'s local.hiddenPaths must be a list of absolute paths, not ["secrets"]');
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
     assert.equal(problem({ docker: { image: "w", network: "n", pool: 4 } }), "The config's docker.pool must be an object, {size, maxIdleSeconds}");
     assert.equal(problem({ kubernetes: { image: "w", pool: { size: -1 } } }), "The config's kubernetes.pool.size must be a whole number from 0 up, not -1");
@@ -975,7 +979,7 @@ describe("the service's start", () => {
     });
   }
 
-  it("hides dataDir, the database and the config from the local runner's tasks, and warns of what they still share", async () => {
+  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
@@ -987,7 +991,10 @@ describe("the service's start", () => {
     const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
     if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
     else {
-      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
+      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
+      // What else they read and connect to, and where the clones go, which gitHosts would limit.
+      warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
+      warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
       // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
       // elsewhere), as each task has its own.
       const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
@@ -1000,7 +1007,37 @@ describe("the service's start", () => {
     await statusOf(started, id, "succeeded");
     const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
     const db = join(dir, "jig.db");
-    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, configFile] });
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
+  });
+
+  it("clones only from gitHosts, follows no redirect, and tells the tenant only that the clone failed", async () => {
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["example.com"] });
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: "https://127.0.0.1:1/x.git" } });
+    assert.deepEqual([posted.status, posted.body.error], [400, "workspace.git must be on one of the config's gitHosts: example.com"]);
+
+    // Without gitHosts, a redirect to a host inside the service's network is not followed, and what git
+    // said of the hosts it tried goes to the service's log alone: it would make the clone a scanner.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const outside = createServer((req, res) => res.writeHead(302, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/internal${req.url}` }).end());
+    for (const server of [inside, outside]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const lines: Record<string, unknown>[] = [];
+    const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
+    const dir = await tempDir("jig-service-");
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], gitProtocols: ["http"], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const started = await startService(config, { secret: SECRET, log });
+    services.push(started);
+    const port = (outside.address() as AddressInfo).port;
+    const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${port}/x.git` } })).body;
+    const task = await statusOf(started, id, "error");
+    assert.deepEqual(asked, []);
+    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    const logged = lines.find((line) => line.msg === "git clone failed");
+    assert.deepEqual([logged?.tenant, logged?.task], ["acme", id]);
+    assert.match(String(logged?.stderr), new RegExp(`127\\.0\\.0\\.1:${port}`));
   });
 
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {

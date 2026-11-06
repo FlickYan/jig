@@ -1,5 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -80,6 +81,10 @@ export interface Config {
   graceSeconds?: number;
   jig?: string[];
   gitProtocols?: string[];
+  /** The hosts a workspace may be cloned from (default: any). */
+  gitHosts?: string[];
+  /** The local runner's: what else its tasks' commands can't read, as absolute paths. */
+  local?: { hiddenPaths?: string[] };
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
   /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
@@ -266,6 +271,7 @@ export async function startService(
     answers,
     region: config.region ?? null,
     model: config.model ?? "deepseek-flash",
+    gitHosts: config.gitHosts,
     maxBody: config.maxBodyBytes ?? 1024 * 1024,
     heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000,
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
@@ -277,11 +283,13 @@ export async function startService(
 
 /**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
- * from their commands, but for the task's own project and home, and the database and the config (see
- * runners/local.ts); without one, they run directly on the machine. With one, they share its kernel, /tmp
- * and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost. And with
- * dataDir in one of those, which they can write, a task's commands can change its home there, whose git
- * config jig's own git reads, outside the sandbox.
+ * from their commands, but for the task's own project and home, and the database and the config's folder
+ * (see runners/local.ts); without one, they run directly on the machine. With one, they share its kernel,
+ * /tmp and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read
+ * whatever else the service's user can, and connect to the Unix sockets there, which a read-only file
+ * system doesn't stop. And with dataDir in one of those, which they can write, a task's commands can change
+ * its home there, whose git config jig's own git reads, outside the sandbox. The workspace's clone is the
+ * service's own, on its network.
  */
 function localRisks(config: Config): string[] {
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
@@ -295,7 +303,9 @@ function localRisks(config: Config): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
-    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
+    "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
+    ...(config.gitHosts ? [] : ["a local task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts"]),
+    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
 }
@@ -372,14 +382,17 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
 
 /**
  * The runner the config names, its lines (and its pool's) in the service's `log`. The local runner's tasks'
- * commands can't read the SQLite database's files or the config (`configFile`), beside dataDir.
+ * commands can't read, beside dataDir, the SQLite database's files, the folder the config (`configFile`)
+ * is in, where the service's other secrets are kept too, the git checkout dataDir is in, if any, and what
+ * the config's local.hiddenPaths list.
  */
 function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, configFile?: string): Runner {
   const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
-    const hidden = [...database, ...(configFile ? [configFile] : [])];
+    const checkout = checkoutOf(config.dataDir);
+    const hidden = [...new Set([...database, ...(configFile ? [dirname(configFile)] : []), ...(checkout ? [checkout] : []), ...(config.local?.hiddenPaths ?? [])])];
     return new LocalRunner({ ...shared, hidden, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
@@ -387,6 +400,22 @@ function runnerFor(config: Config, secret: string, internalBaseUrl: string, log:
   if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
   if (runner === "kubernetes") throw new Error('The kubernetes runner needs "kubernetes": {"image"}: the worker image');
   throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
+}
+
+/**
+ * The top of the git checkout dataDir is in (the service run from one, say), or undefined, as git finds it
+ * once at the start. GIT_CEILING_DIRECTORIES keeps a task's git out of it, but not its commands' reads: its
+ * files, a deploy's .env among them, are the service's. Whoever owns it: git would otherwise refuse another
+ * user's checkout, which would stay readable.
+ */
+function checkoutOf(dataDir: string): string | undefined {
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    const top = execFileSync("git", ["-c", "safe.directory=*", "rev-parse", "--show-toplevel"], { cwd: dataDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    return top.trim() || undefined;
+  } catch {
+    return undefined; // not in one, or no git
+  }
 }
 
 /** Throws with what is wrong if the config isn't one the service can run with. */
@@ -436,6 +465,11 @@ function configProblem(config: Config): string | undefined {
     positive("graceSeconds", config.graceSeconds, true, 86_400) ??
     strings("jig", config.jig) ??
     strings("gitProtocols", config.gitProtocols) ??
+    strings("gitHosts", config.gitHosts) ??
+    (config.local === undefined || isObject(config.local) ? undefined : "local must be an object, {hiddenPaths}") ??
+    (config.local?.hiddenPaths === undefined || (Array.isArray(config.local.hiddenPaths) && config.local.hiddenPaths.every((path) => typeof path === "string" && isAbsolute(path)))
+      ? undefined
+      : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
     whole("maxBodyBytes", config.maxBodyBytes, 1) ??
     positive("heartbeatSeconds", config.heartbeatSeconds, false, 3_600) ??
     text("replicaId", config.replicaId, false) ??
@@ -497,6 +531,7 @@ interface Context {
   answers: Answers;
   region: string | null;
   model: string;
+  gitHosts?: string[];
   maxBody: number;
   heartbeatMs: number;
   /** The SHA-256 of the admin key, when there is one. */
@@ -576,7 +611,7 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     if (region !== context.region) return reply(res, 400, { error: `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router` });
     input = rest;
   }
-  const spec = taskSpec(input, tenant, context.model);
+  const spec = taskSpec(input, tenant, context.model, context.gitHosts);
   if (typeof spec === "string") {
     refused("invalid");
     return reply(res, 400, { error: spec });
@@ -715,8 +750,11 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. */
-export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): TaskSpec | string {
+/**
+ * A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. A
+ * repository to clone must be on one of `gitHosts`, if there are any.
+ */
+export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, gitHosts?: string[]): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
   const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode"].includes(key));
   if (unknown) return `Unknown field: ${unknown}`;
@@ -751,6 +789,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): 
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
+  // The local runner clones on the service's own network, which a tenant would otherwise reach any host on.
+  if (typeof git === "string" && gitHosts && !gitHosts.some((host) => host.toLowerCase() === URL.parse(git)?.hostname.toLowerCase())) return `workspace.git must be on one of the config's gitHosts: ${gitHosts.join(", ")}`;
   if (ref !== undefined && (git === undefined || typeof ref !== "string" || !/^[\w./-]{1,200}$/.test(ref) || ref.startsWith("-"))) return "workspace.ref must be a branch or tag of workspace.git";
   return { prompt, workspace: { files, git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
 }

@@ -20,13 +20,17 @@ queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, ten
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
 own, which is what keeps tenants apart best: jig's sandbox keeps a local task's commands out of the
-database and the other tasks' folders (below), but they share the machine's kernel.
+database's files, the config's folder and the other tasks' folders (below), but they share the machine's
+kernel, its Unix sockets and whatever else the service's user can read.
 
 Run it with a config file and the secret it shares with the gateway:
 
 ```bash
 JIG_GATEWAY_SECRET=$(cat gateway-secret) node server/api.ts --config service.json
 ```
+
+Keep the config in a folder of its own, with the service's other secrets (`gateway-secret` here): the
+local runner hides that whole folder from its tasks' commands.
 
 ```json
 {
@@ -49,7 +53,9 @@ to none and `maxQueued` (its tasks that may wait at once) to 1000. The config ho
 key: `printf %s "$KEY" | sha256sum` gives it. A tenant taken out of the config is shut out at the next
 start: its keys stop working, and its queued tasks are cancelled. Also: `graceSeconds` (30), `jig` (the
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
-(`["https"]`), `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
+(`["https"]`), `gitHosts` (the hosts a `workspace.git` may be on: any, without it; another is a 400),
+`local.hiddenPaths` (absolute paths the local runner's tasks' commands can't read either, below),
+`maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
 the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
 event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
@@ -334,7 +340,9 @@ writes it, into the store and to the streams.
 
 jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
-`hiddenPaths`: `dataDir`, the SQLite database's files and the service's config file. A hidden folder that
+`hiddenPaths`: `dataDir`, the SQLite database's files, the folder the service's config file is in, the git
+checkout `dataDir` is in, if any (the service's own, run from one, whose files `GIT_CEILING_DIRECTORIES`
+doesn't hide), and the config's `local.hiddenPaths`. A hidden folder that
 holds the project hides all in it but the project and the home directory beside it (README: hiddenPaths), so a
 task's commands work in their project and read their home as before, but can't read or write the other
 tasks' folders, their own events, stats and `output.log`, or the database, in a temp folder too:
@@ -346,11 +354,23 @@ kernel, `/tmp` and `/var/tmp` (where a command can still leave a file for anothe
 macOS its processes and `localhost`: Seatbelt lets a command see and signal the processes of the user
 it runs as, the service's own among them, whose environment holds `JIG_GATEWAY_SECRET` and the provider
 key. So on macOS the local runner is for one tenant you trust; the Docker and Kubernetes runners keep
-tenants apart. The config file is hidden when the service starts with `--config`; a program that calls
-`startService` itself passes its path as `configFile`. The service warns at the start when the local runner serves several tenants, when `dataDir` is in a temp
-folder (where a task's commands can write its home, whose git config jig's own git reads outside the
-sandbox), and when there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the
-machine.
+tenants apart. On every system, outside the hidden paths, a command reads whatever the service's user can
+(its `~/.ssh`, `~/.aws`, `.pgpass`), and connects to the Unix sockets there (Docker's, a local Postgres's
+or Redis's, an ssh-agent's), which cutting the network off doesn't close. So run the service as a user of
+its own, with nothing it doesn't need, and list what else is secret in `local.hiddenPaths` (that user's home
+directory, say, unless the toolchains the tasks use are installed there). The config's folder is hidden
+when the service starts with `--config`; a program that calls `startService` itself passes the config's
+path as `configFile`.
+
+The workspace's clone is the service's own, outside the sandbox and on the machine's network, though the
+tasks' commands have none: list the hosts tenants may clone from in `gitHosts`. A redirect is never
+followed, and a clone that fails is `git clone failed (exit N)` to the tenant, with what git said (the
+hosts and ports it tried, and how they answered) in the service's log alone.
+
+The service warns at the start of what the tasks' commands can still read and connect to, of clones
+without `gitHosts`, when the local runner serves several tenants, when `dataDir` is in a temp folder
+(where a task's commands can write its home, whose git config jig's own git reads outside the sandbox),
+and when there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the machine.
 
 ### The Docker runner
 
