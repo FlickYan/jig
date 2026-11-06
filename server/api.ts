@@ -161,10 +161,10 @@ export async function startService(
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
   // A Bearer is read up to the first whitespace, so a key with some could never be given.
   if (adminKey && /\s/.test(adminKey)) throw new Error(`${config.adminKeyEnv} holds whitespace (a trailing newline?): the admin key can't hold any`);
-  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log);
+  const metrics = serviceMetrics();
+  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
-  const metrics = serviceMetrics();
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
    * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.

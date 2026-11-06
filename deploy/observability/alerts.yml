@@ -61,6 +61,14 @@ groups:
         annotations:
           summary: "{{ $labels.tenant }} is being refused tasks at a quota"
           description: "Its tasksPerDay, usdPerDay or usdPerMonth: GET /admin/usage shows what it used."
+      - alert: JigWebhookFailures
+        expr: sum by (tenant) (increase(jig_service_webhook_deliveries_total{result="failed"}[15m])) / sum by (tenant) (increase(jig_service_webhook_deliveries_total[15m])) > 0.5 and sum by (tenant) (increase(jig_service_webhook_deliveries_total[15m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over half of {{ $labels.tenant }}'s approval webhooks fail"
+          description: "Its endpoint isn't 2xx after 4 tries (a redirect counts as a failure), so it isn't told of approvals, which time out as denies: the service's warn lines say why."
       - alert: JigServiceDown
         expr: up{component="api"} == 0
         for: 2m

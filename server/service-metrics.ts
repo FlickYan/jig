@@ -33,6 +33,7 @@ export function serviceMetrics(registry = new Registry()) {
     poolTakes: registry.counter("jig_service_pool_takes_total", "Tasks started with a warm pool, by whether a warm worker took them (hit) or they started cold (miss).", ["result"]),
     approvalsPending: registry.gauge("jig_service_approvals_pending", "Approvals of running tasks waiting for an answer, in the store."),
     approvalWait: registry.histogram("jig_service_approval_wait_seconds", "Seconds from an approval's request to its answer, by decision: allow, deny or timeout.", ["decision"]),
+    webhookDeliveries: registry.counter("jig_service_webhook_deliveries_total", "Approvals posted to tenants' webhooks, by tenant and result: delivered, or failed once the last try failed.", ["tenant", "result"]),
     leaseErrors: registry.counter("jig_service_lease_errors_total", "Rounds of renewing this replica's leases that failed."),
     storeErrors: registry.counter("jig_service_store_errors_total", "Reads and writes of the store that failed outside a request: starting tasks, storing their events and outcomes, following them."),
     replicas: registry.gauge("jig_service_replicas", "Replicas of the service whose heartbeat is in the store."),
