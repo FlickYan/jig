@@ -91,7 +91,8 @@ async function run(task: WorkerInput, program: string, args: string[], env: Reco
   // The pod's HOME is in /task, which starts empty: git config --global or pip install --user need it there.
   if (process.env.HOME) await mkdir(process.env.HOME, { recursive: true });
   await mkdir(task.work, { recursive: true });
-  // What git says of a failed clone is in the pod's log; the task's error says only that it failed.
+  // What git says of a failed clone is in the pod's log; the task's error says only that it failed, or that a
+  // redirect isn't followed.
   await prepareWorkspace(task.work, task.workspace, task.gitProtocols, createLog("worker"), task.gitRedirects ?? false);
   child = spawn(program, args, { cwd: task.work, env: { ...process.env, ...env }, stdio: ["pipe", "inherit", "inherit"] });
   child.stdin!.on("error", () => {});

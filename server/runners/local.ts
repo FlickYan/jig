@@ -138,8 +138,9 @@ export class LocalRunner implements Runner {
 
 /**
  * Writes a task's files into its (empty) workspace, or clones its repository there. What git says of a
- * clone that fails goes to `log`, and only that it failed to the task. With `redirects`, a redirect on the
- * clone's first request is followed, as git does by default; without, none is.
+ * clone that fails goes to `log`; the task is told only that it failed, or that a redirect it was sent isn't
+ * followed. With `redirects`, a redirect on the clone's first request is followed, as git does by default;
+ * without, none is.
  */
 export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log, redirects = false): Promise<void> {
   for (const [path, contents] of Object.entries(workspace?.files ?? {})) {
