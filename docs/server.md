@@ -51,8 +51,11 @@ start: its keys stop working, and its queued tasks are cancelled. Also: `graceSe
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
 (`["https"]`), `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
-the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
-event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
+the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the most bytes of them, as JSON:
+past either they are dropped, but for the `end`, with one `notice` event in place of the first dropped, and
+the run goes on. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
+its events, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what tasks
+store over time.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
@@ -136,6 +139,12 @@ for another replica or the next start. The replica that ends a crashed one's tas
 reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
 go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
 it.
+
+A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
+again, after 100 ms and then twice as long each time up to 2 s, for half of `leaseSeconds`: within that,
+the run goes on, and its outcome and cost are stored as they would have been. Only a write that still fails
+stops the run, as an `error`; an outcome that can't be stored is left to its lease, which ends the task as
+an `error` with nothing spent in the usage ledger.
 
 ### Several replicas, on Postgres
 

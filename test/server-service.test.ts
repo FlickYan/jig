@@ -490,6 +490,15 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
   });
 
+  it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
+    // The first event is past it already.
+    const api = await service({ maxEventBytes: 10 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await statusOf(api, id, "succeeded");
+    const stored = (await api.store.events(id)).map(({ seq, event }) => [seq, (event as { type: string }).type]);
+    assert.deepEqual(stored, [[1, "notice"], [7, "end"]]);
+  });
+
   it("removes a task's folder once it has ended, unless keepTaskDirs", async () => {
     const api = await service({ keepTaskDirs: false });
     const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
@@ -533,6 +542,46 @@ class FakeRunner implements Runner {
     };
   }
 }
+
+/** The store, but for `method`, which throws whenever `fails` says so of its second argument (an event's seq). */
+function failingStore(store: Store, method: keyof Store, fails: (second: unknown) => boolean): Store {
+  return new Proxy(store, {
+    get(target, name, receiver) {
+      const value = Reflect.get(target, name, receiver);
+      if (name !== method) return typeof value === "function" ? value.bind(target) : value;
+      return async (...args: unknown[]) => {
+        if (fails(args[1])) throw new Error("the database went away");
+        return value.apply(target, args);
+      };
+    },
+  });
+}
+
+/** A runner whose runs write two notices and an end that spent `cost`, and exit 0. */
+function endsWith(cost: number): Runner {
+  return {
+    async start() {
+      return {
+        events: (async function* () {
+          for (let seq = 1; seq <= 2; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "notice", text: `notice ${seq}` };
+          yield { v: 1, seq: 3, ts: new Date().toISOString(), type: "end", stop: "end_turn", usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 10 }, cost };
+        })(),
+        wait: async () => ({ exitCode: 0, timedOut: false }),
+        cancel() {},
+      };
+    },
+  };
+}
+
+/** The task once it has ended. */
+const endOf = (store: Store, id: string) =>
+  until(async () => {
+    const task = (await store.task(id))!;
+    return task.status !== "running" && task.status !== "queued" && task;
+  }, `task ${id} to end`);
+
+/** What the usage ledger holds as spent, in all. */
+const billed = async (store: Store) => (await store.usage({ from: "2000-01-01", to: "2100-01-01", group: [] })).reduce((sum, row) => sum + row.costUsd, 0);
 
 /** The tests of the scheduler, which run on each store. */
 const schedulerTests = () => {
@@ -670,22 +719,114 @@ const schedulerTests = () => {
     await store.close();
   });
 
+  for (const failures of [1, 2]) {
+    it(`stores every event of a run whose event write fails ${failures === 1 ? "once" : "twice in a row"}, and bills what it spent`, async () => {
+      const store = await newStore();
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+      // The database drops the connection as the second event is written: a blip, not an outage.
+      let left = failures;
+      const flaky = failingStore(store, "addEvent", (seq) => seq === 2 && left-- > 0);
+      const metrics = serviceMetrics();
+      const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, metrics });
+      await scheduler.poke();
+      const ended = await endOf(store, task.id);
+      assert.deepEqual([ended.status, ended.error, ended.cost], ["succeeded", null, 1.25]);
+      assert.deepEqual((await store.events(task.id)).map(({ seq }) => seq), [1, 2, 3]);
+      assert.equal(await billed(store), 1.25);
+      assert.equal(metrics.storeErrors.get(), failures);
+      await scheduler.close();
+      await store.close();
+    });
+  }
+
+  it("stores the outcome of a run when its first write fails, and bills what it spent", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let left = 1;
+    const flaky = failingStore(store, "finish", () => left-- > 0);
+    // A short lease, so that an outcome given up on would show as the lease's error at once.
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.error, ended.cost], ["succeeded", null, 1.25]);
+    assert.equal(await billed(store), 1.25);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stores the outcome of a cancelled run when its first write fails, and bills what it spent", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let left = 1;
+    const flaky = failingStore(store, "finish", () => left-- > 0);
+    // jig, stopped, writes its end with what it spent so far.
+    let stop!: () => void;
+    const stopped = new Promise<void>((done) => (stop = done));
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            await stopped;
+            yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "end", stop: "interrupted", usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 10 }, cost: 0.75 };
+          })(),
+          wait: async () => (await stopped, { exitCode: 143, timedOut: false }),
+          cancel: () => stop(),
+        };
+      },
+    };
+    const scheduler = newScheduler(flaky, runner, { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    await until(() => scheduler.running("a"), "the run to start");
+    assert.equal(await scheduler.cancel((await store.task(task.id))!), "running");
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.cost], ["cancelled", 0.75]);
+    assert.equal(await billed(store), 0.75);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // As a task's commands can write the events file on Docker and Kubernetes: 200 lines of 512 KiB.
+    const text = "x".repeat(512 * 1024);
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (let seq = 1; seq <= 200; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "notice", text };
+            yield { v: 1, seq: 201, ts: new Date().toISOString(), type: "end", stop: "end_turn" };
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, maxEventBytes: 8 * 1024 * 1024 });
+    await scheduler.poke();
+    assert.equal((await endOf(store, task.id)).status, "succeeded");
+    const events = await store.events(task.id);
+    const [notice, end] = events.slice(-2).map(({ event }) => event as { type: string; text?: string });
+    assert.deepEqual([notice.type, end.type], ["notice", "end"]);
+    assert.match(notice.text!.slice(0, 200), /past 8388608 bytes aren't kept/);
+    const kept = events.slice(0, -2);
+    assert.ok(kept.length > 0 && kept.every(({ event }) => (event as { text?: string }).text === text));
+    assert.ok(kept.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0) <= 8 * 1024 * 1024);
+    assert.equal(kept.length, 15);
+    await scheduler.close();
+    await store.close();
+  });
+
   it("frees a run's slot even when its outcome can't be stored", async () => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     for (const prompt of ["a0", "a1"]) await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
-    // The database fails as the first run's outcome is written.
-    let failures = 1;
-    const failing = new Proxy(store, {
-      get(target, name, receiver) {
-        const value = Reflect.get(target, name, receiver);
-        if (name !== "finish") return typeof value === "function" ? value.bind(target) : value;
-        return async (...args: unknown[]) => {
-          if (failures-- > 0) throw new Error("the database went away");
-          return value.apply(target, args);
-        };
-      },
-    });
+    // The database fails from the first run's outcome on, past every retry.
+    const failing = failingStore(store, "finish", () => true);
     const runner = new FakeRunner();
     const lines: string[] = [];
     const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, log: createLog("service", { write: (line) => lines.push(line) }) });
@@ -854,6 +995,7 @@ describe("the service's config", () => {
     assert.equal(problem({ gatewayBaseUrl: "gateway:8081" }), 'The config\'s gatewayBaseUrl must be an http or https URL, not "gateway:8081"');
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
+    assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
     assert.equal(problem({ docker: { image: "w", network: "n", pool: 4 } }), "The config's docker.pool must be an object, {size, maxIdleSeconds}");

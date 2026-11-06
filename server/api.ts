@@ -92,6 +92,8 @@ export interface Config {
   leaseSeconds?: number;
   /** The most events of a task's that are stored. */
   maxEvents?: number;
+  /** The most bytes of a task's events (as JSON) that are stored. */
+  maxEventBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
@@ -248,9 +250,9 @@ export async function startService(
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, configFile);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     if (runner instanceof LocalRunner) for (const warning of localRisks(config)) log.warn(warning);
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, onApproval, metrics, log });
     const expired = await scheduler.start();
     if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
@@ -441,6 +443,7 @@ function configProblem(config: Config): string | undefined {
     text("replicaId", config.replicaId, false) ??
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
+    whole("maxEventBytes", config.maxEventBytes, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
