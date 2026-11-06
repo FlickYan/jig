@@ -512,6 +512,10 @@ interface Script {
   jobReason?: string;
   hold?: boolean;
   pending?: { reason: string; message: string };
+  /** The pod is never scheduled: no node has room for it, as the scheduler's message says. */
+  unschedulable?: string;
+  /** The kubelet ends the log's stream as the container exits, and its status says so this much later. */
+  exitSeenAfterMs?: number;
   /** The pod is Pending this long before it runs. */
   startsAfterMs?: number;
   /** The log breaks after `lines`, the pod still running; read again, it has these instead (it was rotated). */
@@ -657,11 +661,11 @@ class FakeCluster {
       if (script.startsAfterMs) pod.startsAt = Date.now() + script.startsAfterMs;
       this.pods.set(name, pod);
       if (pool !== -1) pod.claimed = this.claim(pod, command[pool + 1], secret.stringData.ticket);
-      // A pod that never starts, which the Job's deadline ends.
-      if (script.pending) {
-        pod.status = { phase: "Pending", containerStatuses: [{ state: { waiting: script.pending } }] };
-        job.status = { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded", message: "Job was active longer than specified deadline" }] };
-      }
+      // A pod that never starts, which the Job's deadline ends: its container can't, or no node takes it,
+      // when it has no container yet.
+      if (script.pending) pod.status = { phase: "Pending", containerStatuses: [{ state: { waiting: script.pending } }] };
+      if (script.unschedulable) pod.status = { phase: "Pending", conditions: [{ type: "PodScheduled", status: "False", reason: "Unschedulable", message: script.unschedulable }] };
+      if (script.pending || script.unschedulable) job.status = { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded", message: "Job was active longer than specified deadline" }] };
     }
     return this.pods.get(name);
   }
@@ -676,7 +680,8 @@ class FakeCluster {
     else this.end(pod);
   }
 
-  private end(pod: Pod): void {
+  private end(pod: Pod, after = pod.script.exitSeenAfterMs): void {
+    if (after) return void setTimeout(() => this.end(pod, 0), after);
     const { exitCode = 0, reason, jobReason } = pod.script;
     pod.status = { phase: exitCode ? "Failed" : "Succeeded", containerStatuses: [{ state: { terminated: { exitCode, reason: reason ?? (exitCode ? "Error" : "Completed") } } }] };
     const job = this.jobs.get(pod.job);
@@ -802,6 +807,7 @@ describe("the Kubernetes runner", () => {
       // The Job's deadline: jig got SIGTERM and printed no end.
       deadline: { lines: logOf(undefined, undefined), exitCode: 143, jobReason: "DeadlineExceeded" },
       "never starts": { pending: { reason: "ImagePullBackOff", message: 'Back-off pulling image "registry.example.com/jig-worker:1"' } },
+      "no node": { unschedulable: "0/3 nodes are available: 3 Insufficient cpu. preemption: 0/3 nodes are available: 3 No preemption victims found for incoming pod." },
     };
     cluster.script = (prompt) => scripts[prompt];
     const ids = new Map<string, string>();
@@ -818,6 +824,22 @@ describe("the Kubernetes runner", () => {
     const never = await outcome("never starts");
     assert.deepEqual(never.slice(0, 3), ["error", "error", null]);
     assert.match(never[3], /DeadlineExceeded: .* the pod was ImagePullBackOff: Back-off pulling image/);
+    // A pod no node has room for has no container yet: the scheduler's word says why.
+    const unscheduled = await outcome("no node");
+    assert.deepEqual(unscheduled.slice(0, 3), ["error", "error", null]);
+    assert.match(unscheduled[3], /DeadlineExceeded: .* the pod was Unschedulable: 0\/3 nodes are available: 3 Insufficient cpu/);
+  });
+
+  it("reads the pod's log once, though the pod's status says the container has ended a moment after the log does", async () => {
+    // The kubelet ends the stream as the container exits, before the pod's status, which it updates after.
+    const { cluster, api } = await kubernetes();
+    const lines = logOf(0, "end_turn");
+    cluster.script = () => ({ lines, exitSeenAfterMs: 300 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.exitCode], ["succeeded", 0]);
+    assert.equal([...cluster.pods.values()][0].reads, 1);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
   });
 
   it("leaves out a line of the pod's log too long to read", async () => {
