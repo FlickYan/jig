@@ -154,13 +154,15 @@ export interface Webhook {
 /** Tries after a first that fails, and how long each may take. */
 const RETRIES = 3;
 const ATTEMPT_MS = 10_000;
+/** The statuses that redirect, with a location to go to: any other 3xx (a 304, say) is just a failure. */
+const REDIRECTS = [301, 302, 303, 307, 308];
 
 /**
  * Tells tenants that ask (`approvalWebhook`) of each approval their tasks ask for: a POST of {task, approval},
  * signed with the tenant's secret (x-jig-signature: sha256=<hex HMAC-SHA256 of the body>). Sent in the
  * background, so the run never waits on it, and tried again three times, 1, 2 and 4 seconds apart. A redirect
  * is a failed try, never followed: it could send the signed POST anywhere the service reaches. Each approval
- * is counted once in jig_service_webhook_deliveries_total, delivered or failed.
+ * is counted once in jig_service_webhook_deliveries_total, delivered or failed (one cut off by close, neither).
  */
 export class Webhooks {
   private hooks: Map<string, Webhook>;
@@ -177,6 +179,8 @@ export class Webhooks {
     this.retryMs = retryMs;
     this.log = log;
     this.metrics = metrics;
+    // Each tenant's series start at 0, so increase() sees its first deliveries and failures.
+    for (const tenant of hooks.keys()) for (const result of ["delivered", "failed"]) metrics.webhookDeliveries.inc({ tenant, result }, 0);
   }
 
   send(task: Task, approval: Approval): void {
@@ -194,7 +198,7 @@ export class Webhooks {
           const res = await fetch(hook.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.any([stop.signal, AbortSignal.timeout(ATTEMPT_MS)]) });
           await res.body?.cancel();
           if (res.ok) return this.metrics.webhookDeliveries.inc({ tenant: task.tenant, result: "delivered" });
-          last = res.status >= 300 && res.status < 400 ? `${res.status} (redirects are not followed)` : `${res.status}`;
+          last = REDIRECTS.includes(res.status) ? `${res.status} (redirects are not followed)` : `${res.status}`;
         } catch (err) {
           if (stop.signal.aborted) return;
           last = err instanceof Error ? err.message : String(err);

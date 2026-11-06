@@ -209,7 +209,8 @@ signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the se
 it. A redirect is not followed but counted as a failed try, as it could send the signed POST anywhere the
 service can reach. Each approval is counted once in `jig_service_webhook_deliveries_total{tenant,result}`,
 `delivered` or `failed` (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's
-fail.
+fail. One whose tries are cut off by the service stopping is counted neither way. Each tenant with a webhook
+starts at 0 for both, so the first failures show.
 
 ### Quotas and usage
 
@@ -273,7 +274,7 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | metric | what |
 |--------|------|
 | `jig_service_http_requests_total{route,status}`, `jig_service_http_request_seconds{route}` | the API's requests, and their seconds to the end of the response (an event stream's lasts as long as it is followed) |
-| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413) |
+| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413), each at 0 from the start |
 | `jig_service_tasks_ended_total{tenant,status}`, `jig_service_run_seconds{status}` | tasks ended, and their seconds from start to end |
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |

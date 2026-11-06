@@ -162,6 +162,8 @@ export async function startService(
   // A Bearer is read up to the first whitespace, so a key with some could never be given.
   if (adminKey && /\s/.test(adminKey)) throw new Error(`${config.adminKeyEnv} holds whitespace (a trailing newline?): the admin key can't hold any`);
   const metrics = serviceMetrics();
+  // Each tenant's refusals start at 0, so increase() sees the first.
+  for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);

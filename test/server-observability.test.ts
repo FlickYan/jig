@@ -149,6 +149,8 @@ const observeTests = () => {
     assert.equal(value('jig_service_tasks_refused_total{tenant="globex",reason="quota"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="queue"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 2);
+    // Each tenant's series start at 0, so increase() sees its first refusals.
+    assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="quota"}'), 0);
     assert.equal(value("jig_service_replicas"), 1);
     assert.equal(value("jig_service_approvals_pending"), 0);
     assert.equal(value("jig_service_pool_idle"), undefined, "no pool");

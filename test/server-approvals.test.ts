@@ -414,6 +414,29 @@ describe("the approvals' webhooks", () => {
     assert.deepEqual([tries, elsewhere], [4, []]);
   });
 
+  it("says a 3xx that isn't a redirect (a 304, say) failed with its status alone", async () => {
+    for (const [status, said] of [
+      [300, "300"],
+      [304, "304"],
+      [308, "308 (redirects are not followed)"],
+    ] as const) {
+      const receiver = createServer((req, res) => {
+        req.resume();
+        req.on("end", () => res.writeHead(status, { location: "http://127.0.0.1:1/elsewhere" }).end());
+      });
+      await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+      closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+      const lines: string[] = [];
+      const log = createLog("service", { format: "text", level: "info", write: (line) => lines.push(line) });
+      const webhooks = new Webhooks(new Map([["acme", { url: `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`, secret: "s" }]]), 5, log);
+      closers.push(async () => webhooks.close());
+      webhooks.send({ id: "task_1", tenant: "acme" } as Task, { id: "ap_1", step: 1, tool: "bash", description: "make deploy", requestedAt: new Date().toISOString() });
+      const warned = await until(() => lines.find((line) => line.includes("approval webhook failed")), `the warning for a ${status}`);
+      assert.ok(warned.includes(`4 times: ${said}`), warned);
+      if (!said.includes("redirect")) assert.ok(!warned.includes("redirect"), warned);
+    }
+  });
+
   it("counts deliveries by tenant: delivered, or failed once the last try fails", async () => {
     // acme's endpoint always answers 503; globex's twice, then takes it.
     const receiver = (status: (n: number) => number) => {
@@ -434,14 +457,22 @@ describe("the approvals' webhooks", () => {
     closers.push(async () => (saved === undefined ? delete process.env.JIG_TEST_WEBHOOK_SECRET : (process.env.JIG_TEST_WEBHOOK_SECRET = saved)));
     const hook = (url: string) => ({ approvalTimeout: 120, approvalWebhook: url, webhookSecretEnv: "JIG_TEST_WEBHOOK_SECRET" });
     const api = await service({ metrics: { port: 0 }, tenants: [{ ...ACME, ...hook(urls[0]) }, { ...GLOBEX, ...hook(urls[1]) }] }, { webhookRetryMs: 10 });
+    const counted = async () => (await (await fetch(`${api.metricsUrl}/metrics`)).text()).split("\n").filter((line) => line.startsWith("jig_service_webhook_deliveries_total")).sort();
+    // acme's delivered and failed, then globex's.
+    const series = (...values: number[]) =>
+      ["acme delivered", "acme failed", "globex delivered", "globex failed"].map((labels, i) => {
+        const [tenant, result] = labels.split(" ");
+        return `jig_service_webhook_deliveries_total{tenant="${tenant}",result="${result}"} ${values[i]}`;
+      });
+    // Each tenant with a webhook starts at 0 both ways, so increase() sees its first failures.
+    assert.deepEqual(await counted(), series(0, 0, 0, 0));
     for (const [tenant, key] of Object.entries(KEYS)) {
       const id = (await call(api, key, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id;
       await until(async () => (await call(api, key, "GET", `/v1/tasks/${id}/approvals`)).body.approvals.length === 1, `${tenant}'s approval`);
       assert.equal((await call(api, key, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" })).status, 200);
     }
-    const counted = async () => (await (await fetch(`${api.metricsUrl}/metrics`)).text()).split("\n").filter((line) => line.startsWith("jig_service_webhook_deliveries_total"));
-    await until(async () => (await counted()).length === 2, "both tenants' deliveries counted");
-    assert.deepEqual((await counted()).sort(), ['jig_service_webhook_deliveries_total{tenant="acme",result="failed"} 1', 'jig_service_webhook_deliveries_total{tenant="globex",result="delivered"} 1']);
+    await until(async () => (await counted()).filter((line) => line.endsWith(" 1")).length === 2, "both tenants' deliveries counted");
+    assert.deepEqual(await counted(), series(0, 1, 1, 0));
   });
 });
 
