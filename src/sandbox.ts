@@ -152,10 +152,10 @@ export function createSandbox(
 
 /**
  * The session's own places (see keptIn), by real path: a hidden directory holding the project or an added
- * directory hides all in it but those, and the home directory with them, which stay as they were, what is
- * hidden in them too: the local runner hides its data directory from a task's commands, the other tasks'
- * folders and the database in it, but for the task's project and home (see server/runners/local.ts). The
- * home directory too, as git looks for its config there and stops where Seatbelt refuses it, which is no
+ * directory hides all in it but those, and the home directory beside the project, which stay as they were,
+ * what is hidden in them too: the local runner hides its data directory from a task's commands, the other
+ * tasks' folders and the database in it, but for the task's project and home (see server/runners/local.ts).
+ * The home directory too, as git looks for its config there and stops where Seatbelt refuses it, which is no
  * missing file to git. The file tools keep them too (see tools/util.ts's hiddenTest).
  */
 function ownPlaces(project: string, dirs: string[]): Places {

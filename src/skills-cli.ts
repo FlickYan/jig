@@ -139,7 +139,7 @@ async function add(spec: string, { project, scope, only, ref, path, force, confi
   const source = parseSource(spec, { cwd: project, ref, path });
   // Refused and fetched as update would refuse and fetch it, or update would refuse what add installed.
   const hidden = hiddenPaths(project);
-  assertShown(source, hidden);
+  assertShown(source, hidden, scope === "project" ? project : undefined);
   if (source.url) ui.notice(`Fetching ${spec}…`);
   const fetched = fetchSource(source, hidden);
   try {
@@ -192,7 +192,7 @@ async function update(project: string, names: string[], confirm: (question: stri
     let asking = false;
     try {
       await skillDirForChange(skill.scope, project, skill.name, hidden); // refused before it is fetched, or anyone asked
-      const source = lockedSource(skill.entry, hidden);
+      const source = lockedSource(skill.entry, hidden, skill.scope === "project" ? project : undefined);
       fetched = fetchSource(source, hidden);
       const [dir] = findSkills(fetched.dir, 0);
       if (!dir) {

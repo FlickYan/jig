@@ -323,7 +323,9 @@ jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-lim
 
 with the prompt on stdin, in a process group of its own, so a cancel, or the time limit plus `graceSeconds`
 when jig hasn't stopped itself, reaches everything it started: SIGTERM, then SIGKILL after 5 seconds. Its
-environment is the service's `PATH`, `LANG`, `LC_ALL` and `TZ`, its own `TMPDIR` (`home/tmp`), and as its API key
+environment is the service's `PATH`, `LANG`, `LC_ALL` and `TZ`, its own `TMPDIR` (`home/tmp`),
+`GIT_CEILING_DIRECTORIES` set to the task's folder (so neither jig nor git takes a repository `dataDir` lies
+in, the service's checkout say, for the task's, and the sandbox doesn't let commands write it), and as its API key
 (`ANTHROPIC_API_KEY`, or `DEEPSEEK_API_KEY` for a DeepSeek model) the task's gateway token:
 `jgt1.` + base64url(`{"tenant", "task", "exp", "budgetUsd"}`) + `.` + base64url(HMAC-SHA256 of what comes
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
@@ -333,7 +335,7 @@ writes it, into the store and to the streams.
 jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
 `hiddenPaths`: `dataDir`, the SQLite database's files and the service's config file. A hidden folder that
-holds the project hides all in it but the project and the home directory (README: hiddenPaths), so a
+holds the project hides all in it but the project and the home directory beside it (README: hiddenPaths), so a
 task's commands work in their project and read their home as before, but can't read or write the other
 tasks' folders, their own events, stats and `output.log`, or the database, in a temp folder too:
 bubblewrap puts an empty folder over `dataDir` and binds the two back as they were, and Seatbelt denies

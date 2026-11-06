@@ -198,23 +198,33 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
-  it("hides all of a hidden directory holding the home directory but not the project", async () => {
-    // A project in /srv, say, and hiddenPaths ["/home"]: the user meant ~/.ssh hidden too. Only a hidden
-    // directory that holds the project keeps the home directory, as the local runner's data directory does.
+  it("hides all of a hidden directory holding the home directory, but the project or an added folder in it", async () => {
+    // A project in /srv, say, and hiddenPaths ["/home"]: the user meant ~/.ssh hidden too, with ~/notes added
+    // or the project in ~/code as well, which kept the whole home directory. Only a hidden directory that holds
+    // the project, not in the home directory, keeps the home directory, as the local runner's data directory does.
     const [home, other, elsewhere] = [join(dir, "home", "me"), join(dir, "home", "other"), join(dir, "srv", "proj")];
-    for (const folder of [join(home, ".ssh"), other, elsewhere]) await mkdir(folder, { recursive: true });
+    const [notes, code] = [join(home, "notes"), join(home, "code")];
+    for (const folder of [join(home, ".ssh"), other, elsewhere, notes, code]) await mkdir(folder, { recursive: true });
     await writeFile(join(home, ".ssh", "id_rsa"), "MY PRIVATE KEY\n");
     await writeFile(join(other, "x"), "the other user's file\n");
+    await writeFile(join(notes, "n.txt"), "my notes\n");
     const was = process.env.HOME;
     process.env.HOME = home;
-    const sandbox = createSandbox(elsewhere, { network: false, hidden: [join(dir, "home")] })!;
     try {
-      const output = await runCommand(`cat ${join(home, ".ssh", "id_rsa")} ${join(other, "x")}; echo ok > a.txt && cat a.txt`, elsewhere, 20, undefined, sandbox);
-      assert.doesNotMatch(output, /MY PRIVATE KEY/);
-      assert.doesNotMatch(output, /the other user's file/);
-      assert.match(output, /^ok$/m);
+      for (const [project, dirs] of [[elsewhere, []], [elsewhere, [notes]], [code, []]] as const) {
+        const sandbox = createSandbox(project, { network: false, dirs: [...dirs], hidden: [join(dir, "home")] })!;
+        try {
+          const output = await runCommand(`cat ${join(home, ".ssh", "id_rsa")} ${join(other, "x")}; echo ok > a.txt && cat a.txt ${dirs.map((added) => join(added, "n.txt")).join(" ")}`, project, 20, undefined, sandbox);
+          const what = `${project} ${dirs.join(" ")}`;
+          assert.doesNotMatch(output, /MY PRIVATE KEY/, what);
+          assert.doesNotMatch(output, /the other user's file/, what);
+          assert.match(output, /^ok$/m, what);
+          if (dirs.length) assert.match(output, /^my notes$/m, what);
+        } finally {
+          sandbox.close?.();
+        }
+      }
     } finally {
-      sandbox.close?.();
       process.env.HOME = was;
     }
   });
@@ -1256,11 +1266,14 @@ describe("the macOS sandbox's profile", () => {
     for (const path of [work, home]) assert.equal(allows("file-write-unlink", path), false, path);
   });
 
-  it("hides all of a hidden directory holding the home directory but not the project", () => {
-    // hiddenPaths ["/home"] with the project in /srv: the home directory is kept only with the project.
-    const profile = seatbeltProfile(["/srv/p", "/private/tmp"], false, ["/home"], undefined, undefined, { roots: ["/srv/p"], home: "/home/me" });
-    for (const path of ["/home/me/.ssh/id_rsa", "/home/other/x"]) assert.equal(seatbeltAllows(profile, "file-read-data", path), false, path);
-    assert.ok(seatbeltAllows(profile, "file-read-data", "/srv/p/a.txt"));
+  it("hides all of a hidden directory holding the home directory, but the project or an added folder in it", () => {
+    // hiddenPaths ["/home"] with the project in /srv: the home directory is kept only with the project, and
+    // not for one in it, nor for a folder added with --add-dir.
+    for (const roots of [["/srv/p"], ["/srv/p", "/home/me/notes"], ["/home/me/code"]]) {
+      const profile = seatbeltProfile([...roots, "/private/tmp"], false, ["/home"], undefined, undefined, { roots, home: "/home/me" });
+      for (const path of ["/home/me/.ssh/id_rsa", "/home/other/x"]) assert.equal(seatbeltAllows(profile, "file-read-data", path), false, `${roots} ${path}`);
+      for (const root of roots) assert.ok(seatbeltAllows(profile, "file-read-data", `${root}/a.txt`), `${roots} ${root}`);
+    }
   });
 
   it("keeps the directories between git's files and a writable directory holding the project in place", async () => {

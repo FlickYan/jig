@@ -66,7 +66,7 @@ export async function assertVisible(abs: string, path: string, hidden: string[] 
  */
 export type Hiding = "settings" | "own" | "skills";
 
-/** The session's own places, by real path: the project and the --add-dir directories, and the home directory. */
+/** The session's own places, by real path: the project, then the --add-dir directories, and the home directory. */
 export interface Places {
   roots: string[];
   home?: string;
@@ -74,15 +74,18 @@ export interface Places {
 
 /**
  * Those of the session's own places that a hidden path holds, which it doesn't hide: the roots in it, and
- * the home directory, but only with one of them, as the local runner's data directory holds a task's work/
- * and home/ (see server/runners/local.ts). A user who hides the folder holding their home directory, the
- * project elsewhere, meant all of it hidden, ~/.ssh too. One in another of them is left to that one, which
- * shows what is in it as it was (a home directory in the project would otherwise be shown read-only).
+ * the home directory only beside the project, in it too and holding no root, as the local runner's data
+ * directory holds a task's work/ and home/ (see server/runners/local.ts). A user who hides the folder
+ * holding their home directory meant all of it hidden, ~/.ssh too, the project elsewhere or in it (~/code,
+ * which alone is kept), and a folder added with --add-dir (~/notes) keeps only itself. One in another of
+ * them is left to that one, which shows what is in it as it was (a home directory in the project would
+ * otherwise be shown read-only).
  */
 export function keptIn(path: string, { roots, home }: Places): string[] {
   const inPath = (place: string) => place !== path && isInside(path, place);
   const kept = roots.filter(inPath);
-  if (kept.length && home && inPath(home)) kept.push(home);
+  const [project] = roots;
+  if (project && home && inPath(project) && inPath(home) && !roots.some((root) => isInside(home, root))) kept.push(home);
   return [...new Set(kept)].filter((place, _, all) => !all.some((other) => other !== place && isInside(other, place)));
 }
 
@@ -96,8 +99,7 @@ export function keptIn(path: string, { roots, home }: Places): string[] {
  * write_file could plant one. Only where they really lie in it, though: the sandbox binds them read-only
  * at their place there, so skills linked out of it (to a dotfiles repository, say) are as writable to
  * commands as anything else where the link leads, and so to the file tools. The roots that lie in jig's
- * directory stay as they were (a project there is a skill being written, say). jig's own changes in the
- * project, which the user approves, give no roots (see skill-store.ts's assertInProject). Worked out once,
+ * directory stay as they were (a project there is a skill being written, say). Worked out once,
  * to check many files against (see firstVisible, and skills.ts's discoverSkills, which can't wait for it).
  */
 export function hiddenTest(hidden: string[], roots?: string[], change = false): (real: string) => Hiding | undefined {

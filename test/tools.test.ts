@@ -658,20 +658,29 @@ describe("hidden paths", () => {
     }
   });
 
-  it("leave nothing of a hidden directory holding the home directory but not the project", async () => {
-    // hiddenPaths ["/home"] with the project elsewhere: the user meant ~/.ssh hidden too.
+  it("leave nothing of a hidden directory holding the home directory but the project or an added folder in it", async () => {
+    // hiddenPaths ["/home"] with the project elsewhere: the user meant ~/.ssh hidden too, with ~/notes added
+    // or the project in ~/code as well, which kept the whole home directory.
     const homes = await tempDir("jig-homes-");
     const home = join(homes, "me");
-    await mkdir(join(home, ".ssh"), { recursive: true });
+    const [notes, code] = [join(home, "notes"), join(home, "code")];
+    for (const folder of [join(home, ".ssh"), notes, code]) await mkdir(folder, { recursive: true });
     await writeFile(join(home, ".ssh", "id_rsa"), "MY PRIVATE KEY\n");
+    await writeFile(join(notes, "n.txt"), "my notes\n");
     await symlink(join(home, ".ssh", "id_rsa"), join(cwd, "key"));
     const was = process.env.HOME;
     process.env.HOME = home;
     try {
       ctx = { cwd, versions: new FileVersions(), hidden: [homes] };
       await assert.rejects(read("key"), /^Error: key is hidden by the user's settings/);
+      ctx = { cwd, versions: new FileVersions(), hidden: [homes], dirs: [notes] };
+      await assert.rejects(read("key"), /^Error: key is hidden by the user's settings/);
+      assert.match(await read(join(notes, "n.txt")), /my notes/);
+      const key = await realpath(join(home, ".ssh", "id_rsa"));
+      assert.equal(hiddenTest([homes], [code])(key), "settings");
+      assert.equal(hiddenTest([homes], [code])(join(await realpath(code), "a.txt")), undefined);
       // Nor with no roots at all, as skill discovery and skill evals ask.
-      assert.equal(hiddenTest([homes])(await realpath(join(home, ".ssh", "id_rsa"))), "settings");
+      assert.equal(hiddenTest([homes])(key), "settings");
     } finally {
       process.env.HOME = was;
     }

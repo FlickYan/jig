@@ -74,7 +74,10 @@ export class LocalRunner implements Runner {
 
     const timeLimit = task.spec.timeLimit;
     const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
-    const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), TMPDIR: join(home, "tmp"), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
+    // git, jig's and its commands', looks for a repository no further up than the task's folder: a workspace
+    // with none would otherwise take one dataDir lies in (the service run from a checkout) for its own, and
+    // jig's sandbox lets commands write the repository it finds.
+    const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), TMPDIR: join(home, "tmp"), GIT_CEILING_DIRECTORIES: resolve(dir), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
     for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
 
     const events = join(dir, "events.jsonl");

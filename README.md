@@ -403,7 +403,8 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   name, since commands can write the lockfile; `update` says why it skips an entry it refuses or can't
   fetch, updates the rest, and exits non-zero. An entry can point anywhere, so its question names the URL
   or folder a skill would come from; it refuses a folder, or a file URL's repository, that the hidden paths
-  hide or that holds one, and, with paths hidden, has git read a file URL's repository in the sandbox,
+  hide or that holds one (but for the project's own skills, a folder in the project a hidden folder
+  holds), and, with paths hidden, has git read a file URL's repository in the sandbox,
   where there is one, which hides them from git too (a `.git` file in it can lead git elsewhere). `add`
   does the same, so it doesn't install what `update` would refuse, and both take only https, ssh and file
   URLs (git runs a program for some others, and http and git URLs don't check whom they reach). The
@@ -455,9 +456,10 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   can't move aside that directory, nor one in it holding the path. Snapshots leave out those in the
   project, by where they really lead, and `/undo` leaves them as they are (with the project itself hidden,
   `/undo` is off). A hidden folder that holds the project or an `--add-dir` folder hides all in it but
-  those, and your home directory if it holds that too, which stay as they were: the task service's local
-  runner hides its data folder from a task this way, but for the task's own project and home. A hidden
-  folder holding your home directory, the project elsewhere, hides all of it.
+  those, and your home directory if it lies beside the project there, which stay as they were: the task
+  service's local runner hides its data folder from a task this way, but for the task's own project and
+  home. A hidden folder holding your home directory hides all of it, `~/.ssh` too, but for the project or
+  an `--add-dir` folder in it.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that

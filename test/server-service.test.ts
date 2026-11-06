@@ -392,6 +392,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       assert.equal(env.JIG_HOME, join(api.dataDir, "tasks", id, "home", ".jig"));
       // A temp folder of the task's own, not the service's, where jig keeps long outputs (see runners/local.ts).
       assert.equal(env.TMPDIR, join(api.dataDir, "tasks", id, "home", "tmp"));
+      // git looks for a repository no higher than the task's folder, not in one dataDir lies in.
+      assert.equal(env.GIT_CEILING_DIRECTORIES, join(api.dataDir, "tasks", id));
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
       else process.env.ANTHROPIC_AUTH_TOKEN = saved;

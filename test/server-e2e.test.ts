@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readdir, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
@@ -86,14 +88,14 @@ function redisPrefix(): string {
   return prefix;
 }
 
-async function stack(replies: Block[][], backends: Backends = {}): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
+async function stack(replies: Block[][], backends: Backends = {}, base?: string): Promise<{ service: Service; gateway: Gateway; seen: Seen[]; dataDir: string }> {
   const upstream = await provider(replies);
   const gateway = await startGateway(
     { listen: { port: 0 }, upstream: { baseUrl: upstream.url, keyEnv: ["PROVIDER_KEY"] }, ...(backends.redis && { state: { redis: REDIS!, prefix: redisPrefix() } }) },
     { JIG_GATEWAY_SECRET: SECRET, PROVIDER_KEY },
   );
   closers.push(() => gateway.close());
-  const base = await tempDir("jig-e2e-");
+  base ??= await tempDir("jig-e2e-");
   const dataDir = join(base, "data");
   const service = await startService(
     {
@@ -230,6 +232,37 @@ describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gatewa
     assert.match(output, /^mine$/m, "its own work");
     assert.doesNotMatch(await readFile(join(dataDir, "tasks", task.id, "events.jsonl"), "utf8"), /^forged$/m, "its own events");
     assert.equal(await readFile(join(dataDir, "tasks", task.id, "work", "out.txt"), "utf8"), "mine\n");
+  });
+
+  it("keeps a task's commands and its git out of a repository that holds dataDir", { skip: sandboxProblem() }, async () => {
+    // The service run from a git checkout, dataDir in it. A workspace of files has no repository, so jig and
+    // git looked up from work/ and found the service's: the sandbox let commands write it, refs and objects,
+    // and a task's git add and commit went into it. Outside the temp directory, which commands can write anyway.
+    const base = await mkdtemp(join(homedir(), ".jig-e2e-repo-"));
+    closers.push(() => rm(base, { recursive: true, force: true }));
+    const git = (...args: string[]) => execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", ...args], { cwd: base, encoding: "utf8" });
+    git("init", "-q");
+    git("commit", "-q", "--allow-empty", "-m", "the service's own commit");
+    const before = git("for-each-ref") + git("rev-parse", "HEAD");
+    const index = await readFile(join(base, ".git", "index"));
+    const tries = [
+      "git log --oneline",
+      "git add -A && git -c user.name=t -c user.email=t@t commit -qm task && echo committed",
+      `echo planted > ${join(base, ".git", "planted")}`,
+      `echo ${"0".repeat(40)} > ${join(base, ".git", "refs", "heads", "evil")}`,
+      "echo mine > out.txt && cat out.txt",
+    ];
+    const { service } = await stack([[{ tool: "bash", input: { command: tries.join("; ") } }], [{ text: "done" }]], {}, base);
+    const posted = await call(service, "POST", "/v1/tasks", { prompt: "commit it", workspace: { files: { "a.txt": "a\n" } }, maxSteps: 5 });
+    const task = await ended(service, posted.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    const output = (await events(service, task.id)).find((frame) => frame.data.type === "tool_result")!.data.output;
+    assert.doesNotMatch(output, /the service's own commit/, "read the service's repository");
+    assert.doesNotMatch(output, /^committed$/m, "committed into it");
+    assert.match(output, /^mine$/m, "its own work");
+    for (const path of ["planted", join("refs", "heads", "evil")]) assert.equal(existsSync(join(base, ".git", path)), false, path);
+    assert.equal(git("for-each-ref") + git("rev-parse", "HEAD"), before);
+    assert.deepEqual(await readFile(join(base, ".git", "index")), index);
   });
 
   it("keeps a task's long outputs, which jig saves in its TMPDIR, out of the other tasks' reach", { skip: sandboxProblem() }, async () => {
