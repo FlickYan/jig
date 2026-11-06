@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
 import { type Runner, workspaceProblem } from "./runner.ts";
@@ -152,7 +153,8 @@ export async function startService(
     now = () => new Date(),
     log = createLog("service"),
     countsMs = COUNTS_MS,
-  }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date; log?: Log; countsMs?: number },
+    configFile,
+  }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date; log?: Log; countsMs?: number; configFile?: string },
 ): Promise<Service> {
   checkConfig(config);
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
@@ -243,7 +245,7 @@ export async function startService(
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
     url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
     if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
-    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log);
+    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, configFile);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     if (runner instanceof LocalRunner) for (const warning of localRisks(config)) log.warn(warning);
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
@@ -274,8 +276,11 @@ export async function startService(
 }
 
 /**
- * What the local runner's tasks could do to the service: jig's sandbox lets their commands read the whole
- * machine, other tenants' task folders and the database among them, and write the temp folders.
+ * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
+ * from their commands, but for the task's own project and home, and the database and the config (see
+ * runners/local.ts); without one, they run directly on the machine. With one, they share its kernel and
+ * temp folders, and on macOS its processes and localhost. And with dataDir in a temp folder, which they can
+ * write, a task's commands can change its home there, whose git config jig's own git reads, outside the sandbox.
  */
 function localRisks(config: Config): string[] {
   const temps = ["/tmp", "/var/tmp", tmpdir()].flatMap((dir) => [dir, realOrSame(dir)]);
@@ -284,11 +289,17 @@ function localRisks(config: Config): string[] {
       const rel = relative(dir, resolve(path));
       return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
     });
-  const files = [config.dataDir, ...(config.database === ":memory:" || /^postgres(ql)?:\/\//.test(config.database) ? [] : [config.database])];
+  const problem = sandboxProblem();
+  if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
-    ...(config.tenants.length > 1 ? ["the local runner keeps no wall between tenants: a task's commands can read the others' task folders and the database (the docker and kubernetes runners keep them apart)"] : []),
-    ...(files.some(inTemp) ? ["dataDir or the database is in a temp folder, which a local task's commands can write: its events, usage and cost, and the database, are only as trustworthy as the tasks"] : []),
+    ...(config.tenants.length > 1 ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel and temp folders, and on macOS its processes and localhost (the docker and kubernetes runners keep them apart)"] : []),
+    ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
+}
+
+/** Whether the config's database is a SQLite file. */
+function sqliteFile(database: string): boolean {
+  return database !== ":memory:" && !/^postgres(ql)?:\/\//.test(database);
 }
 
 /** The path with its links resolved, or as it is if it isn't there. */
@@ -356,11 +367,18 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
   return hooks;
 }
 
-/** The runner the config names, its lines (and its pool's) in the service's `log`. */
-function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log): Runner {
+/**
+ * The runner the config names, its lines (and its pool's) in the service's `log`. The local runner's tasks'
+ * commands can't read the SQLite database's files or the config (`configFile`), beside dataDir.
+ */
+function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, configFile?: string): Runner {
   const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
-  if (runner === "local") return new LocalRunner({ ...shared, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+  if (runner === "local") {
+    const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
+    const hidden = [...database, ...(configFile ? [configFile] : [])];
+    return new LocalRunner({ ...shared, hidden, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+  }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
   if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
   if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
@@ -820,7 +838,7 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
  * jig is started in each task's workspace, where a relative path would lead nowhere.
  */
 export function resolvePaths(config: Config, base: string): void {
-  if (config.database !== ":memory:" && !/^postgres(ql)?:\/\//.test(config.database)) config.database = resolve(base, config.database);
+  if (sqliteFile(config.database)) config.database = resolve(base, config.database);
   config.dataDir = resolve(base, config.dataDir);
   if (config.jig) config.jig = config.jig.map((entry) => (/^\.\.?\//.test(entry) ? resolve(base, entry) : entry));
 }
@@ -848,7 +866,7 @@ async function main(): Promise<void> {
   checkConfig(config);
   resolvePaths(config, dirname(resolve(values.config)));
   const log = createLog("service");
-  const service = await startService(config, { secret, log });
+  const service = await startService(config, { secret, log, configFile: resolve(values.config) });
   log.info(`listening on ${service.url}`, { internal: service.internalUrl, metrics: service.metricsUrl });
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.once(signal, () => {

@@ -1,7 +1,7 @@
 import { type ChildProcess, execFileSync, type ExecFileSyncOptions, type IOType, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync } from "node:fs";
-import { constants as osConstants, tmpdir } from "node:os";
+import { homedir, constants as osConstants, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
 import { isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
@@ -119,8 +119,9 @@ const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are
  * project, its git directory (not what gitControl lists), the directories added with --add-dir and the
  * temp directories, and without `network` they have no IP network (Unix sockets stay open). Unlike a
  * container, this keeps the user's own toolchain (python, node, compilers) working with no setup. The
- * `hidden` paths they can't read at all, nor jig's own directory but its skills (see ownRules). Returns
- * undefined where there is no sandbox; sandboxProblem says why.
+ * `hidden` paths they can't read at all, nor jig's own directory but its skills (see ownRules), but for the
+ * session's own places in a hidden directory (see ownPlaces). Returns undefined where there is no sandbox;
+ * sandboxProblem says why.
  */
 export function createSandbox(
   root: string,
@@ -141,11 +142,29 @@ export function createSandbox(
   // the session (a shell prompt may run it at every line), and jig's own if jig didn't turn them off. So
   // commands can't change them, or the files that say where they are.
   const guarded = gitControl(project, repo, writable);
+  const places = ownPlaces(project, added);
   const sandbox =
     process.platform === "darwin"
-      ? seatbelt(writable, network, where, unreadable, guarded, home)
-      : bubblewrap(writable, network, where, unreadable, guarded, home, onFallback);
+      ? seatbelt(writable, network, where, unreadable, guarded, home, places)
+      : bubblewrap(writable, network, where, unreadable, guarded, home, onFallback, places);
   return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project, repo?.tree) } : sandbox;
+}
+
+/**
+ * The session's own places, by real path: the project, the added directories and the home directory. A
+ * hidden directory holding one hides all in it but those, which stay as they were, what is hidden in them
+ * too (see keptIn): the local runner hides its data directory from a task's commands, the other tasks'
+ * folders and the database in it, but for the task's project and home (see server/runners/local.ts). The
+ * home directory too, as git looks for its config there and stops where Seatbelt refuses it, which is no
+ * missing file to git. The file tools keep them too (see tools/util.ts's hiddenTest).
+ */
+export function ownPlaces(project: string, dirs: string[]): string[] {
+  return [project, ...dirs, realTargetSync(homedir())].filter((place): place is string => !!place);
+}
+
+/** Those of the session's own places that a hidden path holds, which it doesn't hide. */
+function keptIn(path: string, places: string[]): string[] {
+  return places.filter((place) => place !== path && isInside(path, place));
 }
 
 /**
@@ -510,8 +529,8 @@ export function sandboxProblem(): string | undefined {
   return `jig has no sandbox for ${process.platform} yet`;
 }
 
-function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string): Sandbox {
-  const profile = seatbeltProfile(writable, network, hidden, git, home);
+function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, places: string[] = []): Sandbox {
+  const profile = seatbeltProfile(writable, network, hidden, git, home, places);
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
     limits: `Commands can write only ${where}${network ? "" : ", and can't use the network except localhost"}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.`,
@@ -531,9 +550,9 @@ const CLEAN_START = 'for fd in /dev/fd/*; do fd=${fd##*/}; case $fd in [3-9]|[1-
 
 /**
  * The Seatbelt profile: where commands can write, whether they reach the network, what they can't read.
- * `home` is jig's own directory, by its real path.
+ * `home` is jig's own directory, by its real path, and `places` the session's own (see ownPlaces).
  */
-export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string): string {
+export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string, places: string[] = []): string {
   const denied = [...hidden, ...(home ? [home] : []), ...(git?.locked ?? [])]; // by path, in the rules below
   return [
     "(version 1)",
@@ -554,8 +573,27 @@ export function seatbeltProfile(writable: string[], network: boolean, hidden: st
     // And so do the writable directories holding them, jig's own or what git's lock lists (see writableHolding).
     ...deny("file-write-unlink", writableHolding(writable, denied).map((dir) => `(literal ${quote(dir)})`)),
     // Last, so that it wins over the rules before it: reading and writing alike.
-    ...hidden.map((path) => `(deny file-read* file-write* (subpath ${quote(path)}))`),
+    ...hidden.flatMap((path) => hideRules(path, keptIn(path, places))),
   ].join("\n");
+}
+
+/**
+ * Seatbelt's rules hiding a path but for the session's own places in it (`kept`), where the rules before
+ * stay as they were: git's, jig's own directory's, a hidden path's there. The directories on the way to
+ * them can be looked up, not listed, as resolving a path through them needs (see ownRules). And the places
+ * stay where they are: moved aside, a link to another of the hidden directory's folders could take one's
+ * place, which the file tools, outside the sandbox, would then take for the project.
+ */
+function hideRules(path: string, kept: string[]): string[] {
+  if (!kept.length) return [`(deny file-read* file-write* (subpath ${quote(path)}))`];
+  const way = new Set([path]);
+  for (const place of kept) for (let dir = dirname(place); dir !== path && isInside(path, dir); dir = dirname(dir)) way.add(dir);
+  const literals = (paths: Iterable<string>) => [...paths].map((one) => `(literal ${quote(one)})`).join(" ");
+  return [
+    `(deny file-read* file-write* (require-all (subpath ${quote(path)}) ${kept.map((place) => `(require-not (subpath ${quote(place)}))`).join(" ")}))`,
+    `(allow file-read-metadata ${literals(way)})`,
+    `(deny file-write-unlink ${literals(kept)})`,
+  ];
 }
 
 /**
@@ -657,11 +695,15 @@ function deny(operation: string, filters: string[] = []): string[] {
  * outside the sandbox (see Keeper). A job a command leaves in the background keeps running, reparented to
  * the namespace's init, until jig exits, when the kernel ends every process in the namespace.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void, places: string[] = []): Sandbox {
   const bwrap = findProgram("bwrap")!;
   const keeper = new Keeper(bwrap, hidden, home, onFallback);
-  // An empty directory over each hidden directory, and an empty file over each hidden file.
-  const hiding = hidden.flatMap((path) => (statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path]));
+  // An empty directory over each hidden directory, and an empty file over each hidden file, the outermost
+  // first: one in a place of the session's own that another holds is hidden after that place is shown again.
+  const masks = [...hidden].sort((a, b) => a.length - b.length).map((path) => ({
+    mask: statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path],
+    kept: keptIn(path, places),
+  }));
   // A bind of git's in jig's directory, outside the writable directories ownBinds shows there, or of one
   // holding it, would show it again (a .git a command made can lead anywhere): what is hidden there is out
   // of commands' reach anyway.
@@ -669,22 +711,27 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     !home || (!isInside(path, home) && (!isInside(home, path) || writable.some((dir) => isInside(home, dir) && isInside(dir, path))));
   // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too. --proc
   // mounts a fresh /proc for the session's PID namespace, so it shows only the session's processes.
-  const args = (join: string[]) => [
-    "--ro-bind", "/", "/",
-    "--dev", "/dev",
-    "--proc", "/proc",
-    ...writable.flatMap((dir) => ["--bind", dir, dir]),
-    // Mount points a command can't move aside (see holding), before jig's and git's binds: bound after
-    // them, one would show what those cover again. Only what exists, as binding a path that doesn't fails.
-    ...holding(hidden, writable).filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
-    ...(home ? ownBinds(home, writable) : []),
-    ...(git ? gitBinds(git, shown) : []),
-    ...hiding,
-    // Join the session's namespaces, or in the fallback --unshare-pid and --die-with-parent: if jig is killed,
-    // so are its commands, which a joined one is with the keeper (see Keeper).
-    ...join,
-    ...(network ? [] : ["--unshare-net"]),
-  ];
+  const args = (join: string[]) => {
+    const mounts = [
+      ...writable.flatMap((dir) => ["--bind", dir, dir]),
+      // Mount points a command can't move aside (see holding), before jig's and git's binds: bound after
+      // them, one would show what those cover again. Only what exists, as binding a path that doesn't fails.
+      ...holding(hidden, writable).filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
+      ...(home ? ownBinds(home, writable) : []),
+      ...(git ? gitBinds(git, shown) : []),
+    ];
+    return [
+      "--ro-bind", "/", "/",
+      "--dev", "/dev",
+      "--proc", "/proc",
+      ...mounts,
+      ...masks.flatMap(({ mask, kept }) => [...mask, ...shownAgain(kept, mounts)]),
+      // Join the session's namespaces, or in the fallback --unshare-pid and --die-with-parent: if jig is killed,
+      // so are its commands, which a joined one is with the keeper (see Keeper).
+      ...join,
+      ...(network ? [] : ["--unshare-net"]),
+    ];
+  };
   const offline =
     ", and have no network: each command gets an empty one of its own, so it can't reach the internet, servers on this " +
     "machine's ports, or a server an earlier command started (start a server and use it in the same command)";
@@ -700,6 +747,20 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     },
     close: () => keeper.close(),
   };
+}
+
+/**
+ * bubblewrap's arguments showing again the session's own places a hidden directory holds (see keptIn), as
+ * they were: bubblewrap binds from the machine's file system, so each read-only, as the root is, then those
+ * of `mounts`, the sandbox's binds before the hiding, that lie in it (a writable directory, git's locks,
+ * jig's own directory). Each is a mount point, which a command can't move aside. Only what exists.
+ */
+function shownAgain(kept: string[], mounts: string[]): string[] {
+  // One mount each: --tmpfs <path>, or --bind or --ro-bind <from> <path>.
+  const each: string[][] = [];
+  for (let i = 0, size; i < mounts.length; i += size) each.push(mounts.slice(i, i + (size = mounts[i] === "--tmpfs" ? 2 : 3)));
+  const inside = (place: string) => each.filter((mount) => isInside(place, mount.at(-1)!)).flat();
+  return kept.filter((place) => existsSync(place)).flatMap((place) => ["--ro-bind", place, place, ...inside(place)]);
 }
 
 /**

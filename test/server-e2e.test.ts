@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { randomUUID } from "node:crypto";
 import { type Service, startService } from "../server/api.ts";
@@ -12,6 +12,7 @@ import { Redis } from "../server/redis.ts";
 import { startRouter } from "../server/router.ts";
 import { mintToken } from "../server/token.ts";
 import { costOf } from "../src/prices.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { type Block, messagesReply } from "./fake-api.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -200,6 +201,34 @@ describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gatewa
     assert.equal(task.status, "cancelled");
     assert.equal(task.stop, "interrupted");
     assert.ok(Date.now() - started < 15_000, "the cancel took too long");
+  });
+
+  it("keeps a task's commands out of the database, the other tasks' folders and its own records", { skip: sandboxProblem() }, async () => {
+    // A command that tries them all, from its project, dataDir/tasks/<id>/work, then does its own work.
+    const tries = [
+      "head -c 15 $DB; echo",
+      "ls ../..",
+      "cat ../../*/work/secret.txt ../../*/events.jsonl",
+      "echo forged >> ../events.jsonl",
+      "echo mine > out.txt && cat out.txt",
+    ];
+    const replies: Block[][] = [[{ text: "done" }], [{ tool: "bash", input: { command: tries.join("; ") } }], [{ text: "done" }]];
+    const { service, dataDir } = await stack(replies);
+    replies[1] = [{ tool: "bash", input: { command: tries.join("; ").replace("$DB", join(dirname(dataDir), "jig.db")) } }];
+    const first = await call(service, "POST", "/v1/tasks", { prompt: "keep this", workspace: { files: { "secret.txt": "the first task's secret\n" } }, maxSteps: 5 });
+    assert.equal((await ended(service, first.body.id)).status, "succeeded");
+
+    const second = await call(service, "POST", "/v1/tasks", { prompt: "look around", maxSteps: 5 });
+    const task = await ended(service, second.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    const output = (await events(service, task.id)).find((frame) => frame.data.type === "tool_result")!.data.output;
+    assert.doesNotMatch(output, /SQLite format/, "the database");
+    assert.doesNotMatch(output, new RegExp(first.body.id), "the other task's folder");
+    assert.doesNotMatch(output, /the first task's secret/, "the other task's work");
+    assert.doesNotMatch(output, /"seq"/, "the tasks' events");
+    assert.match(output, /^mine$/m, "its own work");
+    assert.doesNotMatch(await readFile(join(dataDir, "tasks", task.id, "events.jsonl"), "utf8"), /^forged$/m, "its own events");
+    assert.equal(await readFile(join(dataDir, "tasks", task.id, "work", "out.txt"), "utf8"), "mine\n");
   });
 });
 

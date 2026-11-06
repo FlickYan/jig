@@ -17,6 +17,7 @@ import { LocalRunner } from "../server/runners/local.ts";
 import { outcomeOf, Scheduler } from "../server/scheduler.ts";
 import { serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -970,17 +971,27 @@ describe("the service's start", () => {
     });
   }
 
-  it("warns that the local runner keeps no wall between tenants, and that a temp folder lets tasks write their records", async () => {
+  it("hides dataDir, the database and the config from the local runner's tasks, and warns of what they still share", async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
-    const started = await startService(
-      { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)] }] },
-      { secret: SECRET, log },
-    );
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], keepTaskDirs: true, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)] }] };
+    const configFile = join(dir, "service.json");
+    await writeFile(configFile, JSON.stringify(config));
+    const started = await startService(config, { secret: SECRET, log, configFile });
     services.push(started);
-    assert.ok(lines.some((line) => /^jig service: the local runner keeps no wall between tenants/.test(line)), lines.join("\n"));
-    assert.ok(lines.some((line) => /^jig service: dataDir or the database is in a temp folder/.test(line)), lines.join("\n"));
+    const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
+    if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
+    else {
+      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
+      warned(/^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/);
+    }
+    // Each task's jig gets user settings that hide them from its commands, but for its project and home.
+    const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+    await statusOf(started, id, "succeeded");
+    const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+    const db = join(dir, "jig.db");
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, configFile] });
   });
 
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {

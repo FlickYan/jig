@@ -631,6 +631,32 @@ describe("hidden paths", () => {
     assert.equal(await readFile(join(secrets, "credentials"), "utf8"), "aws_secret_access_key = abc\n");
     assert.deepEqual(await readdir(secrets), ["credentials"]);
   });
+
+  it("leave the project and the home directory to the file tools where they hold them, but nothing else of theirs", async () => {
+    // As the local runner hides its data directory from a task, all but the task's own project and home.
+    const data = await tempDir("jig-data-");
+    const [project, home, other] = [join(data, "a", "work"), join(data, "a", "home"), join(data, "b", "work")];
+    for (const folder of [project, home, other]) await mkdir(folder, { recursive: true });
+    await writeFile(join(other, "secret.txt"), "the other task's secret\n");
+    await writeFile(join(home, ".gitconfig"), "[user]\n\tname = the task\n");
+    await writeFile(join(project, "key.txt"), "a hidden key\n");
+    await symlink(join(other, "secret.txt"), join(project, "theirs"));
+    await symlink(join(home, ".gitconfig"), join(project, "gitconfig"));
+    const was = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      ctx = { cwd: project, versions: new FileVersions(), hidden: [data, join(project, "key.txt")] };
+      assert.equal(await write("a.txt", "mine\n"), "Created a.txt (1 line).");
+      assert.match(await read("a.txt"), /mine/);
+      assert.match(await read("gitconfig"), /the task/);
+      await assert.rejects(read("theirs"), /^Error: theirs is hidden by the user's settings/);
+      await assert.rejects(write("theirs", "x\n"), /hidden by the user's settings/);
+      await assert.rejects(read("key.txt"), /hidden by the user's settings/);
+      assert.equal(await readFile(join(other, "secret.txt"), "utf8"), "the other task's secret\n");
+    } finally {
+      process.env.HOME = was;
+    }
+  });
 });
 
 describe("jig's own directory", () => {

@@ -157,6 +157,47 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("shows the project and the home directory as they were in a hidden directory holding them, and hides the rest of it", async () => {
+    // As the local runner hides its data directory from a task's commands, all but the task's project and
+    // home: here in a temp directory, which commands could otherwise write in.
+    const data = join(dir, "data");
+    const [work, home, other] = [join(data, "tasks", "a", "work"), join(data, "tasks", "a", "home"), join(data, "tasks", "b", "work")];
+    for (const folder of [work, join(home, ".jig", "sessions"), other]) await mkdir(folder, { recursive: true });
+    await writeFile(join(other, "secret.txt"), "the other task's secret\n");
+    await writeFile(join(data, "tasks", "a", "events.jsonl"), "");
+    await writeFile(join(work, "key.txt"), "a hidden key\n");
+    await writeFile(join(home, ".gitconfig"), "[user]\n\tname = the task\n");
+    await writeFile(join(home, ".jig", "sessions", "s.jsonl"), "an earlier session\n");
+    git(work, "init", "-q");
+    process.env.JIG_HOME = join(home, ".jig");
+    const was = process.env.HOME;
+    process.env.HOME = home;
+    const sandbox = createSandbox(work, { network: false, hidden: [data, join(work, "key.txt")] })!;
+    try {
+      const inWork = (command: string) => runCommand(command, work, 20, undefined, sandbox);
+      // Its own work goes on, git's included, which looks in the home directory.
+      assert.match(await inWork("echo ok > a.txt && cat a.txt && git config user.name"), /^ok\nthe task\n/);
+      // The rest is out of reach: the other task's folder, and the task's own records.
+      assert.doesNotMatch(await inWork(`cat ${join(other, "secret.txt")}`), /the other task's secret/);
+      assert.doesNotMatch(await inWork(`ls ${join(data, "tasks")}`), /^b$/m);
+      await inWork(`echo planted > ${join(other, "planted.txt")}; echo forged >> ../events.jsonl`);
+      assert.equal(existsSync(join(other, "planted.txt")), false);
+      assert.equal(await readFile(join(data, "tasks", "a", "events.jsonl"), "utf8"), "");
+      // What is hidden in what it shows stays hidden: a hidden path, jig's own directory, git's config.
+      assert.doesNotMatch(await inWork("cat key.txt"), /a hidden key/);
+      assert.doesNotMatch(await inWork(`cat ${join(home, ".jig", "sessions", "s.jsonl")}`), /an earlier session/);
+      const config = await readFile(join(work, ".git", "config"), "utf8");
+      assert.match(await inWork(`printf '[core]\\n\\tfsmonitor = touch planted\\n' >> .git/config`), denied);
+      assert.equal(await readFile(join(work, ".git", "config"), "utf8"), config);
+      // Nor does the project move aside, for a link to the other task's folder to take its place.
+      assert.match(await inWork(`mv ${work} ${work}-moved`), /Exit code: [1-9]/);
+      assert.ok(existsSync(join(work, "a.txt")));
+    } finally {
+      sandbox.close?.();
+      process.env.HOME = was;
+    }
+  });
+
   it("keeps a hidden file out of the snapshots, and those an older jig took out of commands' reach", async () => {
     const app = join(dir, "app");
     await mkdir(app);
@@ -1169,6 +1210,31 @@ describe("the macOS sandbox's profile", () => {
     assert.doesNotMatch(nested, /literal "\/q"/);
   });
 
+  it("hides a directory but for the session's own places in it, whose rules stay as they were", () => {
+    // As the local runner hides its data directory, all but the task's project and home (see ownPlaces).
+    const [work, home] = ["/d/tasks/a/work", "/d/tasks/a/home"];
+    const git = { locked: [`${work}/.git/config`, `${work}/.git/hooks`], fixed: [`${work}/.git`], gitDirectories: [`${work}/.git`] };
+    const profile = seatbeltProfile([work, "/private/tmp"], false, ["/d", `${work}/key.txt`], git, `${home}/.jig`, [work, home, "/u"]);
+    const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
+    // The project as it was: read and written, but for git's config and the hidden file in it.
+    for (const operation of ["file-read-data", "file-write-data", "file-write-create"]) assert.ok(allows(operation, `${work}/a.txt`), operation);
+    assert.equal(allows("file-write-data", `${work}/.git/config`), false);
+    assert.equal(allows("file-read-data", `${work}/key.txt`), false);
+    // The home directory read, not written, and jig's own directory in it hidden.
+    assert.ok(allows("file-read-data", `${home}/.gitconfig`));
+    assert.equal(allows("file-write-create", `${home}/.gitconfig`), false);
+    assert.equal(allows("file-read-data", `${home}/.jig/sessions/s.jsonl`), false);
+    // The rest is hidden: the other tasks' folders, the task's own records, the database, and the listing of
+    // the directories on the way, which can only be looked up.
+    for (const path of ["/d/tasks/b/work/secret.txt", "/d/tasks/a/events.jsonl", "/d/jig.db", "/d/tasks"]) {
+      for (const operation of ["file-read-data", "file-write-create"]) assert.equal(allows(operation, path), false, `${operation} ${path}`);
+    }
+    for (const path of ["/d", "/d/tasks", "/d/tasks/a"]) assert.ok(allows("file-read-metadata", path), path);
+    assert.equal(allows("file-read-metadata", "/d/tasks/b"), false);
+    // Neither moves: a link to another task's folder could otherwise take one's place.
+    for (const path of [work, home]) assert.equal(allows("file-write-unlink", path), false, path);
+  });
+
   it("keeps the directories between git's files and a writable directory holding the project in place", async () => {
     // A clone in a directory in a temp directory: only the project and its git directory stayed in place, so
     // a command could move work aside and put a copy with a config of its own where the repository was.
@@ -1425,21 +1491,37 @@ function git(cwd: string, ...args: string[]): string {
  * Whether a Seatbelt profile lets a command do an operation on a path, as Seatbelt decides it: by the last
  * rule that matches. As much of its language as seatbeltProfile writes, so a profile can be checked on Linux
  * too: operations, one ending in * standing for those it starts and default for all; and literal, subpath and
- * regex filters, a rule with none matching every path and one with others only (the network's) none.
+ * regex filters, and require-all, require-any and require-not of them, a rule with none matching every path
+ * and one with others only (the network's) none.
  */
 function seatbeltAllows(profile: string, operation: string, path: string): boolean {
+  type Filter = string | Filter[];
+  const matches = (filter: Filter): boolean => {
+    if (!Array.isArray(filter)) return false;
+    const [kind, ...args] = filter;
+    if (kind === "require-all") return args.every(matches);
+    if (kind === "require-any") return args.some(matches);
+    if (kind === "require-not") return !matches(args[0]);
+    const value = typeof args[0] === "string" ? args[0].replace(/^#?"|"$/g, "").replace(/\\(.)/g, "$1") : "";
+    if (kind === "literal") return path === value;
+    if (kind === "subpath") return path === value || path.startsWith(`${value}/`);
+    return kind === "regex" && new RegExp(value).test(path);
+  };
   let allowed = false;
   for (const rule of profile.split(/\n(?=\()/)) {
     const [, verdict, body] = /^\((allow|deny) (.*)\)$/s.exec(rule) ?? [];
     if (!verdict) continue;
     const operations = body.split(" (")[0].split(" ");
     const does = operations.some((name) => name === "default" || name === operation || (name.endsWith("*") && operation.startsWith(name.slice(0, -1))));
-    const on = [...body.matchAll(/\((literal|subpath|regex) #?"((?:[^"\\]|\\.)*)"\)/g)].some(([, kind, quoted]) => {
-      const value = quoted.replace(/\\(.)/g, "$1");
-      if (kind === "literal") return path === value;
-      return kind === "subpath" ? path === value || path.startsWith(`${value}/`) : new RegExp(value).test(path);
-    });
-    if (does && (on || !body.includes("("))) allowed = verdict === "allow";
+    // The filters, read as nested lists of their words and quoted strings.
+    const stack: Filter[][] = [[]];
+    for (const [token] of body.slice(body.split(" (")[0].length).matchAll(/\(|\)|#?"(?:[^"\\]|\\.)*"|[^\s()]+/g)) {
+      if (token === "(") stack.push([]);
+      else if (token === ")") stack.at(-2)!.push(stack.pop()!);
+      else stack.at(-1)!.push(token);
+    }
+    const filters = stack[0];
+    if (does && (filters.some(matches) || !filters.length)) allowed = verdict === "allow";
   }
   return allowed;
 }
@@ -1533,7 +1615,9 @@ describe("snapshots", () => {
       assert.equal(await readFile(join(dir, ".env"), "utf8"), "e2");
       assert.equal(await readFile(join(dir, "secrets", "new"), "utf8"), "n");
       assert.equal(await readFile(join(dir, "not-there"), "utf8"), "made by the task");
-      assert.throws(() => new Snapshots(join(dir, "secrets"), [link]).take("t"), /hiddenPaths hide the project/);
+      assert.throws(() => new Snapshots(join(dir, "secrets"), [join(link, "secrets")]).take("t"), /hiddenPaths hide the project/);
+      // One holding the project hides the rest of what it holds, not the project (see sandbox.ts's ownPlaces).
+      assert.doesNotThrow(() => new Snapshots(join(dir, "secrets"), [link]).take("t"));
     } finally {
       await rm(link);
     }

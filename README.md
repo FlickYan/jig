@@ -450,7 +450,9 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   hidden by their paths, so where one lies in a directory commands can write in (the project, say), they
   can't move aside that directory, nor one in it holding the path. Snapshots leave out those in the
   project, by where they really lead, and `/undo` leaves them as they are (with the project itself hidden,
-  `/undo` is off).
+  `/undo` is off). A hidden folder that holds the project, an `--add-dir` folder or your home directory
+  hides all in it but those, which stay as they were: the task service's local runner hides its data
+  folder from a task this way, but for the task's own project and home.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that

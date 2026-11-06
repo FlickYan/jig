@@ -19,8 +19,8 @@ modules, and it isn't part of the npm package.
 queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, tenant)` gives a handle with
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
-own, which is what keeps tenants apart: jig's sandbox protects a user's machine from the model, but its
-commands share the machine's kernel, so it is no wall between tenants.
+own, which is what keeps tenants apart best: jig's sandbox keeps a local task's commands out of the
+database and the other tasks' folders (below), but they share the machine's kernel.
 
 Run it with a config file and the secret it shares with the gateway:
 
@@ -330,11 +330,19 @@ before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the g
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
 
-The local runner is for one trusted tenant, or for development. jig's sandbox lets a task's commands read
-the whole machine, other tasks' folders and the database among them, and write the temp folders (`/tmp`,
-`/var/tmp` and `$TMPDIR`): with `dataDir` or the database there, they can write their own events (the
-`end` event's usage and cost, which go in the ledger) and the database too. The service warns at the start
-when the local runner serves several tenants, or has `dataDir` or the database in a temp folder.
+jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
+and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
+`hiddenPaths`: `dataDir`, the SQLite database's files and the service's config file. A hidden folder that
+holds the project or the home directory hides all in it but those (README: hiddenPaths), so a task's
+commands work in their project and read their home as before, but can't read or write the other tasks'
+folders, their own events, stats and `output.log`, or the database, in a temp folder too: bubblewrap puts an
+empty folder over `dataDir` and binds the two back as they were, and Seatbelt denies `dataDir` but for
+them. jig's file tools refuse the same paths. What the tasks still share is the machine: its kernel, its
+temp folders, and on macOS its process list and `localhost`, so the Docker and Kubernetes runners keep
+tenants apart better. The service warns at the start when the local runner serves several tenants, when
+`dataDir` is in a temp folder (where a task's commands can write its home, whose git config jig's own git
+reads outside the sandbox), and when there is no sandbox (`bubblewrap` missing, say), as then commands run
+directly on the machine.
 
 ### The Docker runner
 

@@ -1,16 +1,19 @@
 import { execFile, spawn } from "node:child_process";
 import { closeSync, constants, openSync } from "node:fs";
 import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
 // work/ is the project jig works in, home/ its HOME and JIG_HOME, and beside them the events and stats files
-// jig writes, outside the project. jig's sandbox lets its commands read the whole machine, other tasks'
-// folders and the database among them, and write the temp folders: with dataDir there, they can write
-// these files too. So this runner is for one trusted tenant, or for development.
+// jig writes, outside the project. jig's sandbox lets its commands read the whole machine and write the temp
+// folders, so the runner gives each jig settings that hide the data directory from them, all but the task's
+// own project and home (see sandbox.ts's ownPlaces), and the database and the service's config: another
+// task's folder, the events and stats files and the database are out of their reach, in a temp folder too.
+// What they still share is the machine: its kernel and its temp folders, and on macOS its processes and
+// localhost. Without a sandbox (sandboxProblem), commands run directly on it.
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -28,6 +31,8 @@ export interface LocalRunnerConfig {
   internalBaseUrl?: string;
   /** How often the events file is read, in milliseconds. */
   pollMs?: number;
+  /** What else tasks' commands can't read, beside dataDir: the database's files and the service's config. */
+  hidden?: string[];
 }
 
 // The service's environment holds its own secrets (and maybe real provider keys): jig gets only these of it.
@@ -58,7 +63,9 @@ export class LocalRunner implements Runner {
     const home = join(dir, "home");
     await rm(dir, { recursive: true, force: true });
     await mkdir(work, { recursive: true });
-    await mkdir(home);
+    await mkdir(join(home, ".jig"), { recursive: true });
+    const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
+    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
     await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"]);
 
     const timeLimit = task.spec.timeLimit;
