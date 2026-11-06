@@ -328,6 +328,25 @@ describe("the Docker runner", () => {
   const kills = async (state: string) => (await readFile(join(state, "kills.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const pidOf = async (state: string, name: string) => Number(await readFile(join(state, `${name}.pid`), "utf8"));
 
+  it("clones on the service's side following a redirect only when told to, as it is without gitHosts", async () => {
+    const asked: string[] = [];
+    const moved = createHttpServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const project = createHttpServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(moved.address() as AddressInfo).port}/moved${req.url}` }).end());
+    for (const server of [moved, project]) {
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    }
+    const git = `http://127.0.0.1:${(project.address() as AddressInfo).port}/x`;
+    const blocked = await docker({ gitProtocols: ["http"] });
+    const refused = await ended(blocked.api, (await call(blocked.api, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id);
+    assert.equal(refused.error, "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+    assert.deepEqual(asked, []);
+    const following = await docker({ gitProtocols: ["http"], gitRedirects: true });
+    const followed = await ended(following.api, (await call(following.api, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id);
+    assert.match(followed.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, ["/moved/x/info/refs?service=git-upload-pack"]);
+  });
+
   it("gives a task to a warm worker, whose jig starts without a docker run, well before a container could start", async () => {
     Object.assign(process.env, REAL);
     // A container takes 4 seconds to exist (its image being pulled, say): the warm one did so before the task came.
@@ -852,7 +871,7 @@ describe("the Kubernetes runner", () => {
     assert.deepEqual(secret.metadata.ownerReferences, [{ apiVersion: "batch/v1", kind: "Job", name: objectName(id), uid: job.metadata.uid }]);
     const payload = payloadOf(secret.stringData.token);
     assert.deepEqual([payload.tenant, payload.task, payload.budgetUsd], ["acme", id, 2.5]);
-    assert.deepEqual(JSON.parse(secret.stringData["task.json"]), { prompt: "the task, in the Secret", workspace: { files: { "app.py": "print(1)\n" } }, gitProtocols: ["https"], work: "/task/work", stats: "/task/stats.json" });
+    assert.deepEqual(JSON.parse(secret.stringData["task.json"]), { prompt: "the task, in the Secret", workspace: { files: { "app.py": "print(1)\n" } }, gitProtocols: ["https"], gitRedirects: false, work: "/task/work", stats: "/task/stats.json" });
     const sent = JSON.stringify(cluster.requests);
     for (const value of [...Object.values(REAL), SECRET]) assert.ok(!sent.includes(value), "no real key nor the gateway's secret reaches the cluster");
     // Every request had the token from the file, over TLS checked against the CA from its file.
@@ -926,6 +945,37 @@ describe("the Kubernetes runner", () => {
     const pod = cluster.jobs.get(objectName(task.id)).spec.template.spec;
     assert.equal(pod.terminationGracePeriodSeconds, 45);
     assert.deepEqual(pod.containers[0].env.find((variable: { name: string }) => variable.name === "JIG_EVENTS_FLUSH_SECONDS"), { name: "JIG_EVENTS_FLUSH_SECONDS", value: "40" });
+  });
+
+  it("tells the worker to follow a clone's redirect only when the runner does, which it does without gitHosts", async () => {
+    const { cluster, runner } = await bare({ gitRedirects: true });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    assert.equal(JSON.parse(cluster.secrets.get(objectName(task.id)).stringData["task.json"]).gitRedirects, true);
+  });
+
+  it("reads the log of a task whose backstop is past a timer's 2^31 ms, without the timer firing at once", async () => {
+    // The config keeps the backstop under it; a runner made otherwise is kept from cutting every read.
+    const warnings: Error[] = [];
+    const warned = (warning: Error) => warnings.push(warning);
+    process.on("warning", warned);
+    try {
+      const { cluster, runner } = await bare({ graceSeconds: 86_400, terminationGraceSeconds: 100_000 });
+      const lines = logOf(0, "end_turn");
+      cluster.script = () => ({ lines });
+      const [task, tenant] = aTask({ timeLimit: 2_000_000 });
+      const handle = await runner.start(task, tenant);
+      const events: unknown[] = [];
+      for await (const event of handle.events) events.push(event);
+      const exit = await handle.wait();
+      assert.deepEqual([exit.exitCode, exit.stats], [0, { stop: "end_turn", steps: 1 }]);
+      assert.deepEqual(events, lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
+      await new Promise((done) => setImmediate(done));
+      assert.deepEqual(warnings.filter((warning) => warning.name === "TimeoutOverflowWarning"), []);
+    } finally {
+      process.off("warning", warned);
+    }
   });
 
   it("waits for a pod's end past the deadline and its slack by the pods' grace, which the pod may take to end", async () => {
@@ -1256,6 +1306,7 @@ describe("the Kubernetes runner", () => {
       prompt: "the task, in the claim's answer",
       workspace: { files: { "app.py": "print(1)\n" } },
       gitProtocols: ["https"],
+      gitRedirects: false,
       work: "/task/work",
       stats: "/task/stats.json",
       command: ["jig", "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--base-url", "http://jig-gateway.jig.svc:8081/anthropic", "--max-steps", "50", "--time-limit", "600", "--events", "-", "--stats", "/task/stats.json", "-C", "/task/work", "-"],
@@ -1332,6 +1383,28 @@ describe("the worker a task's pod runs", () => {
     assert.equal(stdout, "");
     assert.match(stderr, /leads out of the workspace/);
     assert.equal(existsSync(join(dir, "escape")), false);
+  });
+
+  it("follows no redirect of a clone unless told to, and says the clone was redirected, but not where", async () => {
+    const asked: string[] = [];
+    const inside = createHttpServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const outside = createHttpServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/inside${req.url}` }).end());
+    for (const server of [inside, outside]) {
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    }
+    const git = `http://127.0.0.1:${(outside.address() as AddressInfo).port}/x`;
+    const blocked = await worker({ prompt: "exit 0", gitProtocols: ["http"], workspace: { git } }, await tempDir("jig-worker-"));
+    assert.equal(blocked.code, 1);
+    assert.deepEqual(asked, []);
+    // The last line, which the runner takes for the task's error, says it was a redirect; git's own line,
+    // with the host and port, is the worker's log in the pod's.
+    assert.equal(blocked.stderr.trim().split("\n").at(-1), "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+
+    const followed = await worker({ prompt: "exit 0", gitProtocols: ["http"], gitRedirects: true, workspace: { git } }, await tempDir("jig-worker-"));
+    assert.equal(followed.code, 1);
+    assert.deepEqual(asked, ["/inside/x/info/refs?service=git-upload-pack"]);
+    assert.match(followed.stderr.trim().split("\n").at(-1)!, /^git clone failed \(exit \d+\)$/);
   });
 
   /** A warm worker, its claim answered by `answer` (status and body), with the ticket in its environment. */
@@ -1620,6 +1693,8 @@ describe("the deploy files", () => {
     assert.deepEqual([config.runner, config.docker.network, new URL(config.gatewayBaseUrl).hostname], ["docker", "jig-tasks", "gateway"]);
     assert.equal(config.internalBaseUrl, `http://api:${config.internal.port}`);
     assert.equal(config.internal.host, "0.0.0.0");
+    // The service clones on the host's network, not on jig-tasks: gitHosts limits where to.
+    assert.deepEqual(config.gitHosts, ["github.com"]);
     // The data's folder is at the same path for the daemon as for the service.
     assert.ok(compose.services.api.volumes.includes(`${config.dataDir}:${config.dataDir}`));
 

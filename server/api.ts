@@ -110,7 +110,7 @@ export interface Config {
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl" | "log";
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
 /** The longest time limit or approval timeout, in seconds: under jig's 24 days, and a timer's 2^31 ms. */
@@ -413,7 +413,7 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
  * config's local.hiddenPaths list.
  */
 function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, folders: HiddenFolder[]): Runner {
-  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
+  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, gitRedirects: !config.gitHosts, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
@@ -463,6 +463,11 @@ function hiddenFolders(dataDir: string, configFile: string | undefined): HiddenF
   return folders;
 }
 
+/** Whether a gitHosts entry is other than a hostname as URL gives it, which it is matched to. */
+function notHostname(host: string): boolean {
+  return host.endsWith(".") || URL.parse(`http://${host}/`)?.hostname !== host.toLowerCase();
+}
+
 /** Throws with what is wrong if the config isn't one the service can run with. */
 export function checkConfig(config: Config): void {
   const problem = configProblem(config);
@@ -506,11 +511,14 @@ function configProblem(config: Config): string | undefined {
     http("internalBaseUrl", config.internalBaseUrl) ??
     whole("concurrency", config.concurrency, 1) ??
     text("model", config.model, false) ??
-    // A time limit and its grace stay under a timer's 2^31 ms, past which it fires at once.
+    // A time limit and its grace (and a pod's termination grace, below) stay under a timer's 2^31 ms, past
+    // which it fires at once.
     positive("graceSeconds", config.graceSeconds, true, 86_400) ??
     strings("jig", config.jig) ??
     strings("gitProtocols", config.gitProtocols) ??
     strings("gitHosts", config.gitHosts) ??
+    // An entry is matched to a URL's hostname, which has no scheme, port, path or trailing dot.
+    (config.gitHosts?.some(notHostname) ? `gitHosts must be hostnames as a URL has them (no scheme, port, path or trailing dot; IPv6 in brackets; punycode), not ${JSON.stringify(config.gitHosts.find(notHostname))}` : undefined) ??
     (config.local === undefined || isObject(config.local) ? undefined : "local must be an object, {hiddenPaths}") ??
     (config.local?.hiddenPaths === undefined || (Array.isArray(config.local.hiddenPaths) && config.local.hiddenPaths.every((path) => typeof path === "string" && isAbsolute(path)))
       ? undefined
@@ -526,7 +534,7 @@ function configProblem(config: Config): string | undefined {
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
     (runner === "kubernetes" ? text("kubernetes.image", config.kubernetes?.image, true) : undefined) ??
     // jig is given 5 s less than the grace to write its end, and needs 5 for a reader that takes nothing.
-    whole("kubernetes.terminationGraceSeconds", config.kubernetes?.terminationGraceSeconds, 10) ??
+    whole("kubernetes.terminationGraceSeconds", config.kubernetes?.terminationGraceSeconds, 10, 3_600) ??
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??

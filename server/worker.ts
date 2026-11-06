@@ -25,6 +25,8 @@ export interface WorkerInput {
   prompt: string;
   workspace?: Workspace;
   gitProtocols: string[];
+  /** Whether the clone follows a redirect on its first request: not unless the runner says so. */
+  gitRedirects?: boolean;
   /** The folder jig works in, and its --stats file. */
   work: string;
   stats: string;
@@ -90,7 +92,7 @@ async function run(task: WorkerInput, program: string, args: string[], env: Reco
   if (process.env.HOME) await mkdir(process.env.HOME, { recursive: true });
   await mkdir(task.work, { recursive: true });
   // What git says of a failed clone is in the pod's log; the task's error says only that it failed.
-  await prepareWorkspace(task.work, task.workspace, task.gitProtocols, createLog("worker"));
+  await prepareWorkspace(task.work, task.workspace, task.gitProtocols, createLog("worker"), task.gitRedirects ?? false);
   child = spawn(program, args, { cwd: task.work, env: { ...process.env, ...env }, stdio: ["pipe", "inherit", "inherit"] });
   child.stdin!.on("error", () => {});
   child.stdin!.end(task.prompt);

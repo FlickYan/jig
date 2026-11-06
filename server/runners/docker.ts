@@ -41,6 +41,8 @@ export interface DockerRunnerConfig {
   gatewaySecret: string;
   graceSeconds: number;
   gitProtocols?: string[];
+  /** Whether a clone follows a redirect on its first request (default: no, as with gitHosts). */
+  gitRedirects?: boolean;
   /** The service's internal listener as the containers reach it, on the network: where tasks ask for approvals. */
   internalBaseUrl?: string;
   /** Workers started ahead of tasks (pool.ts): none unless `size` is set. */
@@ -120,7 +122,7 @@ export class DockerRunner implements Runner {
     const { jig = ["jig"], graceSeconds } = this.config;
     const dir = this.dir(task.id);
     await this.makeFolder(dir);
-    await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }));
+    await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
     await this.chown(dir);
 
     // The token goes by name only (-e NAME), its value in the CLI's environment, out of the process list.
@@ -144,7 +146,7 @@ export class DockerRunner implements Runner {
     const { jig = ["jig"], graceSeconds } = this.config;
     const { name, dir, container } = warm.slot;
     try {
-      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }));
+      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
       await this.chown(dir);
     } catch (err) {
       warm.stop();
