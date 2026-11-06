@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { closeSync, existsSync, openSync } from "node:fs";
 import { lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { type AddressInfo, createServer as createNetServer, type Socket } from "node:net";
@@ -513,22 +513,25 @@ describe("--events", () => {
     const reader = spawn(process.execPath, ["-e", SLOW_READER], { stdio: ["pipe", "ignore", "ignore"] });
     const cli = join(import.meta.dirname, "..", "src", "cli.ts");
     const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1" };
-    const child = spawn(process.execPath, [cli, ...args, "--events", "-", "Fix the parser."], { cwd: project, env, stdio: ["ignore", reader.stdin, "pipe"] });
+    // stderr to a file: on a pipe this test reads slowly under load, the long text's tail could still wait in
+    // jig when the end's wait began, which runs no event loop, and the exit after it would lose the notice.
+    const errors = join(outside, "stderr.txt");
+    const fd = openSync(errors, "w");
+    const child = spawn(process.execPath, [cli, ...args, "--events", "-", "Fix the parser."], { cwd: project, env, stdio: ["ignore", reader.stdin, fd] });
+    closeSync(fd);
     reader.stdin.destroy(); // jig holds the pipe's end now
     const deadline = setTimeout(() => child.kill("SIGKILL"), 80_000);
     try {
-      let stderr = "";
-      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
       const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
       await Promise.race([second, exited]);
       const asked = Date.now();
       await new Promise((done) => setTimeout(done, 1_500));
       child.kill("SIGTERM");
-      assert.equal(await exited, 0, stderr.slice(-1_000));
+      const code = await exited;
       const took = Date.now() - asked;
+      const stderr = await readFile(errors, "utf8");
+      assert.equal(code, 0, stderr.slice(-1_000));
       assert.ok(took >= 59_000 && took < 66_000, `exited ${took} ms after the last request`);
-      // What it said last may still be on its way when it has exited.
-      if (child.stderr.readable) await new Promise((done) => child.stderr.on("close", done));
       assert.match(stderr.slice(-1_000), /The --events reader didn't take them all in the 60 s jig gives it at a normal end: \d+ events? (weren't|wasn't) written\./);
     } finally {
       clearTimeout(deadline);

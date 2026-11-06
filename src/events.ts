@@ -71,6 +71,8 @@ export class Events {
   private cost: number | null;
   private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
+  // What a listener threw at a call event, until the task fails with it (see meter).
+  private failed: { error: unknown } | undefined;
   /** The end's exit code, once it is written: a signal after it doesn't change how jig exits. */
   endedWith: number | undefined;
 
@@ -114,6 +116,7 @@ export class Events {
     return {
       ...base,
       step: (step, reply) => {
+        this.check();
         base.step?.(step, reply);
         this.step = step;
         const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
@@ -124,12 +127,14 @@ export class Events {
         if (reply.text.trim()) this.text(reply.text);
       },
       toolCall: (name, description, id) => {
+        this.check();
         base.toolCall(name, description, id);
         // A command or a diff can be any length: the terminal shows its first lines.
         const [shown, truncated] = cut(description, EVENT_OUTPUT_CHARS);
         this.write("tool_call", { step: this.step, id, name, description: shown, ...(truncated && { truncated }) });
       },
       toolResult: (output, isError, id) => {
+        this.check();
         base.toolResult(output, isError, id);
         const [shown, truncated] = cut(output, EVENT_OUTPUT_CHARS);
         this.write("tool_result", { step: this.step, id, isError, output: shown, ...(truncated && { truncated }) });
@@ -142,10 +147,14 @@ export class Events {
    * model's calls (and --escalate's) are steps, which ui writes, but for those that summarize: the wrap-up,
    * known by its request, and a compaction. Those and every call of a subagent's or the reviewer's model
    * (`kind`) are written here as calls, with what they were for and the main loop's step they came in, or
-   * the last before them.
+   * the last before them. A listener that throws there doesn't fail the call: each caller takes a failed call
+   * its own way (a subagent's is its tool's result, a wrap-up's is left out), and the task would go on. Its
+   * error is kept, and thrown at the next model call, step, tool call or result, or by check once the loop is
+   * over, so the task ends with it, as it does when the listener throws at any other event.
    */
   meter(callModel: CallModel, model: string, kind?: "subagent" | "review"): CallModel {
     return async (messages, signal, options) => {
+      this.check();
       const turn = await callModel(messages, signal, options);
       const what = kind ?? (!options?.summarize ? undefined : messages.at(-1)?.content === WRAP_UP ? "wrap-up" : "compaction");
       const usage: Usage = { input: 0, cacheWrite: 0, cacheRead: 0, output: 0 };
@@ -160,9 +169,18 @@ export class Events {
       this.metered = true;
       // One call of a model without a price leaves the whole without one.
       this.cost = before === null || cost === undefined ? null : before + cost;
-      if (what) this.write("call", { for: what, step: this.step, usage: inOrder(usage), cost: cost ?? null });
+      try {
+        if (what) this.write("call", { for: what, step: this.step, usage: inOrder(usage), cost: cost ?? null });
+      } catch (error) {
+        this.failed ??= { error };
+      }
       return turn;
     };
+  }
+
+  /** Throws what a listener threw at a call event, if it did (see meter). */
+  check(): void {
+    if (this.failed) throw this.failed.error;
   }
 
   /** The model's text in the current step (or the wrap-up's after the last). */

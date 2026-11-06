@@ -716,6 +716,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
         // The task is the message without the overview. A compaction before the first step keeps it in place
         // of the message, so jig's notes, which the model hasn't seen yet, stay in it.
         result = await runAgent(conversation, { ...agent, task: [...told, text].join("\n\n"), checkUntil, budgetNotes }, signal);
+        // A listener that threw at the wrap-up's call event, say, after which the loop called it no more.
+        events?.check();
       } finally {
         clearTimeout(timer);
       }

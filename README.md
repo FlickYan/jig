@@ -171,8 +171,8 @@ long as it takes some every 5 s, 60 s at most in all (a SIGTERM in that wait end
 after a signal 20 s at most, once its commands are killed; a second signal in that wait doesn't cut it
 short (at any other end, Ctrl+C still does). If it gives up, it
 says on stderr how many events it couldn't write, and exits: the last line it wrote may then be cut off, so
-a reader should drop a last line without a newline. So a reader that is behind but reads loses no line, the
-`end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
+a reader should drop a last line without a newline. So a reader that is behind but reads, and takes them all
+within those limits, loses no line, the `end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
 otherwise, jig says so on stderr, writes no more events, and goes on with the task. `--events /dev/stdout`
 isn't `-`: jig opens it as a file, whose writes can wait for the reader, signals with them, and the
 terminal's output goes there too.

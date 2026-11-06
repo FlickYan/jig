@@ -8,7 +8,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, it } from "node:test";
 import { type Approval, type Event, runTask, type TaskOptions } from "../src/lib.ts";
-import { type FakeApi, fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
+import { type Block, type FakeApi, fakeMessagesApi, runJig, systemText } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // jig as a library: runTask() runs a task in the calling program, as `jig --events` would, and several can
@@ -281,6 +281,39 @@ describe("runTask", () => {
       const result = await runTask({ ...options, onEvent: throwingAt("tool_call") });
       assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at tool_call"]);
       await assert.rejects(runTask({ ...options, onEvent: throwingAt("end") }), /^Error: listener bug at end$/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("ends with a listener's error when it throws at a call event, which no caller takes for a failed call", async () => {
+    // The first step calls a subagent, or a glob with one step only, and a wrap-up follows: each makes a call event.
+    let first: Block[] = [];
+    const api = await fakeMessagesApi((request) => {
+      if (systemText(request as { system: string }).includes("You are a subagent")) return [{ text: "In parser.py." }];
+      return (request.messages as unknown[]).length === 1 ? first : [{ text: "Done." }];
+    });
+    try {
+      const { options } = await setUp(api, { yes: true });
+      const events: Event[] = [];
+      const onEvent = (event: Event) => {
+        events.push(event);
+        if (event.type === "call") throw new Error("listener bug at call");
+      };
+      // A subagent's failed call is its tool's result: the model would be told of it, and the task done.
+      first = [{ tool: "subagent", input: { description: "find", prompt: "Where is the parser?" } }];
+      let result = await runTask({ ...options, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "call", "notice", "end"]);
+      // A failed wrap-up is left out, its report with it, and the task ends out of steps.
+      events.length = 0;
+      first = [{ tool: "glob", input: { pattern: "*" } }];
+      result = await runTask({ ...options, maxSteps: 1, onEvent });
+      assert.deepEqual([result.stop, result.exitCode, result.error], ["error", 1, "listener bug at call"]);
+      assert.deepEqual(types(events), ["start", "step", "tool_call", "tool_result", "notice", "call", "notice", "end"]);
+      assert.equal(ofType(events, "call")[0].for, "wrap-up");
+      const notices = ofType(events, "notice").map((event) => event.text);
+      assert.deepEqual(notices, ["Out of steps: asking the model where the work stands.", "listener bug at call"]);
     } finally {
       api.close();
     }
