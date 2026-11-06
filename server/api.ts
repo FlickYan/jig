@@ -141,7 +141,8 @@ interface ServedRequest {
  * The runner is the local one unless one is given (a test's); `webhookRetryMs` is the pause before a
  * webhook's first retry; `now` is the clock the quotas' days and months, the tasks' creation times they
  * count, and the usage report's default range, are read from; `log` is where its lines go (createLog's, by
- * default); `countsMs`, how long the metrics' reads of the store are used for.
+ * default); `countsMs`, how long the metrics' reads of the store are used for; `configFile`, the config's
+ * path, which the local runner hides from its tasks' commands.
  */
 export async function startService(
   config: Config,
@@ -294,7 +295,7 @@ function localRisks(config: Config): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
-    ...(config.tenants.length > 1 ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost (the docker and kubernetes runners keep them apart)"] : []),
+    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
 }

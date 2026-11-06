@@ -341,8 +341,11 @@ bubblewrap puts an empty folder over `dataDir` and binds the two back as they we
 `--keep-inputs`' copies, in `$TMPDIR`, which is why each task has its own there, in its home: in a shared
 one the other tasks' commands could read and write them. What the tasks still share is the machine: its
 kernel, `/tmp` and `/var/tmp` (where a command can still leave a file for another, by its path), and on
-macOS its process list and `localhost`, so the Docker and Kubernetes runners keep tenants apart better.
-The service warns at the start when the local runner serves several tenants, when `dataDir` is in a temp
+macOS its processes and `localhost`: Seatbelt lets a command see and signal the processes of the user
+it runs as, the service's own among them, whose environment holds `JIG_GATEWAY_SECRET` and the provider
+key. So on macOS the local runner is for one tenant you trust; the Docker and Kubernetes runners keep
+tenants apart. The config file is hidden when the service starts with `--config`; a program that calls
+`startService` itself passes its path as `configFile`. The service warns at the start when the local runner serves several tenants, when `dataDir` is in a temp
 folder (where a task's commands can write its home, whose git config jig's own git reads outside the
 sandbox), and when there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the
 machine.
@@ -518,7 +521,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `tool_call` | `step`, `id`, `name`, `description` (at most 4,000 characters, cut from the middle), `truncated` |
 | `tool_result` | `step`, `id`, `isError`, `output` (at most 4,000 characters, cut from the middle), `truncated` |
 | `notice` | `text`: what jig told the user |
-| `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
+| `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it, 0 before the first), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |

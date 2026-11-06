@@ -227,7 +227,7 @@ export class Events {
     if (this.lines && interrupted) for (const signal of SIGNALS) process.on(signal, ignore);
     try {
       if (interrupted) this.lines?.flush(SIGNAL_FLUSH_SECONDS, "after a signal");
-      else this.lines?.flush(END_FLUSH_SECONDS, "at a normal end");
+      else this.lines?.flush(END_FLUSH_SECONDS, "without a signal");
     } finally {
       for (const signal of SIGNALS) process.off(signal, ignore);
     }

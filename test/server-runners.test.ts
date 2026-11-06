@@ -941,6 +941,19 @@ describe("the Kubernetes runner", () => {
     assert.match(String(stored[3].text), /^Events 4 to 5 aren't in the pod's log: it was rotated before it was read again/);
   });
 
+  it("reads the pod's log again when it breaks after a worker-shaped line that isn't its last", async () => {
+    // A task's commands can write a line like the worker's (through /proc/1/fd/1): only the log's last counts.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), JSON.stringify({ jigWorker: 1, exitCode: 0 }), event(2, "text", { text: "two" })];
+    const again = [event(1, "start"), event(2, "text", { text: "two" }), event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
+    cluster.script = () => ({ lines, again });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+  });
+
   it("gives a tenant whose id is no label value a hashed one, the id in an annotation", async () => {
     assert.equal(labelValue("acme"), "acme");
     assert.equal(labelValue(`a${"-".repeat(61)}z`), `a${"-".repeat(61)}z`);

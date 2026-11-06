@@ -532,7 +532,7 @@ describe("--events", () => {
       const stderr = await readFile(errors, "utf8");
       assert.equal(code, 0, stderr.slice(-1_000));
       assert.ok(took >= 59_000 && took < 66_000, `exited ${took} ms after the last request`);
-      assert.match(stderr.slice(-1_000), /The --events reader didn't take them all in the 60 s jig gives it at a normal end: \d+ events? (weren't|wasn't) written\./);
+      assert.match(stderr.slice(-1_000), /The --events reader didn't take them all in the 60 s jig gives it without a signal: \d+ events? (weren't|wasn't) written\./);
     } finally {
       clearTimeout(deadline);
       child.kill("SIGKILL");
@@ -778,7 +778,7 @@ describe("Events", () => {
       assert.equal(events.end("end_turn", 0)?.exitCode, 0);
       assert.equal(slow.io.now(), 60_000);
       assert.equal(slow.got().length, 32);
-      assert.deepEqual(told, ["The --events reader didn't take them all in the 60 s jig gives it at a normal end: 2 events weren't written."]);
+      assert.deepEqual(told, ["The --events reader didn't take them all in the 60 s jig gives it without a signal: 2 events weren't written."]);
     });
   });
 

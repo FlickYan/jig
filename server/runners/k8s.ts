@@ -337,7 +337,7 @@ export class KubernetesRunner implements Runner {
     let seq = 0;
     let said: string | undefined;
     let worker: { exitCode?: number; stats?: unknown } = {};
-    /** The container has run; its log was read to the end; and the last line read was the worker's. */
+    /** The container has run; its log was read to the end; and the last line read was the worker's (or one like it). */
     let started = false;
     let logged = false;
     let reported = false;
@@ -358,7 +358,8 @@ export class KubernetesRunner implements Runner {
           if (res.statusCode === 200) {
             for await (const line of lines(res)) {
               const event = parseEvent(line);
-              // The worker's line is the log's last: a stream that ends with it has the whole log.
+              // The worker writes its line last: a stream that ends with it has the whole log. A task's commands
+              // can write such a line too, which at worst ends the read of their own task's log early.
               reported = false;
               if (event && event.seq > seq) {
                 // jig's seqs follow one another: a gap is events the log no longer has, once the kubelet has
