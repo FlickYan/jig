@@ -2,7 +2,6 @@ import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
@@ -278,12 +277,15 @@ export async function startService(
 /**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
  * from their commands, but for the task's own project and home, and the database and the config (see
- * runners/local.ts); without one, they run directly on the machine. With one, they share its kernel and
- * temp folders, and on macOS its processes and localhost. And with dataDir in a temp folder, which they can
- * write, a task's commands can change its home there, whose git config jig's own git reads, outside the sandbox.
+ * runners/local.ts); without one, they run directly on the machine. With one, they share its kernel, /tmp
+ * and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost. And with
+ * dataDir in one of those, which they can write, a task's commands can change its home there, whose git
+ * config jig's own git reads, outside the sandbox.
  */
 function localRisks(config: Config): string[] {
-  const temps = ["/tmp", "/var/tmp", tmpdir()].flatMap((dir) => [dir, realOrSame(dir)]);
+  // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
+  // task's own TMPDIR: not the service's.
+  const temps = (process.platform === "darwin" ? ["/tmp", "/private/tmp"] : ["/tmp", "/var/tmp"]).flatMap((dir) => [dir, realOrSame(dir)]);
   const inTemp = (path: string) =>
     temps.some((dir) => {
       const rel = relative(dir, resolve(path));
@@ -292,7 +294,7 @@ function localRisks(config: Config): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
-    ...(config.tenants.length > 1 ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel and temp folders, and on macOS its processes and localhost (the docker and kubernetes runners keep them apart)"] : []),
+    ...(config.tenants.length > 1 ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost (the docker and kubernetes runners keep them apart)"] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
 }

@@ -198,6 +198,27 @@ describe("sandbox", { skip: sandboxProblem() }, () => {
     }
   });
 
+  it("hides all of a hidden directory holding the home directory but not the project", async () => {
+    // A project in /srv, say, and hiddenPaths ["/home"]: the user meant ~/.ssh hidden too. Only a hidden
+    // directory that holds the project keeps the home directory, as the local runner's data directory does.
+    const [home, other, elsewhere] = [join(dir, "home", "me"), join(dir, "home", "other"), join(dir, "srv", "proj")];
+    for (const folder of [join(home, ".ssh"), other, elsewhere]) await mkdir(folder, { recursive: true });
+    await writeFile(join(home, ".ssh", "id_rsa"), "MY PRIVATE KEY\n");
+    await writeFile(join(other, "x"), "the other user's file\n");
+    const was = process.env.HOME;
+    process.env.HOME = home;
+    const sandbox = createSandbox(elsewhere, { network: false, hidden: [join(dir, "home")] })!;
+    try {
+      const output = await runCommand(`cat ${join(home, ".ssh", "id_rsa")} ${join(other, "x")}; echo ok > a.txt && cat a.txt`, elsewhere, 20, undefined, sandbox);
+      assert.doesNotMatch(output, /MY PRIVATE KEY/);
+      assert.doesNotMatch(output, /the other user's file/);
+      assert.match(output, /^ok$/m);
+    } finally {
+      sandbox.close?.();
+      process.env.HOME = was;
+    }
+  });
+
   it("keeps a hidden file out of the snapshots, and those an older jig took out of commands' reach", async () => {
     const app = join(dir, "app");
     await mkdir(app);
@@ -1214,7 +1235,7 @@ describe("the macOS sandbox's profile", () => {
     // As the local runner hides its data directory, all but the task's project and home (see ownPlaces).
     const [work, home] = ["/d/tasks/a/work", "/d/tasks/a/home"];
     const git = { locked: [`${work}/.git/config`, `${work}/.git/hooks`], fixed: [`${work}/.git`], gitDirectories: [`${work}/.git`] };
-    const profile = seatbeltProfile([work, "/private/tmp"], false, ["/d", `${work}/key.txt`], git, `${home}/.jig`, [work, home, "/u"]);
+    const profile = seatbeltProfile([work, "/private/tmp"], false, ["/d", `${work}/key.txt`], git, `${home}/.jig`, { roots: [work, "/u"], home });
     const allows = (operation: string, path: string) => seatbeltAllows(profile, operation, path);
     // The project as it was: read and written, but for git's config and the hidden file in it.
     for (const operation of ["file-read-data", "file-write-data", "file-write-create"]) assert.ok(allows(operation, `${work}/a.txt`), operation);
@@ -1233,6 +1254,13 @@ describe("the macOS sandbox's profile", () => {
     assert.equal(allows("file-read-metadata", "/d/tasks/b"), false);
     // Neither moves: a link to another task's folder could otherwise take one's place.
     for (const path of [work, home]) assert.equal(allows("file-write-unlink", path), false, path);
+  });
+
+  it("hides all of a hidden directory holding the home directory but not the project", () => {
+    // hiddenPaths ["/home"] with the project in /srv: the home directory is kept only with the project.
+    const profile = seatbeltProfile(["/srv/p", "/private/tmp"], false, ["/home"], undefined, undefined, { roots: ["/srv/p"], home: "/home/me" });
+    for (const path of ["/home/me/.ssh/id_rsa", "/home/other/x"]) assert.equal(seatbeltAllows(profile, "file-read-data", path), false, path);
+    assert.ok(seatbeltAllows(profile, "file-read-data", "/srv/p/a.txt"));
   });
 
   it("keeps the directories between git's files and a writable directory holding the project in place", async () => {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -390,6 +390,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       for (const name of ["ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "JIG_GATEWAY_SECRET"]) assert.equal(env[name], undefined, name);
       assert.ok(!Object.values(env).includes(SECRET));
       assert.equal(env.JIG_HOME, join(api.dataDir, "tasks", id, "home", ".jig"));
+      // A temp folder of the task's own, not the service's, where jig keeps long outputs (see runners/local.ts).
+      assert.equal(env.TMPDIR, join(api.dataDir, "tasks", id, "home", "tmp"));
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
       else process.env.ANTHROPIC_AUTH_TOKEN = saved;
@@ -984,7 +986,12 @@ describe("the service's start", () => {
     if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
     else {
       warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
-      warned(/^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/);
+      // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
+      // elsewhere), as each task has its own.
+      const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
+      const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
+      if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
+      else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
     }
     // Each task's jig gets user settings that hide them from its commands, but for its project and home.
     const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;

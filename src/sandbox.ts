@@ -4,7 +4,7 @@ import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readd
 import { homedir, constants as osConstants, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { jigHome } from "./paths.ts";
-import { isGitControl, isInside, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
+import { isGitControl, isInside, keptIn, type Places, readRegularFile, realTargetSync, SAFE_GIT, withoutKeys } from "./tools/util.ts";
 
 /** Where commands run when jig contains them (see createSandbox). */
 export interface Sandbox {
@@ -151,20 +151,15 @@ export function createSandbox(
 }
 
 /**
- * The session's own places, by real path: the project, the added directories and the home directory. A
- * hidden directory holding one hides all in it but those, which stay as they were, what is hidden in them
- * too (see keptIn): the local runner hides its data directory from a task's commands, the other tasks'
+ * The session's own places (see keptIn), by real path: a hidden directory holding the project or an added
+ * directory hides all in it but those, and the home directory with them, which stay as they were, what is
+ * hidden in them too: the local runner hides its data directory from a task's commands, the other tasks'
  * folders and the database in it, but for the task's project and home (see server/runners/local.ts). The
  * home directory too, as git looks for its config there and stops where Seatbelt refuses it, which is no
  * missing file to git. The file tools keep them too (see tools/util.ts's hiddenTest).
  */
-export function ownPlaces(project: string, dirs: string[]): string[] {
-  return [project, ...dirs, realTargetSync(homedir())].filter((place): place is string => !!place);
-}
-
-/** Those of the session's own places that a hidden path holds, which it doesn't hide. */
-function keptIn(path: string, places: string[]): string[] {
-  return places.filter((place) => place !== path && isInside(path, place));
+function ownPlaces(project: string, dirs: string[]): Places {
+  return { roots: [project, ...dirs], home: realTargetSync(homedir()) };
 }
 
 /**
@@ -529,7 +524,7 @@ export function sandboxProblem(): string | undefined {
   return `jig has no sandbox for ${process.platform} yet`;
 }
 
-function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, places: string[] = []): Sandbox {
+function seatbelt(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, places: Places = { roots: [] }): Sandbox {
   const profile = seatbeltProfile(writable, network, hidden, git, home, places);
   return {
     description: `macOS sandbox${network ? "" : ", no network"}`,
@@ -552,7 +547,7 @@ const CLEAN_START = 'for fd in /dev/fd/*; do fd=${fd##*/}; case $fd in [3-9]|[1-
  * The Seatbelt profile: where commands can write, whether they reach the network, what they can't read.
  * `home` is jig's own directory, by its real path, and `places` the session's own (see ownPlaces).
  */
-export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string, places: string[] = []): string {
+export function seatbeltProfile(writable: string[], network: boolean, hidden: string[], git?: GitControl, home?: string, places: Places = { roots: [] }): string {
   const denied = [...hidden, ...(home ? [home] : []), ...(git?.locked ?? [])]; // by path, in the rules below
   return [
     "(version 1)",
@@ -695,7 +690,7 @@ function deny(operation: string, filters: string[] = []): string[] {
  * outside the sandbox (see Keeper). A job a command leaves in the background keeps running, reparented to
  * the namespace's init, until jig exits, when the kernel ends every process in the namespace.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void, places: string[] = []): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void, places: Places = { roots: [] }): Sandbox {
   const bwrap = findProgram("bwrap")!;
   const keeper = new Keeper(bwrap, hidden, home, onFallback);
   // An empty directory over each hidden directory, and an empty file over each hidden file, the outermost

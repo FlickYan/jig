@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, realpath, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
@@ -12,7 +12,7 @@ import { bashTool, noTestsNote, OutputFiles, runCommand } from "../src/tools/bas
 import { editTool } from "../src/tools/edit.ts";
 import { checkInput, MAX_OUTPUT_CHARS, parseToolList, selectTools, TOOLS, truncate, type ToolContext } from "../src/tools/index.ts";
 import { readTool } from "../src/tools/read.ts";
-import { FileVersions, readRegularFile } from "../src/tools/util.ts";
+import { FileVersions, hiddenTest, readRegularFile } from "../src/tools/util.ts";
 import { writeTool } from "../src/tools/write.ts";
 import { checkLimits } from "../src/tools/write-check.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -653,6 +653,25 @@ describe("hidden paths", () => {
       await assert.rejects(write("theirs", "x\n"), /hidden by the user's settings/);
       await assert.rejects(read("key.txt"), /hidden by the user's settings/);
       assert.equal(await readFile(join(other, "secret.txt"), "utf8"), "the other task's secret\n");
+    } finally {
+      process.env.HOME = was;
+    }
+  });
+
+  it("leave nothing of a hidden directory holding the home directory but not the project", async () => {
+    // hiddenPaths ["/home"] with the project elsewhere: the user meant ~/.ssh hidden too.
+    const homes = await tempDir("jig-homes-");
+    const home = join(homes, "me");
+    await mkdir(join(home, ".ssh"), { recursive: true });
+    await writeFile(join(home, ".ssh", "id_rsa"), "MY PRIVATE KEY\n");
+    await symlink(join(home, ".ssh", "id_rsa"), join(cwd, "key"));
+    const was = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      ctx = { cwd, versions: new FileVersions(), hidden: [homes] };
+      await assert.rejects(read("key"), /^Error: key is hidden by the user's settings/);
+      // Nor with no roots at all, as skill discovery and skill evals ask.
+      assert.equal(hiddenTest([homes])(await realpath(join(home, ".ssh", "id_rsa"))), "settings");
     } finally {
       process.env.HOME = was;
     }
