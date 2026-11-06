@@ -512,10 +512,11 @@ waits in jig, in order, and jig goes on: a stopped reader holds the events, not 
 it. It holds 64 MiB at most, and drops later events (not the `end`), saying how many on stderr and, with room,
 in a `notice` before the `end`. At its end, on every path a signal included, jig writes what it holds,
 waiting while the reader takes some every 5 s (after a signal, 20 s at most in all, its commands killed
-first), and otherwise gives up on the rest, saying how many events on stderr; the last line it wrote may
-then be cut off, so a reader drops a last line without a newline. Once the reader has closed the pipe, or a
-write jig tries again has failed, jig writes no more events and goes on with the task. `/dev/stdout` is not
-`-`: jig opens it as a file, whose writes may wait for the reader.
+first, a second signal ignored; otherwise Ctrl+C still ends the wait at once), and otherwise gives up on the
+rest, saying how many events on stderr; the last line it wrote may then be cut off, so a reader drops a last
+line without a newline. Once the reader has closed the pipe, or a write jig tries again has failed, jig writes
+no more events and goes on with the task. `/dev/stdout` is not `-`: jig opens it as a file, whose writes may
+wait for the reader.
 
 `jig --approve-via <url>` asks for the tool calls the mode would ask about at a terminal over HTTP: after the
 call's `approval_request` it polls `GET <url>/<id>?wait=25` with `Authorization: Bearer <its API key>` (a

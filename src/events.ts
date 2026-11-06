@@ -186,15 +186,16 @@ export class Events {
     const end = { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds };
     this.write("end", { ...end });
     // However jig ends, the end is written (by its exit handler, at worst): what Lines holds goes with it.
-    // While it waits for the reader, a second Ctrl+C, SIGTERM or SIGHUP would end jig by the signal's default
-    // action where jig has no handler left for it (Ctrl+C's goes with the task, SIGTERM's runs once), losing
-    // the end without a word. Each is ignored until the wait, which is bounded, is over; jig then exits as the
-    // first signal had it.
+    // After a signal, an orchestrator's SIGKILL is coming: the reader gets SIGNAL_FLUSH_SECONDS in all. While
+    // it waits, a second Ctrl+C, SIGTERM or SIGHUP would end jig by the signal's default action where jig has
+    // no handler left for it (Ctrl+C's goes with the task, SIGTERM's runs once), losing the end without a word.
+    // Each is ignored until that wait is over; jig then exits as the first signal had it. Only that wait: at
+    // another end a reader that keeps reading has no bound in all, and Ctrl+C must still stop jig at once.
+    const interrupted = stop === "interrupted";
     const ignore = () => {};
-    if (this.lines) for (const signal of SIGNALS) process.on(signal, ignore);
+    if (this.lines && interrupted) for (const signal of SIGNALS) process.on(signal, ignore);
     try {
-      // After a signal, an orchestrator's SIGKILL is coming: the reader gets SIGNAL_FLUSH_SECONDS in all.
-      this.lines?.flush(stop === "interrupted" ? SIGNAL_FLUSH_SECONDS : undefined);
+      this.lines?.flush(interrupted ? SIGNAL_FLUSH_SECONDS : undefined);
     } finally {
       for (const signal of SIGNALS) process.off(signal, ignore);
     }

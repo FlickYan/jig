@@ -167,12 +167,13 @@ reading holds the events, not jig, which still acts on a signal. jig holds 64 Mi
 it drops new events (not the `end`), and says how many on stderr and, where there is room by then, in a
 `notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
 long as it takes some every 5 s, and after a signal 20 s at most in all, once its commands are killed; a
-second signal in that wait doesn't cut it short. If it gives up, it says on stderr how many events it
-couldn't write, and exits: the last line it wrote may then be cut off, so a reader should drop a last line
-without a newline. So a reader that is behind but reads loses no line, the `end` included, on
-Linux or macOS. If the reader closes the pipe, or a write jig tries again fails otherwise, jig says so on
-stderr, writes no more events, and goes on with the task. `--events /dev/stdout` isn't `-`: jig opens it as a
-file, whose writes can wait for the reader, signals with them, and the terminal's output goes there too.
+second signal in that wait doesn't cut it short (at any other end, Ctrl+C still does). If it gives up, it
+says on stderr how many events it couldn't write, and exits: the last line it wrote may then be cut off, so
+a reader should drop a last line without a newline. So a reader that is behind but reads loses no line, the
+`end` included, on Linux or macOS. If the reader closes the pipe, or a write jig tries again fails
+otherwise, jig says so on stderr, writes no more events, and goes on with the task. `--events /dev/stdout`
+isn't `-`: jig opens it as a file, whose writes can wait for the reader, signals with them, and the
+terminal's output goes there too.
 
 `--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
 task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the

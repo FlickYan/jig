@@ -459,6 +459,43 @@ describe("--events", () => {
     }
   });
 
+  it("with -, a Ctrl+C while it waits for a slow reader at a normal end still stops it at once", async () => {
+    // The signals are ignored only in the wait after a signal, which is bounded in all: at a normal end a
+    // reader that keeps reading kept jig going, Ctrl+C ignored, as long as it took 4 KiB every half second.
+    const long = "All work and no play. ".repeat(80_000);
+    let waiting!: () => void;
+    const second = new Promise<void>((done) => (waiting = done));
+    const api = await fakeMessagesApi((request) => {
+      if ((request.messages as unknown[]).length === 1) return [{ text: long }, { tool: "glob", input: { pattern: "*" } }];
+      waiting();
+      return [{ text: "Done." }];
+    });
+    const reader = spawn(process.execPath, ["-e", SLOW_READER], { stdio: ["pipe", "ignore", "ignore"] });
+    const cli = join(import.meta.dirname, "..", "src", "cli.ts");
+    const env = { ...process.env, ANTHROPIC_BASE_URL: api.url, ANTHROPIC_API_KEY: "test-key", JIG_HOME: join(outside, "home"), NO_COLOR: "1" };
+    const child = spawn(process.execPath, [cli, ...args, "--events", "-", "Fix the parser."], { cwd: project, env, stdio: ["ignore", reader.stdin, "pipe"] });
+    reader.stdin.destroy(); // jig holds the pipe's end now
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 15_000);
+    try {
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+      // A moment after the last reply the task is over, and jig waits for the reader with what it holds.
+      await Promise.race([second, exited]);
+      await new Promise((done) => setTimeout(done, 1_500));
+      const sent = Date.now();
+      child.kill("SIGINT");
+      assert.equal(await exited, "SIGINT", stderr.slice(-1_000));
+      const took = Date.now() - sent;
+      assert.ok(took < 2_000, `exited ${took} ms after Ctrl+C`);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      reader.kill("SIGKILL");
+      api.close();
+    }
+  });
+
   it("with -, goes on with the task when the events' reader is gone, and says so once", async () => {
     const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
     try {
