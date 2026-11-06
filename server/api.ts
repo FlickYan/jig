@@ -3,13 +3,14 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
-import { type Runner, workspaceProblem } from "./runner.ts";
+import { checkedGit, type Runner, workspaceProblem } from "./runner.ts";
 import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
 import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
@@ -250,12 +251,18 @@ export async function startService(
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
     url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
     if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
-    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, configFile);
+    // What the local runner hides beside dataDir that holds more than the service's own files.
+    const folders = !runner && (config.runner ?? "local") === "local" ? hiddenFolders(config.dataDir, configFile) : [];
+    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, folders);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
-    if (runner instanceof LocalRunner) for (const warning of localRisks(config)) log.warn(warning);
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
+    if (runner instanceof LocalRunner) for (const warning of localRisks(config, folders)) log.warn(warning);
+    // The Kubernetes runner's clone is in the task's pod, on its network.
+    if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
+      log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
+    }
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs, gitHosts } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, gitHosts, onApproval, metrics, log });
     const expired = await scheduler.start();
     if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
@@ -288,10 +295,10 @@ export async function startService(
  * /tmp and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read
  * whatever else the service's user can, and connect to the Unix sockets there, which a read-only file
  * system doesn't stop. And with dataDir in one of those, which they can write, a task's commands can change
- * its home there, whose git config jig's own git reads, outside the sandbox. The workspace's clone is the
- * service's own, on its network.
+ * its home there, whose git config jig's own git reads, outside the sandbox. A hidden folder (`folders`)
+ * that is the machine's root, /etc, /usr or the service user's home hides what their commands need.
  */
-function localRisks(config: Config): string[] {
+function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
   // task's own TMPDIR: not the service's.
   const temps = (process.platform === "darwin" ? ["/tmp", "/private/tmp"] : ["/tmp", "/var/tmp"]).flatMap((dir) => [dir, realOrSame(dir)]);
@@ -304,7 +311,13 @@ function localRisks(config: Config): string[] {
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
     "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
-    ...(config.gitHosts ? [] : ["a local task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts"]),
+    ...folders.flatMap(({ what, path }) => {
+      const real = realOrSame(path);
+      const home = realOrSame(homedir());
+      if (real !== home && !["/", "/etc", "/usr"].some((dir) => real === realOrSame(dir))) return [];
+      const fix = what === "the config's folder" ? "keep the config in a folder of its own" : "keep dataDir out of that checkout";
+      return [`the local runner hides ${what}, ${path}, from its tasks' commands, and that is ${real === home ? "the service user's home directory, where the toolchains they use may be" : "a folder every task's commands need"}: ${fix}`];
+    }),
     ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
@@ -382,17 +395,15 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
 
 /**
  * The runner the config names, its lines (and its pool's) in the service's `log`. The local runner's tasks'
- * commands can't read, beside dataDir, the SQLite database's files, the folder the config (`configFile`)
- * is in, where the service's other secrets are kept too, the git checkout dataDir is in, if any, and what
- * the config's local.hiddenPaths list.
+ * commands can't read, beside dataDir, the SQLite database's files, `folders` (hiddenFolders') and what the
+ * config's local.hiddenPaths list.
  */
-function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, configFile?: string): Runner {
+function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, folders: HiddenFolder[]): Runner {
   const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
-    const checkout = checkoutOf(config.dataDir);
-    const hidden = [...new Set([...database, ...(configFile ? [dirname(configFile)] : []), ...(checkout ? [checkout] : []), ...(config.local?.hiddenPaths ?? [])])];
+    const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
     return new LocalRunner({ ...shared, hidden, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
@@ -402,20 +413,37 @@ function runnerFor(config: Config, secret: string, internalBaseUrl: string, log:
   throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
 }
 
+/** A folder the local runner hides that holds more than the service's own files, and what it is. */
+interface HiddenFolder {
+  what: string;
+  path: string;
+}
+
 /**
- * The top of the git checkout dataDir is in (the service run from one, say), or undefined, as git finds it
- * once at the start. GIT_CEILING_DIRECTORIES keeps a task's git out of it, but not its commands' reads: its
- * files, a deploy's .env among them, are the service's. Whoever owns it: git would otherwise refuse another
- * user's checkout, which would stay readable.
+ * The folders the local runner hides beside dataDir and the database: the one the config (`configFile`) is
+ * in, where the service's other secrets are kept too, and the git checkouts dataDir is in (the service run
+ * from one, say), as git finds them once at the start: its own, and that one's superproject, if it is a
+ * submodule, or main checkout, if it is a worktree. GIT_CEILING_DIRECTORIES keeps a task's git out of them,
+ * but not its commands' reads: their files, a deploy's .env among them, are the service's. Whoever owns
+ * them: git would otherwise refuse another user's checkout, which would stay readable.
  */
-function checkoutOf(dataDir: string): string | undefined {
+function hiddenFolders(dataDir: string, configFile: string | undefined): HiddenFolder[] {
+  const folders = configFile ? [{ what: "the config's folder", path: dirname(resolve(configFile)) }] : [];
   try {
     mkdirSync(dataDir, { recursive: true });
-    const top = execFileSync("git", ["-c", "safe.directory=*", "rev-parse", "--show-toplevel"], { cwd: dataDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH, HOME: process.env.HOME } });
-    return top.trim() || undefined;
+    // The superproject last, as git prints nothing for it outside a submodule.
+    const args = ["-c", "safe.directory=*", "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--show-superproject-working-tree"];
+    const said = execFileSync("git", args, { cwd: dataDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    const [top, common, superproject] = said.split("\n");
+    if (top) folders.push({ what: "the git checkout dataDir is in", path: top });
+    // A checkout's own common folder is its .git; a worktree's, its main checkout's; a submodule's, in its
+    // superproject's .git/modules, so not a checkout's .git.
+    if (common && basename(common) === ".git" && dirname(common) !== top) folders.push({ what: "the main checkout of the worktree dataDir is in", path: dirname(common) });
+    if (superproject) folders.push({ what: "the superproject of the checkout dataDir is in", path: superproject });
   } catch {
-    return undefined; // not in one, or no git
+    // Not in one, or no git.
   }
+  return folders;
 }
 
 /** Throws with what is wrong if the config isn't one the service can run with. */
@@ -789,13 +817,12 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
-  // The local runner clones on the service's own network, which a tenant would otherwise reach any host on.
-  // git is then given the URL as it was read here: git's curl reads `https://ok.host\@inside/` as userinfo
-  // before the `@`, where URL reads the backslash as a slash, so the raw string could reach another host.
-  const url = typeof git === "string" && gitHosts ? URL.parse(git) : undefined;
-  if (typeof git === "string" && gitHosts && !gitHosts.some((host) => host.toLowerCase() === url?.hostname.toLowerCase())) return `workspace.git must be on one of the config's gitHosts: ${gitHosts.join(", ")}`;
+  // The local and Docker runners clone on the service's own network, which a tenant would otherwise reach
+  // any host on. The scheduler checks it again as the task starts, should gitHosts have changed.
+  const checked = typeof git === "string" ? checkedGit(git, gitHosts) : undefined;
+  if (checked && "error" in checked) return checked.error;
   if (ref !== undefined && (git === undefined || typeof ref !== "string" || !/^[\w./-]{1,200}$/.test(ref) || ref.startsWith("-"))) return "workspace.ref must be a branch or tag of workspace.git";
-  return { prompt, workspace: { files, git: url?.href ?? git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
+  return { prompt, workspace: { files, git: checked?.git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {

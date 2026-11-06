@@ -1059,6 +1059,91 @@ describe("the service's start", () => {
     assert.deepEqual(asked, []);
   });
 
+  it("checks a queued task's workspace.git against gitHosts again when it starts", async () => {
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const base = await tempDir("jig-service-");
+    const db = await database(base);
+    // Queued without gitHosts: acme may run none at once, so its tasks wait for the next start.
+    const tenants = (concurrency: number) => [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency }];
+    const first = await service({ database: db, gitProtocols: ["http"], tenants: tenants(0) }, base);
+    const post = async (git: string) => (await call(first, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id as string;
+    const elsewhere = await post(`http://127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    // On the host gitHosts will list, as URL reads it, but not as git's curl would.
+    const sly = await post(`http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    services.splice(services.indexOf(first), 1);
+    await first.close();
+
+    const api = await service({ database: db, gitProtocols: ["http"], gitHosts: ["localhost"], tenants: tenants(2) }, base);
+    const refused = await statusOf(api, elsewhere, "error");
+    assert.equal(refused.error, "workspace.git must be on one of the config's gitHosts: localhost (checked again as the task started)");
+    assert.equal(existsSync(work(api, elsewhere)), false);
+    const cloned = await statusOf(api, sly, "error");
+    assert.match(cloned.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
+  it("warns that the docker runner's clones are on the service's network too, without gitHosts", async () => {
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = await tempDir("jig-service-");
+    const docker = { image: "jig-worker", network: "jig-tasks", docker: [process.execPath, "-e", "process.exit(1)"] };
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", runner: "docker", docker, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const clones = /^jig service: a docker task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/;
+    services.push(await startService(config, { secret: SECRET, log }));
+    assert.ok(lines.some((line) => clones.test(line)), lines.join("\n"));
+    lines.length = 0;
+    services.push(await startService({ ...config, gitHosts: ["example.com"] }, { secret: SECRET, log }));
+    assert.ok(!lines.some((line) => clones.test(line)), lines.join("\n"));
+  });
+
+  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in", async () => {
+    const dir = realpathSync(await tempDir("jig-service-"));
+    const git = (cwd: string, ...args: string[]) => promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main", ...args], { cwd });
+    const repo = async (path: string) => {
+      await git(dir, "init", "--quiet", path);
+      await git(path, "commit", "--quiet", "--allow-empty", "-m", "first");
+    };
+    await repo(join(dir, "main"));
+    await git(join(dir, "main"), "worktree", "add", "--quiet", join(dir, "tree"));
+    await repo(join(dir, "lib"));
+    await repo(join(dir, "super"));
+    await git(join(dir, "super"), "submodule", "--quiet", "add", join(dir, "lib"), "sub");
+    for (const [checkout, holder] of [[join(dir, "tree"), join(dir, "main")], [join(dir, "super", "sub"), join(dir, "super")]]) {
+      const db = join(dir, `${holder.split("/").at(-1)}.db`);
+      const api = await service({ database: db }, checkout);
+      const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+      await statusOf(api, id, "succeeded");
+      const settings = JSON.parse(await readFile(join(checkout, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+      assert.deepEqual(settings.hiddenPaths, [join(checkout, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, checkout, holder]);
+    }
+  });
+
+  it("warns when hiding the config's folder or dataDir's checkout would hide the service user's home", async () => {
+    if (sandboxProblem()) return;
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = realpathSync(await tempDir("jig-service-"));
+    await promisify(execFile)("git", ["init", "--quiet", dir]);
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      services.push(await startService(config, { secret: SECRET, log, configFile: join(dir, "service.json") }));
+    } finally {
+      process.env.HOME = home;
+    }
+    for (const what of ["the config's folder", "the git checkout dataDir is in"]) {
+      const warning = new RegExp(`^jig service: the local runner hides ${what}, ${dir}, from its tasks' commands, and that is the service user's home directory`);
+      assert.ok(lines.some((line) => warning.test(line)), lines.join("\n"));
+    }
+  });
+
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {
     const api = pathToFileURL(join(import.meta.dirname, "..", "server", "api.ts")).href;
     const { stderr } = await promisify(execFile)(process.execPath, ["--input-type=module", "-e", `await import(${JSON.stringify(api)})`]);

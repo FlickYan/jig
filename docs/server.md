@@ -53,7 +53,7 @@ to none and `maxQueued` (its tasks that may wait at once) to 1000. The config ho
 key: `printf %s "$KEY" | sha256sum` gives it. A tenant taken out of the config is shut out at the next
 start: its keys stop working, and its queued tasks are cancelled. Also: `graceSeconds` (30), `jig` (the
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
-(`["https"]`), `gitHosts` (the hosts a `workspace.git` may be on: any, without it; another is a 400),
+(`["https"]`), `gitHosts` (the hosts a `workspace.git` may be on: any, without it; another is a 400; below),
 `local.hiddenPaths` (absolute paths the local runner's tasks' commands can't read either, below),
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
@@ -314,6 +314,28 @@ leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all th
 reach those ports (the tenants' API from anywhere, the internal listener and the gateway from the pods in
 `jig`).
 
+### Clones and gitHosts
+
+A task's `workspace.git` is cloned before jig starts. The local and Docker runners clone it in the
+service's own process, outside the sandbox or the container, on the network of the machine the service
+runs on. The tasks' commands may have no network, but the clone does. So list the hosts tenants may clone
+from in `gitHosts`, for either runner. The service warns at the start when one of them clones without it.
+
+`gitHosts` limits hostnames, not ports: any port on a listed host can be cloned from. Each entry is a
+hostname as it is in a URL: an IPv6 address in brackets (`[fd00::1]`), an international name in punycode
+(`xn--...`), and no trailing dot. Case doesn't matter. A listed name is cloned from whatever address it
+resolves to. git is given the URL as it was checked, in its normal form, so `https://allowed.host\@inside/`
+is cloned from `allowed.host`. A redirect is never followed. A clone that fails is `git clone failed (exit
+N)` to the tenant, with what git said (the hosts and ports it tried, and how they answered) in the
+service's log alone.
+
+`gitHosts` is checked when a task is posted, and again as it starts. A task queued before `gitHosts` was
+set, or before its host was taken out of it, is not cloned: it ends as an `error` that says so.
+
+The Kubernetes runner clones in the task's pod (`server/worker.ts`), on the pod's network, which
+`deploy/k8s/networkpolicy.yaml` limits: the git host needs a rule there too (below). `gitHosts` still
+applies there, checked by the service as above.
+
 ### The local runner
 
 Each task gets a folder in `dataDir/tasks/<id>/`: `work/`, the project jig works in (the files written
@@ -342,7 +364,8 @@ jig's sandbox lets a task's commands read the whole machine and write the temp f
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
 `hiddenPaths`: `dataDir`, the SQLite database's files, the folder the service's config file is in, the git
 checkout `dataDir` is in, if any (the service's own, run from one, whose files `GIT_CEILING_DIRECTORIES`
-doesn't hide), and the config's `local.hiddenPaths`. A hidden folder that
+doesn't hide), with its superproject if it is a submodule, or its main checkout if it is a worktree, and
+the config's `local.hiddenPaths`. A hidden folder that
 holds the project hides all in it but the project and the home directory beside it (README: hiddenPaths), so a
 task's commands work in their project and read their home as before, but can't read or write the other
 tasks' folders, their own events, stats and `output.log`, or the database, in a temp folder too:
@@ -363,15 +386,15 @@ when the service starts with `--config`; a program that calls `startService` its
 path as `configFile`.
 
 The workspace's clone is the service's own, outside the sandbox and on the machine's network, though the
-tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (git is then given the URL
-as it was checked, in its normal form, so `https://allowed.host\@inside/` is cloned from `allowed.host`).
-A redirect is never followed, and a clone that fails is `git clone failed (exit N)` to the tenant, with what git said (the
-hosts and ports it tried, and how they answered) in the service's log alone.
+tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (above).
 
-The service warns at the start of what the tasks' commands can still read and connect to, of clones
-without `gitHosts`, when the local runner serves several tenants, when `dataDir` is in a temp folder
-(where a task's commands can write its home, whose git config jig's own git reads outside the sandbox),
-and when there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the machine.
+The service warns at the start of what the tasks' commands can still read and connect to, when the local
+runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
+home, whose git config jig's own git reads outside the sandbox), and when there is no sandbox
+(`bubblewrap` missing, say), as then commands run directly on the machine. It also warns when the config's
+folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's home directory: hiding it
+would break the tasks' commands, so keep the config in a folder of its own and `dataDir` out of that
+checkout.
 
 ### The Docker runner
 
