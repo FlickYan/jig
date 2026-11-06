@@ -161,7 +161,11 @@ should pass over a type it doesn't know: later versions may add some. It is only
 file is opened before the task starts, written anew as `--stats`' is (a link in its place is replaced, not
 written through), and written a line at a time, so a crash loses at most the last; ended by SIGTERM, SIGHUP,
 a Ctrl+C before the task starts or a second one in it, jig still writes an `end`, its stop `interrupted` (and
-`error`, with exit code 1, after a failure nothing caught).
+`error`, with exit code 1, after a failure nothing caught). With `-` too, each line is written whole before
+jig goes on: while the reader of the pipe is behind, jig waits for it (a reader that stops reading holds jig
+up), so a signal loses no line on Linux or macOS. Node had kept what the pipe couldn't take in memory, and
+lost it, the `end` with it, at the exit a signal brings. If the reader closes the pipe, jig says so on
+stderr, writes no more events, and goes on with the task.
 
 `--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
 task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the

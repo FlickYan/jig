@@ -13,6 +13,7 @@ import { redact } from "./export.ts";
 import type { CallModel } from "./model.ts";
 import { costOf } from "./prices.ts";
 import { truncate } from "./tools/index.ts";
+import { notice } from "./ui.ts";
 
 /**
  * The most of a tool's output, or of a tool call's description, an event holds: the terminal shows a few
@@ -51,9 +52,9 @@ export interface Start {
  * The events of one run, written to `path`, or to stdout for "-", or handed to a listener as objects. The
  * file is opened before the task starts and written anew: made beside the path and renamed into place, so a
  * link a command left there (one an earlier run's background job made, say) is replaced, not written
- * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is one write to
- * that file, so a crash loses at most the line being written. Every string goes through the redaction
- * `jig sessions export` uses.
+ * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is written whole
+ * before jig goes on, to the file or to stdout, so a crash loses at most the line being written. Every
+ * string goes through the redaction `jig sessions export` uses.
  */
 export class Events {
   private readonly fd: number | undefined; // undefined: stdout, or the listener
@@ -66,6 +67,7 @@ export class Events {
   private cost: number | null;
   private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
+  private gone = false; // the reader closed the pipe the events go to
 
   constructor(path: string | ((event: Event) => void), model: string) {
     this.model = model;
@@ -175,9 +177,38 @@ export class Events {
     if (this.ended && type !== "end") return;
     const event = redact({ v: 1, seq: ++this.seq, ts: new Date().toISOString(), type, ...fields }).value as Event;
     if (this.listener) return this.listener(event);
-    const line = `${JSON.stringify(event)}\n`;
-    if (this.fd === undefined) process.stdout.write(line);
-    else writeSync(this.fd, line);
+    if (this.gone) return;
+    try {
+      // Written before jig goes on, to stdout as to a file: a write to process.stdout's pipe waited in jig's
+      // memory while the reader was behind, and the exit a signal brings lost it, the end with it.
+      writeWhole(this.fd ?? 1, Buffer.from(`${JSON.stringify(event)}\n`));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
+      // The reader closed the pipe: no one follows the events now, but the task can still be done.
+      this.gone = true;
+      notice("The --events reader is gone (its pipe was closed): jig writes no more events, and goes on with the task.");
+    }
+  }
+}
+
+// What a pipe's writer waits on while its reader is behind: nothing wakes it, so each wait is the few
+// milliseconds given, without spinning.
+const pause = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Writes the whole of `data` to `fd` before it returns. Once process.stdout exists (ui.ts makes it), Node
+ * has made a pipe on stdout non-blocking, so while the reader is behind a write takes only part of the
+ * data, or fails with EAGAIN: jig writes the rest when there is room, waiting 5 ms at a time. `write` is
+ * fs.writeSync, or a test's.
+ */
+export function writeWhole(fd: number, data: Uint8Array, write = (fd: number, data: Uint8Array, offset: number) => writeSync(fd, data, offset)): void {
+  for (let offset = 0; offset < data.length; ) {
+    try {
+      offset += write(fd, data, offset);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
+      Atomics.wait(pause, 0, 0, 5);
+    }
   }
 }
 

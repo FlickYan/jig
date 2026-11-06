@@ -7,9 +7,9 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { AgentUI } from "../src/agent.ts";
-import { type Event as Written, Events } from "../src/events.ts";
+import { type Event as Written, Events, writeWhole } from "../src/events.ts";
 import type { CallModel } from "../src/model.ts";
-import { type FakeApi, fakeMessagesApi, runJig } from "./fake-api.ts";
+import { type FakeApi, fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // --events: the JSON lines a backend reads to follow a one-shot task, in place of the terminal's output.
@@ -243,6 +243,73 @@ describe("--events", () => {
     }
   });
 
+  it("with -, loses no line to a reader that is behind, the end of a run stopped by SIGTERM included", async () => {
+    // A reply's text larger than a pipe holds, and than the reader takes in before it stops reading: Node
+    // queued what didn't fit in jig, and lost it at the exit a signal brings, the end with it.
+    const long = "All work and no play. ".repeat(20_000);
+    let answered!: () => void;
+    let waiting!: () => void;
+    const first = new Promise<void>((done) => (answered = done));
+    const second = new Promise<void>((done) => (waiting = done));
+    // The first request gets the text and a tool call; the second is taken and never answered.
+    let calls = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      if (calls++ > 0) return waiting();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]), answered);
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+    const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+    // A jig held up for good fails the test rather than hangs it.
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    try {
+      child.stdout.pause(); // the reader is behind: it reads nothing more until jig is stopped
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const closed = new Promise((done) => child.on("close", (code, signal) => done(code ?? signal)));
+      // Stopped once jig waits for its second reply, or, held up writing the first's text, a second after it.
+      await Promise.race([second, first.then(() => new Promise((done) => setTimeout(done, 1000))), closed]);
+      child.kill("SIGTERM");
+      let stdout = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+      child.stdout.resume(); // and then reads everything
+      assert.equal(await closed, 143, stderr);
+      assert.ok(stdout.endsWith("\n"), `the last line is whole: ${stdout.length} characters came`);
+      const events = parse(stdout);
+      assert.deepEqual(
+        events.map((event) => event.seq),
+        events.map((_, i) => i + 1),
+      );
+      assert.deepEqual(types(events).slice(0, 3), ["start", "step", "text"]);
+      assert.equal(events[2].text, long);
+      const end = events.at(-1)!;
+      assert.deepEqual([end.type, end.stop, end.exitCode], ["end", "interrupted", 143]);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      api.close();
+    }
+  });
+
+  it("with -, goes on with the task when the events' reader is gone, and says so once", async () => {
+    const api = await fakeMessagesApi((request) => ((request.messages as unknown[]).length === 1 ? [{ tool: "glob", input: { pattern: "*" } }] : [{ text: "Done." }]));
+    try {
+      const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+      child.stdout.destroy(); // gone before jig writes its first event: each write to the pipe fails with EPIPE
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const code = await new Promise((done) => child.on("close", done));
+      assert.equal(code, 0, stderr);
+      assert.equal(api.requests.length, 2);
+      assert.equal(stderr.match(/no more events/g)?.length, 1, stderr);
+      assert.match(stderr, /Done\.\n2 steps · /);
+    } finally {
+      api.close();
+    }
+  });
+
   it("replaces a link in its place rather than writing through it, and is refused without a task", async () => {
     // A job a command of an earlier run left in the background can plant a link where the next run's file goes.
     const victim = join(outside, "bashrc");
@@ -274,6 +341,31 @@ describe("Events", () => {
     const events = new Events((event) => got.push(event), "claude-opus-5-5");
     return { got, events, ui: events.ui({ toolCall() {}, toolResult() {}, notice() {} } as AgentUI) };
   };
+
+  it("writes a line whole to a pipe whose reader is behind: what is left after a part, and after EAGAIN", () => {
+    const data = Buffer.from(`${JSON.stringify({ text: "x".repeat(100) })}\n`);
+    const got: number[] = [];
+    let call = 0;
+    // As a non-blocking pipe: 7 bytes, full, full, 30 bytes, full, then the rest.
+    const write = (fd: number, buffer: Uint8Array, offset: number): number => {
+      assert.equal(fd, 1);
+      call++;
+      if (call === 2 || call === 3 || call === 5) throw Object.assign(new Error("EAGAIN: resource temporarily unavailable, write"), { code: "EAGAIN" });
+      const taken = buffer.subarray(offset, call === 1 ? offset + 7 : call === 4 ? offset + 30 : undefined);
+      got.push(...taken);
+      return taken.length;
+    };
+    const started = Date.now();
+    writeWhole(1, data, write);
+    assert.deepEqual(Buffer.from(got), data);
+    assert.equal(call, 6);
+    assert.ok(Date.now() - started >= 10, "it waited at each EAGAIN");
+    // Any other failure is the caller's.
+    const closed = () => {
+      throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" });
+    };
+    assert.throws(() => writeWhole(1, data, closed), /EPIPE/);
+  });
 
   it("blanks out a key before it cuts the output, so a key the cut falls in isn't left half there", () => {
     const { got, ui } = listen();
