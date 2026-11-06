@@ -522,6 +522,8 @@ interface Script {
   again?: string[];
   /** With `again`: the container exits this long after the log's first read, whether it is read again or not. */
   exitsAfterMs?: number;
+  /** The pod is gone (evicted, or deleted at the Job's deadline) this long after its log's first read ends. */
+  goneAfterMs?: number;
 }
 
 interface Pod {
@@ -536,6 +538,8 @@ interface Pod {
   /** Its log was read this many times, and the last read all went to the service. */
   reads: number;
   flushed?: boolean;
+  /** Deleted, though its Job is not: the API server no longer has it, and no new one is made. */
+  gone?: boolean;
 }
 
 /** The API server's rule for a label's value. */
@@ -629,12 +633,12 @@ class FakeCluster {
     }
     if (req.method === "GET" && url.pathname === `/api/v1${ns}pods`) {
       const [key, value] = url.searchParams.get("labelSelector")!.split("=");
-      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod) => pod !== undefined);
+      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod): pod is Pod => pod !== undefined && !pod.gone);
       return reply(200, { kind: "PodList", items: items.map((pod) => ({ metadata: { name: pod.name }, status: statusOf(pod) })) });
     }
     if (req.method === "GET" && (match = new RegExp(`^/api/v1${ns}pods/([\\w-]+)(/log)?$`).exec(url.pathname))) {
       const pod = this.pods.get(match[1]);
-      if (!pod) return missing();
+      if (!pod || pod.gone) return missing();
       if (!match[2]) return reply(200, { metadata: { name: pod.name }, status: statusOf(pod) });
       assert.equal(url.searchParams.get("follow"), "true");
       await pod.claimed;
@@ -645,6 +649,7 @@ class FakeCluster {
       res.on("finish", () => (pod.flushed = true));
       res.write((again && read ? again : lines).map((line) => `${line}\n`).join(""));
       if (hold) return void pod.logs.push(res);
+      if (pod.script.goneAfterMs && !read) setTimeout(() => (pod.gone = true), pod.script.goneAfterMs);
       if (!again || read) this.end(pod);
       else if (pod.script.exitsAfterMs) setTimeout(() => this.end(pod, 0), pod.script.exitsAfterMs);
       return void res.end();
@@ -984,6 +989,31 @@ describe("the Kubernetes runner", () => {
     assert.deepEqual([task.status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
     assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
     assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when a cancel deletes the Job before the pod's status says the container ended", async () => {
+    // The cancel's DELETE takes the Job at once, while the kubelet's word on the container is still to come.
+    const { cluster, runner } = await bare({ pollMs: 200 });
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, exitSeenAfterMs: 2000 });
+    const [task, tenant] = aTask();
+    const handle = await runner.start(task, tenant);
+    const pod = `/api/v1/namespaces/jig/pods/${objectName(task.id)}-x7k2p`;
+    await until(() => cluster.requests.some((request) => request.path === pod), "the pod looked at after its log's read");
+    handle.cancel();
+    const exit = await handle.wait();
+    assert.deepEqual([exit.exitCode, exit.stats, exit.message], [143, { stop: "interrupted", steps: 1 }, "its Job was deleted"]);
+    const types: string[] = [];
+    for await (const event of handle.events) types.push(event.type);
+    assert.deepEqual(types, ["start", "tool_call", "step", "end"]);
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when the pod is gone before its status says the container ended", async () => {
+    // At the Job's deadline, or an eviction, the pod can be deleted while its status still lags its log.
+    const { cluster, runner } = await bare();
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, jobReason: "DeadlineExceeded", exitSeenAfterMs: 500, goneAfterMs: 60 });
+    const [task, tenant] = aTask();
+    const exit = await (await runner.start(task, tenant)).wait();
+    assert.deepEqual([exit.exitCode, exit.timedOut, exit.stats], [143, true, { stop: "interrupted", steps: 1 }]);
   });
 
   it("gives a tenant whose id is no label value a hashed one, the id in an annotation", async () => {

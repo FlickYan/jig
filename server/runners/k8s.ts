@@ -347,6 +347,9 @@ export class KubernetesRunner implements Runner {
     let seq = 0;
     let said: string | undefined;
     let worker: { exitCode?: number; stats?: unknown } = {};
+    // The worker's line as the latest read that got the log has it: what's left when no read after the
+    // container's end can be made, once the Job or the pod is gone (a cancel, a deadline, an eviction).
+    let seen: typeof worker | undefined;
     /** The container has run; and its log was read to the end, after it had ended. */
     let started = false;
     let logged = false;
@@ -358,7 +361,10 @@ export class KubernetesRunner implements Runner {
         const job = await this.get(jobPath);
         pod = (await this.get(`/api/v1/namespaces/${ns}/pods?labelSelector=${encodeURIComponent(selector)}`))?.items?.[0] ?? pod;
         const container = pod?.status?.containerStatuses?.[0]?.state;
-        if (!job) return { exitCode: container?.terminated?.exitCode ?? worker.exitCode ?? null, timedOut: false, stats: worker.stats, message: "its Job was deleted" };
+        if (!job) {
+          const kept = logged ? worker : (seen ?? worker);
+          return { exitCode: container?.terminated?.exitCode ?? kept.exitCode ?? null, timedOut: false, stats: kept.stats, message: "its Job was deleted" };
+        }
         if (!logged && (container?.running || container?.terminated)) {
           started = true;
           const res = await this.send("GET", `/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}/log?container=jig&follow=true`, undefined, 0);
@@ -387,6 +393,7 @@ export class KubernetesRunner implements Runner {
                 else if (line.trim()) said = line.trim().slice(-500);
               }
             }
+            seen = last;
           } else res.resume();
           clearTimeout(hang);
           // Read to its end only once the container has ended (or the pod is gone): a stream that ended before is
@@ -395,7 +402,7 @@ export class KubernetesRunner implements Runner {
           const after = await this.get(`/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}`);
           if (after) pod = after;
           logged = !after || Boolean(after.status?.containerStatuses?.[0]?.state?.terminated);
-          if (logged && last) worker = last;
+          if (logged) worker = (after ? last : seen) ?? worker;
           if (logged) continue;
         }
         const ended = job.status?.conditions?.find((condition) => ["Complete", "Failed"].includes(condition.type) && condition.status === "True");
