@@ -15,7 +15,7 @@ import type { JigEvent, Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { openStore, type Task, type Tenant } from "../server/store.ts";
 import { Channel, KubernetesRunner, labelValue, objectName, POOL_LABEL, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
-import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
+import { Lines, lastLine, MAX_LINE, parseEvent, readStats, tail } from "../server/runners/local.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 import { parseYaml } from "./yaml.ts";
 
@@ -483,6 +483,13 @@ describe("the Docker runner", () => {
     const out = [];
     for (let i = 0; i < bytes.length; i += 1000) out.push(...lines.push(bytes.subarray(i, i + 1000)));
     assert.deepEqual([...out, lines.end()], [`a${wide}`, "b", "c"]);
+  });
+
+  it("leaves out an event whose seq is past what the stores can hold", () => {
+    const line = (seq: number) => JSON.stringify({ v: 1, seq, ts: "", type: "notice", text: "x" });
+    assert.equal(parseEvent(line(2 ** 31 - 1))?.seq, 2 ** 31 - 1);
+    assert.equal(parseEvent(line(2 ** 31)), undefined);
+    assert.equal(parseEvent(line(2 ** 53)), undefined);
   });
 
   it("reads the run's files only where they are regular files, not links or pipes a task's commands left", async () => {

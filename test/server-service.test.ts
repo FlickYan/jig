@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { bracketHost, checkConfig, type Config, resolvePaths, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
+import { PgError } from "../server/pg.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { outcomeOf, Scheduler } from "../server/scheduler.ts";
@@ -543,14 +544,17 @@ class FakeRunner implements Runner {
   }
 }
 
-/** The store, but for `method`, which throws whenever `fails` says so of its second argument (an event's seq). */
-function failingStore(store: Store, method: keyof Store, fails: (second: unknown) => boolean): Store {
+/**
+ * The store, but for `method`, which throws `error` whenever `fails` says so (at once, or once it settles)
+ * of its second argument (an event's seq).
+ */
+function failingStore(store: Store, method: keyof Store, fails: (second: unknown) => boolean | Promise<boolean>, error = () => new Error("the database went away")): Store {
   return new Proxy(store, {
     get(target, name, receiver) {
       const value = Reflect.get(target, name, receiver);
       if (name !== method) return typeof value === "function" ? value.bind(target) : value;
       return async (...args: unknown[]) => {
-        if (fails(args[1])) throw new Error("the database went away");
+        if (await fails(args[1])) throw error();
         return value.apply(target, args);
       };
     },
@@ -784,6 +788,62 @@ const schedulerTests = () => {
     const ended = await endOf(store, task.id);
     assert.deepEqual([ended.status, ended.cost], ["cancelled", 0.75]);
     assert.equal(await billed(store), 0.75);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("tries an outcome again only within half a lease of its first try's start, though that try hangs", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // The first try hangs past half the lease (as a query waits for its timeout), then fails.
+    let tries = 0;
+    const flaky = failingStore(store, "finish", async () => tries++ === 0 && (await new Promise((done) => setTimeout(done, 600)), true));
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    // Given up on, it is left to its lease, which ends it.
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, tries], ["error", 1]);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("doesn't try again a write the database says is wrong in its data, and ends the run as an error", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let tries = 0;
+    const outOfRange = () => new PgError({ C: "22003", M: "value out of range for type integer" });
+    const flaky = failingStore(store, "addEvent", (seq) => seq === 2 && (tries++, true), outOfRange);
+    // A long lease: retried, the write would hold the run for half of it.
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 60_000 });
+    const began = Date.now();
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.error, tries], ["error", "value out of range for type integer", 1]);
+    assert.ok(Date.now() - began < 5000);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("holds a run's slot while its outcome is tried again", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const ids: string[] = [];
+    for (const prompt of ["a0", "a1"]) ids.push((await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" })).id);
+    // The first three tries of the first outcome fail, over 700 ms; when the fourth was begun is kept.
+    let tries = 0;
+    let stored: number | undefined;
+    const flaky = failingStore(store, "finish", () => ++tries <= 3 || ((stored ??= Date.now()), false));
+    const started = new Map<string, number>();
+    const ends = endsWith(0);
+    const runner: Runner = { start: (task, tenant) => (started.set(task.id, Date.now()), ends.start(task, tenant)) };
+    const scheduler = newScheduler(flaky, runner, { concurrency: 4, leaseMs: 4000 });
+    await scheduler.start();
+    await until(() => started.has(ids[1]), "the second run to start");
+    assert.ok(stored !== undefined && started.get(ids[1])! >= stored, "the second run started while the first's outcome was tried again");
+    for (const id of ids) assert.equal((await endOf(store, id)).status, "succeeded");
+    assert.equal(tries, 5);
     await scheduler.close();
     await store.close();
   });

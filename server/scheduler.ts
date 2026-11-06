@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
+import { PgError } from "./pg.ts";
 import { type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
@@ -340,6 +341,8 @@ export class Scheduler {
         // and jig's wait for it ends at its timeout, as a deny. Each write is tried again on a failure,
         // which is safe as each is kept once however often it is made.
         const request = approvalRequest(kept);
+        // A try whose write was made but whose reply was lost leaves the next one undefined, as the approval
+        // is kept already: it is stored, and can be answered, but its webhook isn't sent.
         const approval = request && (await this.retrying(() => this.store.addApproval(task.id, request), run));
         if (approval) asked.set(approval.id, Date.parse(kept.ts));
         await this.retrying(() => this.store.addEvent(task.id, kept.seq, kept), run);
@@ -393,22 +396,25 @@ export class Scheduler {
 
   /**
    * Runs `write`, and on a failure (a dropped connection, a failover) runs it again, waiting 100 ms and then
-   * twice as long each time, up to 2 s, until half a lease has gone by since the first failure, or the run,
-   * still going, is being stopped; then its error is thrown. Half a lease, so that an ended run, whose lease
-   * is no longer renewed, still holds it when the last try is made; and an ended run's outcome is tried for
-   * all of that, however it was stopped, as it holds what the run spent. Each failure is counted. The write
-   * must be one that is kept once however often it is made, as one that failed may have been made.
+   * twice as long each time, up to 2 s, until half a lease has gone by since the first try began, or the run,
+   * still going, is being stopped; then its error is thrown. Half a lease from the first try's start, as a
+   * try can hang (up to the pool's query timeout) before it fails: an ended run's lease is no longer renewed,
+   * but was renewed a third of a lease or less before the run ended (when the renewals went through), so
+   * the run still holds it when the last try is begun. A try begun may end past the lease, which the store
+   * checks: an outcome stored after another replica ended the task isn't stored. An ended run's outcome is tried for all of that, however it was stopped, as it holds what the run
+   * spent. An error the database says is in the data (a value out of range, a constraint broken) is thrown
+   * at once, as it would fail every time. Each failure is counted. The write must be one that is kept once
+   * however often it is made, as one that failed may have been made.
    */
   private async retrying<T>(write: () => Promise<T>, run: Run): Promise<T> {
-    let first: number | undefined;
+    const deadline = Date.now() + this.leaseMs / 2;
     for (let wait = 100; ; wait = Math.min(wait * 2, 2000)) {
       try {
         return await write();
       } catch (err) {
         this.metrics.storeErrors.inc();
-        first ??= Date.now();
-        const left = first + this.leaseMs / 2 - Date.now();
-        if (left <= 0 || (run.stopping && !run.ended)) throw err;
+        const left = deadline - Date.now();
+        if (left <= 0 || (run.stopping && !run.ended) || permanent(err)) throw err;
         await new Promise((done) => setTimeout(done, Math.min(wait, left)));
       }
     }
@@ -418,7 +424,9 @@ export class Scheduler {
     const { id, tenant } = task;
     try {
       // One this replica no longer held was ended by another, which counted it. Tried again on a failure
-      // while the slot is held, so the limits hold; a task given up on ends when its lease runs out.
+      // while the slot is held, so the limits hold; a task given up on ends when its lease runs out. A try
+      // whose write was made but whose reply was lost leaves the next one false, as the task has ended: the
+      // outcome and the ledger are right, but the task isn't counted in the metrics, nor its cost.
       if (await this.retrying(() => this.store.finish(id, this.replicaId, outcome), run)) {
         this.ended(task, outcome.status, Date.now() - run.claimed);
         const spent = spentOf(outcome);
@@ -455,6 +463,14 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
     usage: (end?.usage as Usage | undefined) ?? null,
     cost: typeof end?.cost === "number" ? end.cost : null,
   };
+}
+
+/**
+ * Whether a store's error would come again however often the write is made: Postgres's SQLSTATE classes 22
+ * (a data exception, such as a number out of range) and 23 (an integrity constraint broken).
+ */
+function permanent(err: unknown): boolean {
+  return err instanceof PgError && /^2[23]/.test(err.code);
 }
 
 /** The text with each NUL character replaced by U+FFFD, which shows something was there. */

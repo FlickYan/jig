@@ -141,10 +141,13 @@ go on spending; a local run a crashed service started can outlive it, until jig'
 it.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
-again, after 100 ms and then twice as long each time up to 2 s, for half of `leaseSeconds`: within that,
-the run goes on, and its outcome and cost are stored as they would have been. Only a write that still fails
-stops the run, as an `error`; an outcome that can't be stored is left to its lease, which ends the task as
-an `error` with nothing spent in the usage ledger.
+again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
+since the first try began: within that, the run goes on, and its outcome and cost are stored as they would
+have been. Only a write that still fails stops the run, as an `error`; an outcome that can't be stored is
+left to its lease, which ends the task as an `error` with nothing spent in the usage ledger. During a
+cancel or a shutdown, a write of a run's events or approvals isn't tried again, as the run is stopping:
+past the first failure, its events aren't stored. Its outcome is still tried again. On Postgres, an error in the data itself (SQLSTATE class 22 or 23) isn't
+tried again, as it would fail each time.
 
 ### Several replicas, on Postgres
 
@@ -195,7 +198,7 @@ answered already or a task that has ended. `allow` runs the call, and with `alwa
 has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer (0 once it has ended).
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
-`timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
+`timeout`), and that is the record the list shows. An approval asked for past `maxEvents` or `maxEventBytes` isn't stored, so
 it times out as a deny. The answer jig is given is always the API's, though: on the Docker and Kubernetes
 runners (and on the local one without a sandbox) a task's commands can write its events, so the record of
 how jig acted is only as good as they are. An `approval` event that says the API answered when it didn't,

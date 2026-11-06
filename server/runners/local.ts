@@ -225,11 +225,17 @@ export async function* tail(file: string, finished: () => boolean, pollMs: numbe
   }
 }
 
-/** The event a line holds, or undefined if it isn't one. */
+/** The most a seq can be: what a Postgres integer (and so both stores) can hold. */
+const MAX_SEQ = 2 ** 31 - 1;
+
+/**
+ * The event a line holds, or undefined if it isn't one. A seq past MAX_SEQ isn't one: a run's commands may
+ * write its events, and that one could never be stored.
+ */
 export function parseEvent(line: string): JigEvent | undefined {
   try {
     const event = JSON.parse(line);
-    return event && Number.isInteger(event.seq) && event.seq > 0 && typeof event.type === "string" ? event : undefined;
+    return event && Number.isInteger(event.seq) && event.seq > 0 && event.seq <= MAX_SEQ && typeof event.type === "string" ? event : undefined;
   } catch {
     return undefined;
   }
