@@ -57,8 +57,11 @@ program and first arguments that start jig: this checkout's `src/cli.ts` by defa
 `local.hiddenPaths` (absolute paths the local runner's tasks' commands can't read either, below),
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
-the most of a task's events that are stored: past it they are dropped, but for the `end`, with one `notice`
-event in place of the first dropped, and the run goes on, so a task's commands can't fill the database.
+the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the most bytes of them, as JSON:
+past either they are dropped, but for the `end`, with one `notice` event in place of the first dropped, and
+the run goes on. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
+its events, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what tasks
+store over time.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
@@ -143,6 +146,15 @@ reach of the run (a Kubernetes Job, or a Docker container on its own daemon, bel
 go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
 it.
 
+A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
+again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
+since the first try began: within that, the run goes on, and its outcome and cost are stored as they would
+have been. Only a write that still fails stops the run, as an `error`; an outcome that can't be stored is
+left to its lease, which ends the task as an `error` with nothing spent in the usage ledger. During a
+cancel or a shutdown, a write of a run's events or approvals isn't tried again, as the run is stopping:
+past the first failure, its events aren't stored. Its outcome is still tried again. On Postgres, an error in the data itself (SQLSTATE class 22 or 23) isn't
+tried again, as it would fail each time.
+
 ### Several replicas, on Postgres
 
 With `"database": "postgres://user:password@host:5432/jig?sslmode=require"` (or the URL in
@@ -192,7 +204,7 @@ answered already or a task that has ended. `allow` runs the call, and with `alwa
 has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer (0 once it has ended).
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
-`timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
+`timeout`), and that is the record the list shows. An approval asked for past `maxEvents` or `maxEventBytes` isn't stored, so
 it times out as a deny. The answer jig is given is always the API's, though: on the Docker and Kubernetes
 runners (and on the local one without a sandbox) a task's commands can write its events, so the record of
 how jig acted is only as good as they are. An `approval` event that says the API answered when it didn't,
