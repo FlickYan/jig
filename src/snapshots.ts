@@ -172,7 +172,8 @@ export class Snapshots {
     return this.hidden.flatMap((path) => {
       const real = realTargetSync(path);
       if (real === undefined) return [];
-      if (isInside(real, root)) throw new Error("the settings' hiddenPaths hide the project");
+      // One holding the project hides the rest of what it holds, not the project (see sandbox.ts's ownPlaces).
+      if (real === root) throw new Error("the settings' hiddenPaths hide the project");
       return isInside(root, real) ? [Buffer.from(relative(root, real))] : [];
     });
   }

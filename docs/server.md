@@ -19,8 +19,8 @@ modules, and it isn't part of the npm package.
 queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, tenant)` gives a handle with
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
-own, which is what keeps tenants apart: jig's sandbox protects a user's machine from the model, but its
-commands share the machine's kernel, so it is no wall between tenants.
+own, which is what keeps tenants apart best: jig's sandbox keeps a local task's commands out of the
+database and the other tasks' folders (below), but they share the machine's kernel.
 
 Run it with a config file and the secret it shares with the gateway:
 
@@ -187,10 +187,10 @@ has `approvals`, its `mode` and `pendingApprovals`, how many wait for an answer 
 With no answer within the tenant's `approvalTimeout` (600 seconds), jig takes a deny; the task's time limit
 runs on while it waits. jig's own `approval` event says how each was answered in the end (`by`: `api`, or
 `timeout`), and that is the record the list shows. An approval asked for past `maxEvents` isn't stored, so
-it times out as a deny. The answer jig is given is always the API's, though: on every runner (on the
-local one when `dataDir` is in a temp folder) a task's commands can write its events, so the record of how
-jig acted is only as good as they are. An `approval` event that says the API answered when it didn't, or
-answered otherwise, is left out of the record (and logged), and a timeout is only ever a deny.
+it times out as a deny. The answer jig is given is always the API's, though: on the Docker and Kubernetes
+runners (and on the local one without a sandbox) a task's commands can write its events, so the record of
+how jig acted is only as good as they are. An `approval` event that says the API answered when it didn't,
+or answered otherwise, is left out of the record (and logged), and a timeout is only ever a deny.
 
 jig waits on a second listener, `internal` (`{"host", "port"}`, 127.0.0.1:8082 by default), which serves
 only `GET /internal/approvals/<id>?wait=<seconds>` and `GET /healthz`. Its Bearer is the task's gateway
@@ -236,9 +236,9 @@ the ledger, the `usage` table, in the transaction that ends it, once: `tenant`, 
 ended, `YYYY-MM-DD`), `model`, `status`, `input`, `output`, `cache_read`, `cache_write`, `cost_usd` and
 `seconds` (from its start to its end; 0 if it never started). The tokens and cost are those of jig's `end`
 event, as the task's view has them: a run with none (killed, or lost with its replica) counts 0, as does
-the cost of one whose `end` has none (`null`: a model without a price), and on every runner (on the local
-one when `dataDir` is in a temp folder) a task's commands can write that event, so for what a tenant must
-pay the gateway's counts are the record. Tasks that ended before the ledger came have no row.
+the cost of one whose `end` has none (`null`: a model without a price), and on the Docker and Kubernetes
+runners (and on the local one without a sandbox) a task's commands can write that event, so for what a
+tenant must pay the gateway's counts are the record. Tasks that ended before the ledger came have no row.
 
 ```bash
 # The tenant's own usage, by UTC day, model or both (day,model), over from..to (both included; this month
@@ -323,18 +323,29 @@ jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-lim
 
 with the prompt on stdin, in a process group of its own, so a cancel, or the time limit plus `graceSeconds`
 when jig hasn't stopped itself, reaches everything it started: SIGTERM, then SIGKILL after 5 seconds. Its
-environment is the service's `PATH`, `LANG`, `LC_ALL`, `TZ` and `TMPDIR`, and as its API key
+environment is the service's `PATH`, `LANG`, `LC_ALL` and `TZ`, its own `TMPDIR` (`home/tmp`), and as its API key
 (`ANTHROPIC_API_KEY`, or `DEEPSEEK_API_KEY` for a DeepSeek model) the task's gateway token:
 `jgt1.` + base64url(`{"tenant", "task", "exp", "budgetUsd"}`) + `.` + base64url(HMAC-SHA256 of what comes
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
 
-The local runner is for one trusted tenant, or for development. jig's sandbox lets a task's commands read
-the whole machine, other tasks' folders and the database among them, and write the temp folders (`/tmp`,
-`/var/tmp` and `$TMPDIR`): with `dataDir` or the database there, they can write their own events (the
-`end` event's usage and cost, which go in the ledger) and the database too. The service warns at the start
-when the local runner serves several tenants, or has `dataDir` or the database in a temp folder.
+jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
+and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
+`hiddenPaths`: `dataDir`, the SQLite database's files and the service's config file. A hidden folder that
+holds the project hides all in it but the project and the home directory (README: hiddenPaths), so a
+task's commands work in their project and read their home as before, but can't read or write the other
+tasks' folders, their own events, stats and `output.log`, or the database, in a temp folder too:
+bubblewrap puts an empty folder over `dataDir` and binds the two back as they were, and Seatbelt denies
+`dataDir` but for them. jig's file tools refuse the same paths. jig keeps a long command output, and
+`--keep-inputs`' copies, in `$TMPDIR`, which is why each task has its own there, in its home: in a shared
+one the other tasks' commands could read and write them. What the tasks still share is the machine: its
+kernel, `/tmp` and `/var/tmp` (where a command can still leave a file for another, by its path), and on
+macOS its process list and `localhost`, so the Docker and Kubernetes runners keep tenants apart better.
+The service warns at the start when the local runner serves several tenants, when `dataDir` is in a temp
+folder (where a task's commands can write its home, whose git config jig's own git reads outside the
+sandbox), and when there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the
+machine.
 
 ### The Docker runner
 

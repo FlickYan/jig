@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -17,6 +17,7 @@ import { LocalRunner } from "../server/runners/local.ts";
 import { outcomeOf, Scheduler } from "../server/scheduler.ts";
 import { serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -389,6 +390,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       for (const name of ["ANTHROPIC_AUTH_TOKEN", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "JIG_GATEWAY_SECRET"]) assert.equal(env[name], undefined, name);
       assert.ok(!Object.values(env).includes(SECRET));
       assert.equal(env.JIG_HOME, join(api.dataDir, "tasks", id, "home", ".jig"));
+      // A temp folder of the task's own, not the service's, where jig keeps long outputs (see runners/local.ts).
+      assert.equal(env.TMPDIR, join(api.dataDir, "tasks", id, "home", "tmp"));
     } finally {
       if (saved === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN;
       else process.env.ANTHROPIC_AUTH_TOKEN = saved;
@@ -970,17 +973,32 @@ describe("the service's start", () => {
     });
   }
 
-  it("warns that the local runner keeps no wall between tenants, and that a temp folder lets tasks write their records", async () => {
+  it("hides dataDir, the database and the config from the local runner's tasks, and warns of what they still share", async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
-    const started = await startService(
-      { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)] }] },
-      { secret: SECRET, log },
-    );
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], keepTaskDirs: true, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }, { id: "globex", keys: [sha256(KEYS.globex)] }] };
+    const configFile = join(dir, "service.json");
+    await writeFile(configFile, JSON.stringify(config));
+    const started = await startService(config, { secret: SECRET, log, configFile });
     services.push(started);
-    assert.ok(lines.some((line) => /^jig service: the local runner keeps no wall between tenants/.test(line)), lines.join("\n"));
-    assert.ok(lines.some((line) => /^jig service: dataDir or the database is in a temp folder/.test(line)), lines.join("\n"));
+    const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
+    if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
+    else {
+      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
+      // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
+      // elsewhere), as each task has its own.
+      const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
+      const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
+      if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
+      else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
+    }
+    // Each task's jig gets user settings that hide them from its commands, but for its project and home.
+    const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+    await statusOf(started, id, "succeeded");
+    const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+    const db = join(dir, "jig.db");
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, configFile] });
   });
 
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {
