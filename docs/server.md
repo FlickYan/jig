@@ -407,8 +407,10 @@ say otherwise. The Job is named `jig-<task id>`; its pod runs once (`backoffLimi
 no privilege escalation, no capabilities, a read-only root, seccomp's `RuntimeDefault`, no service account
 token and `runtimeClassName` if one is set (`gvisor`, with `deploy/k8s/runtimeclass.yaml`); the Job's
 `activeDeadlineSeconds` is the task's time limit and the grace, and `ttlSecondsAfterFinished` (600) how long
-it stays after. A Secret the Job owns, so deleted with it, holds the task's token, which jig gets as its
-key, and the prompt and workspace. A Secret holds at most 1 MiB, so a task whose prompt and workspace, with
+it stays after. The pod has `terminationGraceSeconds` (30, 10 at least) between SIGTERM and SIGKILL, and
+jig is given 5 s less to write its events at its end (`JIG_EVENTS_FLUSH_SECONDS`, below), so the `end`,
+which alone says what the task cost, is in the log before the SIGKILL. A Secret the Job owns, so deleted
+with it, holds the task's token, which jig gets as its key, and the prompt and workspace. A Secret holds at most 1 MiB, so a task whose prompt and workspace, with
 the token, come to more is refused (an `error` that says so) before a Job is made for it: keep
 `maxBodyBytes` at its default with this runner. The Job is labelled with its task's id (`jig.dev/task`) and its tenant's
 (`jig.dev/tenant`); a tenant id that can't be a label's value (over 63 characters, with characters
@@ -426,8 +428,10 @@ A pod's files are on its node, out of the service's reach, so the events come in
 `node server/worker.ts`, which makes `HOME` and the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events
-it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) and
-takes the exit code from the pod, the stats from that line and a
+it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) until
+its container has ended: a stream that ends while it runs is read again, whatever its last line, since the
+task's commands can write a line like the worker's too. It takes the exit code from the pod, the stats from
+the worker's line, the last of a read after the container ended, and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
 says so, and a pod that never started (its image couldn't be pulled, or no node had room for it, say) an
 `error` with the pod's reason or the scheduler's, at the deadline. A cancel deletes the Job with
@@ -535,7 +539,8 @@ it. It holds 64 MiB at most, and drops later events (not the `end`; a smaller on
 in a `notice` before the `end`. At its end, on every path a signal included, jig writes what it holds,
 waiting while the reader takes some every 5 s, 60 s at most in all (a SIGTERM in it is acted on when it is
 over; after a signal, 20 s, its commands killed first, a second signal ignored; otherwise Ctrl+C still ends
-the wait at once), and otherwise gives up on the
+the wait at once; `JIG_EVENTS_FLUSH_SECONDS`, if set, lowers both, as the Kubernetes runner does to fit its
+pods' grace), and otherwise gives up on the
 rest, saying how many events on stderr; the last line it wrote may then be cut off, so a reader drops a last
 line without a newline. Once the reader has closed the pipe, or a write jig tries again has failed, jig writes
 no more events and goes on with the task. `/dev/stdout` is not `-`: jig opens it as a file, whose writes may

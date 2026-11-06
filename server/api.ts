@@ -445,6 +445,8 @@ function configProblem(config: Config): string | undefined {
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
     (runner === "kubernetes" ? text("kubernetes.image", config.kubernetes?.image, true) : undefined) ??
+    // jig is given 5 s less than the grace to write its end, and needs 5 for a reader that takes nothing.
+    whole("kubernetes.terminationGraceSeconds", config.kubernetes?.terminationGraceSeconds, 10) ??
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??

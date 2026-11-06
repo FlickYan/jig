@@ -782,6 +782,36 @@ describe("Events", () => {
     });
   });
 
+  it("waits no longer in all than JIG_EVENTS_FLUSH_SECONDS says, at a normal end or after a signal, as a pod's grace needs", () => {
+    // The Kubernetes runner sets it a few seconds under its pods' grace, after which the kubelet's SIGKILL comes.
+    const told: string[] = [];
+    const before = process.env.JIG_EVENTS_FLUSH_SECONDS;
+    try {
+      withContext({ silent: true, told: (text) => told.push(text) }, () => {
+        const waited = (bound: string | undefined, stop: string) => {
+          if (bound === undefined) delete process.env.JIG_EVENTS_FLUSH_SECONDS;
+          else process.env.JIG_EVENTS_FLUSH_SECONDS = bound;
+          const stopped = pipe(); // a reader that never reads
+          const events = new Events("-", "claude-opus-5-5", stopped.io);
+          events.notice("one");
+          assert.equal(events.end(stop, 0)?.exitCode, 0);
+          return stopped.io.now();
+        };
+        assert.equal(waited("3", "end_turn"), 3000);
+        assert.equal(waited("3", "interrupted"), 3000);
+        // Without a positive number, the bounds are jig's own: a reader that takes nothing is given up on after 5 s.
+        for (const bound of [undefined, "0", "-1", "soon"]) assert.equal(waited(bound, "end_turn"), FLUSH_SECONDS * 1000, String(bound));
+        assert.deepEqual(told.slice(0, 2), [
+          "The --events reader didn't take them all in the 3 s jig gives it without a signal: 2 events weren't written.",
+          "The --events reader didn't take them all in the 3 s jig gives it after a signal: 2 events weren't written.",
+        ]);
+      });
+    } finally {
+      if (before === undefined) delete process.env.JIG_EVENTS_FLUSH_SECONDS;
+      else process.env.JIG_EVENTS_FLUSH_SECONDS = before;
+    }
+  });
+
   it("holds lines up to its limit, drops the events past it but for the end, and says how many it dropped", () => {
     const told: string[] = [];
     withContext({ silent: true, told: (text) => told.push(text) }, () => {
