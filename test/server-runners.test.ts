@@ -288,12 +288,13 @@ describe("the Docker runner", () => {
     const task = await ended(api, id);
     assert.deepEqual([task.status, task.stop, task.exitCode], ["succeeded", "end_turn", 0]);
     assert.equal(runner.pool!.stats().hits, 1);
-    // The worker keeps its own names, so the log says which container and folder are the task's.
+    // Its container is renamed for the task, as a cold one is named; its folder keeps the worker's name, which the log says.
+    assert.deepEqual(JSON.parse(await readFile(join(state, "renames.jsonl"), "utf8")), { from: name, to: `jig-${id}` });
     const taken = lines.filter((line) => line.msg === "the task runs on a warm worker");
-    assert.deepEqual(taken.map(({ task, tenant, container, folder }) => ({ task, tenant, container, folder })), [{ task: id, tenant: "acme", container: name, folder: dir(id) }]);
+    assert.deepEqual(taken.map(({ task, tenant, container, folder }) => ({ task, tenant, container, folder })), [{ task: id, tenant: "acme", container: `jig-${id}`, folder: dir(id) }]);
     assert.match(dir(id), /[/\\]tasks[/\\]pool_[0-9a-f]{24}$/);
 
-    // No docker run for the task: it ran in the warm container, with its folder at /task.
+    // No docker run for the task (that record is the run's, by the name it ran with): it ran in the warm container, with its folder at /task.
     assert.ok(!(await runs(state)).has(`jig-${id}`));
     assert.deepEqual(values(warm.args, "--mount"), [`type=bind,source=${dir(id)},target=/task`]);
     // With the isolation a cold container gets, the ticket by name in its environment, and no key.
@@ -348,17 +349,50 @@ describe("the Docker runner", () => {
     assert.deepEqual(await readdir(join(runner.dir("none"), "..")), []);
   });
 
+  it("kills a warm worker's container that a crashed replica left running, renamed for its task when given it", async () => {
+    const base = await tempDir("jig-docker-");
+    const state = join(base, "state");
+    await mkdir(state);
+    const database = join(base, "jig.db");
+    const replica = await crashingReplica(database);
+    // The crashed replica's runner, with a warm worker claiming at a listener of its own.
+    const crashed = new DockerRunner(options(base, state, { pool: { size: 1 } }));
+    const listener = createHttpServer((req, res) => void crashed.claim(req, res));
+    await new Promise<void>((done) => listener.listen(0, "127.0.0.1", done));
+    servers.push({ close: () => new Promise((done) => (listener.closeAllConnections(), listener.close(() => done()))) });
+    crashed.warm(`http://127.0.0.1:${(listener.address() as AddressInfo).port}`);
+    await until(() => crashed.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    const [pool] = [...(await runs(state)).keys()];
+    const task = await replica.claim();
+    const handle = await crashed.start(task, replica.tenant);
+    assert.equal(handle.warm, true);
+    const record = await until(async () => JSON.parse(await readFile(join(crashed.dir(task.id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
+    // Renamed as a cold container is named, so a replica that ends the task finds it.
+    assert.deepEqual(JSON.parse(await readFile(join(state, "renames.jsonl"), "utf8")), { from: pool, to: `jig-${task.id}` });
+    const worker = await pidOf(state, `jig-${task.id}`);
+    // The worker started in its place is stopped; the one with the task is left running, as a crash leaves it.
+    await crashed.close();
+    await replica.crash();
+    assert.ok([worker, record.pid, record.child].every(alive));
+
+    const api = await service(new DockerRunner(options(base, state)), "acme", database);
+    assert.equal((await api.store.task(task.id))!.status, "error");
+    await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
+    assert.deepEqual((await kills(state)).filter((kill) => kill.name === `jig-${task.id}`), [{ signal: "KILL", name: `jig-${task.id}` }]);
+    assert.equal((await handle.wait()).exitCode, 137);
+  });
+
   it("cancels a task on a warm worker with docker kill, which ends everything in its container", async () => {
     const { api, state, runner, dir } = await docker({ pool: { size: 1 } });
     await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
-    const [name] = [...(await runs(state)).keys()];
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "hang" })).body.id;
     const record = await until(async () => JSON.parse(await readFile(join(dir(id), "work", ".fake-jig.json"), "utf8").catch(() => "null")), "the fake jig's record");
-    const worker = await pidOf(state, name);
+    // Sent by the name it has since it was given the task.
+    const worker = await until(() => pidOf(state, `jig-${id}`).catch(() => 0), "the container renamed for the task");
     assert.ok(alive(worker) && alive(record.pid) && alive(record.child));
     assert.equal((await call(api, "POST", `/v1/tasks/${id}/cancel`)).status, 202);
     assert.equal((await ended(api, id)).status, "cancelled");
-    assert.deepEqual((await kills(state)).filter((kill) => kill.name === name), [{ signal: "TERM", name }]);
+    assert.deepEqual(await kills(state), [{ signal: "TERM", name: `jig-${id}` }]);
     await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
   });
 

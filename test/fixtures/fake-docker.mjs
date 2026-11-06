@@ -2,7 +2,9 @@
 // `fake-docker.mjs <state folder> <docker's arguments>`. `run` records its arguments and environment in
 // <state>/<name>.json and runs the container's command as the fake jig, with the paths under the bind
 // mount's target read as its source, in a process group of its own. `kill --signal <s> <name>` records
-// the kill in <state>/kills.jsonl and sends the signal to that group. A flag it doesn't know fails as
+// the kill in <state>/kills.jsonl and sends the signal to that group. `rename <old> <new>` records the
+// rename in <state>/renames.jsonl and moves <old>.pid to <new>.pid, so kills find the container by its new
+// name only (its run's record keeps the name it ran with). A flag it doesn't know fails as
 // docker's do, with 125. Files in <state> change what it does: `delay` holds the milliseconds `run` takes
 // before the container exists (its image being pulled), a `deaf` container ignores TERM, as a jig whose
 // commands hold it up might, and `flood` holds the length of an event too long to read (a text of that
@@ -12,7 +14,7 @@
 // through a proxy here that turns the container's paths in the answer into the host's, and jig into the
 // fake jig, as `run` does for a task's own command.
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { constants } from "node:os";
 import { join } from "node:path";
@@ -83,6 +85,18 @@ if (command === "run") {
   try {
     process.kill(-pid, `SIG${signal}`);
   } catch {} // already gone
+} else if (command === "rename") {
+  const [from, to] = rest;
+  appendFileSync(join(state, "renames.jsonl"), `${JSON.stringify({ from, to })}\n`);
+  if (!existsSync(join(state, `${from}.pid`))) {
+    console.error(`Error response from daemon: No such container: ${from}`);
+    process.exit(1);
+  }
+  if (existsSync(join(state, `${to}.pid`))) {
+    console.error(`Error response from daemon: Conflict. The container name "/${to}" is already in use`);
+    process.exit(1);
+  }
+  renameSync(join(state, `${from}.pid`), join(state, `${to}.pid`));
 } else {
   console.error(`fake docker: no command ${command}`);
   process.exit(1);
