@@ -294,8 +294,16 @@ export class PostgresStore implements Store {
     );
   }
 
-  async events(task: string, after = 0): Promise<{ seq: number; event: object }[]> {
-    const { rows } = await this.pool.query("SELECT seq, json FROM events WHERE task = $1 AND seq > $2 ORDER BY seq", [task, after]);
+  async events(task: string, after = 0, limit?: number, bytes?: number): Promise<{ seq: number; event: object }[]> {
+    // LIMIT NULL is none. An event is left out once those before it come to `bytes`; octet_length reads a
+    // stored value's size without reading the value.
+    const { rows } = await this.pool.query(
+      `SELECT seq, json FROM (
+         SELECT seq, json, sum(octet_length(json)) OVER (ORDER BY seq) - octet_length(json) AS before
+         FROM events WHERE task = $1 AND seq > $2 ORDER BY seq LIMIT $3) page
+       WHERE $4::bigint IS NULL OR before < $4 ORDER BY seq`,
+      [task, after, limit ?? null, bytes ?? null],
+    );
     return rows.map((row) => ({ seq: Number(row.seq), event: JSON.parse(String(row.json)) }));
   }
 

@@ -119,6 +119,16 @@ const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 /** How long what the metrics read from the store is used for, however many scrape meanwhile. */
 const COUNTS_MS = 5_000;
+/**
+ * The most stored events a stream reads at once: a page is read and parsed in one go, which holds the event
+ * loop, and is kept until the client has taken it. 500 of 256 KiB took 250 MB and over a second.
+ */
+const EVENTS_PAGE = 100;
+/**
+ * The most JSON a page of events holds, in bytes, give or take its last event: events can be large (up to a
+ * MiB, the runners' MAX_LINE), and 100 of them would be 100 MB.
+ */
+const PAGE_BYTES = 4 * 1024 * 1024;
 /** A client's x-request-id that is used as it is; any other gets one of the service's own. */
 const REQUEST_ID = /^[\w.-]{1,128}$/;
 
@@ -855,17 +865,30 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * live ones, then `event: done` with the status it ended in, and the stream ends. A client that reconnects
  * with Last-Event-ID gets only what came after. The task may run on this replica, whose scheduler passes on
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
- * (SQLite, or a lost connection to Postgres), the store is read again every second.
+ * (SQLite, or a lost connection to Postgres), the store is read again every second. Stored events are read
+ * a page at a time (EVENTS_PAGE of them, or PAGE_BYTES), and the next page only once the client has taken
+ * the last: a slow client or one that stops reading holds a page, not the task's events.
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;
-  const send = (seq: number, event: object) => {
-    if (seq <= last || ended || res.destroyed) return;
+  // False once what is written waits for the client: no more is written until it has taken it.
+  const send = (seq: number, json: string): boolean => {
+    if (seq <= last || ended || res.destroyed) return true;
     last = seq;
-    res.write(`id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`);
+    return res.write(`id: ${seq}\ndata: ${json}\n\n`);
   };
+  // Until the client has taken what is written, or is gone.
+  const drained = () =>
+    new Promise<void>((done) => {
+      if (res.closed || !res.writableNeedDrain) return done();
+      const go = () => {
+        res.off("drain", go).off("close", go);
+        done();
+      };
+      res.on("drain", go).on("close", go);
+    });
   const end = (status: TaskStatus) => {
     if (ended) return;
     ended = true;
@@ -873,14 +896,31 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     res.end(`event: done\ndata: ${JSON.stringify({ status })}\n\n`);
   };
   // Sends what is stored after the last event sent, and ends the stream if the task has ended. The status
-  // is read first: once a task has ended, all its events are stored. One read at a time, in order.
+  // is read first: once a task has ended, all its events are stored. One read at a time, in order; one
+  // asked for while another waits to start is that one, which will read what this would.
   let reading = Promise.resolve();
+  let waiting = false;
   const pull = () => {
+    if (waiting) return;
+    waiting = true;
     reading = reading
       .then(async () => {
+        waiting = false;
         if (ended || res.destroyed) return;
         const { status } = (await store.task(task.id))!;
-        for (const { seq, event } of await store.events(task.id, last)) send(seq, event);
+        for (;;) {
+          const events = await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES);
+          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
+          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          let bytes = 0;
+          for (const { seq, event } of events) {
+            const json = JSON.stringify(event);
+            bytes += Buffer.byteLength(json);
+            if (!send(seq, json)) await drained();
+          }
+          if (ended || res.destroyed) return;
+          if (events.length < EVENTS_PAGE && bytes < PAGE_BYTES) break;
+        }
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
@@ -888,8 +928,9 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
-  // The next event as it comes goes at once; one after a gap, or the end, sends what is stored first.
-  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 ? send(update.event.seq, update.event) : pull());
+  // The next event as it comes goes at once, unless the client is behind; one after a gap, or the end,
+  // sends what is stored first.
+  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 && !res.writableNeedDrain ? send(update.event.seq, JSON.stringify(update.event)) : pull());
   const changed = (id: string, seq?: unknown) => id === task.id && !(typeof seq === "number" && seq <= last) && pull();
   scheduler.updates.on(task.id, follow);
   store.changes.on("event", changed);
