@@ -303,7 +303,6 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
       }
     : viaService;
   const events = (state.events = sink === undefined ? undefined : new Events(sink, model));
-  events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   // Ctrl+C before the first task starts (while the MCP servers connect, say) ends jig as it would without a
   // handler, but through the exit event, so the end is written and the cleanup below runs.
   const beforeTask = () => process.exit(130);
@@ -327,6 +326,9 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(events?.endedWith ?? 128 + constants.signals[signal]));
     process.on("SIGINT", beforeTask);
   }
+  // Only now, with the handlers above in place: a reader that sees the start may stop jig at once, and a signal
+  // jig has no handler for yet ends it at once, with no end written.
+  events?.start({ task: taskText, cwd, model, version: VERSION, limits: { maxSteps, timeLimit: timeLimit ?? null } });
   const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
   const dirs = values["add-dir"].map((dir) => resolve(dir));
   for (const dir of dirs) if (!existsSync(dir)) throw new Error(`--add-dir: ${dir} doesn't exist`);
