@@ -52,12 +52,14 @@ export interface Start {
  * The events of one run, written to `path`, or to stdout for "-", or handed to a listener as objects. The
  * file is opened before the task starts and written anew: made beside the path and renamed into place, so a
  * link a command left there (one an earlier run's background job made, say) is replaced, not written
- * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is written whole
- * before jig goes on, to the file or to stdout, so a crash loses at most the line being written. Every
- * string goes through the redaction `jig sessions export` uses.
+ * through, as --stats' file is. A path in /dev or /proc is written to as it is. Each event is written as
+ * it happens, so a crash loses at most the line being written; one a pipe on stdout has no room for waits in
+ * jig (see Lines), and at the end jig waits for the reader to take it, up to FLUSH_SECONDS without
+ * progress. Every string goes through the redaction `jig sessions export` uses.
  */
 export class Events {
   private readonly fd: number | undefined; // undefined: stdout, or the listener
+  private readonly lines: Lines | undefined; // undefined: the listener
   private readonly listener: ((event: Event) => void) | undefined;
   private readonly model: string;
   private readonly started = Date.now();
@@ -67,15 +69,24 @@ export class Events {
   private cost: number | null;
   private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
-  private gone = false; // the reader closed the pipe the events go to
 
   constructor(path: string | ((event: Event) => void), model: string) {
     this.model = model;
     this.cost = costOf(model, this.usage) ?? null;
     if (typeof path === "function") this.listener = path;
-    if (typeof path === "function" || path === "-") return;
+    if (typeof path === "function") return;
+    if (path === "-") {
+      // Node makes process.stdout on a pipe or a socket with libuv's uv_pipe_open or uv_tcp_open, which make
+      // fd 1 non-blocking, on Linux as on macOS: a write the reader has no room for then fails with EAGAIN
+      // rather than blocking jig in the kernel, where no signal handler can run. Made here (ui.ts has made it
+      // already) and never written to: a file or a terminal on fd 1 stays blocking, and takes each line at once.
+      void process.stdout;
+      this.lines = new Lines(1);
+      return;
+    }
     if (/^\/(dev|proc)\//.test(path)) {
       this.fd = openSync(path, "a");
+      this.lines = new Lines(this.fd);
       return;
     }
     const temp = `${path}.${randomBytes(4).toString("hex")}.tmp`;
@@ -87,6 +98,7 @@ export class Events {
       rmSync(temp, { force: true });
       throw error;
     }
+    this.lines = new Lines(this.fd);
   }
 
   start(start: Start): void {
@@ -169,6 +181,8 @@ export class Events {
     const seconds = Math.round((Date.now() - this.started) / 100) / 10;
     const end = { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds };
     this.write("end", { ...end });
+    // However jig ends, the end is written (by its exit handler, at worst): what Lines holds goes with it.
+    this.lines?.flush();
     if (this.fd !== undefined) closeSync(this.fd);
     return end;
   }
@@ -177,38 +191,103 @@ export class Events {
     if (this.ended && type !== "end") return;
     const event = redact({ v: 1, seq: ++this.seq, ts: new Date().toISOString(), type, ...fields }).value as Event;
     if (this.listener) return this.listener(event);
-    if (this.gone) return;
-    try {
-      // Written before jig goes on, to stdout as to a file: a write to process.stdout's pipe waited in jig's
-      // memory while the reader was behind, and the exit a signal brings lost it, the end with it.
-      writeWhole(this.fd ?? 1, Buffer.from(`${JSON.stringify(event)}\n`));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EPIPE") throw error;
-      // The reader closed the pipe: no one follows the events now, but the task can still be done.
-      this.gone = true;
-      notice("The --events reader is gone (its pipe was closed): jig writes no more events, and goes on with the task.");
-    }
+    // Not process.stdout.write: what the pipe couldn't take waited in Node, and the exit a signal brings
+    // lost it, the end with it. What Lines holds, end writes before jig exits.
+    this.lines?.write(`${JSON.stringify(event)}\n`);
   }
 }
 
-// What a pipe's writer waits on while its reader is behind: nothing wakes it, so each wait is the few
-// milliseconds given, without spinning.
-const pause = new Int32Array(new SharedArrayBuffer(4));
+/** How long jig, at its end, waits for a reader that takes none of the events it holds before it gives up on them. */
+export const FLUSH_SECONDS = 5;
+// While the reader is behind, how often jig tries again to write the lines it holds.
+const RETRY_MS = 10;
+
+/** What Lines writes with: fs.writeSync, the clock and a wait that doesn't spin, or a test's. */
+export interface Io {
+  write(fd: number, data: Uint8Array): number;
+  now(): number;
+  wait(ms: number): void;
+}
+
+const pause = new Int32Array(new SharedArrayBuffer(4)); // nothing wakes it: each wait is the time given
+const system: Io = { write: (fd, data) => writeSync(fd, data), now: Date.now, wait: (ms) => Atomics.wait(pause, 0, 0, ms) };
 
 /**
- * Writes the whole of `data` to `fd` before it returns. Once process.stdout exists (ui.ts makes it), Node
- * has made a pipe on stdout non-blocking, so while the reader is behind a write takes only part of the
- * data, or fails with EAGAIN: jig writes the rest when there is room, waiting 5 ms at a time. `write` is
- * fs.writeSync, or a test's.
+ * Lines written to `fd` whole and in order, without holding jig up while the fd is a pipe whose reader is
+ * behind (the fd is then non-blocking, see Events). What the pipe can't take now, the rest of a line or all
+ * of it, waits here, every later line behind it, and is tried again every few milliseconds, on a timer that
+ * doesn't keep jig alive. jig never waits for the reader while it runs, so it acts on a signal even when the
+ * reader takes nothing: while a write waited, its signal handlers couldn't run. A file or a terminal takes
+ * each line at once.
  */
-export function writeWhole(fd: number, data: Uint8Array, write = (fd: number, data: Uint8Array, offset: number) => writeSync(fd, data, offset)): void {
-  for (let offset = 0; offset < data.length; ) {
-    try {
-      offset += write(fd, data, offset);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EAGAIN") throw error;
-      Atomics.wait(pause, 0, 0, 5);
+export class Lines {
+  private readonly held: Uint8Array[] = [];
+  private timer: NodeJS.Timeout | undefined;
+  private written = 0; // bytes, to tell whether the reader took any
+  private gone = false; // the reader closed the pipe
+  private readonly fd: number;
+  private readonly io: Io;
+
+  constructor(fd: number, io = system) {
+    this.fd = fd;
+    this.io = io;
+  }
+
+  write(line: string): void {
+    if (this.gone) return;
+    this.held.push(Buffer.from(line));
+    if (this.held.length === 1) this.drain();
+  }
+
+  /** Writes what the fd takes now, and tries the rest again a moment later. */
+  drain(): void {
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    if (!this.take()) this.timer = setTimeout(() => this.drain(), RETRY_MS).unref();
+  }
+
+  /**
+   * At the end: waits for the reader to take what is held, as long as it takes some every FLUSH_SECONDS, and
+   * then gives up on the rest, saying so. Returns how many lines weren't written whole (the first of them
+   * perhaps in part).
+   */
+  flush(): number {
+    clearTimeout(this.timer);
+    let written = this.written;
+    let since = this.io.now();
+    while (!this.take()) {
+      if (this.written > written) [written, since] = [this.written, this.io.now()];
+      else if (this.io.now() - since >= FLUSH_SECONDS * 1000) break;
+      this.io.wait(5);
     }
+    const lost = this.held.length;
+    this.held.length = 0;
+    if (lost) notice(`The --events reader took nothing for ${FLUSH_SECONDS} s: ${lost === 1 ? "1 event wasn't" : `${lost} events weren't`} written.`);
+    return lost;
+  }
+
+  /** Writes held lines until the fd takes no more. Whether none is left. */
+  private take(): boolean {
+    while (this.held.length) {
+      const line = this.held[0];
+      let taken: number;
+      try {
+        taken = this.io.write(this.fd, line);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EAGAIN") return false; // the pipe is full: the reader is behind
+        if (code !== "EPIPE") throw error;
+        // The reader closed the pipe: no one follows the events now, but the task can still be done.
+        this.gone = true;
+        this.held.length = 0;
+        notice("The --events reader is gone (its pipe was closed): jig writes no more events, and goes on with the task.");
+        return true;
+      }
+      this.written += taken;
+      if (taken < line.length) this.held[0] = line.subarray(taken);
+      else this.held.shift();
+    }
+    return true;
   }
 }
 

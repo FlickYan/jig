@@ -7,7 +7,8 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import type { AgentUI } from "../src/agent.ts";
-import { type Event as Written, Events, writeWhole } from "../src/events.ts";
+import { withContext } from "../src/context.ts";
+import { type Event as Written, Events, FLUSH_SECONDS, type Io, Lines } from "../src/events.ts";
 import type { CallModel } from "../src/model.ts";
 import { type FakeApi, fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -247,9 +248,7 @@ describe("--events", () => {
     // A reply's text larger than a pipe holds, and than the reader takes in before it stops reading: Node
     // queued what didn't fit in jig, and lost it at the exit a signal brings, the end with it.
     const long = "All work and no play. ".repeat(20_000);
-    let answered!: () => void;
     let waiting!: () => void;
-    const first = new Promise<void>((done) => (answered = done));
     const second = new Promise<void>((done) => (waiting = done));
     // The first request gets the text and a tool call; the second is taken and never answered.
     let calls = 0;
@@ -257,20 +256,20 @@ describe("--events", () => {
       req.resume();
       if (calls++ > 0) return waiting();
       res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]), answered);
+      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]));
     });
     await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
     const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
     const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
     // A jig held up for good fails the test rather than hangs it.
-    const deadline = setTimeout(() => child.kill("SIGKILL"), 30_000);
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
     try {
       child.stdout.pause(); // the reader is behind: it reads nothing more until jig is stopped
       let stderr = "";
       child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
       const closed = new Promise((done) => child.on("close", (code, signal) => done(code ?? signal)));
-      // Stopped once jig waits for its second reply, or, held up writing the first's text, a second after it.
-      await Promise.race([second, first.then(() => new Promise((done) => setTimeout(done, 1000))), closed]);
+      // Stopped once jig waits for its second reply: the first's events are written, or held, by then.
+      await Promise.race([second, closed]);
       child.kill("SIGTERM");
       let stdout = "";
       child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
@@ -286,6 +285,89 @@ describe("--events", () => {
       assert.equal(events[2].text, long);
       const end = events.at(-1)!;
       assert.deepEqual([end.type, end.stop, end.exitCode], ["end", "interrupted", 143]);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      api.close();
+    }
+  });
+
+  it("with -, writes every line by the normal end of a run whose reader is behind, and goes on without it", async () => {
+    const long = "All work and no play. ".repeat(40_000);
+    let waiting!: () => void;
+    const second = new Promise<void>((done) => (waiting = done));
+    const api = await fakeMessagesApi((request) => {
+      if ((request.messages as unknown[]).length === 1) return [{ text: long }, { tool: "glob", input: { pattern: "*" } }];
+      waiting();
+      return [{ text: "Done." }];
+    });
+    const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    try {
+      child.stdout.pause(); // behind until jig has asked its second question
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      const closed = new Promise((done) => child.on("close", (code, signal) => done(code ?? signal)));
+      await Promise.race([second, closed]);
+      let stdout = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+      child.stdout.resume();
+      assert.equal(await closed, 0, stderr);
+      const events = parse(stdout);
+      assert.deepEqual(types(events), ["start", "step", "text", "tool_call", "tool_result", "step", "text", "end"]);
+      assert.equal(events[2].text, long);
+      assert.equal(api.requests.length, 2);
+      assert.doesNotMatch(stderr, /--events reader/);
+    } finally {
+      clearTimeout(deadline);
+      child.kill("SIGKILL");
+      api.close();
+    }
+  });
+
+  it("with -, goes on while the reader takes nothing, and on SIGTERM gives up on it within 5 s, saying how many events it held", async () => {
+    // The text fills the pipe: a jig that waited for the reader ignored SIGTERM, its handler never run.
+    const long = "All work and no play. ".repeat(40_000);
+    let waiting!: () => void;
+    const second = new Promise<void>((done) => (waiting = done));
+    let calls = 0;
+    const server = createServer((req, res) => {
+      req.resume();
+      if (calls++ > 0) return waiting();
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]));
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+    const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+    const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+    try {
+      // The reader never reads, and keeps the pipe open, until jig has exited (Node resumes it then).
+      let stdout = "";
+      child.stdout.setEncoding("utf8").on("data", (chunk) => (stdout += chunk));
+      child.stdout.pause();
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+      // Exited, not closed: its stdout isn't closed while the reader leaves it unread.
+      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+      await Promise.race([second, exited]);
+      assert.equal(calls, 2, `jig went on to its second request without the reader: ${stderr}`);
+      const killed = Date.now();
+      child.kill("SIGTERM");
+      assert.equal(await exited, 143, stderr);
+      const took = Date.now() - killed;
+      assert.ok(took >= 4_500 && took < 10_000, `exited ${took} ms after SIGTERM`);
+      const [, held] = stderr.match(/The --events reader took nothing for 5 s: (\d+) events? (weren't|wasn't) written\./) ?? [];
+      assert.ok(held, stderr);
+      // What did arrive: the first lines whole and in order, then perhaps part of the next.
+      const closed = new Promise((done) => child.on("close", done));
+      child.stdout.resume();
+      await closed;
+      const events = parse(stdout.slice(0, stdout.lastIndexOf("\n") + 1));
+      assert.deepEqual(types(events), ["start", "step", "text", "tool_call", "tool_result"].slice(0, events.length));
+      assert.ok(events.length >= 2, `${events.length} whole lines came`);
+      // Those and the ones it held are all of them: the five, and the end.
+      assert.equal(events.length + Number(held), 6, stderr);
     } finally {
       clearTimeout(deadline);
       child.kill("SIGKILL");
@@ -342,29 +424,75 @@ describe("Events", () => {
     return { got, events, ui: events.ui({ toolCall() {}, toolResult() {}, notice() {} } as AgentUI) };
   };
 
-  it("writes a line whole to a pipe whose reader is behind: what is left after a part, and after EAGAIN", () => {
-    const data = Buffer.from(`${JSON.stringify({ text: "x".repeat(100) })}\n`);
-    const got: number[] = [];
-    let call = 0;
-    // As a non-blocking pipe: 7 bytes, full, full, 30 bytes, full, then the rest.
-    const write = (fd: number, buffer: Uint8Array, offset: number): number => {
-      assert.equal(fd, 1);
-      call++;
-      if (call === 2 || call === 3 || call === 5) throw Object.assign(new Error("EAGAIN: resource temporarily unavailable, write"), { code: "EAGAIN" });
-      const taken = buffer.subarray(offset, call === 1 ? offset + 7 : call === 4 ? offset + 30 : undefined);
-      got.push(...taken);
-      return taken.length;
-    };
-    const started = Date.now();
-    writeWhole(1, data, write);
-    assert.deepEqual(Buffer.from(got), data);
-    assert.equal(call, 6);
-    assert.ok(Date.now() - started >= 10, "it waited at each EAGAIN");
-    // Any other failure is the caller's.
-    const closed = () => {
-      throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" });
-    };
-    assert.throws(() => writeWhole(1, data, closed), /EPIPE/);
+  it("holds what a pipe whose reader is behind can't take, every later line behind it, and writes it in order as room comes", () => {
+    const { io, got, room } = pipe();
+    const lines = new Lines(1, io);
+    room(7);
+    lines.write("first line\n");
+    lines.write("second\n"); // held behind the rest of the first, though the pipe has no room for either
+    assert.equal(got(), "first l");
+    room(5);
+    lines.drain(); // as the retry does
+    assert.equal(got(), "first line\ns");
+    room(Infinity);
+    lines.write("third\n");
+    assert.equal(got(), "first line\ns", "the third waits behind the second");
+    lines.drain();
+    assert.equal(got(), "first line\nsecond\nthird\n");
+  });
+
+  it("at the end waits for a reader that takes some, and gives up on one that takes nothing for 5 s", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      // Takes 2 bytes every 4 s: slow, but never 5 s without taking any.
+      let next = 0;
+      const slow = pipe((now) => (now < next ? 0 : ((next = now + 4000), 2)));
+      const lines = new Lines(1, slow.io);
+      lines.write("abcdef\n");
+      assert.equal(lines.flush(), 0);
+      assert.equal(slow.got(), "abcdef\n");
+      assert.ok(slow.io.now() >= 12_000, `waited ${slow.io.now()} ms`);
+      assert.deepEqual(told, []);
+
+      // Takes 3 bytes, then nothing.
+      const stopped = pipe();
+      const held = new Lines(1, stopped.io);
+      stopped.room(3);
+      for (const line of ["one\n", "two\n", "three\n"]) held.write(line);
+      assert.equal(held.flush(), 3);
+      assert.equal(stopped.got(), "one");
+      assert.equal(stopped.io.now(), FLUSH_SECONDS * 1000);
+      assert.deepEqual(told, ["The --events reader took nothing for 5 s: 3 events weren't written."]);
+    });
+  });
+
+  it("writes no more once the reader closed the pipe, says so once, and leaves any other failure to the caller", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      let calls = 0;
+      const closed: Io = {
+        write: () => {
+          calls++;
+          throw Object.assign(new Error("EPIPE: broken pipe, write"), { code: "EPIPE" });
+        },
+        now: () => 0,
+        wait: () => {},
+      };
+      const lines = new Lines(1, closed);
+      lines.write("one\n");
+      lines.write("two\n");
+      assert.equal(lines.flush(), 0);
+      assert.equal(calls, 1);
+      assert.equal(told.length, 1);
+      assert.match(told[0], /no more events/);
+      const broken: Io = {
+        ...closed,
+        write: () => {
+          throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+        },
+      };
+      assert.throws(() => new Lines(1, broken).write("one\n"), /EIO/);
+    });
   });
 
   it("blanks out a key before it cuts the output, so a key the cut falls in isn't left half there", () => {
@@ -445,4 +573,27 @@ async function runSplit(api: FakeApi, argv: string[]): Promise<{ code: number | 
   child.stdin.end();
   const code = await new Promise<number | null>((done) => child.on("close", done));
   return { code, stdout, stderr };
+}
+
+/**
+ * A non-blocking pipe for Lines, on a clock that moves only as Lines waits: it takes what room() allows, or
+ * what `taking` gives at each moment, and fails with EAGAIN when it takes nothing.
+ */
+function pipe(taking?: (now: number) => number) {
+  let clock = 0;
+  let room = 0;
+  const bytes: number[] = [];
+  const io: Io = {
+    write: (fd, data) => {
+      assert.equal(fd, 1);
+      const taken = data.subarray(0, Math.min(data.length, taking ? taking(clock) : room));
+      if (!taken.length) throw Object.assign(new Error("EAGAIN: resource temporarily unavailable, write"), { code: "EAGAIN" });
+      if (!taking) room -= taken.length;
+      bytes.push(...taken);
+      return taken.length;
+    },
+    now: () => clock,
+    wait: (ms) => void (clock += ms),
+  };
+  return { io, got: () => Buffer.from(bytes).toString(), room: (bytes: number) => void (room = bytes) };
 }

@@ -507,8 +507,10 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
-goes to stdout: the terminal's output goes to stderr. Each line is written whole before jig goes on, to the
-pipe as to a file: jig waits while the reader is behind, so a signal loses no line; once the reader has
+goes to stdout: the terminal's output goes to stderr. What the pipe can't take while the reader is behind
+waits in jig, in order, and jig goes on: a stopped reader holds the events, not jig, so a signal still ends
+it. At its end, on every path a signal included, jig writes what it holds, waiting while the reader takes
+some every 5 s, and otherwise gives up on the rest, saying how many events on stderr. Once the reader has
 closed the pipe, jig writes no more events and goes on with the task.
 
 `jig --approve-via <url>` asks for the tool calls the mode would ask about at a terminal over HTTP: after the
