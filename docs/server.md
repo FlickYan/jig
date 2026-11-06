@@ -413,8 +413,9 @@ with its exit code and `--stats`. The service follows the log (from the start ag
 it has, should the stream break, and any line over 1 MiB, which only the task's commands would write) and
 takes the exit code from the pod, the stats from that line and a
 reason from the Job: past its deadline the task is `stopped` (`time_limit`), out of memory an `error` that
-says so, and a pod that never started (its image couldn't be pulled, say) an `error` with the pod's
-reason, at the deadline. A cancel deletes the Job with `propagationPolicy: Background`, which takes its pod
+says so, and a pod that never started (its image couldn't be pulled, or no node had room for it, say) an
+`error` with the pod's reason or the scheduler's, at the deadline. A cancel deletes the Job with
+`propagationPolicy: Background`, which takes its pod
 and Secret with it, asked again every few seconds if the API server fails it. The Jobs a crashed replica
 left are deleted the same way by the replica that ends their tasks, found by their `jig.dev/task` label (a
 warm worker's Job too, once given its task), so the Role in `deploy/k8s/rbac.yaml` allows `list` on Jobs.
@@ -851,3 +852,28 @@ gateway, with a Redis that keeps its data in a volume, so a restart of either fo
 Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sha256sum`) in place of the
 placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
 refuses to start with it.
+
+### Trying it on kind
+
+`deploy/kind.sh` runs `deploy/k8s` on a [kind](https://kind.sigs.k8s.io) cluster on your machine (docker,
+kind and kubectl needed): it makes the cluster, with Calico, which enforces the NetworkPolicies, builds the
+two images and loads them, applies `deploy/k8s` as it is, then the Secrets it leaves to you, a Postgres,
+and a fake model provider the gateway calls in place of DeepSeek, so no task reaches a model API or spends
+anything; it points the router at the service, posts a task through it (the fake provider has `run: <a
+command>` run in bash), prints its events, and shows what a pod labelled as a task's reaches. `deploy/kind.sh
+down` deletes the cluster. `SERVICE='{"kubernetes": {"pool": {"size": 1}}}'` adds to the service's config,
+and `BUILD=0` keeps the images there are. kind's own network plugin needs the kernel's nft queue for
+NetworkPolicy, which some kernels lack, hence Calico; and the cluster has containerd keep the pods'
+`oom_score_adj` no lower than its own, as root may not lower it on some machines.
+
+On such a cluster (Kubernetes 1.32, with kind 0.27 and Calico 3.29) the tasks ran as Jobs with their events
+streamed, asked for approvals at the internal listener, were cancelled and stopped at their time limits
+and Jobs' deadlines, took warm workers, and outlived a replica killed mid-task, whose Jobs the other
+deleted; a tenant whose id has a space was labelled with its hash, the API server took a Secret of 1 MiB and
+refused one byte more, as the runner's check has it, and a log of 30 MB, rotated by the kubelet on the way,
+was read to its end. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
+metrics ports answered only the `monitoring` namespace, and Redis only the gateway. Two things the fake API
+server in the tests didn't show were fixed: the kubelet ends a log's stream a moment before the pod's
+status says the container has ended, so every log was read twice (now a stream that ends with the worker's
+line is taken as whole), and a pod no node had room for has no container to say why it waits (now the
+scheduler's reason is the task's error).

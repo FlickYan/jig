@@ -337,9 +337,10 @@ export class KubernetesRunner implements Runner {
     let seq = 0;
     let said: string | undefined;
     let worker: { exitCode?: number; stats?: unknown } = {};
-    /** The container has run; and its log was read to the end. */
+    /** The container has run; its log was read to the end; and the last line read was the worker's. */
     let started = false;
     let logged = false;
+    let reported = false;
     let pod: Resource | undefined;
     let failure: unknown;
     let pause = pollMs;
@@ -357,6 +358,8 @@ export class KubernetesRunner implements Runner {
           if (res.statusCode === 200) {
             for await (const line of lines(res)) {
               const event = parseEvent(line);
+              // The worker's line is the log's last: a stream that ends with it has the whole log.
+              reported = false;
               if (event && event.seq > seq) {
                 // jig's seqs follow one another: a gap is events the log no longer has, once the kubelet has
                 // rotated it before a read again (or ones too long to read). A notice takes the first's seq.
@@ -370,16 +373,18 @@ export class KubernetesRunner implements Runner {
                 await events.push(event);
               } else if (!event) {
                 const ours = workerLine(line);
-                if (ours) worker = ours;
+                if (ours) [worker, reported] = [ours, true];
                 else if (line.trim()) said = line.trim().slice(-500);
               }
             }
           } else res.resume();
           clearTimeout(hang);
-          // Read to its end once the container has ended; a stream cut short before is read again.
+          // Read to its end once the container has ended, or once the stream ended with the worker's line (the
+          // kubelet ends it as the container exits, a moment before the pod's status says so); a stream cut
+          // short before is read again.
           const after = await this.get(`/api/v1/namespaces/${ns}/pods/${pod!.metadata!.name}`);
           if (after) pod = after;
-          logged = !after || Boolean(after.status?.containerStatuses?.[0]?.state?.terminated);
+          logged = !after || reported || Boolean(after.status?.containerStatuses?.[0]?.state?.terminated);
           if (logged) continue;
         }
         const ended = job.status?.conditions?.find((condition) => ["Complete", "Failed"].includes(condition.type) && condition.status === "True");
@@ -388,7 +393,8 @@ export class KubernetesRunner implements Runner {
           const exitCode = terminated?.exitCode ?? worker.exitCode ?? null;
           // A pod that never started (its image couldn't be pulled, say) is an error, not a time limit.
           const timedOut = started && ended.reason === "DeadlineExceeded";
-          const waiting = pod?.status?.containerStatuses?.[0]?.state?.waiting;
+          // Why it never started: its container's waiting reason, or, with no container yet, the scheduler's.
+          const waiting = pod?.status?.containerStatuses?.[0]?.state?.waiting ?? pod?.status?.conditions?.find((condition) => condition.type === "PodScheduled" && condition.status === "False");
           const message =
             terminated?.reason === "OOMKilled" ? `it ran out of memory (OOMKilled)${said ? `: ${said}` : ""}`
             : exitCode === null ? [ended.reason, ended.message, waiting && `the pod was ${waiting.reason}: ${waiting.message ?? ""}`].filter(Boolean).join(": ")

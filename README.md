@@ -724,7 +724,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts), [`state.ts`](server/state.ts), [`redis.ts`](server/redis.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits and quotas, usage and budgets, in memory or in Redis for several replicas, and failover between providers |
 | [`server/router.ts`](server/router.ts) | The router in front of several regions ([docs/server.md](docs/server.md)): each tenant's requests to its home region, a task's to the region in its id, new tasks to another region while the home is down |
 | [`server/metrics.ts`](server/metrics.ts), [`log.ts`](server/log.ts), [`service-metrics.ts`](server/service-metrics.ts) | What the service, the gateway and the router say about themselves: metrics in Prometheus's text format, and logs as plain lines or JSON (`JIG_LOG_FORMAT=json`); the task service's metrics |
-| [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, Kubernetes manifests, and Prometheus, alert and Grafana files |
+| [`deploy/`](deploy) | The worker and server images, a Docker Compose file for one machine, Kubernetes manifests and a script to try them on kind, and Prometheus, alert and Grafana files |
 | [`bench/`](bench) | The benchmark: tasks, runner and report; [`bench/memory/`](bench/memory) and `bench/memory.ts`, the memory benchmark |
 | [`eval/`](eval) | Terminal-Bench through Harbor: jig's adapter, the runner, the task samples, the report and its results |
 
