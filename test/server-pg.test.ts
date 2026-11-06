@@ -273,10 +273,11 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     const db = pool(url, { max: 1 });
     const admin = pool(url);
     const mark = marker();
-    const sleeping = db.query(`SELECT pg_sleep(30), '${mark}'`);
+    // Caught at once: the query can fail while the terminate is still being answered, before it is awaited.
+    const sleeping = db.query(`SELECT pg_sleep(30), '${mark}'`).then(() => undefined, (err: Error) => err);
     const pid = await backendOf(admin, mark);
     await admin.query("SELECT pg_terminate_backend($1)", [pid]);
-    await assert.rejects(sleeping, /terminating connection|connection to the database was lost/);
+    assert.match(String((await sleeping)?.message), /terminating connection|connection to the database was lost/);
     assert.notEqual((await db.query("SELECT pg_backend_pid() AS pid")).rows[0].pid, pid);
   });
 
@@ -331,5 +332,37 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     await admin.query("SELECT pg_notify($1, 'after')", [channel]);
     await until(() => heard.length === 2, "the notification after it came back");
     assert.deepEqual(heard, ["before", "after"]);
+  });
+});
+
+describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => {
+  it("reads a task's events a page at a time, and all of them without a limit", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    for (let seq = 1; seq <= 250; seq++) await store.addEvent(task.id, seq, { v: 1, seq, ts: "", type: "text" });
+    const seqs = async (after: number, limit?: number) => (await store.events(task.id, after, limit)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100), Array.from({ length: 100 }, (_, i) => i + 1));
+    assert.deepEqual(await seqs(100, 100), Array.from({ length: 100 }, (_, i) => i + 101));
+    assert.deepEqual(await seqs(200, 100), Array.from({ length: 50 }, (_, i) => i + 201));
+    assert.equal((await seqs(0)).length, 250);
+  });
+
+  it("stops a page of a task's events once their JSON comes to the bytes asked for, in UTF-8", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // "é" is a character, and two bytes in UTF-8.
+    const event = (seq: number) => ({ v: 1, seq, ts: "", type: "text", text: "é".repeat(1000) });
+    for (let seq = 1; seq <= 10; seq++) await store.addEvent(task.id, seq, event(seq));
+    const size = Buffer.byteLength(JSON.stringify(event(1)));
+    const seqs = async (after: number, limit: number, bytes: number) => (await store.events(task.id, after, limit, bytes)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100, 3 * size), [1, 2, 3]);
+    assert.deepEqual(await seqs(0, 100, 3 * size + 1), [1, 2, 3, 4]);
+    assert.deepEqual(await seqs(2, 100, 1), [3]);
+    assert.deepEqual(await seqs(0, 2, 100 * size), [1, 2]);
+    assert.deepEqual(await seqs(7, 100, 100 * size), [8, 9, 10]);
   });
 });

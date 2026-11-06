@@ -39,13 +39,21 @@ groups:
           summary: "Over 5% of the task service's requests fail with a 5xx"
           description: "Its error lines (level error, with the request's id) say why."
       - alert: JigStoreErrors
-        expr: sum(increase(jig_service_store_errors_total[5m])) > 0
+        expr: sum(increase(jig_service_store_errors_total{retried="false"}[5m])) > 0
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "The task service can't read or write its database"
-          description: "Tasks aren't started, or their events and outcomes aren't stored."
+          description: "Reads and writes failed past their retries: tasks aren't started, or their events and outcomes aren't stored. The service's error lines say which."
+      - alert: JigStoreDegraded
+        expr: sum(increase(jig_service_store_errors_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reads and writes of the task service's database keep failing"
+          description: "Each failed try is counted, also one a retry then got through (retried is true), so this alone doesn't mean anything was lost: JigStoreErrors says when it was."
       - alert: JigLeaseErrors
         expr: sum by (instance) (increase(jig_service_lease_errors_total[5m])) > 0
         for: 2m
@@ -61,6 +69,14 @@ groups:
         annotations:
           summary: "{{ $labels.tenant }} is being refused tasks at a quota"
           description: "Its tasksPerDay, usdPerDay or usdPerMonth: GET /admin/usage shows what it used."
+      - alert: JigWebhookFailures
+        expr: sum by (tenant) (increase(jig_service_webhook_deliveries_total{result="failed"}[15m])) / sum by (tenant) (increase(jig_service_webhook_deliveries_total[15m])) > 0.5 and sum by (tenant) (increase(jig_service_webhook_deliveries_total[15m])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Over half of {{ $labels.tenant }}'s approval webhooks fail"
+          description: "Its endpoint isn't 2xx after 4 tries (a redirect counts as a failure), so it isn't told of approvals, which time out as denies: the service's warn lines say why."
       - alert: JigServiceDown
         expr: up{component="api"} == 0
         for: 2m

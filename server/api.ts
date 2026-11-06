@@ -1,14 +1,16 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
-import { type Runner, workspaceProblem } from "./runner.ts";
+import { checkedGit, type Runner, workspaceProblem } from "./runner.ts";
 import { DockerRunner, type DockerRunnerConfig } from "./runners/docker.ts";
 import { KubernetesRunner, type KubernetesRunnerConfig } from "./runners/k8s.ts";
 import { LocalRunner } from "./runners/local.ts";
@@ -80,6 +82,10 @@ export interface Config {
   graceSeconds?: number;
   jig?: string[];
   gitProtocols?: string[];
+  /** The hosts a workspace may be cloned from (default: any). */
+  gitHosts?: string[];
+  /** The local runner's: what else its tasks' commands can't read, as absolute paths. */
+  local?: { hiddenPaths?: string[] };
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
   /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
@@ -92,6 +98,8 @@ export interface Config {
   leaseSeconds?: number;
   /** The most events of a task's that are stored. */
   maxEvents?: number;
+  /** The most bytes of a task's events (as JSON) that are stored. */
+  maxEventBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
@@ -102,7 +110,7 @@ export interface Config {
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "internalBaseUrl" | "log";
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
 /** The longest time limit or approval timeout, in seconds: under jig's 24 days, and a timer's 2^31 ms. */
@@ -111,6 +119,16 @@ const MAX_PROMPT = 100_000;
 const MAX_FILES = 1_000;
 /** How long what the metrics read from the store is used for, however many scrape meanwhile. */
 const COUNTS_MS = 5_000;
+/**
+ * The most stored events a stream reads at once: a page is read and parsed in one go, which holds the event
+ * loop, and is kept until the client has taken it. 500 of 256 KiB took 250 MB and over a second.
+ */
+const EVENTS_PAGE = 100;
+/**
+ * The most JSON a page of events holds, in bytes, give or take its last event: events can be large (up to a
+ * MiB, the runners' MAX_LINE), and 100 of them would be 100 MB.
+ */
+const PAGE_BYTES = 4 * 1024 * 1024;
 /** A client's x-request-id that is used as it is; any other gets one of the service's own. */
 const REQUEST_ID = /^[\w.-]{1,128}$/;
 
@@ -161,10 +179,12 @@ export async function startService(
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
   // A Bearer is read up to the first whitespace, so a key with some could never be given.
   if (adminKey && /\s/.test(adminKey)) throw new Error(`${config.adminKeyEnv} holds whitespace (a trailing newline?): the admin key can't hold any`);
-  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log);
+  const metrics = serviceMetrics();
+  // Each tenant's refusals start at 0, so increase() sees the first.
+  for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region });
   const answers = new Answers(store);
-  const metrics = serviceMetrics();
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
    * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
@@ -245,12 +265,18 @@ export async function startService(
     internalUrl = await listen(internal, config.internal?.port ?? 8082, config.internal?.host ?? "127.0.0.1");
     url = await listen(server, config.port ?? 8080, config.host ?? "127.0.0.1");
     if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
-    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, configFile);
+    // What the local runner hides beside dataDir that holds more than the service's own files.
+    const folders = !runner && (config.runner ?? "local") === "local" ? hiddenFolders(config.dataDir, configFile) : [];
+    runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, folders);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
-    if (runner instanceof LocalRunner) for (const warning of localRisks(config)) log.warn(warning);
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, keepTaskDirs } = config;
+    if (runner instanceof LocalRunner) for (const warning of localRisks(config, folders)) log.warn(warning);
+    // The Kubernetes runner's clone is in the task's pod, on its network.
+    if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
+      log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
+    }
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, keepTaskDirs, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
     const expired = await scheduler.start();
     if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
   } catch (err) {
@@ -266,6 +292,7 @@ export async function startService(
     answers,
     region: config.region ?? null,
     model: config.model ?? "deepseek-flash",
+    gitHosts: config.gitHosts,
     maxBody: config.maxBodyBytes ?? 1024 * 1024,
     heartbeatMs: (config.heartbeatSeconds ?? 15) * 1000,
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
@@ -277,13 +304,15 @@ export async function startService(
 
 /**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
- * from their commands, but for the task's own project and home, and the database and the config (see
- * runners/local.ts); without one, they run directly on the machine. With one, they share its kernel, /tmp
- * and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost. And with
- * dataDir in one of those, which they can write, a task's commands can change its home there, whose git
- * config jig's own git reads, outside the sandbox.
+ * from their commands, but for the task's own project and home, and the database and the config's folder
+ * (see runners/local.ts); without one, they run directly on the machine. With one, they share its kernel,
+ * /tmp and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read
+ * whatever else the service's user can, and connect to the Unix sockets there, which a read-only file
+ * system doesn't stop. And with dataDir in one of those, which they can write, a task's commands can change
+ * its home there, whose git config jig's own git reads, outside the sandbox. A hidden folder (`folders`)
+ * that is the machine's root, /etc, /usr or the service user's home hides what their commands need.
  */
-function localRisks(config: Config): string[] {
+function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
   // task's own TMPDIR: not the service's.
   const temps = (process.platform === "darwin" ? ["/tmp", "/private/tmp"] : ["/tmp", "/var/tmp"]).flatMap((dir) => [dir, realOrSame(dir)]);
@@ -295,7 +324,15 @@ function localRisks(config: Config): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
-    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
+    "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
+    ...folders.flatMap(({ what, path }) => {
+      const real = realOrSame(path);
+      const home = realOrSame(homedir());
+      if (real !== home && !["/", "/etc", "/usr"].some((dir) => real === realOrSame(dir))) return [];
+      const fix = what === "the config's folder" ? "keep the config in a folder of its own" : "keep dataDir out of that checkout";
+      return [`the local runner hides ${what}, ${path}, from its tasks' commands, and that is ${real === home ? "the service user's home directory, where the toolchains they use may be" : "a folder every task's commands need"}: ${fix}`];
+    }),
+    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
 }
@@ -327,7 +364,7 @@ function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: 
     read = { at: Date.now(), counts: reading };
     // A failed read is tried again at the next scrape; meanwhile the gauges stay as they were.
     reading.catch(() => {
-      metrics.storeErrors.inc();
+      metrics.storeErrors.inc({ retried: "false" });
       if (read?.counts === reading) read = undefined;
     });
     return reading;
@@ -372,14 +409,15 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
 
 /**
  * The runner the config names, its lines (and its pool's) in the service's `log`. The local runner's tasks'
- * commands can't read the SQLite database's files or the config (`configFile`), beside dataDir.
+ * commands can't read, beside dataDir, the SQLite database's files, `folders` (hiddenFolders') and what the
+ * config's local.hiddenPaths list.
  */
-function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, configFile?: string): Runner {
-  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, internalBaseUrl, log };
+function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, folders: HiddenFolder[]): Runner {
+  const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, gitRedirects: !config.gitHosts, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
-    const hidden = [...database, ...(configFile ? [configFile] : [])];
+    const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
     return new LocalRunner({ ...shared, hidden, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
@@ -387,6 +425,47 @@ function runnerFor(config: Config, secret: string, internalBaseUrl: string, log:
   if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
   if (runner === "kubernetes") throw new Error('The kubernetes runner needs "kubernetes": {"image"}: the worker image');
   throw new Error(`runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`);
+}
+
+/** A folder the local runner hides that holds more than the service's own files, and what it is. */
+interface HiddenFolder {
+  what: string;
+  path: string;
+}
+
+/**
+ * The folders the local runner hides beside dataDir and the database: the one the config (`configFile`) is
+ * in, where the service's other secrets are kept too, and the git checkouts dataDir is in (the service run
+ * from one, say), as git finds them once at the start: its own, and that one's superproject, if it is a
+ * submodule, or main checkout, if it is a worktree. GIT_CEILING_DIRECTORIES keeps a task's git out of them,
+ * but not its commands' reads: their files, a deploy's .env among them, are the service's. Whoever owns
+ * them: git would otherwise refuse another user's checkout, which would stay readable.
+ */
+function hiddenFolders(dataDir: string, configFile: string | undefined): HiddenFolder[] {
+  const folders = configFile ? [{ what: "the config's folder", path: dirname(resolve(configFile)) }] : [];
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    // The superproject last, as git prints nothing for it outside a submodule. The common folder comes
+    // relative to dataDir unless it is elsewhere: --path-format=absolute would make it absolute, but a git
+    // before 2.31 (Debian 11 has 2.30) prints it back as if it were a path.
+    const args = ["-c", "safe.directory=*", "rev-parse", "--show-toplevel", "--git-common-dir", "--show-superproject-working-tree"];
+    const said = execFileSync("git", args, { cwd: dataDir, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+    const [top, relativeCommon, superproject] = said.split("\n");
+    const common = relativeCommon && realpathSync(resolve(realpathSync(dataDir), relativeCommon));
+    if (top) folders.push({ what: "the git checkout dataDir is in", path: top });
+    // A checkout's own common folder is its .git; a worktree's, its main checkout's; a submodule's, in its
+    // superproject's .git/modules, so not a checkout's .git.
+    if (common && basename(common) === ".git" && dirname(common) !== top) folders.push({ what: "the main checkout of the worktree dataDir is in", path: dirname(common) });
+    if (superproject) folders.push({ what: "the superproject of the checkout dataDir is in", path: superproject });
+  } catch {
+    // Not in one, or no git.
+  }
+  return folders;
+}
+
+/** Whether a gitHosts entry is other than a hostname as URL gives it, which it is matched to. */
+function notHostname(host: string): boolean {
+  return host.endsWith(".") || URL.parse(`http://${host}/`)?.hostname !== host.toLowerCase();
 }
 
 /** Throws with what is wrong if the config isn't one the service can run with. */
@@ -432,19 +511,30 @@ function configProblem(config: Config): string | undefined {
     http("internalBaseUrl", config.internalBaseUrl) ??
     whole("concurrency", config.concurrency, 1) ??
     text("model", config.model, false) ??
-    // A time limit and its grace stay under a timer's 2^31 ms, past which it fires at once.
+    // A time limit and its grace (and a pod's termination grace, below) stay under a timer's 2^31 ms, past
+    // which it fires at once.
     positive("graceSeconds", config.graceSeconds, true, 86_400) ??
     strings("jig", config.jig) ??
     strings("gitProtocols", config.gitProtocols) ??
+    strings("gitHosts", config.gitHosts) ??
+    // An entry is matched to a URL's hostname, which has no scheme, port, path or trailing dot.
+    (config.gitHosts?.some(notHostname) ? `gitHosts must be hostnames as a URL has them (no scheme, port, path or trailing dot; IPv6 in brackets; punycode), not ${JSON.stringify(config.gitHosts.find(notHostname))}` : undefined) ??
+    (config.local === undefined || isObject(config.local) ? undefined : "local must be an object, {hiddenPaths}") ??
+    (config.local?.hiddenPaths === undefined || (Array.isArray(config.local.hiddenPaths) && config.local.hiddenPaths.every((path) => typeof path === "string" && isAbsolute(path)))
+      ? undefined
+      : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
     whole("maxBodyBytes", config.maxBodyBytes, 1) ??
     positive("heartbeatSeconds", config.heartbeatSeconds, false, 3_600) ??
     text("replicaId", config.replicaId, false) ??
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
+    whole("maxEventBytes", config.maxEventBytes, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
     (runner === "kubernetes" ? text("kubernetes.image", config.kubernetes?.image, true) : undefined) ??
+    // jig is given 5 s less than the grace to write its end, and needs 5 for a reader that takes nothing.
+    whole("kubernetes.terminationGraceSeconds", config.kubernetes?.terminationGraceSeconds, 10, 3_600) ??
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
@@ -497,6 +587,7 @@ interface Context {
   answers: Answers;
   region: string | null;
   model: string;
+  gitHosts?: string[];
   maxBody: number;
   heartbeatMs: number;
   /** The SHA-256 of the admin key, when there is one. */
@@ -576,7 +667,7 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     if (region !== context.region) return reply(res, 400, { error: `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router` });
     input = rest;
   }
-  const spec = taskSpec(input, tenant, context.model);
+  const spec = taskSpec(input, tenant, context.model, context.gitHosts);
   if (typeof spec === "string") {
     refused("invalid");
     return reply(res, 400, { error: spec });
@@ -715,8 +806,11 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. */
-export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): TaskSpec | string {
+/**
+ * A task's spec from a request, with the tenant's limits as the defaults and the bounds; or what is wrong. A
+ * repository to clone must be on one of `gitHosts`, if there are any, and is then kept as URL reads it.
+ */
+export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, gitHosts?: string[]): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
   const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode"].includes(key));
   if (unknown) return `Unknown field: ${unknown}`;
@@ -751,8 +845,12 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string): 
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
+  // The local and Docker runners clone on the service's own network, which a tenant would otherwise reach
+  // any host on. The scheduler checks it again as the task starts, should gitHosts have changed.
+  const checked = typeof git === "string" ? checkedGit(git, gitHosts) : undefined;
+  if (checked && "error" in checked) return checked.error;
   if (ref !== undefined && (git === undefined || typeof ref !== "string" || !/^[\w./-]{1,200}$/.test(ref) || ref.startsWith("-"))) return "workspace.ref must be a branch or tag of workspace.git";
-  return { prompt, workspace: { files, git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
+  return { prompt, workspace: { files, git: checked?.git, ref } as TaskSpec["workspace"], maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -779,17 +877,30 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * live ones, then `event: done` with the status it ended in, and the stream ends. A client that reconnects
  * with Last-Event-ID gets only what came after. The task may run on this replica, whose scheduler passes on
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
- * (SQLite, or a lost connection to Postgres), the store is read again every second.
+ * (SQLite, or a lost connection to Postgres), the store is read again every second. Stored events are read
+ * a page at a time (EVENTS_PAGE of them, or PAGE_BYTES), and the next page only once the client has taken
+ * the last: a slow client or one that stops reading holds a page, not the task's events.
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;
-  const send = (seq: number, event: object) => {
-    if (seq <= last || ended || res.destroyed) return;
+  // False once what is written waits for the client: no more is written until it has taken it.
+  const send = (seq: number, json: string): boolean => {
+    if (seq <= last || ended || res.destroyed) return true;
     last = seq;
-    res.write(`id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`);
+    return res.write(`id: ${seq}\ndata: ${json}\n\n`);
   };
+  // Until the client has taken what is written, or is gone.
+  const drained = () =>
+    new Promise<void>((done) => {
+      if (res.closed || !res.writableNeedDrain) return done();
+      const go = () => {
+        res.off("drain", go).off("close", go);
+        done();
+      };
+      res.on("drain", go).on("close", go);
+    });
   const end = (status: TaskStatus) => {
     if (ended) return;
     ended = true;
@@ -797,23 +908,41 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     res.end(`event: done\ndata: ${JSON.stringify({ status })}\n\n`);
   };
   // Sends what is stored after the last event sent, and ends the stream if the task has ended. The status
-  // is read first: once a task has ended, all its events are stored. One read at a time, in order.
+  // is read first: once a task has ended, all its events are stored. One read at a time, in order; one
+  // asked for while another waits to start is that one, which will read what this would.
   let reading = Promise.resolve();
+  let waiting = false;
   const pull = () => {
+    if (waiting) return;
+    waiting = true;
     reading = reading
       .then(async () => {
+        waiting = false;
         if (ended || res.destroyed) return;
         const { status } = (await store.task(task.id))!;
-        for (const { seq, event } of await store.events(task.id, last)) send(seq, event);
+        for (;;) {
+          const events = await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES);
+          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
+          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          let bytes = 0;
+          for (const { seq, event } of events) {
+            const json = JSON.stringify(event);
+            bytes += Buffer.byteLength(json);
+            if (!send(seq, json)) await drained();
+          }
+          if (ended || res.destroyed) return;
+          if (events.length < EVENTS_PAGE && bytes < PAGE_BYTES) break;
+        }
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
-        metrics.storeErrors.inc();
+        metrics.storeErrors.inc({ retried: "false" });
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
-  // The next event as it comes goes at once; one after a gap, or the end, sends what is stored first.
-  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 ? send(update.event.seq, update.event) : pull());
+  // The next event as it comes goes at once, unless the client is behind; one after a gap, or the end,
+  // sends what is stored first.
+  const follow = (update: Update) => ("event" in update && update.event.seq === last + 1 && !res.writableNeedDrain ? send(update.event.seq, JSON.stringify(update.event)) : pull());
   const changed = (id: string, seq?: unknown) => id === task.id && !(typeof seq === "number" && seq <= last) && pull();
   scheduler.updates.on(task.id, follow);
   store.changes.on("event", changed);

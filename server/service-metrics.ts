@@ -17,7 +17,7 @@ export function routeOf(path: string): string {
 
 /** The service's metrics, in a registry of their own: each service started in a process has its own. */
 export function serviceMetrics(registry = new Registry()) {
-  return {
+  const metrics = {
     registry,
     httpRequests: registry.counter("jig_service_http_requests_total", "Requests to the API, by route and status.", ["route", "status"]),
     httpSeconds: registry.histogram("jig_service_http_request_seconds", "Seconds from a request to the end of its response (an event stream's lasts as long as it is followed), by route.", ["route"]),
@@ -33,12 +33,16 @@ export function serviceMetrics(registry = new Registry()) {
     poolTakes: registry.counter("jig_service_pool_takes_total", "Tasks started with a warm pool, by whether a warm worker took them (hit) or they started cold (miss).", ["result"]),
     approvalsPending: registry.gauge("jig_service_approvals_pending", "Approvals of running tasks waiting for an answer, in the store."),
     approvalWait: registry.histogram("jig_service_approval_wait_seconds", "Seconds from an approval's request to its answer, by decision: allow, deny or timeout.", ["decision"]),
+    webhookDeliveries: registry.counter("jig_service_webhook_deliveries_total", "Approvals posted to tenants' webhooks, by tenant and result: delivered, or failed once the last try failed.", ["tenant", "result"]),
     leaseErrors: registry.counter("jig_service_lease_errors_total", "Rounds of renewing this replica's leases that failed."),
-    storeErrors: registry.counter("jig_service_store_errors_total", "Reads and writes of the store that failed outside a request: starting tasks, storing their events and outcomes, following them."),
+    storeErrors: registry.counter("jig_service_store_errors_total", "Tries of reads and writes of the store that failed outside a request (starting tasks, storing their events and outcomes, following them), by whether the try was retried: true, or false when it was given up on.", ["retried"]),
     replicas: registry.gauge("jig_service_replicas", "Replicas of the service whose heartbeat is in the store."),
     cost: registry.counter("jig_service_cost_usd_total", "USD the tasks this replica ended spent, by tenant, from their end events.", ["tenant"]),
     tokens: registry.counter("jig_service_tokens_total", "Tokens the tasks this replica ended used, by tenant and kind, from their end events.", ["tenant", "kind"]),
   };
+  // At 0 from the start, so the first failure of each is counted by increase().
+  for (const retried of ["true", "false"]) metrics.storeErrors.inc({ retried }, 0);
+  return metrics;
 }
 
 export type ServiceMetrics = ReturnType<typeof serviceMetrics>;

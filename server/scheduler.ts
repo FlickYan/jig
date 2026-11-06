@@ -3,7 +3,8 @@ import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
-import { type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
+import { PgError } from "./pg.ts";
+import { checkedGit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
@@ -29,8 +30,12 @@ export interface SchedulerOptions {
   leaseMs?: number;
   /** The most of a run's events that are stored; past it they are dropped, with one notice (default 10,000). */
   maxEvents?: number;
+  /** The most bytes of a run's events (as JSON) that are stored; past it, as past maxEvents (default 64 MiB). */
+  maxEventBytes?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
+  /** The hosts a workspace may be cloned from (default: any), checked again as each task starts. */
+  gitHosts?: string[];
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
   onApproval?: (task: Task, approval: Approval) => void;
   /** Where its runs, leases and failures are counted (default: a registry of its own, which nothing serves). */
@@ -79,19 +84,23 @@ export class Scheduler {
   private concurrency: number;
   private leaseMs: number;
   private maxEvents: number;
+  private maxEventBytes: number;
   private keepTaskDirs: boolean;
+  private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
     this.replicaId = replicaId ?? `${hostname()}-${process.pid}-${randomBytes(3).toString("hex")}`;
     this.leaseMs = leaseMs;
     this.maxEvents = maxEvents;
+    this.maxEventBytes = maxEventBytes;
     this.keepTaskDirs = keepTaskDirs;
+    this.gitHosts = gitHosts;
     this.onApproval = onApproval;
     this.metrics = metrics ?? serviceMetrics();
     this.log = log ?? createLog("service");
@@ -167,7 +176,7 @@ export class Scheduler {
     // ended already: one that can't be read goes uncounted, and the rest are counted all the same.
     for (const id of expired) {
       const task = await this.store.task(id).catch((err: unknown) => {
-        this.metrics.storeErrors.inc();
+        this.metrics.storeErrors.inc({ retried: "false" });
         this.log.error("couldn't read an expired task to count it", { task: id, err });
         return undefined;
       });
@@ -195,7 +204,7 @@ export class Scheduler {
       this.again = false;
       // A store that fails now may not later: the next poke tries again.
       await this.fill().catch((err: unknown) => {
-        this.metrics.storeErrors.inc();
+        this.metrics.storeErrors.inc({ retried: "false" });
         this.log.error("couldn't start queued tasks", { err });
       });
     }
@@ -305,11 +314,17 @@ export class Scheduler {
     let failure: string | undefined;
     let end: JigEvent | undefined;
     let stored = 0;
-    let dropping = false;
+    /** The bytes of the events stored, as JSON. */
+    let bytes = 0;
+    /** The cap the run's events went past, as the notice gives it: once it is set, they are dropped. */
+    let past: string | undefined;
+    let noticed = false;
+    /** Past a cap, the run's latest event if it is an end: stored after the last event, unless one follows it. */
+    let held: JigEvent | undefined;
     // When jig asked for each approval this run stored, by its own clock, to time a timeout's wait.
     const asked = new Map<string, number>();
     try {
-      run.handle = await this.runner.start(task, tenant);
+      run.handle = await this.runner.start(this.cloneable(task), tenant);
       if (run.stopping) run.handle.cancel();
       // With a pool, whether a warm worker took it; and how long jig took to start, either way.
       const start = run.handle.warm ? "warm" : "cold";
@@ -318,32 +333,50 @@ export class Scheduler {
         if (!stored) this.metrics.startSeconds.observe({ start }, (Date.now() - run.claimed) / 1000);
         if (event.type === "end") end = event;
         let kept = event;
-        // Past the cap, a run's events are dropped, but for its end, and one notice in place of the first
-        // dropped says so: a task's commands can't fill the store, and the run goes on.
-        if (stored >= this.maxEvents && event.type !== "end") {
-          if (dropping) continue;
-          dropping = true;
-          kept = { v: 1, seq: event.seq, ts: event.ts, type: "notice", text: `The run's events past ${this.maxEvents} aren't kept: the service drops them, but for the end.` };
+        // Past either cap, a run's events are dropped, but for its last event if that is an end (jig writes
+        // its own last), and one notice in place of the first dropped says so: a task's commands can't fill
+        // the store with one task, and the run goes on. Lines of up to 1 MiB are read, so the bytes are capped
+        // as well as the count. An end counts as any event does, as a task's commands may write ends too.
+        if (!past) {
+          const size = Buffer.byteLength(JSON.stringify(event));
+          past = stored >= this.maxEvents ? `${this.maxEvents}` : bytes + size > this.maxEventBytes ? `${this.maxEventBytes} bytes` : undefined;
+          if (!past) bytes += size;
+        }
+        if (past) {
+          // An end held is dropped once another event comes; this one is held in its place if it is an end.
+          const dropped = held ?? (event.type === "end" ? undefined : event);
+          held = event.type === "end" ? event : undefined;
+          if (noticed || !dropped) continue;
+          noticed = true;
+          kept = { v: 1, seq: dropped.seq, ts: dropped.ts, type: "notice", text: `The run's events past ${past} aren't kept: the service drops them, but for its last event if it is an end.` };
         }
         // The approval first, so it can be answered by whoever sees its event; one past the cap isn't kept,
-        // and jig's wait for it ends at its timeout, as a deny.
+        // and jig's wait for it ends at its timeout, as a deny. Each write is tried again on a failure,
+        // which is safe as each is kept once however often it is made.
         const request = approvalRequest(kept);
-        const approval = request && (await this.store.addApproval(task.id, request));
+        // A try whose write was made but whose reply was lost leaves the next one undefined, as the approval
+        // is kept already: it is stored, and can be answered, but its webhook isn't sent.
+        const approval = request && (await this.retrying(() => this.store.addApproval(task.id, request), run));
         if (approval) asked.set(approval.id, Date.parse(kept.ts));
-        await this.store.addEvent(task.id, kept.seq, kept);
+        await this.retrying(() => this.store.addEvent(task.id, kept.seq, kept), run);
         stored++;
         // jig's own word on how it was answered is the record, but for an answer by the API it never gave:
         // a run's commands may write its events (on Docker and Kubernetes), so that one is only logged.
         const answered = approvalAnswer(kept);
-        const recorded = answered && (await this.store.recordApproval(task.id, answered.id, answered.answer));
+        const recorded = answered && (await this.retrying(() => this.store.recordApproval(task.id, answered.id, answered.answer), run));
         if (answered && !recorded && answered.answer.by === "api") {
           const said = `${answered.answer.decision}${answered.answer.always ? " always" : ""}`;
           this.log.warn(`the run says the API answered ${answered.id} with ${said}, which it didn't: left out of the record`, { tenant: task.tenant, task: task.id });
         }
         // An answer through the API is counted as it is given (api.ts); a timeout, as jig records it.
-        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id, Date.parse(kept.ts) - (asked.get(answered.id) ?? NaN), run).catch(() => this.metrics.storeErrors.inc());
+        if (recorded && answered.answer.by === "timeout") await this.waited(task.id, answered.id, Date.parse(kept.ts) - (asked.get(answered.id) ?? NaN), run).catch(() => this.metrics.storeErrors.inc({ retried: "false" }));
         this.updates.emit(task.id, { event: kept } satisfies Update);
         if (approval) this.onApproval?.(task, approval);
+      }
+      if (held) {
+        const last = held;
+        await this.retrying(() => this.store.addEvent(task.id, last.seq, last), run);
+        this.updates.emit(task.id, { event: last } satisfies Update);
       }
       exit = await run.handle.wait();
     } catch (err) {
@@ -356,12 +389,24 @@ export class Scheduler {
       }
     }
     run.ended = true;
+    // Each failure to store it is counted as it is tried again.
     const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => {
-      this.metrics.storeErrors.inc();
       this.log.error("couldn't store how the task ended", { tenant: task.tenant, task: task.id, err });
     });
     this.recording.add(recorded);
     await recorded.finally(() => this.recording.delete(recorded));
+  }
+
+  /**
+   * The task as its runner is to start it: one queued before gitHosts was set, or listed fewer hosts, is
+   * checked again here, and its workspace.git given as it was checked; one no longer allowed throws.
+   */
+  private cloneable(task: Task): Task {
+    const git = task.spec.workspace?.git;
+    if (git === undefined) return task;
+    const checked = checkedGit(git, this.gitHosts);
+    if ("error" in checked) throw new Error(`${checked.error} (checked again as the task started)`);
+    return checked.git === git ? task : { ...task, spec: { ...task.spec, workspace: { ...task.spec.workspace, git: checked.git } } };
   }
 
   /**
@@ -379,11 +424,42 @@ export class Scheduler {
     if (approval?.decidedAt) this.metrics.approvalWait.observe({ decision: "timeout" }, Math.max(0, Date.parse(approval.decidedAt) - Date.parse(approval.requestedAt)) / 1000);
   }
 
+  /**
+   * Runs `write`, and on a failure (a dropped connection, a failover) runs it again, waiting 100 ms and then
+   * twice as long each time, up to 2 s, until half a lease has gone by since the first try began, or the run,
+   * still going, is being stopped; then its error is thrown. Half a lease from the first try's start, as a try
+   * can hang (up to the pool's query timeout) before it fails: an ended run's lease is no longer renewed, but
+   * was renewed a third of a lease or less before the run ended (when the renewals went through), so the run
+   * still holds it when the last try is begun. A try begun may end past the lease, which the store checks: an
+   * outcome stored after another replica ended the task isn't stored. An ended run's outcome is tried for all
+   * of that, however it was stopped, as it holds what the run spent. An error the database says is in the data
+   * (a value out of range, a constraint broken) is thrown at once, as it would fail every time. Each failure
+   * is counted, as retried or as given up on. The write must be one that is kept once however often it is
+   * made, as one that failed may have been made.
+   */
+  private async retrying<T>(write: () => Promise<T>, run: Run): Promise<T> {
+    const deadline = Date.now() + this.leaseMs / 2;
+    for (let wait = 100; ; wait = Math.min(wait * 2, 2000)) {
+      try {
+        return await write();
+      } catch (err) {
+        const left = deadline - Date.now();
+        const givenUp = left <= 0 || (run.stopping && !run.ended) || permanent(err);
+        this.metrics.storeErrors.inc({ retried: givenUp ? "false" : "true" });
+        if (givenUp) throw err;
+        await new Promise((done) => setTimeout(done, Math.min(wait, left)));
+      }
+    }
+  }
+
   private async record(task: Task, run: Run, outcome: Outcome): Promise<void> {
     const { id, tenant } = task;
     try {
-      // One this replica no longer held was ended by another, which counted it.
-      if (await this.store.finish(id, this.replicaId, outcome)) {
+      // One this replica no longer held was ended by another, which counted it. Tried again on a failure
+      // while the slot is held, so the limits hold; a task given up on ends when its lease runs out. A try
+      // whose write was made but whose reply was lost leaves the next one false, as the task has ended: the
+      // outcome and the ledger are right, but the task isn't counted in the metrics, nor its cost.
+      if (await this.retrying(() => this.store.finish(id, this.replicaId, outcome), run)) {
         this.ended(task, outcome.status, Date.now() - run.claimed);
         const spent = spentOf(outcome);
         if (spent.costUsd) this.metrics.cost.inc({ tenant }, spent.costUsd);
@@ -419,6 +495,14 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
     usage: (end?.usage as Usage | undefined) ?? null,
     cost: typeof end?.cost === "number" ? end.cost : null,
   };
+}
+
+/**
+ * Whether a store's error would come again however often the write is made: Postgres's SQLSTATE classes 22
+ * (a data exception, such as a number out of range) and 23 (an integrity constraint broken).
+ */
+function permanent(err: unknown): boolean {
+  return err instanceof PgError && /^2[23]/.test(err.code);
 }
 
 /** The text with each NUL character replaced by U+FFFD, which shows something was there. */

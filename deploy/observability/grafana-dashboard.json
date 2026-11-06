@@ -476,7 +476,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Approvals",
-      "description": "Approvals waiting for an answer, and how long they waited.",
+      "description": "Approvals waiting for an answer, how long they waited, and the approvals posted to webhooks, delivered or failed.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -522,6 +522,15 @@
           "expr": "histogram_quantile(0.9, sum by (le, decision) (rate(jig_service_approval_wait_seconds_bucket{region=~\"$region\"}[$__rate_interval])))",
           "legendFormat": "p90 wait (s), {{decision}}",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (result) (increase(jig_service_webhook_deliveries_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "webhooks {{result}}",
+          "refId": "C"
         }
       ]
     },
@@ -617,7 +626,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Errors and replicas",
-      "description": "Failed reads and writes of the database, and the replicas whose heartbeat is in it.",
+      "description": "Failed tries of reads and writes of the database (retried true: tried again; false: given up on), failed lease renewals, and the replicas whose heartbeat is in it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -651,8 +660,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(jig_service_store_errors_total{region=~\"$region\"}[$__rate_interval]))",
-          "legendFormat": "store errors",
+          "expr": "sum by (retried) (increase(jig_service_store_errors_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "store errors, retried={{retried}}",
           "refId": "A"
         },
         {

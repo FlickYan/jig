@@ -1,21 +1,23 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server } from "node:https";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { type Service, startService } from "../server/api.ts";
+import { type Config, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { type Exited, WarmPool } from "../server/pool.ts";
 import type { JigEvent, Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { openStore, type Task, type Tenant } from "../server/store.ts";
 import { Channel, KubernetesRunner, labelValue, objectName, POOL_LABEL, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
-import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
+import { Lines, lastLine, MAX_LINE, parseEvent, readStats, tail } from "../server/runners/local.ts";
+import { createSandbox, sandboxProblem } from "../src/sandbox.ts";
+import { runCommand } from "../src/tools/bash.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 import { parseYaml } from "./yaml.ts";
 
@@ -125,6 +127,62 @@ const alive = (pid: number) => {
     return false;
   }
 };
+
+describe("the local runner", () => {
+  /**
+   * The service as `node server/api.ts --config` starts it, on the local runner with the fake jig: its config
+   * file and a gateway-secret beside it in etc/, dataDir in a git checkout, and `config` added. Runs one
+   * task, and gives the folders and the hiddenPaths the task's jig got.
+   */
+  async function oneTask(config: Partial<Config> = {}) {
+    const dir = await tempDir("jig-local-");
+    const etc = join(dir, "etc");
+    const checkout = join(dir, "checkout");
+    await mkdir(etc);
+    await mkdir(checkout);
+    execFileSync("git", ["init", "-q", checkout]);
+    const configFile = join(etc, "service.json");
+    const full: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(checkout, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", jig: [process.execPath, FAKE_JIG], graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")] }], ...config };
+    await writeFile(configFile, JSON.stringify(full));
+    await writeFile(join(etc, "gateway-secret"), "SECRET123\n");
+    const started = await startService(full, { secret: SECRET, configFile });
+    services.push(started);
+    const { id } = (await call(started, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "app.py": "print(1)\n" } } })).body;
+    assert.equal((await ended(started, id)).status, "succeeded");
+    const task = join(checkout, "data", "tasks", id);
+    const { hiddenPaths } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    return { etc, checkout, task, hiddenPaths: hiddenPaths as string[] };
+  }
+
+  it("hides the config's folder, the checkout dataDir lies in, and local.hiddenPaths", async () => {
+    const extra = ["/srv/secrets", "/home/service/.ssh"];
+    const { etc, checkout, hiddenPaths } = await oneTask({ local: { hiddenPaths: extra } });
+    // The folder, not just the file: the gateway-secret the docs keep beside it is the service's too. And
+    // the checkout, whose files (a deploy's .env, say) GIT_CEILING_DIRECTORIES left readable.
+    for (const path of [etc, realpathSync(checkout), ...extra]) assert.ok(hiddenPaths.includes(path), `${path} in ${JSON.stringify(hiddenPaths)}`);
+  });
+
+  it("keeps a secret beside the config from a task's commands, which still work in their project", { skip: sandboxProblem() }, async () => {
+    const { etc, task, hiddenPaths } = await oneTask();
+    const [work, home] = [join(task, "work"), join(task, "home")];
+    // As the task's jig makes its sandbox: its HOME and JIG_HOME are the task's, and these its settings.
+    const was = { HOME: process.env.HOME, JIG_HOME: process.env.JIG_HOME };
+    process.env.HOME = home;
+    process.env.JIG_HOME = join(home, ".jig");
+    const sandbox = createSandbox(work, { network: false, hidden: hiddenPaths })!;
+    try {
+      const inWork = (command: string) => runCommand(command, work, 20, undefined, sandbox);
+      assert.match(await inWork("cat app.py"), /print\(1\)/);
+      assert.doesNotMatch(await inWork(`cat ${join(etc, "gateway-secret")}`), /SECRET123/);
+    } finally {
+      sandbox.close?.();
+      for (const [name, value] of Object.entries(was)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+});
 
 describe("the Docker runner", () => {
   type Options = Partial<ConstructorParameters<typeof DockerRunner>[0]>;
@@ -269,6 +327,25 @@ describe("the Docker runner", () => {
   };
   const kills = async (state: string) => (await readFile(join(state, "kills.jsonl"), "utf8").catch(() => "")).trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const pidOf = async (state: string, name: string) => Number(await readFile(join(state, `${name}.pid`), "utf8"));
+
+  it("clones on the service's side following a redirect only when told to, as it is without gitHosts", async () => {
+    const asked: string[] = [];
+    const moved = createHttpServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const project = createHttpServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(moved.address() as AddressInfo).port}/moved${req.url}` }).end());
+    for (const server of [moved, project]) {
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    }
+    const git = `http://127.0.0.1:${(project.address() as AddressInfo).port}/x`;
+    const blocked = await docker({ gitProtocols: ["http"] });
+    const refused = await ended(blocked.api, (await call(blocked.api, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id);
+    assert.equal(refused.error, "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+    assert.deepEqual(asked, []);
+    const following = await docker({ gitProtocols: ["http"], gitRedirects: true });
+    const followed = await ended(following.api, (await call(following.api, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id);
+    assert.match(followed.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, ["/moved/x/info/refs?service=git-upload-pack"]);
+  });
 
   it("gives a task to a warm worker, whose jig starts without a docker run, well before a container could start", async () => {
     Object.assign(process.env, REAL);
@@ -485,6 +562,13 @@ describe("the Docker runner", () => {
     assert.deepEqual([...out, lines.end()], [`a${wide}`, "b", "c"]);
   });
 
+  it("leaves out an event whose seq is past what the stores can hold", () => {
+    const line = (seq: number) => JSON.stringify({ v: 1, seq, ts: "", type: "notice", text: "x" });
+    assert.equal(parseEvent(line(2 ** 31 - 1))?.seq, 2 ** 31 - 1);
+    assert.equal(parseEvent(line(2 ** 31)), undefined);
+    assert.equal(parseEvent(line(2 ** 53)), undefined);
+  });
+
   it("reads the run's files only where they are regular files, not links or pipes a task's commands left", async () => {
     // jig runs without its sandbox in a container, so its commands can replace anything in /task.
     const dir = await tempDir("jig-docker-");
@@ -520,6 +604,10 @@ interface Script {
   startsAfterMs?: number;
   /** The log breaks after `lines`, the pod still running; read again, it has these instead (it was rotated). */
   again?: string[];
+  /** With `again`: the container exits this long after the log's first read, whether it is read again or not. */
+  exitsAfterMs?: number;
+  /** The pod is gone (evicted, or deleted at the Job's deadline) this long after its log's first read ends. */
+  goneAfterMs?: number;
 }
 
 interface Pod {
@@ -534,6 +622,8 @@ interface Pod {
   /** Its log was read this many times, and the last read all went to the service. */
   reads: number;
   flushed?: boolean;
+  /** Deleted, though its Job is not: the API server no longer has it, and no new one is made. */
+  gone?: boolean;
 }
 
 /** The API server's rule for a label's value. */
@@ -627,12 +717,12 @@ class FakeCluster {
     }
     if (req.method === "GET" && url.pathname === `/api/v1${ns}pods`) {
       const [key, value] = url.searchParams.get("labelSelector")!.split("=");
-      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod) => pod !== undefined);
+      const items = [...this.jobs.values()].filter((job) => job.spec.template.metadata.labels[key] === value).map((job) => this.pod(job)).filter((pod): pod is Pod => pod !== undefined && !pod.gone);
       return reply(200, { kind: "PodList", items: items.map((pod) => ({ metadata: { name: pod.name }, status: statusOf(pod) })) });
     }
     if (req.method === "GET" && (match = new RegExp(`^/api/v1${ns}pods/([\\w-]+)(/log)?$`).exec(url.pathname))) {
       const pod = this.pods.get(match[1]);
-      if (!pod) return missing();
+      if (!pod || pod.gone) return missing();
       if (!match[2]) return reply(200, { metadata: { name: pod.name }, status: statusOf(pod) });
       assert.equal(url.searchParams.get("follow"), "true");
       await pod.claimed;
@@ -643,7 +733,9 @@ class FakeCluster {
       res.on("finish", () => (pod.flushed = true));
       res.write((again && read ? again : lines).map((line) => `${line}\n`).join(""));
       if (hold) return void pod.logs.push(res);
+      if (pod.script.goneAfterMs && !read) setTimeout(() => (pod.gone = true), pod.script.goneAfterMs);
       if (!again || read) this.end(pod);
+      else if (pod.script.exitsAfterMs) setTimeout(() => this.end(pod, 0), pod.script.exitsAfterMs);
       return void res.end();
     }
     reply(404, { kind: "Status", message: `no route ${req.method} ${url.pathname}`, code: 404 });
@@ -756,6 +848,7 @@ describe("the Kubernetes runner", () => {
     assert.equal(pod.serviceAccountName, "jig-task");
     assert.equal(pod.automountServiceAccountToken, false);
     assert.equal(pod.enableServiceLinks, false);
+    assert.equal(pod.terminationGracePeriodSeconds, 30);
     assert.deepEqual(pod.securityContext, { runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: { type: "RuntimeDefault" } });
     assert.equal(pod.containers.length, 1);
     const [container] = pod.containers;
@@ -767,6 +860,8 @@ describe("the Kubernetes runner", () => {
       { name: "HOME", value: "/task/home" },
       { name: "JIG_HOME", value: "/task/home/.jig" },
       { name: "NO_COLOR", value: "1" },
+      // jig's wait for the reader at its end, 5 s inside the pod's grace, so the end is in the log before SIGKILL.
+      { name: "JIG_EVENTS_FLUSH_SECONDS", value: "25" },
       { name: "ANTHROPIC_API_KEY", valueFrom: { secretKeyRef: { name: objectName(id), key: "token" } } },
     ]);
     assert.ok(!JSON.stringify(job).includes("the task, in the Secret"), "the task is in the Secret, not the Job");
@@ -776,7 +871,7 @@ describe("the Kubernetes runner", () => {
     assert.deepEqual(secret.metadata.ownerReferences, [{ apiVersion: "batch/v1", kind: "Job", name: objectName(id), uid: job.metadata.uid }]);
     const payload = payloadOf(secret.stringData.token);
     assert.deepEqual([payload.tenant, payload.task, payload.budgetUsd], ["acme", id, 2.5]);
-    assert.deepEqual(JSON.parse(secret.stringData["task.json"]), { prompt: "the task, in the Secret", workspace: { files: { "app.py": "print(1)\n" } }, gitProtocols: ["https"], work: "/task/work", stats: "/task/stats.json" });
+    assert.deepEqual(JSON.parse(secret.stringData["task.json"]), { prompt: "the task, in the Secret", workspace: { files: { "app.py": "print(1)\n" } }, gitProtocols: ["https"], gitRedirects: false, work: "/task/work", stats: "/task/stats.json" });
     const sent = JSON.stringify(cluster.requests);
     for (const value of [...Object.values(REAL), SECRET]) assert.ok(!sent.includes(value), "no real key nor the gateway's secret reaches the cluster");
     // Every request had the token from the file, over TLS checked against the CA from its file.
@@ -830,16 +925,66 @@ describe("the Kubernetes runner", () => {
     assert.match(unscheduled[3], /DeadlineExceeded: .* the pod was Unschedulable: 0\/3 nodes are available: 3 Insufficient cpu/);
   });
 
-  it("reads the pod's log once, though the pod's status says the container has ended a moment after the log does", async () => {
+  it("reads the pod's log again until the pod's status says the container has ended, a moment after the log does, each event passed on once", async () => {
     // The kubelet ends the stream as the container exits, before the pod's status, which it updates after.
     const { cluster, api } = await kubernetes();
     const lines = logOf(0, "end_turn");
     cluster.script = () => ({ lines, exitSeenAfterMs: 300 });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
     const task = await ended(api, id);
-    assert.deepEqual([task.status, task.exitCode], ["succeeded", 0]);
-    assert.equal([...cluster.pods.values()][0].reads, 1);
+    assert.deepEqual([task.status, task.exitCode, task.stats], ["succeeded", 0, { stop: "end_turn", steps: 1 }]);
+    assert.ok([...cluster.pods.values()][0].reads > 1);
     assert.deepEqual((await api.store.events(id)).map(({ event }) => event), lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
+  });
+
+  it("gives the pods the configured grace, and jig 5 s less for its events at its end", async () => {
+    const { cluster, runner } = await bare({ terminationGraceSeconds: 45 });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    const pod = cluster.jobs.get(objectName(task.id)).spec.template.spec;
+    assert.equal(pod.terminationGracePeriodSeconds, 45);
+    assert.deepEqual(pod.containers[0].env.find((variable: { name: string }) => variable.name === "JIG_EVENTS_FLUSH_SECONDS"), { name: "JIG_EVENTS_FLUSH_SECONDS", value: "40" });
+  });
+
+  it("tells the worker to follow a clone's redirect only when the runner does, which it does without gitHosts", async () => {
+    const { cluster, runner } = await bare({ gitRedirects: true });
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    assert.equal(JSON.parse(cluster.secrets.get(objectName(task.id)).stringData["task.json"]).gitRedirects, true);
+  });
+
+  it("reads the log of a task whose backstop is past a timer's 2^31 ms, without the timer firing at once", async () => {
+    // The config keeps the backstop under it; a runner made otherwise is kept from cutting every read.
+    const warnings: Error[] = [];
+    const warned = (warning: Error) => warnings.push(warning);
+    process.on("warning", warned);
+    try {
+      const { cluster, runner } = await bare({ graceSeconds: 86_400, terminationGraceSeconds: 100_000 });
+      const lines = logOf(0, "end_turn");
+      cluster.script = () => ({ lines });
+      const [task, tenant] = aTask({ timeLimit: 2_000_000 });
+      const handle = await runner.start(task, tenant);
+      const events: unknown[] = [];
+      for await (const event of handle.events) events.push(event);
+      const exit = await handle.wait();
+      assert.deepEqual([exit.exitCode, exit.stats], [0, { stop: "end_turn", steps: 1 }]);
+      assert.deepEqual(events, lines.slice(0, -1).filter((line) => !line.startsWith("›")).map((line) => JSON.parse(line)));
+      await new Promise((done) => setImmediate(done));
+      assert.deepEqual(warnings.filter((warning) => warning.name === "TimeoutOverflowWarning"), []);
+    } finally {
+      process.off("warning", warned);
+    }
+  });
+
+  it("waits for a pod's end past the deadline and its slack by the pods' grace, which the pod may take to end", async () => {
+    // A time limit a minute in the past leaves 2 s to the deadline's slack; the pods' grace is 30 s more.
+    const { cluster, runner } = await bare({ graceSeconds: 0, pollMs: 200 });
+    cluster.script = () => ({ lines: logOf(0, "end_turn"), exitSeenAfterMs: 3000 });
+    const [task, tenant] = aTask({ timeLimit: -58 });
+    const exit = await (await runner.start(task, tenant)).wait();
+    assert.deepEqual([exit.exitCode, exit.timedOut, exit.stats], [0, false, { stop: "end_turn", steps: 1 }]);
   });
 
   it("leaves out a line of the pod's log too long to read", async () => {
@@ -935,7 +1080,8 @@ describe("the Kubernetes runner", () => {
     const again = [event(6, "text", { text: "six" }), event(7, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
     cluster.script = () => ({ lines: [event(1, "start"), event(2, "text", { text: "two" }), event(3, "text", { text: "three" })], again });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
-    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    // The second read ends as the container exits, while it ran: a third, after it ended, is the whole log.
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 3]);
     const stored = (await api.store.events(id)).map(({ event }) => event as JigEvent);
     assert.deepEqual(stored.map((event) => [event.seq, event.type]), [[1, "start"], [2, "text"], [3, "text"], [4, "notice"], [6, "text"], [7, "end"]]);
     assert.match(String(stored[3].text), /^Events 4 to 5 aren't in the pod's log: it was rotated before it was read again/);
@@ -950,8 +1096,79 @@ describe("the Kubernetes runner", () => {
     const again = [event(1, "start"), event(2, "text", { text: "two" }), event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0 })];
     cluster.script = () => ({ lines, again });
     const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
-    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    // The second read ends as the container exits, while it ran: a third, after it ended, is the whole log.
+    assert.deepEqual([(await ended(api, id)).status, [...cluster.pods.values()][0].reads], ["succeeded", 3]);
     assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+  });
+
+  it("reads the pod's log again when it ends on a worker-shaped line while the container runs, the stats only from a read after it ended", async () => {
+    // A task's commands can write a line like the worker's (through /proc/1/fd/1), and the stream can break
+    // right after it: the events after it, the end and approval requests among them, must still come.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), event(2, "text", { text: "two" }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    const again = [...lines, event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { stop: "end_turn", steps: 1 } })];
+    cluster.script = () => ({ lines, again, exitsAfterMs: 1000 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.equal(task.status, "succeeded");
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("reads the pod's log again when it ends on a worker-shaped line and the container exits before the pod is looked at", async () => {
+    // The stream breaks after a forged line, and the container has ended by the GET of the pod that follows:
+    // the read began while it ran, so it may lack what came after, and isn't the one that counts.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const usage = { input: 10, cacheRead: 0, cacheWrite: 0, output: 5 };
+    const lines = [event(1, "start"), event(2, "text", { text: "two" }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    const again = [...lines, event(3, "end", { stop: "end_turn", exitCode: 0, steps: 1, usage, cost: 0.001, seconds: 1 }), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { stop: "end_turn", steps: 1 } })];
+    cluster.script = () => ({ lines, again, exitsAfterMs: 1 });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, [...cluster.pods.values()][0].reads], ["succeeded", 2]);
+    assert.deepEqual((await api.store.events(id)).map(({ event }) => [(event as JigEvent).seq, (event as JigEvent).type]), [[1, "start"], [2, "text"], [3, "end"]]);
+    assert.deepEqual(task.stats, { stop: "end_turn", steps: 1 });
+  });
+
+  it("takes no stats from a worker-shaped line in a read made while the container ran, when the last read has no worker's line", async () => {
+    // The container is killed (out of memory, say) before the worker writes its line: the forged line, in a
+    // read that began while it ran, is not the worker's.
+    const { cluster, api } = await kubernetes();
+    const event = (seq: number, type: string, fields: object = {}) => JSON.stringify({ v: 1, seq, ts: new Date().toISOString(), type, ...fields });
+    const lines = [event(1, "start"), JSON.stringify({ jigWorker: 1, exitCode: 0, stats: { forged: true } })];
+    cluster.script = () => ({ lines, again: [event(1, "start"), event(2, "text", { text: "two" })], exitCode: 137, reason: "OOMKilled" });
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "x" })).body.id;
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.exitCode, task.stats], ["error", 137, null]);
+    assert.match(String(task.error), /out of memory/);
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when a cancel deletes the Job before the pod's status says the container ended", async () => {
+    // The cancel's DELETE takes the Job at once, while the kubelet's word on the container is still to come.
+    const { cluster, runner } = await bare({ pollMs: 200 });
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, exitSeenAfterMs: 2000 });
+    const [task, tenant] = aTask();
+    const handle = await runner.start(task, tenant);
+    const pod = `/api/v1/namespaces/jig/pods/${objectName(task.id)}-x7k2p`;
+    await until(() => cluster.requests.some((request) => request.path === pod), "the pod looked at after its log's read");
+    handle.cancel();
+    const exit = await handle.wait();
+    assert.deepEqual([exit.exitCode, exit.stats, exit.message], [143, { stop: "interrupted", steps: 1 }, "its Job was deleted"]);
+    const types: string[] = [];
+    for await (const event of handle.events) types.push(event.type);
+    assert.deepEqual(types, ["start", "tool_call", "step", "end"]);
+  });
+
+  it("keeps the worker's exit and stats from the last read of the log when the pod is gone before its status says the container ended", async () => {
+    // At the Job's deadline, or an eviction, the pod can be deleted while its status still lags its log.
+    const { cluster, runner } = await bare();
+    cluster.script = () => ({ lines: logOf(143, "interrupted"), exitCode: 143, jobReason: "DeadlineExceeded", exitSeenAfterMs: 500, goneAfterMs: 60 });
+    const [task, tenant] = aTask();
+    const exit = await (await runner.start(task, tenant)).wait();
+    assert.deepEqual([exit.exitCode, exit.timedOut, exit.stats], [143, true, { stop: "interrupted", steps: 1 }]);
   });
 
   it("gives a tenant whose id is no label value a hashed one, the id in an annotation", async () => {
@@ -1089,6 +1306,7 @@ describe("the Kubernetes runner", () => {
       prompt: "the task, in the claim's answer",
       workspace: { files: { "app.py": "print(1)\n" } },
       gitProtocols: ["https"],
+      gitRedirects: false,
       work: "/task/work",
       stats: "/task/stats.json",
       command: ["jig", "--no-sandbox", "--yes", "--model", "claude-haiku-4-5", "--base-url", "http://jig-gateway.jig.svc:8081/anthropic", "--max-steps", "50", "--time-limit", "600", "--events", "-", "--stats", "/task/stats.json", "-C", "/task/work", "-"],
@@ -1165,6 +1383,28 @@ describe("the worker a task's pod runs", () => {
     assert.equal(stdout, "");
     assert.match(stderr, /leads out of the workspace/);
     assert.equal(existsSync(join(dir, "escape")), false);
+  });
+
+  it("follows no redirect of a clone unless told to, and says the clone was redirected, but not where", async () => {
+    const asked: string[] = [];
+    const inside = createHttpServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const outside = createHttpServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/inside${req.url}` }).end());
+    for (const server of [inside, outside]) {
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      servers.push({ close: () => new Promise((done) => (server.closeAllConnections(), server.close(() => done()))) });
+    }
+    const git = `http://127.0.0.1:${(outside.address() as AddressInfo).port}/x`;
+    const blocked = await worker({ prompt: "exit 0", gitProtocols: ["http"], workspace: { git } }, await tempDir("jig-worker-"));
+    assert.equal(blocked.code, 1);
+    assert.deepEqual(asked, []);
+    // The last line, which the runner takes for the task's error, says it was a redirect; git's own line,
+    // with the host and port, is the worker's log in the pod's.
+    assert.equal(blocked.stderr.trim().split("\n").at(-1), "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+
+    const followed = await worker({ prompt: "exit 0", gitProtocols: ["http"], gitRedirects: true, workspace: { git } }, await tempDir("jig-worker-"));
+    assert.equal(followed.code, 1);
+    assert.deepEqual(asked, ["/inside/x/info/refs?service=git-upload-pack"]);
+    assert.match(followed.stderr.trim().split("\n").at(-1)!, /^git clone failed \(exit \d+\)$/);
   });
 
   /** A warm worker, its claim answered by `answer` (status and body), with the ticket in its environment. */
@@ -1453,6 +1693,8 @@ describe("the deploy files", () => {
     assert.deepEqual([config.runner, config.docker.network, new URL(config.gatewayBaseUrl).hostname], ["docker", "jig-tasks", "gateway"]);
     assert.equal(config.internalBaseUrl, `http://api:${config.internal.port}`);
     assert.equal(config.internal.host, "0.0.0.0");
+    // The service clones on the host's network, not on jig-tasks: gitHosts limits where to.
+    assert.deepEqual(config.gitHosts, ["github.com"]);
     // The data's folder is at the same path for the daemon as for the service.
     assert.ok(compose.services.api.volumes.includes(`${config.dataDir}:${config.dataDir}`));
 

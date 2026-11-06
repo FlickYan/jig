@@ -4,6 +4,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createLog, type Log } from "./log.ts";
 import type { JigEvent } from "./runner.ts";
+import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task } from "./store.ts";
 import { verifyToken } from "./token.ts";
 
@@ -153,25 +154,33 @@ export interface Webhook {
 /** Tries after a first that fails, and how long each may take. */
 const RETRIES = 3;
 const ATTEMPT_MS = 10_000;
+/** The statuses that redirect, with a location to go to: any other 3xx (a 304, say) is just a failure. */
+const REDIRECTS = [301, 302, 303, 307, 308];
 
 /**
  * Tells tenants that ask (`approvalWebhook`) of each approval their tasks ask for: a POST of {task, approval},
  * signed with the tenant's secret (x-jig-signature: sha256=<hex HMAC-SHA256 of the body>). Sent in the
- * background, so the run never waits on it, and tried again three times, 1, 2 and 4 seconds apart.
+ * background, so the run never waits on it, and tried again three times, 1, 2 and 4 seconds apart. A redirect
+ * is a failed try, never followed: it could send the signed POST anywhere the service reaches. Each approval
+ * is counted once in jig_service_webhook_deliveries_total, delivered or failed (one cut off by close, neither).
  */
 export class Webhooks {
   private hooks: Map<string, Webhook>;
   private retryMs: number;
   private pending = new Set<AbortController>();
   private log: Log;
+  private metrics: ServiceMetrics;
   /** Set by close: a run still draining as the service stops may ask after it, and is posted nothing. */
   private closed = false;
 
-  /** `log` is where a webhook that keeps failing is said (the service's). */
-  constructor(hooks: Map<string, Webhook>, retryMs = 1000, log = createLog("service")) {
+  /** `log` is where a webhook that keeps failing is said (the service's); `metrics` count the deliveries. */
+  constructor(hooks: Map<string, Webhook>, retryMs = 1000, log = createLog("service"), metrics = serviceMetrics()) {
     this.hooks = hooks;
     this.retryMs = retryMs;
     this.log = log;
+    this.metrics = metrics;
+    // Each tenant's series start at 0, so increase() sees its first deliveries and failures.
+    for (const tenant of hooks.keys()) for (const result of ["delivered", "failed"]) metrics.webhookDeliveries.inc({ tenant, result }, 0);
   }
 
   send(task: Task, approval: Approval): void {
@@ -186,15 +195,16 @@ export class Webhooks {
       for (let attempt = 0; attempt <= RETRIES; attempt++) {
         try {
           if (attempt) await sleep(this.retryMs * 2 ** (attempt - 1), undefined, { signal: stop.signal });
-          const res = await fetch(hook.url, { method: "POST", headers, body, signal: AbortSignal.any([stop.signal, AbortSignal.timeout(ATTEMPT_MS)]) });
+          const res = await fetch(hook.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.any([stop.signal, AbortSignal.timeout(ATTEMPT_MS)]) });
           await res.body?.cancel();
-          if (res.ok) return;
-          last = `${res.status}`;
+          if (res.ok) return this.metrics.webhookDeliveries.inc({ tenant: task.tenant, result: "delivered" });
+          last = REDIRECTS.includes(res.status) ? `${res.status} (redirects are not followed)` : `${res.status}`;
         } catch (err) {
           if (stop.signal.aborted) return;
           last = err instanceof Error ? err.message : String(err);
         }
       }
+      this.metrics.webhookDeliveries.inc({ tenant: task.tenant, result: "failed" });
       this.log.warn(`the approval webhook failed for ${approval.id}, ${RETRIES + 1} times: ${last}`, { tenant: task.tenant, task: task.id });
     })().finally(() => this.pending.delete(stop));
   }

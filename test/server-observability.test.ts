@@ -149,6 +149,8 @@ const observeTests = () => {
     assert.equal(value('jig_service_tasks_refused_total{tenant="globex",reason="quota"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="queue"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 2);
+    // Each tenant's series start at 0, so increase() sees its first refusals.
+    assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="quota"}'), 0);
     assert.equal(value("jig_service_replicas"), 1);
     assert.equal(value("jig_service_approvals_pending"), 0);
     assert.equal(value("jig_service_pool_idle"), undefined, "no pool");
@@ -251,7 +253,8 @@ const observeTests = () => {
     };
     const { value } = await scrape(api);
     assert.equal(value('jig_service_tasks{tenant="acme",status="queued"}'), undefined);
-    assert.ok(value("jig_service_store_errors_total")! >= 1);
+    assert.ok(value('jig_service_store_errors_total{retried="false"}')! >= 1);
+    assert.equal(value('jig_service_store_errors_total{retried="true"}'), 0);
     delete (api.store as Partial<Service["store"]>).counts;
 
     // The next scrape reads again, and that read is kept for a minute.
@@ -449,10 +452,23 @@ describe("the observability deploy files", () => {
     return names;
   }
   const used = (query: string) => [...query.matchAll(/\bjig_[a-z_]+/g)].map(([name]) => name);
+  /** The labels each of the service's series may be selected by: its metric's own, and those a scrape adds. */
+  function serviceLabels(): Map<string, Set<string>> {
+    const labels = new Map<string, Set<string>>();
+    for (const metric of Object.values(serviceMetrics())) {
+      if (!("name" in metric)) continue;
+      const own = [...(metric as unknown as { labels: string[] }).labels, "region", "component", "instance", "job"];
+      for (const suffix of ["", "_bucket", "_sum", "_count"]) labels.set(metric.name + suffix, new Set(suffix === "_bucket" ? [...own, "le"] : own));
+    }
+    return labels;
+  }
+  /** Each service series a query selects by labels, with the labels it selects by. */
+  const selected = (query: string) => [...query.matchAll(/\b(jig_service_[a-z_]+)\{([^}]*)\}/g)].map(([, name, matchers]) => ({ name: name!, labels: [...matchers!.matchAll(/([a-zA-Z_]\w*)\s*(?:=~|!~|!=|=)/g)].map(([, label]) => label!) }));
   const read = async (file: string) => readFile(join(DEPLOY, file), "utf8");
 
-  it("alert on the service's, the gateway's and the router's metrics, by the names they have", async () => {
+  it("alert on the service's, the gateway's and the router's metrics, by the names and labels they have", async () => {
     const names = await known();
+    const labels = serviceLabels();
     const [{ groups }] = parseYaml(await read("observability/alerts.yml")) as any[];
     assert.deepEqual(groups.map((group: any) => group.name), ["jig-service", "jig-gateway", "jig-router"]);
     const alerts = groups.flatMap((group: any) => group.rules);
@@ -464,7 +480,13 @@ describe("the observability deploy files", () => {
       assert.ok(rule.annotations.summary && rule.annotations.description, rule.alert);
       if (rule.for !== undefined) assert.match(rule.for, /^\d+[smh]$/, rule.alert);
       for (const name of used(rule.expr)) assert.ok(names.has(name), `${rule.alert}: ${name} isn't a metric`);
+      for (const { name, labels: by } of selected(rule.expr)) for (const label of by) assert.ok(labels.get(name)?.has(label), `${rule.alert}: ${name} has no label ${label}`);
     }
+    // The store's critical alert is for reads and writes given up on, so it means something was lost; the
+    // warning, for every failed try, a retried one too.
+    const rule = (name: string) => alerts.find((each: any) => each.alert === name);
+    assert.deepEqual([rule("JigStoreErrors").expr, rule("JigStoreErrors").labels.severity], ['sum(increase(jig_service_store_errors_total{retried="false"}[5m])) > 0', "critical"]);
+    assert.deepEqual([rule("JigStoreDegraded").expr, rule("JigStoreDegraded").labels.severity], ["sum(increase(jig_service_store_errors_total[5m])) > 0", "warning"]);
     // What the proposal asks to be told of, each part's.
     const exprs = alerts.map((rule: any) => rule.expr).join("\n");
     for (const name of ["jig_service_queue_oldest_seconds", "jig_service_queue_seconds_bucket", "jig_service_tasks_ended_total", "jig_service_store_errors_total", "jig_service_lease_errors_total", "jig_service_tasks_refused_total", "jig_gateway_requests_total", "jig_gateway_failovers_total", "jig_gateway_upstream_open", "jig_gateway_keys", "jig_gateway_refused_total", "jig_router_region_up"]) {
@@ -474,6 +496,7 @@ describe("the observability deploy files", () => {
 
   it("chart every metric of the service's, and only metrics that are, on a dashboard Grafana can import", async () => {
     const names = await known();
+    const labels = serviceLabels();
     const dashboard = JSON.parse(await read("observability/grafana-dashboard.json"));
     assert.equal(dashboard.uid, "jig-fleet");
     const panels = dashboard.panels.filter((panel: any) => panel.type !== "row");
@@ -487,6 +510,7 @@ describe("the observability deploy files", () => {
       for (const target of panel.targets) {
         assert.match(target.refId, /^[A-Z]$/);
         for (const name of used(target.expr)) assert.ok(names.has(name), `${panel.title}: ${name} isn't a metric`);
+        for (const { name, labels: by } of selected(target.expr)) for (const label of by) assert.ok(labels.get(name)?.has(label), `${panel.title}: ${name} has no label ${label}`);
         queries.push(target.expr);
       }
     }

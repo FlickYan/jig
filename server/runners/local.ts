@@ -3,6 +3,7 @@ import { closeSync, constants, openSync } from "node:fs";
 import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import { createLog, type Log } from "../log.ts";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
@@ -10,12 +11,13 @@ import type { Task, Tenant, Workspace } from "../store.ts";
 // work/ is the project jig works in, home/ its HOME and JIG_HOME, home/tmp its TMPDIR, and beside them the
 // events and stats files jig writes, outside the project. jig's sandbox lets its commands read the whole
 // machine and write the temp folders, so the runner gives each jig settings that hide the data directory from
-// them, all but the task's own project and home (see tools/util.ts's keptIn), and the database and the
-// service's config: another task's folder, the events and stats files and the database are out of their
-// reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so that is the
-// task's own: in a shared one, other tasks' commands could read them, and write them. What they still share is
-// the machine: its kernel, /tmp and /var/tmp by their paths, and on macOS its processes and localhost.
-// Without a sandbox (sandboxProblem), commands run directly on it.
+// them, all but the task's own project and home (see tools/util.ts's keptIn), and what `hidden` lists (the
+// database, the config's folder): another task's folder, the events and stats files and the database are
+// out of their reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so
+// that is the task's own: in a shared one, other tasks' commands could read them, and write them. What they
+// still share is the machine: its kernel, /tmp and /var/tmp by their paths, its Unix sockets, the rest of
+// what the service's user can read, and on macOS its processes and localhost. Without a sandbox
+// (sandboxProblem), commands run directly on it.
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -29,12 +31,16 @@ export interface LocalRunnerConfig {
   graceSeconds: number;
   /** The protocols a git workspace may be cloned over (default: https only). */
   gitProtocols?: string[];
+  /** Whether a clone follows a redirect on its first request, as git does by default (default: no, as with gitHosts). */
+  gitRedirects?: boolean;
   /** The service's internal listener, where a task with approvals asks for them. */
   internalBaseUrl?: string;
   /** How often the events file is read, in milliseconds. */
   pollMs?: number;
-  /** What else tasks' commands can't read, beside dataDir: the database's files and the service's config. */
+  /** What else tasks' commands can't read, beside dataDir: the database's files and the config's folder, say. */
   hidden?: string[];
+  /** Where the runner's lines go (default: the service's log). */
+  log?: Log;
 }
 
 // The service's environment holds its own secrets (and maybe real provider keys): jig gets only these of it.
@@ -45,9 +51,11 @@ export const TERM_MS = 5_000;
 
 export class LocalRunner implements Runner {
   private config: LocalRunnerConfig;
+  private log: Log;
 
   constructor(config: LocalRunnerConfig) {
     this.config = config;
+    this.log = config.log ?? createLog("service");
   }
 
   /** The task's folder. */
@@ -70,7 +78,7 @@ export class LocalRunner implements Runner {
     await mkdir(join(home, "tmp"));
     const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
     await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
-    await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"]);
+    await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
 
     const timeLimit = task.spec.timeLimit;
     const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
@@ -128,8 +136,13 @@ export class LocalRunner implements Runner {
   }
 }
 
-/** Writes a task's files into its (empty) workspace, or clones its repository there. */
-export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[]): Promise<void> {
+/**
+ * Writes a task's files into its (empty) workspace, or clones its repository there. What git says of a
+ * clone that fails goes to `log`; the task is told only that it failed, or that a redirect it was sent isn't
+ * followed. With `redirects`, a redirect on the clone's first request is followed, as git does by default;
+ * without, none is.
+ */
+export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log, redirects = false): Promise<void> {
   for (const [path, contents] of Object.entries(workspace?.files ?? {})) {
     const problem = workspaceProblem(path);
     if (problem) throw new Error(`The workspace file ${JSON.stringify(path)} ${problem}.`);
@@ -138,11 +151,19 @@ export async function prepareWorkspace(work: string, workspace: Workspace | unde
   }
   if (!workspace?.git) return;
   // Shallow, with no hooks or templates (whose hooks a clone would run) and only the protocols allowed: git
-  // runs a program for some others (ext::).
-  const args = ["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", "clone", "--quiet", "--depth", "1", "--no-tags", ...(workspace.ref ? ["--branch", workspace.ref] : []), "--", workspace.git, work];
+  // runs a program for some others (ext::). With gitHosts, no redirect is followed: the tenant's URL, checked
+  // against them, is the only host asked. Without, any host may be named, so a redirect gets round nothing.
+  const args = ["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", ...(redirects ? [] : ["-c", "http.followRedirects=false"]), "clone", "--quiet", "--depth", "1", "--no-tags", ...(workspace.ref ? ["--branch", workspace.ref] : []), "--", workspace.git, work];
   const env = { PATH: process.env.PATH, HOME: dirname(work), GIT_ALLOW_PROTOCOL: protocols.join(":"), GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
-  await promisify(execFile)("git", args, { env, timeout: 120_000 }).catch((err: { stderr?: string; message: string }) => {
-    throw new Error(`git clone failed: ${(err.stderr || err.message).trim()}`);
+  await promisify(execFile)("git", args, { env, timeout: 120_000 }).catch((err: { code?: unknown; signal?: string | null; stderr?: string; message: string }) => {
+    // git names the hosts and ports it tried and how they answered: told to the tenant, a clone on the
+    // service's network would scan it for them.
+    log?.warn("git clone failed", { stderr: (err.stderr || err.message).trim() });
+    // That much is the tenant's to know, to give the URL the host redirects to: not where it redirects.
+    if (!redirects && /The requested URL returned error: 30[12378]\b/.test(err.stderr ?? "")) {
+      throw new Error("git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+    }
+    throw new Error(`git clone failed (${typeof err.code === "number" ? `exit ${err.code}` : (err.signal ?? err.code ?? "no exit code")})`);
   });
 }
 
@@ -225,11 +246,17 @@ export async function* tail(file: string, finished: () => boolean, pollMs: numbe
   }
 }
 
-/** The event a line holds, or undefined if it isn't one. */
+/** The most a seq can be: what a Postgres integer (and so both stores) can hold. */
+const MAX_SEQ = 2 ** 31 - 1;
+
+/**
+ * The event a line holds, or undefined if it isn't one. A seq past MAX_SEQ isn't one: a run's commands may
+ * write its events, and that one could never be stored.
+ */
 export function parseEvent(line: string): JigEvent | undefined {
   try {
     const event = JSON.parse(line);
-    return event && Number.isInteger(event.seq) && event.seq > 0 && typeof event.type === "string" ? event : undefined;
+    return event && Number.isInteger(event.seq) && event.seq > 0 && event.seq <= MAX_SEQ && typeof event.type === "string" ? event : undefined;
   } catch {
     return undefined;
   }

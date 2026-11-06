@@ -3,8 +3,8 @@ import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createServer, get, type IncomingMessage, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -12,6 +12,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { bracketHost, checkConfig, type Config, resolvePaths, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
+import { PgError } from "../server/pg.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { outcomeOf, Scheduler } from "../server/scheduler.ts";
@@ -140,9 +141,14 @@ interface Frame {
 async function* sse(service: Service, path: string, headers: Record<string, string> = {}): AsyncGenerator<Frame> {
   const res = await fetch(service.url + path, { headers: { authorization: `Bearer ${KEYS.acme}`, ...headers } });
   assert.equal(res.headers.get("content-type"), "text/event-stream");
+  yield* framesOf(res.body as unknown as AsyncIterable<Uint8Array>);
+}
+
+/** The server-sent events in a response's body, frame by frame. */
+async function* framesOf(body: AsyncIterable<Uint8Array>): AsyncGenerator<Frame> {
   const decoder = new TextDecoder();
   let buffer = "";
-  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+  for await (const chunk of body) {
     buffer += decoder.decode(chunk, { stream: true });
     for (let end; (end = buffer.indexOf("\n\n")) >= 0; buffer = buffer.slice(end + 2)) {
       const frame: Frame = { data: "" };
@@ -159,6 +165,84 @@ async function collect(frames: AsyncGenerator<Frame>): Promise<Frame[]> {
   const all: Frame[] = [];
   for await (const frame of frames) all.push(frame);
   return all;
+}
+
+/**
+ * A service whose tasks each write `count` events of 128 KiB, with a pause of a millisecond after every
+ * tenth: the first, then, once `go` has resolved, the rest.
+ */
+async function bigEvents(name: string, count: number, go: () => Promise<void>): Promise<Service> {
+  const text = "y".repeat(128 * 1024);
+  const runner: Runner = {
+    async start() {
+      return {
+        events: (async function* () {
+          yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "text", text };
+          await go();
+          for (let seq = 2; seq <= count; seq++) {
+            yield { v: 1, seq, ts: new Date().toISOString(), type: "text", text };
+            if (seq % 10 === 0) await new Promise((done) => setTimeout(done, 1));
+          }
+        })(),
+        wait: async () => ({ exitCode: 0, timedOut: false }),
+        cancel() {},
+      };
+    },
+  };
+  const base = await tempDir(`jig-service-${name}-`);
+  const api = await startService(
+    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+    { secret: SECRET, runner },
+  );
+  services.push(api);
+  return api;
+}
+
+/**
+ * Watches what event streams hold written for their clients, which the client (and the kernel) hasn't
+ * taken yet: `most` is the most one held, as it wrote. Until the test ends.
+ */
+function watchStreams(): { most: () => number } {
+  const write = ServerResponse.prototype.write as (...args: unknown[]) => boolean;
+  let most = 0;
+  ServerResponse.prototype.write = function (this: ServerResponse, ...args: unknown[]) {
+    const result = write.apply(this, args);
+    if (this.req.url?.endsWith("/events")) most = Math.max(most, this.writableLength);
+    return result;
+  } as typeof ServerResponse.prototype.write;
+  opened.push(async () => void (ServerResponse.prototype.write = write as typeof ServerResponse.prototype.write));
+  return { most: () => most };
+}
+
+/** A task's event stream whose client reads the first chunk, then nothing until it reads the frames. */
+async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame> }> {
+  const res = await new Promise<IncomingMessage>((done, fail) => get(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
+  const first = await new Promise<Buffer>((done) =>
+    res.once("data", (chunk: Buffer) => {
+      res.pause();
+      done(chunk);
+    }),
+  );
+  return {
+    frames: () =>
+      framesOf(
+        (async function* () {
+          yield first;
+          yield* res;
+        })(),
+      ),
+  };
+}
+
+/** The ids of a stream's events, and the frame it ended with. */
+async function idsAndEnd(frames: AsyncGenerator<Frame>): Promise<{ ids: string[]; done?: Frame }> {
+  const ids: string[] = [];
+  let done: Frame | undefined;
+  for await (const frame of frames) {
+    if (frame.id) ids.push(frame.id);
+    else done = frame;
+  }
+  return { ids, done };
 }
 
 const work = (service: { dataDir: string }, id: string) => join(service.dataDir, "tasks", id, "work");
@@ -490,6 +574,15 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
   });
 
+  it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
+    // The first event is past it already.
+    const api = await service({ maxEventBytes: 10 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await statusOf(api, id, "succeeded");
+    const stored = (await api.store.events(id)).map(({ seq, event }) => [seq, (event as { type: string }).type]);
+    assert.deepEqual(stored, [[1, "notice"], [7, "end"]]);
+  });
+
   it("removes a task's folder once it has ended, unless keepTaskDirs", async () => {
     const api = await service({ keepTaskDirs: false });
     const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
@@ -498,6 +591,64 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     await api.scheduler.settled();
     assert.equal(existsSync(join(api.dataDir, "tasks", id)), false);
     assert.equal((await api.store.events(id)).length, 7);
+  });
+
+  it("streams a task's events at its client's pace, holding a page of them while the client reads none", { skip: name !== "SQLite" && "SQLite's: Postgres's pages are tested in server-pg.test.ts" }, async () => {
+    // 200 events of 128 KiB, 25 MB in all, stored before the stream starts.
+    const api = await bigEvents(name, 200, async () => {});
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await statusOf(api, id, "succeeded");
+    /** How long /healthz took to answer: Infinity if it failed. */
+    const healthz = async () => {
+      const began = performance.now();
+      const ok = await fetch(`${api.url}/healthz`).then(async (res) => (await res.text(), res.ok), () => false);
+      return ok ? performance.now() - began : Infinity;
+    };
+    assert.ok((await healthz()) < Infinity);
+    // The most JSON of the pages it reads from the store.
+    let page = 0;
+    const events = api.store.events.bind(api.store);
+    api.store.events = async (...args) => {
+      const read = await events(...args);
+      page = Math.max(page, read.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0));
+      return read;
+    };
+    const held = watchStreams();
+
+    // The service answers others all along, from the request on.
+    let slowest = 0;
+    let probing = true;
+    const probes = (async () => {
+      while (probing) {
+        slowest = Math.max(slowest, await healthz());
+        await new Promise((done) => setTimeout(done, 20));
+      }
+    })();
+    // The client reads the first chunk, then nothing for a second.
+    const stream = await pausedStream(api, id);
+    await new Promise((done) => setTimeout(done, 1000));
+    probing = false;
+    await probes;
+    assert.ok(slowest < 2000, `/healthz took ${slowest === Infinity ? "forever: one failed" : `${Math.round(slowest)} ms`}`);
+    // It held at most an event and the socket's buffer, written for the client, and a page of 4 MiB.
+    assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
+    assert.ok(page < 4.5 * 1024 * 1024, `a page held ${Math.round(page / 1024)} KiB of events`);
+
+    // Then it reads the rest: every event, once each, in order.
+    assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
+  });
+
+  it("sends live events at its client's pace too, holding none of them while the client reads none", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    // The first event, then, once the client has stopped reading, 200 of 128 KiB.
+    let paused!: () => void;
+    const api = await bigEvents(name, 200, () => new Promise<void>((done) => (paused = done)));
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    const held = watchStreams();
+    const stream = await pausedStream(api, id);
+    paused();
+    await statusOf(api, id, "succeeded");
+    assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
+    assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
   });
 };
 
@@ -533,6 +684,49 @@ class FakeRunner implements Runner {
     };
   }
 }
+
+/**
+ * The store, but for `method`, which throws `error` whenever `fails` says so (at once, or once it settles)
+ * of its second argument (an event's seq).
+ */
+function failingStore(store: Store, method: keyof Store, fails: (second: unknown) => boolean | Promise<boolean>, error = () => new Error("the database went away")): Store {
+  return new Proxy(store, {
+    get(target, name, receiver) {
+      const value = Reflect.get(target, name, receiver);
+      if (name !== method) return typeof value === "function" ? value.bind(target) : value;
+      return async (...args: unknown[]) => {
+        if (await fails(args[1])) throw error();
+        return value.apply(target, args);
+      };
+    },
+  });
+}
+
+/** A runner whose runs write two notices and an end that spent `cost`, and exit 0. */
+function endsWith(cost: number): Runner {
+  return {
+    async start() {
+      return {
+        events: (async function* () {
+          for (let seq = 1; seq <= 2; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "notice", text: `notice ${seq}` };
+          yield { v: 1, seq: 3, ts: new Date().toISOString(), type: "end", stop: "end_turn", usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 10 }, cost };
+        })(),
+        wait: async () => ({ exitCode: 0, timedOut: false }),
+        cancel() {},
+      };
+    },
+  };
+}
+
+/** The task once it has ended. */
+const endOf = (store: Store, id: string) =>
+  until(async () => {
+    const task = (await store.task(id))!;
+    return task.status !== "running" && task.status !== "queued" && task;
+  }, `task ${id} to end`);
+
+/** What the usage ledger holds as spent, in all. */
+const billed = async (store: Store) => (await store.usage({ from: "2000-01-01", to: "2100-01-01", group: [] })).reduce((sum, row) => sum + row.costUsd, 0);
 
 /** The tests of the scheduler, which run on each store. */
 const schedulerTests = () => {
@@ -670,31 +864,246 @@ const schedulerTests = () => {
     await store.close();
   });
 
+  for (const failures of [1, 2]) {
+    it(`stores every event of a run whose event write fails ${failures === 1 ? "once" : "twice in a row"}, and bills what it spent`, async () => {
+      const store = await newStore();
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+      // The database drops the connection as the second event is written: a blip, not an outage.
+      let left = failures;
+      const flaky = failingStore(store, "addEvent", (seq) => seq === 2 && left-- > 0);
+      const metrics = serviceMetrics();
+      const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, metrics });
+      await scheduler.poke();
+      const ended = await endOf(store, task.id);
+      assert.deepEqual([ended.status, ended.error, ended.cost], ["succeeded", null, 1.25]);
+      assert.deepEqual((await store.events(task.id)).map(({ seq }) => seq), [1, 2, 3]);
+      assert.equal(await billed(store), 1.25);
+      // Each failed try is counted as retried: nothing was given up on, so nothing was lost.
+      assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [failures, 0]);
+      await scheduler.close();
+      await store.close();
+    });
+  }
+
+  it("stores the outcome of a run when its first write fails, and bills what it spent", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let left = 1;
+    const flaky = failingStore(store, "finish", () => left-- > 0);
+    // A short lease, so that an outcome given up on would show as the lease's error at once.
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.error, ended.cost], ["succeeded", null, 1.25]);
+    assert.equal(await billed(store), 1.25);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stores the outcome of a cancelled run when its first write fails, and bills what it spent", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let left = 1;
+    const flaky = failingStore(store, "finish", () => left-- > 0);
+    // jig, stopped, writes its end with what it spent so far.
+    let stop!: () => void;
+    const stopped = new Promise<void>((done) => (stop = done));
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            await stopped;
+            yield { v: 1, seq: 1, ts: new Date().toISOString(), type: "end", stop: "interrupted", usage: { input: 10, cacheRead: 0, cacheWrite: 0, output: 10 }, cost: 0.75 };
+          })(),
+          wait: async () => (await stopped, { exitCode: 143, timedOut: false }),
+          cancel: () => stop(),
+        };
+      },
+    };
+    const scheduler = newScheduler(flaky, runner, { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    await until(() => scheduler.running("a"), "the run to start");
+    assert.equal(await scheduler.cancel((await store.task(task.id))!), "running");
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.cost], ["cancelled", 0.75]);
+    assert.equal(await billed(store), 0.75);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("tries an outcome again only within half a lease of its first try's start, though that try hangs", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // The first try hangs past half the lease (as a query waits for its timeout), then fails.
+    let tries = 0;
+    const flaky = failingStore(store, "finish", async () => tries++ === 0 && (await new Promise((done) => setTimeout(done, 600)), true));
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 1000 });
+    await scheduler.start();
+    // Given up on, it is left to its lease, which ends it.
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, tries], ["error", 1]);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("doesn't try again a write the database says is wrong in its data, and ends the run as an error", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    let tries = 0;
+    const outOfRange = () => new PgError({ C: "22003", M: "value out of range for type integer" });
+    const flaky = failingStore(store, "addEvent", (seq) => seq === 2 && (tries++, true), outOfRange);
+    // A long lease: retried, the write would hold the run for half of it.
+    const scheduler = newScheduler(flaky, endsWith(1.25), { concurrency: 4, leaseMs: 60_000 });
+    const began = Date.now();
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.error, tries], ["error", "value out of range for type integer", 1]);
+    assert.ok(Date.now() - began < 5000);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("holds a run's slot while its outcome is tried again", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const ids: string[] = [];
+    for (const prompt of ["a0", "a1"]) ids.push((await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" })).id);
+    // The first three tries of the first outcome fail, over 700 ms; when the fourth was begun is kept.
+    let tries = 0;
+    let stored: number | undefined;
+    const flaky = failingStore(store, "finish", () => ++tries <= 3 || ((stored ??= Date.now()), false));
+    const started = new Map<string, number>();
+    const ends = endsWith(0);
+    const runner: Runner = { start: (task, tenant) => (started.set(task.id, Date.now()), ends.start(task, tenant)) };
+    const scheduler = newScheduler(flaky, runner, { concurrency: 4, leaseMs: 4000 });
+    await scheduler.start();
+    await until(() => started.has(ids[1]), "the second run to start");
+    assert.ok(stored !== undefined && started.get(ids[1])! >= stored, "the second run started while the first's outcome was tried again");
+    for (const id of ids) assert.equal((await endOf(store, id)).status, "succeeded");
+    assert.equal(tries, 5);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // As a task's commands can write the events file on Docker and Kubernetes: 200 lines of 512 KiB.
+    const text = "x".repeat(512 * 1024);
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (let seq = 1; seq <= 200; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "notice", text };
+            yield { v: 1, seq: 201, ts: new Date().toISOString(), type: "end", stop: "end_turn" };
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, maxEventBytes: 8 * 1024 * 1024 });
+    await scheduler.poke();
+    assert.equal((await endOf(store, task.id)).status, "succeeded");
+    const events = await store.events(task.id);
+    const [notice, end] = events.slice(-2).map(({ event }) => event as { type: string; text?: string });
+    assert.deepEqual([notice.type, end.type], ["notice", "end"]);
+    assert.match(notice.text!.slice(0, 200), /past 8388608 bytes aren't kept/);
+    const kept = events.slice(0, -2);
+    assert.ok(kept.length > 0 && kept.every(({ event }) => (event as { text?: string }).text === text));
+    assert.ok(kept.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0) <= 8 * 1024 * 1024);
+    assert.equal(kept.length, 15);
+    await scheduler.close();
+    await store.close();
+  });
+
+  it("counts a run's ends against maxEvents and maxEventBytes, and stores only its last end past them", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    // A task's commands can write ends as well: 200 lines of 512 KiB, then jig's own end, last.
+    const text = "x".repeat(512 * 1024);
+    const usage = { input: 1, cacheRead: 0, cacheWrite: 0, output: 1 };
+    const runner: Runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (let seq = 1; seq <= 200; seq++) yield { v: 1, seq, ts: new Date().toISOString(), type: "end", stop: "error", usage, cost: 9, text };
+            yield { v: 1, seq: 201, ts: new Date().toISOString(), type: "end", stop: "end_turn", usage, cost: 0.5 };
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, maxEventBytes: 8 * 1024 * 1024 });
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    assert.deepEqual([ended.status, ended.stop, ended.cost], ["succeeded", "end_turn", 0.5]);
+    const events = await store.events(task.id);
+    const kept = events.slice(0, -2);
+    assert.equal(kept.length, 15);
+    assert.ok(kept.reduce((sum, { event }) => sum + Buffer.byteLength(JSON.stringify(event)), 0) <= 8 * 1024 * 1024);
+    assert.deepEqual(events.slice(-2).map(({ seq, event }) => [seq, (event as { type: string }).type]), [[16, "notice"], [201, "end"]]);
+    await scheduler.close();
+    await store.close();
+  });
+
+  for (const [types, want] of [
+    [["start", "start", "end"], [[1, "start"], [2, "start"], [3, "end"]]],
+    [["start", "start", "end", "end"], [[1, "start"], [2, "start"], [3, "notice"], [4, "end"]]],
+    [["start", "start", "end", "start"], [[1, "start"], [2, "start"], [3, "notice"]]],
+    [["start", "start", "start", "end", "end"], [[1, "start"], [2, "start"], [3, "notice"], [5, "end"]]],
+  ] as const) {
+    it(`past maxEvents stores a run's last event only if it is an end, and a notice in place of the first dropped: ${types.join(", ")}`, async () => {
+      const store = await newStore();
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+      const runner: Runner = {
+        async start() {
+          return {
+            events: (async function* () {
+              for (const [i, type] of types.entries()) yield { v: 1, seq: i + 1, ts: new Date().toISOString(), type, stop: "end_turn" };
+            })(),
+            wait: async () => ({ exitCode: 0, timedOut: false }),
+            cancel() {},
+          };
+        },
+      };
+      const scheduler = newScheduler(store, runner, { concurrency: 4, maxEvents: 2 });
+      await scheduler.poke();
+      await endOf(store, task.id);
+      assert.deepEqual((await store.events(task.id)).map(({ seq, event }) => [seq, (event as { type: string }).type]), want);
+      await scheduler.close();
+      await store.close();
+    });
+  }
+
   it("frees a run's slot even when its outcome can't be stored", async () => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     for (const prompt of ["a0", "a1"]) await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
-    // The database fails as the first run's outcome is written.
-    let failures = 1;
-    const failing = new Proxy(store, {
-      get(target, name, receiver) {
-        const value = Reflect.get(target, name, receiver);
-        if (name !== "finish") return typeof value === "function" ? value.bind(target) : value;
-        return async (...args: unknown[]) => {
-          if (failures-- > 0) throw new Error("the database went away");
-          return value.apply(target, args);
-        };
-      },
-    });
+    // The database fails from the first run's outcome on, past every retry.
+    const failing = failingStore(store, "finish", () => true);
     const runner = new FakeRunner();
     const lines: string[] = [];
-    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, log: createLog("service", { write: (line) => lines.push(line) }) });
+    const metrics = serviceMetrics();
+    const scheduler = newScheduler(failing, runner, { concurrency: 4, leaseMs: 300, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
     await scheduler.start();
     await until(() => runner.active.size, "a0 to start");
     runner.active.values().next().value!.end();
     // a0's lease, no longer renewed, runs out: it ends as an error, and a1 takes the slot it had.
     await until(() => runner.started.length === 2, "a1 to start");
     assert.ok(lines.some((line) => line.includes("couldn't store how the task ended")), lines.join("\n"));
+    // The tries before the last are counted as retried, and the outcome given up on once.
+    assert.ok(metrics.storeErrors.get({ retried: "true" }) >= 1);
+    assert.equal(metrics.storeErrors.get({ retried: "false" }), 1);
     const [lost] = await store.inStatus("error");
     assert.equal(lost.spec.prompt, "a0");
     assert.match(lost.error!, /stopped renewing its lease/);
@@ -804,7 +1213,7 @@ const schedulerTests = () => {
     const lines: string[] = [];
     const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
     assert.deepEqual(await scheduler.start(), [left.id]);
-    assert.equal(metrics.storeErrors.get(), 1);
+    assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [0, 1]);
     assert.ok(lines.some((line) => line.includes("couldn't read an expired task to count it")), lines.join("\n"));
     assert.equal((await store.task(left.id))!.status, "error");
     await scheduler.close();
@@ -834,6 +1243,65 @@ describe("a run's outcome", () => {
   });
 });
 
+describe("the SQLite store's reads", () => {
+  const limits = { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+  const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+
+  it("reads a task's events a page at a time, and all of them without a limit", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const task = await store.createTask("a", spec);
+    for (let seq = 1; seq <= 250; seq++) await store.addEvent(task.id, seq, { v: 1, seq, ts: "", type: "text" });
+    const seqs = async (after: number, limit?: number) => (await store.events(task.id, after, limit)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100), Array.from({ length: 100 }, (_, i) => i + 1));
+    assert.deepEqual(await seqs(100, 100), Array.from({ length: 100 }, (_, i) => i + 101));
+    assert.deepEqual(await seqs(200, 100), Array.from({ length: 50 }, (_, i) => i + 201));
+    assert.equal((await seqs(0)).length, 250);
+  });
+
+  it("stops a page of a task's events once their JSON comes to the bytes asked for, in UTF-8", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const task = await store.createTask("a", spec);
+    // "é" is a character, and two bytes in UTF-8.
+    const event = (seq: number) => ({ v: 1, seq, ts: "", type: "text", text: "é".repeat(1000) });
+    for (let seq = 1; seq <= 10; seq++) await store.addEvent(task.id, seq, event(seq));
+    const size = Buffer.byteLength(JSON.stringify(event(1)));
+    const seqs = async (after: number, limit: number, bytes: number) => (await store.events(task.id, after, limit, bytes)).map((row) => row.seq);
+    assert.deepEqual(await seqs(0, 100, 3 * size), [1, 2, 3]);
+    assert.deepEqual(await seqs(0, 100, 3 * size + 1), [1, 2, 3, 4]);
+    assert.deepEqual(await seqs(2, 100, 1), [3]);
+    assert.deepEqual(await seqs(0, 2, 100 * size), [1, 2]);
+    assert.deepEqual(await seqs(7, 100, 100 * size), [8, 9, 10]);
+  });
+
+  it("lists a tenant's tasks in an index's order, with no sort of them all", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    for (const id of ["a", "b"]) await store.putTenant({ id, limits }, []);
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await store.createTask(i % 2 ? "a" : "b", spec)).id);
+    // The plans of the statements the store prepares to list them, as it prepares them.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const prepare = DatabaseSync.prototype.prepare;
+    const plans: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (/ FROM tasks WHERE tenant = \?/.test(sql)) plans.push((prepare.call(this, `EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((row) => row.detail).join("; "));
+      return prepare.call(this, sql);
+    };
+    try {
+      assert.equal((await store.tasks("a", { limit: 5 })).length, 5);
+      assert.equal((await store.tasks("a", { limit: 5, before: ids.at(-1) })).length, 5);
+    } finally {
+      DatabaseSync.prototype.prepare = prepare;
+    }
+    assert.equal(plans.length, 2);
+    for (const plan of plans) assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
+  });
+});
+
 describe("the service's config", () => {
   const base = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [] } satisfies Config;
   const problem = (config: object) => {
@@ -854,7 +1322,16 @@ describe("the service's config", () => {
     assert.equal(problem({ gatewayBaseUrl: "gateway:8081" }), 'The config\'s gatewayBaseUrl must be an http or https URL, not "gateway:8081"');
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
+    assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
+    assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
+    // An entry is matched to a URL's hostname: one with a scheme, port, path or trailing dot would match none.
+    const notHost = (host: string) => `The config's gitHosts must be hostnames as a URL has them (no scheme, port, path or trailing dot; IPv6 in brackets; punycode), not ${JSON.stringify(host)}`;
+    for (const host of ["https://github.com", "github.com:443", "github.com/org", "u@github.com", "github.com.", "bücher.de"]) assert.equal(problem({ gitHosts: ["example.com", host] }), notHost(host));
+    assert.equal(problem({ gitHosts: ["GitHub.com", "[fd00::1]", "xn--bcher-kva.de", "10.0.0.7"] }), undefined);
+    assert.equal(problem({ local: [] }), "The config's local must be an object, {hiddenPaths}");
+    assert.equal(problem({ local: { hiddenPaths: ["secrets"] } }), 'The config\'s local.hiddenPaths must be a list of absolute paths, not ["secrets"]');
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
     assert.equal(problem({ docker: { image: "w", network: "n", pool: 4 } }), "The config's docker.pool must be an object, {size, maxIdleSeconds}");
     assert.equal(problem({ kubernetes: { image: "w", pool: { size: -1 } } }), "The config's kubernetes.pool.size must be a whole number from 0 up, not -1");
@@ -883,6 +1360,13 @@ describe("the service's config", () => {
     assert.equal(problem({ runner: "docker" }), "The config's docker.image is missing");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "" } }), "The config's kubernetes.image must be a string that isn't empty");
     assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w" } }), undefined);
+    // jig gets 5 s less than a pod's grace to write its end, and needs 5 to give up on a reader that takes nothing.
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 5 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 to 3600, not 5");
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 10 } }), undefined);
+    // It adds to the time limit and grace in the timer that lets a pod's log go: with them at their most,
+    // an hour keeps it under 2^31 ms.
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 3600 }, graceSeconds: 86_400, tenants: [{ id: "acme", keys: [], timeLimit: 2_000_000 }] }), undefined);
+    assert.equal(problem({ runner: "kubernetes", kubernetes: { image: "w", terminationGraceSeconds: 3601 } }), "The config's kubernetes.terminationGraceSeconds must be a whole number from 10 to 3600, not 3601");
     // A replica never runs more than concurrency at once, so idle workers past it are never used.
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4000 } } }), "The config's docker.pool.size must be at most concurrency, 4: idle workers past it are never used");
     assert.equal(problem({ concurrency: 8, kubernetes: { image: "w", pool: { size: 8 } } }), undefined);
@@ -975,7 +1459,7 @@ describe("the service's start", () => {
     });
   }
 
-  it("hides dataDir, the database and the config from the local runner's tasks, and warns of what they still share", async () => {
+  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
@@ -987,7 +1471,10 @@ describe("the service's start", () => {
     const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
     if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
     else {
-      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
+      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
+      // What else they read and connect to, and where the clones go, which gitHosts would limit.
+      warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
+      warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
       // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
       // elsewhere), as each task has its own.
       const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
@@ -1000,7 +1487,170 @@ describe("the service's start", () => {
     await statusOf(started, id, "succeeded");
     const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
     const db = join(dir, "jig.db");
-    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, configFile] });
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
+  });
+
+  it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", async () => {
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["example.com"] });
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: "https://127.0.0.1:1/x.git" } });
+    assert.deepEqual([posted.status, posted.body.error], [400, "workspace.git must be on one of the config's gitHosts: example.com"]);
+
+    // With gitHosts, a redirect to a host inside the service's network is not followed, and what git said
+    // of the hosts it tried goes to the service's log alone: it would make the clone a scanner. The tenant
+    // is told it was a redirect, but not where to.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const outside = createServer((req, res) => res.writeHead(302, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/internal${req.url}` }).end());
+    for (const server of [inside, outside]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const lines: Record<string, unknown>[] = [];
+    const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
+    const dir = await tempDir("jig-service-");
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], gitProtocols: ["http"], gitHosts: ["127.0.0.1"], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const started = await startService(config, { secret: SECRET, log });
+    services.push(started);
+    const port = (outside.address() as AddressInfo).port;
+    const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${port}/x.git` } })).body;
+    const task = await statusOf(started, id, "error");
+    assert.deepEqual(asked, []);
+    assert.equal(task.error, "git clone failed: the git host answered with a redirect, which isn't followed; give the repository's URL as the host has it (with .git at its end, say)");
+    const logged = lines.find((line) => line.msg === "git clone failed");
+    assert.deepEqual([logged?.tenant, logged?.task], ["acme", id]);
+    assert.match(String(logged?.stderr), new RegExp(`127\\.0\\.0\\.1:${port}`));
+    // A failure that isn't a redirect says only how git ended.
+    const refused = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/x.git` } })).body.id;
+    assert.match((await statusOf(started, refused, "error")).error, /^git clone failed \(exit \d+\)$/);
+  });
+
+  it("follows a redirect on a clone's first request without gitHosts, as git does, since any host may be named", async () => {
+    // GitLab redirects a project's URL without .git to the one with it.
+    const asked: string[] = [];
+    const moved = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const project = createServer((req, res) => res.writeHead(301, { location: `http://127.0.0.1:${(moved.address() as AddressInfo).port}/group/project.git${req.url!.slice("/group/project".length)}` }).end());
+    for (const server of [moved, project]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const api = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitProtocols: ["http"] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${(project.address() as AddressInfo).port}/group/project` } })).body;
+    assert.match((await statusOf(api, id, "error")).error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, ["/group/project.git/info/refs?service=git-upload-pack"]);
+  });
+
+  it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", async () => {
+    // git's curl reads what is before the `@` as userinfo, and would connect to the inside server; URL reads
+    // the backslash as a slash, so the host checked is localhost, and that is the host git is given.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["localhost"], gitProtocols: ["http"] });
+    const git = `http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`;
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } });
+    assert.equal(posted.status, 201);
+    const task = await statusOf(limited, posted.body.id, "error");
+    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
+  it("checks a queued task's workspace.git against gitHosts again when it starts", async () => {
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const base = await tempDir("jig-service-");
+    const db = await database(base);
+    // Queued without gitHosts: acme may run none at once, so its tasks wait for the next start.
+    const tenants = (concurrency: number) => [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency }];
+    const first = await service({ database: db, gitProtocols: ["http"], tenants: tenants(0) }, base);
+    const post = async (git: string) => (await call(first, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id as string;
+    const elsewhere = await post(`http://127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    // On the host gitHosts will list, as URL reads it, but not as git's curl would.
+    const sly = await post(`http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    services.splice(services.indexOf(first), 1);
+    await first.close();
+
+    const api = await service({ database: db, gitProtocols: ["http"], gitHosts: ["localhost"], tenants: tenants(2) }, base);
+    const refused = await statusOf(api, elsewhere, "error");
+    assert.equal(refused.error, "workspace.git must be on one of the config's gitHosts: localhost (checked again as the task started)");
+    assert.equal(existsSync(work(api, elsewhere)), false);
+    const cloned = await statusOf(api, sly, "error");
+    assert.match(cloned.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
+  it("warns that the docker runner's clones are on the service's network too, without gitHosts", async () => {
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = await tempDir("jig-service-");
+    const docker = { image: "jig-worker", network: "jig-tasks", docker: [process.execPath, "-e", "process.exit(1)"] };
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", runner: "docker", docker, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const clones = /^jig service: a docker task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/;
+    services.push(await startService(config, { secret: SECRET, log }));
+    assert.ok(lines.some((line) => clones.test(line)), lines.join("\n"));
+    lines.length = 0;
+    services.push(await startService({ ...config, gitHosts: ["example.com"] }, { secret: SECRET, log }));
+    assert.ok(!lines.some((line) => clones.test(line)), lines.join("\n"));
+  });
+
+  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in, with an old git too", async () => {
+    const dir = realpathSync(await tempDir("jig-service-"));
+    const git = (cwd: string, ...args: string[]) => promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main", ...args], { cwd });
+    const repo = async (path: string) => {
+      await git(dir, "init", "--quiet", path);
+      await git(path, "commit", "--quiet", "--allow-empty", "-m", "first");
+    };
+    await repo(join(dir, "main"));
+    await git(join(dir, "main"), "worktree", "add", "--quiet", join(dir, "tree"));
+    await repo(join(dir, "lib"));
+    await repo(join(dir, "super"));
+    await git(join(dir, "super"), "submodule", "--quiet", "add", join(dir, "lib"), "sub");
+    await repo(join(dir, "plain"));
+    // As git rev-parse before 2.31 (2.30 is Debian 11's) takes --path-format=absolute: it prints it back.
+    const real = (await promisify(execFile)("sh", ["-c", "command -v git"])).stdout.trim();
+    await mkdir(join(dir, "bin"));
+    await writeFile(join(dir, "bin", "git"), `#!/bin/sh\nfor a do shift; case $a in --path-format=*) echo "$a" ;; *) set -- "$@" "$a" ;; esac; done\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    for (const old of [false, true]) {
+      for (const [checkout, holder] of [[join(dir, "tree"), join(dir, "main")], [join(dir, "super", "sub"), join(dir, "super")], [join(dir, "plain")]]) {
+        const db = join(dir, `${checkout.split("/").at(-1)}-${old}.db`);
+        if (old) process.env.PATH = `${join(dir, "bin")}:${path}`;
+        const api = await service({ database: db }, checkout).finally(() => (process.env.PATH = path));
+        const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+        await statusOf(api, id, "succeeded");
+        const settings = JSON.parse(await readFile(join(checkout, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+        const hidden = [join(checkout, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, checkout, ...(holder ? [holder] : [])];
+        assert.deepEqual(settings.hiddenPaths, hidden, old ? "with a git before 2.31" : "");
+      }
+    }
+  });
+
+  it("warns when hiding the config's folder or dataDir's checkout would hide the service user's home", async () => {
+    if (sandboxProblem()) return;
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = realpathSync(await tempDir("jig-service-"));
+    await promisify(execFile)("git", ["init", "--quiet", dir]);
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      services.push(await startService(config, { secret: SECRET, log, configFile: join(dir, "service.json") }));
+    } finally {
+      process.env.HOME = home;
+    }
+    for (const what of ["the config's folder", "the git checkout dataDir is in"]) {
+      const warning = new RegExp(`^jig service: the local runner hides ${what}, ${dir}, from its tasks' commands, and that is the service user's home directory`);
+      assert.ok(lines.some((line) => warning.test(line)), lines.join("\n"));
+    }
   });
 
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {

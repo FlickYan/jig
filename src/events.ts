@@ -234,13 +234,15 @@ export class Events {
     // no handler left for it (Ctrl+C's goes with the task, SIGTERM's runs once), losing the end without a word.
     // Each is ignored until that wait is over; jig then exits as the first signal had it. Only that wait: at
     // another end Ctrl+C must still stop jig at once. A SIGTERM there is acted on once the wait is over, so it
-    // has a bound in all too, END_FLUSH_SECONDS, however steadily the reader reads.
+    // has a bound in all too, END_FLUSH_SECONDS, however steadily the reader reads. Both are lowered to
+    // JIG_EVENTS_FLUSH_SECONDS where it is set: in a pod whose grace is shorter, a SIGTERM must still be
+    // acted on, and the end written, before the SIGKILL.
     const interrupted = stop === "interrupted";
     const ignore = () => {};
     if (this.lines && interrupted) for (const signal of SIGNALS) process.on(signal, ignore);
     try {
-      if (interrupted) this.lines?.flush(SIGNAL_FLUSH_SECONDS, "after a signal");
-      else this.lines?.flush(END_FLUSH_SECONDS, "without a signal");
+      if (interrupted) this.lines?.flush(flushBound(SIGNAL_FLUSH_SECONDS), "after a signal");
+      else this.lines?.flush(flushBound(END_FLUSH_SECONDS), "without a signal");
     } finally {
       for (const signal of SIGNALS) process.off(signal, ignore);
     }
@@ -278,7 +280,8 @@ const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 export const FLUSH_SECONDS = 5;
 /**
  * How long in all jig waits for the reader at an end a signal brought, however steadily it reads: inside the
- * 30 s Kubernetes gives a pod between SIGTERM and SIGKILL. jig's own cleanup is done before (see run.ts).
+ * 30 s Kubernetes gives a pod between SIGTERM and SIGKILL by default (the runner passes a pod's own grace
+ * on, see flushBound). jig's own cleanup is done before (see run.ts).
  */
 export const SIGNAL_FLUSH_SECONDS = 20;
 /**
@@ -287,6 +290,15 @@ export const SIGNAL_FLUSH_SECONDS = 20;
  * for good.
  */
 export const END_FLUSH_SECONDS = 60;
+/**
+ * `seconds`, or JIG_EVENTS_FLUSH_SECONDS where that is a positive number and less: the Kubernetes runner sets
+ * it a few seconds under its pods' grace, so the end is written, and the process gone, before the kubelet's
+ * SIGKILL. Anything else leaves `seconds`, as the CLI has it.
+ */
+function flushBound(seconds: number): number {
+  const most = Number(process.env.JIG_EVENTS_FLUSH_SECONDS);
+  return Number.isFinite(most) && most > 0 ? Math.min(seconds, most) : seconds;
+}
 /** The most of the lines jig holds for a reader that is behind: past it, events are dropped (not the end). */
 export const HELD_BYTES = 64 * 1024 * 1024;
 // While the reader is behind, how often jig tries again to write the lines it holds.
