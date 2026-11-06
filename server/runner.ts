@@ -108,6 +108,18 @@ export function workspaceProblem(path: string): string | undefined {
   return undefined;
 }
 
+/**
+ * A workspace.git as git is to be given it, or what is wrong. With `gitHosts`, its host must be one of them,
+ * and git is given the URL as URL reads it: git's curl reads `https://ok.host\@inside/` as userinfo before
+ * the `@`, where URL reads the backslash as a slash, so the raw string could reach another host.
+ */
+export function checkedGit(git: string, gitHosts: string[] | undefined): { git: string } | { error: string } {
+  if (!gitHosts) return { git };
+  const url = URL.parse(git);
+  if (!url || !gitHosts.some((host) => host.toLowerCase() === url.hostname.toLowerCase())) return { error: `workspace.git must be on one of the config's gitHosts: ${gitHosts.join(", ")}` };
+  return { git: url.href };
+}
+
 // jig's exit codes (README: a task given on the command line exits with ...) and the stops they stand for.
 const STOPS: Record<number, string> = { 0: "end_turn", 1: "error", 2: "max_steps", 3: "max_tokens", 4: "refusal", 5: "unapproved", 6: "loop", 7: "time_limit", 8: "empty", 130: "interrupted" };
 

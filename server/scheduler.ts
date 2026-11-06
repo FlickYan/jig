@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
-import { type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
+import { checkedGit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
@@ -31,6 +31,8 @@ export interface SchedulerOptions {
   maxEvents?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
+  /** The hosts a workspace may be cloned from (default: any), checked again as each task starts. */
+  gitHosts?: string[];
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
   onApproval?: (task: Task, approval: Approval) => void;
   /** Where its runs, leases and failures are counted (default: a registry of its own, which nothing serves). */
@@ -80,11 +82,12 @@ export class Scheduler {
   private leaseMs: number;
   private maxEvents: number;
   private keepTaskDirs: boolean;
+  private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -92,6 +95,7 @@ export class Scheduler {
     this.leaseMs = leaseMs;
     this.maxEvents = maxEvents;
     this.keepTaskDirs = keepTaskDirs;
+    this.gitHosts = gitHosts;
     this.onApproval = onApproval;
     this.metrics = metrics ?? serviceMetrics();
     this.log = log ?? createLog("service");
@@ -309,7 +313,7 @@ export class Scheduler {
     // When jig asked for each approval this run stored, by its own clock, to time a timeout's wait.
     const asked = new Map<string, number>();
     try {
-      run.handle = await this.runner.start(task, tenant);
+      run.handle = await this.runner.start(this.cloneable(task), tenant);
       if (run.stopping) run.handle.cancel();
       // With a pool, whether a warm worker took it; and how long jig took to start, either way.
       const start = run.handle.warm ? "warm" : "cold";
@@ -362,6 +366,18 @@ export class Scheduler {
     });
     this.recording.add(recorded);
     await recorded.finally(() => this.recording.delete(recorded));
+  }
+
+  /**
+   * The task as its runner is to start it: one queued before gitHosts was set, or listed fewer hosts, is
+   * checked again here, and its workspace.git given as it was checked; one no longer allowed throws.
+   */
+  private cloneable(task: Task): Task {
+    const git = task.spec.workspace?.git;
+    if (git === undefined) return task;
+    const checked = checkedGit(git, this.gitHosts);
+    if ("error" in checked) throw new Error(`${checked.error} (checked again as the task started)`);
+    return checked.git === git ? task : { ...task, spec: { ...task.spec, workspace: { ...task.spec.workspace, git: checked.git } } };
   }
 
   /**

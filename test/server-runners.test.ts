@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, symlink, writeFile } from "node:fs/promises";
 import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createServer, type Server } from "node:https";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { type Service, startService } from "../server/api.ts";
+import { type Config, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { type Exited, WarmPool } from "../server/pool.ts";
 import type { JigEvent, Runner } from "../server/runner.ts";
@@ -16,6 +16,8 @@ import { DockerRunner } from "../server/runners/docker.ts";
 import { openStore, type Task, type Tenant } from "../server/store.ts";
 import { Channel, KubernetesRunner, labelValue, objectName, POOL_LABEL, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
 import { Lines, lastLine, MAX_LINE, readStats, tail } from "../server/runners/local.ts";
+import { createSandbox, sandboxProblem } from "../src/sandbox.ts";
+import { runCommand } from "../src/tools/bash.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 import { parseYaml } from "./yaml.ts";
 
@@ -125,6 +127,62 @@ const alive = (pid: number) => {
     return false;
   }
 };
+
+describe("the local runner", () => {
+  /**
+   * The service as `node server/api.ts --config` starts it, on the local runner with the fake jig: its config
+   * file and a gateway-secret beside it in etc/, dataDir in a git checkout, and `config` added. Runs one
+   * task, and gives the folders and the hiddenPaths the task's jig got.
+   */
+  async function oneTask(config: Partial<Config> = {}) {
+    const dir = await tempDir("jig-local-");
+    const etc = join(dir, "etc");
+    const checkout = join(dir, "checkout");
+    await mkdir(etc);
+    await mkdir(checkout);
+    execFileSync("git", ["init", "-q", checkout]);
+    const configFile = join(etc, "service.json");
+    const full: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(checkout, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", jig: [process.execPath, FAKE_JIG], graceSeconds: 5, tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")] }], ...config };
+    await writeFile(configFile, JSON.stringify(full));
+    await writeFile(join(etc, "gateway-secret"), "SECRET123\n");
+    const started = await startService(full, { secret: SECRET, configFile });
+    services.push(started);
+    const { id } = (await call(started, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "app.py": "print(1)\n" } } })).body;
+    assert.equal((await ended(started, id)).status, "succeeded");
+    const task = join(checkout, "data", "tasks", id);
+    const { hiddenPaths } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    return { etc, checkout, task, hiddenPaths: hiddenPaths as string[] };
+  }
+
+  it("hides the config's folder, the checkout dataDir lies in, and local.hiddenPaths", async () => {
+    const extra = ["/srv/secrets", "/home/service/.ssh"];
+    const { etc, checkout, hiddenPaths } = await oneTask({ local: { hiddenPaths: extra } });
+    // The folder, not just the file: the gateway-secret the docs keep beside it is the service's too. And
+    // the checkout, whose files (a deploy's .env, say) GIT_CEILING_DIRECTORIES left readable.
+    for (const path of [etc, realpathSync(checkout), ...extra]) assert.ok(hiddenPaths.includes(path), `${path} in ${JSON.stringify(hiddenPaths)}`);
+  });
+
+  it("keeps a secret beside the config from a task's commands, which still work in their project", { skip: sandboxProblem() }, async () => {
+    const { etc, task, hiddenPaths } = await oneTask();
+    const [work, home] = [join(task, "work"), join(task, "home")];
+    // As the task's jig makes its sandbox: its HOME and JIG_HOME are the task's, and these its settings.
+    const was = { HOME: process.env.HOME, JIG_HOME: process.env.JIG_HOME };
+    process.env.HOME = home;
+    process.env.JIG_HOME = join(home, ".jig");
+    const sandbox = createSandbox(work, { network: false, hidden: hiddenPaths })!;
+    try {
+      const inWork = (command: string) => runCommand(command, work, 20, undefined, sandbox);
+      assert.match(await inWork("cat app.py"), /print\(1\)/);
+      assert.doesNotMatch(await inWork(`cat ${join(etc, "gateway-secret")}`), /SECRET123/);
+    } finally {
+      sandbox.close?.();
+      for (const [name, value] of Object.entries(was)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  });
+});
 
 describe("the Docker runner", () => {
   type Options = Partial<ConstructorParameters<typeof DockerRunner>[0]>;

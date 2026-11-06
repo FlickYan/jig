@@ -120,7 +120,7 @@ export class DockerRunner implements Runner {
     const { jig = ["jig"], graceSeconds } = this.config;
     const dir = this.dir(task.id);
     await this.makeFolder(dir);
-    await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"]);
+    await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }));
     await this.chown(dir);
 
     // The token goes by name only (-e NAME), its value in the CLI's environment, out of the process list.
@@ -144,7 +144,7 @@ export class DockerRunner implements Runner {
     const { jig = ["jig"], graceSeconds } = this.config;
     const { name, dir, container } = warm.slot;
     try {
-      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"]);
+      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }));
       await this.chown(dir);
     } catch (err) {
       warm.stop();

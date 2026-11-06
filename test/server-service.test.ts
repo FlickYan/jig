@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -855,6 +855,10 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
+    assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
+    assert.equal(problem({ local: [] }), "The config's local must be an object, {hiddenPaths}");
+    assert.equal(problem({ local: { hiddenPaths: ["secrets"] } }), 'The config\'s local.hiddenPaths must be a list of absolute paths, not ["secrets"]');
     assert.equal(problem({ docker: { image: "w", network: "n", pool: { size: 4, maxIdleSeconds: 300, baseUrl: "http://10.0.0.7:8082" } } }), undefined);
     assert.equal(problem({ docker: { image: "w", network: "n", pool: 4 } }), "The config's docker.pool must be an object, {size, maxIdleSeconds}");
     assert.equal(problem({ kubernetes: { image: "w", pool: { size: -1 } } }), "The config's kubernetes.pool.size must be a whole number from 0 up, not -1");
@@ -975,7 +979,7 @@ describe("the service's start", () => {
     });
   }
 
-  it("hides dataDir, the database and the config from the local runner's tasks, and warns of what they still share", async () => {
+  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
@@ -987,7 +991,10 @@ describe("the service's start", () => {
     const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
     if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
     else {
-      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't reach the database or the other tasks' folders, but share/);
+      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
+      // What else they read and connect to, and where the clones go, which gitHosts would limit.
+      warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
+      warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
       // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
       // elsewhere), as each task has its own.
       const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
@@ -1000,7 +1007,151 @@ describe("the service's start", () => {
     await statusOf(started, id, "succeeded");
     const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
     const db = join(dir, "jig.db");
-    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, configFile] });
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
+  });
+
+  it("clones only from gitHosts, follows no redirect, and tells the tenant only that the clone failed", async () => {
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["example.com"] });
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: "https://127.0.0.1:1/x.git" } });
+    assert.deepEqual([posted.status, posted.body.error], [400, "workspace.git must be on one of the config's gitHosts: example.com"]);
+
+    // Without gitHosts, a redirect to a host inside the service's network is not followed, and what git
+    // said of the hosts it tried goes to the service's log alone: it would make the clone a scanner.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const outside = createServer((req, res) => res.writeHead(302, { location: `http://127.0.0.1:${(inside.address() as AddressInfo).port}/internal${req.url}` }).end());
+    for (const server of [inside, outside]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const lines: Record<string, unknown>[] = [];
+    const log = createLog("service", { format: "json", write: (line) => lines.push(JSON.parse(line)) });
+    const dir = await tempDir("jig-service-");
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], gitProtocols: ["http"], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const started = await startService(config, { secret: SECRET, log });
+    services.push(started);
+    const port = (outside.address() as AddressInfo).port;
+    const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: `http://127.0.0.1:${port}/x.git` } })).body;
+    const task = await statusOf(started, id, "error");
+    assert.deepEqual(asked, []);
+    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    const logged = lines.find((line) => line.msg === "git clone failed");
+    assert.deepEqual([logged?.tenant, logged?.task], ["acme", id]);
+    assert.match(String(logged?.stderr), new RegExp(`127\\.0\\.0\\.1:${port}`));
+  });
+
+  it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", async () => {
+    // git's curl reads what is before the `@` as userinfo, and would connect to the inside server; URL reads
+    // the backslash as a slash, so the host checked is localhost, and that is the host git is given.
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["localhost"], gitProtocols: ["http"] });
+    const git = `http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`;
+    const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } });
+    assert.equal(posted.status, 201);
+    const task = await statusOf(limited, posted.body.id, "error");
+    assert.match(task.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
+  it("checks a queued task's workspace.git against gitHosts again when it starts", async () => {
+    const asked: string[] = [];
+    const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
+    const allowed = createServer((_req, res) => res.writeHead(404).end());
+    for (const server of [inside, allowed]) {
+      await once(server.listen(0, "127.0.0.1"), "listening");
+      opened.push(() => new Promise((done) => server.close(done)));
+    }
+    const base = await tempDir("jig-service-");
+    const db = await database(base);
+    // Queued without gitHosts: acme may run none at once, so its tasks wait for the next start.
+    const tenants = (concurrency: number) => [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency }];
+    const first = await service({ database: db, gitProtocols: ["http"], tenants: tenants(0) }, base);
+    const post = async (git: string) => (await call(first, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git } })).body.id as string;
+    const elsewhere = await post(`http://127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    // On the host gitHosts will list, as URL reads it, but not as git's curl would.
+    const sly = await post(`http://localhost:${(allowed.address() as AddressInfo).port}\\@127.0.0.1:${(inside.address() as AddressInfo).port}/x.git`);
+    services.splice(services.indexOf(first), 1);
+    await first.close();
+
+    const api = await service({ database: db, gitProtocols: ["http"], gitHosts: ["localhost"], tenants: tenants(2) }, base);
+    const refused = await statusOf(api, elsewhere, "error");
+    assert.equal(refused.error, "workspace.git must be on one of the config's gitHosts: localhost (checked again as the task started)");
+    assert.equal(existsSync(work(api, elsewhere)), false);
+    const cloned = await statusOf(api, sly, "error");
+    assert.match(cloned.error, /^git clone failed \(exit \d+\)$/);
+    assert.deepEqual(asked, []);
+  });
+
+  it("warns that the docker runner's clones are on the service's network too, without gitHosts", async () => {
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = await tempDir("jig-service-");
+    const docker = { image: "jig-worker", network: "jig-tasks", docker: [process.execPath, "-e", "process.exit(1)"] };
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", runner: "docker", docker, tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const clones = /^jig service: a docker task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/;
+    services.push(await startService(config, { secret: SECRET, log }));
+    assert.ok(lines.some((line) => clones.test(line)), lines.join("\n"));
+    lines.length = 0;
+    services.push(await startService({ ...config, gitHosts: ["example.com"] }, { secret: SECRET, log }));
+    assert.ok(!lines.some((line) => clones.test(line)), lines.join("\n"));
+  });
+
+  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in, with an old git too", async () => {
+    const dir = realpathSync(await tempDir("jig-service-"));
+    const git = (cwd: string, ...args: string[]) => promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main", ...args], { cwd });
+    const repo = async (path: string) => {
+      await git(dir, "init", "--quiet", path);
+      await git(path, "commit", "--quiet", "--allow-empty", "-m", "first");
+    };
+    await repo(join(dir, "main"));
+    await git(join(dir, "main"), "worktree", "add", "--quiet", join(dir, "tree"));
+    await repo(join(dir, "lib"));
+    await repo(join(dir, "super"));
+    await git(join(dir, "super"), "submodule", "--quiet", "add", join(dir, "lib"), "sub");
+    await repo(join(dir, "plain"));
+    // As git rev-parse before 2.31 (2.30 is Debian 11's) takes --path-format=absolute: it prints it back.
+    const real = (await promisify(execFile)("sh", ["-c", "command -v git"])).stdout.trim();
+    await mkdir(join(dir, "bin"));
+    await writeFile(join(dir, "bin", "git"), `#!/bin/sh\nfor a do shift; case $a in --path-format=*) echo "$a" ;; *) set -- "$@" "$a" ;; esac; done\nexec '${real}' "$@"\n`, { mode: 0o755 });
+    const path = process.env.PATH;
+    for (const old of [false, true]) {
+      for (const [checkout, holder] of [[join(dir, "tree"), join(dir, "main")], [join(dir, "super", "sub"), join(dir, "super")], [join(dir, "plain")]]) {
+        const db = join(dir, `${checkout.split("/").at(-1)}-${old}.db`);
+        if (old) process.env.PATH = `${join(dir, "bin")}:${path}`;
+        const api = await service({ database: db }, checkout).finally(() => (process.env.PATH = path));
+        const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
+        await statusOf(api, id, "succeeded");
+        const settings = JSON.parse(await readFile(join(checkout, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
+        const hidden = [join(checkout, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, checkout, ...(holder ? [holder] : [])];
+        assert.deepEqual(settings.hiddenPaths, hidden, old ? "with a git before 2.31" : "");
+      }
+    }
+  });
+
+  it("warns when hiding the config's folder or dataDir's checkout would hide the service user's home", async () => {
+    if (sandboxProblem()) return;
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
+    const dir = realpathSync(await tempDir("jig-service-"));
+    await promisify(execFile)("git", ["init", "--quiet", dir]);
+    const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: [process.execPath, FAKE_JIG], tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] };
+    const home = process.env.HOME;
+    process.env.HOME = dir;
+    try {
+      services.push(await startService(config, { secret: SECRET, log, configFile: join(dir, "service.json") }));
+    } finally {
+      process.env.HOME = home;
+    }
+    for (const what of ["the config's folder", "the git checkout dataDir is in"]) {
+      const warning = new RegExp(`^jig service: the local runner hides ${what}, ${dir}, from its tasks' commands, and that is the service user's home directory`);
+      assert.ok(lines.some((line) => warning.test(line)), lines.join("\n"));
+    }
   });
 
   it("loads node:sqlite only for a SQLite store, so a service on Postgres gives no warning of it", async () => {
