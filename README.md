@@ -164,7 +164,7 @@ a Ctrl+C before the task starts or a second one in it, jig still writes an `end`
 `error`, with exit code 1, after a failure nothing caught). With `-`, what the pipe can't take while its
 reader is behind waits in jig, each later line behind it, and jig goes on with the task: a reader that stops
 reading holds the events, not jig, which still acts on a signal. jig holds 64 MiB of them at most: past that
-it drops new events (not the `end`), and says how many on stderr and, where there is room by then, in a
+it drops new events (not the `end`; not always in a row, as a smaller one may still fit), and says how many on stderr and, where there is room by then, in a
 `notice` before the `end`. When jig ends, however it ends, it writes what it holds, waiting for the reader as
 long as it takes some every 5 s, and after a signal 20 s at most in all, once its commands are killed; a
 second signal in that wait doesn't cut it short (at any other end, Ctrl+C still does). If it gives up, it

@@ -70,6 +70,8 @@ export class Events {
   private cost: number | null;
   private metered = false; // whether a call has been priced: until then the cost is the task's model's
   private ended = false;
+  /** The end's exit code, once it is written: a signal after it doesn't change how jig exits. */
+  endedWith: number | undefined;
 
   constructor(path: string | ((event: Event) => void), model: string) {
     this.model = model;
@@ -182,6 +184,7 @@ export class Events {
     const dropped = this.lines?.dropped ?? 0;
     if (dropped) this.notice(`${count(dropped)} written: the --events reader was too far behind.`);
     this.ended = true;
+    this.endedWith = exitCode;
     const seconds = Math.round((Date.now() - this.started) / 100) / 10;
     const end = { stop, exitCode, steps: this.step, usage: inOrder(this.usage), cost: this.cost, seconds };
     this.write("end", { ...end });
@@ -292,7 +295,7 @@ export class Lines {
     const begun = this.io.now();
     let since = begun;
     let why = "";
-    while (!this.take()) {
+    while (!this.taken()) {
       const now = this.io.now();
       if (this.written > written) [written, since] = [this.written, now];
       else if (now - since >= FLUSH_SECONDS * 1000) why = `took nothing for ${FLUSH_SECONDS} s`;
@@ -317,6 +320,22 @@ export class Lines {
       this.gone = true;
       this.lose();
       notice(`The --events reader is gone (a write failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}): jig writes no more events, and goes on with the task.`);
+    }
+  }
+
+  /**
+   * take, at the end: a write failing otherwise than EAGAIN or EPIPE (EIO, say) would throw out of jig's exit
+   * handler, so the reader counts as gone, as in the retry.
+   */
+  private taken(): boolean {
+    try {
+      return this.take();
+    } catch (error) {
+      const lost = this.held.length;
+      this.gone = true;
+      this.lose();
+      notice(`The --events reader is gone (a write failed: ${(error as NodeJS.ErrnoException).code ?? String(error)}): ${count(lost)} written.`);
+      return true;
     }
   }
 

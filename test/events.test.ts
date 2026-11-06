@@ -420,44 +420,47 @@ describe("--events", () => {
     }
   });
 
-  it("with -, a second Ctrl+C while it waits for the reader at the end doesn't kill it: it exits with 130, saying so", async () => {
-    // Once the task is over its Ctrl+C handler is gone, so a second Ctrl+C killed jig by the signal's default
-    // action as it waited for the reader: no word on stderr, and the end lost.
-    const long = "All work and no play. ".repeat(40_000);
-    let waiting!: () => void;
-    const second = new Promise<void>((done) => (waiting = done));
-    let calls = 0;
-    const server = createServer((req, res) => {
-      req.resume();
-      if (calls++ > 0) return waiting();
-      res.writeHead(200, { "content-type": "text/event-stream" });
-      res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]));
+  for (const again of ["SIGINT", "SIGTERM"] as const) {
+    it(`with -, a ${again === "SIGINT" ? "second Ctrl+C" : "SIGTERM after a Ctrl+C"} while it waits for the reader at the end doesn't kill it: it exits with 130, the end's code, saying so`, async () => {
+      // Once the task is over its Ctrl+C handler is gone, so a second Ctrl+C killed jig by the signal's default
+      // action as it waited for the reader: no word on stderr, and the end lost.
+      const long = "All work and no play. ".repeat(40_000);
+      let waiting!: () => void;
+      const second = new Promise<void>((done) => (waiting = done));
+      let calls = 0;
+      const server = createServer((req, res) => {
+        req.resume();
+        if (calls++ > 0) return waiting();
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(messagesReply([{ text: long }, { tool: "glob", input: { pattern: "*" } }]));
+      });
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
+      const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
+      const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
+      try {
+        child.stdout.pause(); // the reader takes nothing
+        let stderr = "";
+        child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
+        const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
+        await Promise.race([second, exited]);
+        const sent = Date.now();
+        child.kill("SIGINT");
+        await new Promise((done) => setTimeout(done, 200));
+        // A SIGTERM once the end is written exited with 143, where the end said 130.
+        child.kill(again);
+        assert.equal(await exited, 130, stderr);
+        const took = Date.now() - sent;
+        assert.ok(took >= 4_500, `exited ${took} ms after the first Ctrl+C`);
+        assert.match(stderr, /The --events reader took nothing for 5 s: \d+ events? (weren't|wasn't) written\./);
+      } finally {
+        clearTimeout(deadline);
+        child.kill("SIGKILL");
+        child.stdout.destroy();
+        api.close();
+      }
     });
-    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
-    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close()) };
-    const child = spawnJig(api, [...args, "--events", "-", "Fix the parser."]);
-    const deadline = setTimeout(() => child.kill("SIGKILL"), 20_000);
-    try {
-      child.stdout.pause(); // the reader takes nothing
-      let stderr = "";
-      child.stderr.setEncoding("utf8").on("data", (chunk) => (stderr += chunk));
-      const exited = new Promise((done) => child.on("exit", (code, signal) => done(code ?? signal)));
-      await Promise.race([second, exited]);
-      const sent = Date.now();
-      child.kill("SIGINT");
-      await new Promise((done) => setTimeout(done, 200));
-      child.kill("SIGINT");
-      assert.equal(await exited, 130, stderr);
-      const took = Date.now() - sent;
-      assert.ok(took >= 4_500, `exited ${took} ms after the first Ctrl+C`);
-      assert.match(stderr, /The --events reader took nothing for 5 s: \d+ events? (weren't|wasn't) written\./);
-    } finally {
-      clearTimeout(deadline);
-      child.kill("SIGKILL");
-      child.stdout.destroy();
-      api.close();
-    }
-  });
+  }
 
   it("with -, a Ctrl+C while it waits for a slow reader at a normal end still stops it at once", async () => {
     // The signals are ignored only in the wait after a signal, which is bounded in all: at a normal end a
@@ -636,6 +639,26 @@ describe("Events", () => {
       lines.write("two\n");
       assert.equal(lines.flush(), 0);
       assert.equal(calls, 2);
+    });
+  });
+
+  it("at the end counts the reader gone when a write fails otherwise (EIO, say), rather than throw out of jig's exit", () => {
+    const told: string[] = [];
+    withContext({ silent: true, told: (text) => told.push(text) }, () => {
+      let calls = 0;
+      const failing: Io = {
+        write: () => {
+          if (calls++ === 0) throw Object.assign(new Error("EAGAIN: resource temporarily unavailable, write"), { code: "EAGAIN" });
+          throw Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+        },
+        now: () => 0,
+        wait: () => {},
+      };
+      const lines = new Lines(1, failing);
+      lines.write("one\n"); // held
+      lines.write("two\n");
+      assert.doesNotThrow(() => lines.flush());
+      assert.deepEqual(told, ["The --events reader is gone (a write failed: EIO): 2 events weren't written."]);
     });
   });
 

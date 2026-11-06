@@ -509,7 +509,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
 goes to stdout: the terminal's output goes to stderr. What the pipe can't take while the reader is behind
 waits in jig, in order, and jig goes on: a stopped reader holds the events, not jig, so a signal still ends
-it. It holds 64 MiB at most, and drops later events (not the `end`), saying how many on stderr and, with room,
+it. It holds 64 MiB at most, and drops later events (not the `end`; a smaller one past a dropped one may still fit), saying how many on stderr and, with room,
 in a `notice` before the `end`. At its end, on every path a signal included, jig writes what it holds,
 waiting while the reader takes some every 5 s (after a signal, 20 s at most in all, its commands killed
 first, a second signal ignored; otherwise Ctrl+C still ends the wait at once), and otherwise gives up on the

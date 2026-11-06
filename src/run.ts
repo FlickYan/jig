@@ -323,7 +323,8 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     // A signal ends jig without the exit event, so closing the terminal (SIGHUP) or a kill (SIGTERM) would
     // leave the files and the commands behind: they end it with an ordinary exit instead, and the exit code a
     // shell would give.
-    for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(128 + constants.signals[signal]));
+    // One that comes once the end is written (as jig waits for the reader with it) leaves the end's code.
+    for (const signal of ["SIGHUP", "SIGTERM"] as const) process.once(signal, () => process.exit(events?.endedWith ?? 128 + constants.signals[signal]));
     process.on("SIGINT", beforeTask);
   }
   const withEvents = (base: AgentUI): AgentUI => events?.ui(base) ?? base;
