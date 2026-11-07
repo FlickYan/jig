@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
 import { Pool } from "../server/pg.ts";
 import { openStore } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -344,7 +345,7 @@ const quotaTests = () => {
 };
 
 for (const { name, skip } of BACKENDS) {
-  describe(`quotas and usage (${name})`, { skip }, () => {
+  describe(`quotas and usage (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => {
       backend = name;
       clock = undefined;

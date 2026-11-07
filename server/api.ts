@@ -1005,9 +1005,9 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, tenant: Tenant, context: Context, request: ServedRequest): Promise<void> {
   const { store, scheduler, heartbeatMs, metrics, maxStreams, streams } = context;
-  // A client that went away while its tenant and task were read has had its response's close already: a
-  // stream counted now, or followed, would never be let go.
-  if (res.destroyed) return;
+  // A client that went away while its tenant and task were read has had its response's close, or its
+  // connection's, already: a stream counted now, or followed, would never be let go.
+  if (res.destroyed || req.socket.destroyed) return;
   // Counted and taken in one go, with no wait between, so streams asked for at once can't all slip past.
   const mine = streams.byTenant.get(tenant.id) ?? 0;
   const most = tenant.limits.maxStreams ?? DEFAULT_LIMITS.maxStreams;
@@ -1016,32 +1016,28 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   streams.open++;
   streams.byTenant.set(tenant.id, mine + 1);
   metrics.eventStreams.inc({ tenant: tenant.id });
-  // A response closes once, whether the stream ended or its client went away.
-  res.once("close", () => {
-    streams.open--;
-    const left = streams.byTenant.get(tenant.id)! - 1;
-    if (left) streams.byTenant.set(tenant.id, left);
-    else streams.byTenant.delete(tenant.id);
-    metrics.eventStreams.dec({ tenant: tenant.id });
-  });
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
+  const socket = req.socket;
   let last = after;
   let ended = false;
+  let freed = false;
   // False once what is written waits for the client: no more is written until it has taken it.
   const send = (seq: number, json: string): boolean => {
     if (seq <= last || ended || res.destroyed) return true;
     last = seq;
     return res.write(`id: ${seq}\ndata: ${json}\n\n`);
   };
-  // Until the client has taken what is written, or is gone.
+  // Until the client has taken what is written, or is gone (its response closed, or its connection).
   const drained = () =>
     new Promise<void>((done) => {
-      if (res.closed || !res.writableNeedDrain) return done();
+      if (freed || res.closed || !res.writableNeedDrain) return done();
       const go = () => {
         res.off("drain", go).off("close", go);
+        socket.off("close", go);
         done();
       };
       res.on("drain", go).on("close", go);
+      socket.once("close", go);
     });
   const end = (status: TaskStatus) => {
     if (ended) return;
@@ -1112,7 +1108,25 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     clearInterval(heartbeat);
     clearInterval(poll);
   };
-  res.on("close", cleanup);
+  // Let go once, when the response closes, whether the stream ended or its client went away, or when its
+  // connection does: a response that waits behind another on its connection (requests sent one behind
+  // another) has no close when the connection goes. A connection kept alive serves many requests, so the
+  // listener on it goes too.
+  const free = () => {
+    if (freed) return;
+    freed = true;
+    res.off("close", free);
+    socket.off("close", free);
+    ended = true;
+    cleanup();
+    streams.open--;
+    const left = streams.byTenant.get(tenant.id)! - 1;
+    if (left) streams.byTenant.set(tenant.id, left);
+    else streams.byTenant.delete(tenant.id);
+    metrics.eventStreams.dec({ tenant: tenant.id });
+  };
+  res.once("close", free);
+  socket.once("close", free);
   // Followed before the stored events are read, so none falls between the two.
   pull();
   await reading;

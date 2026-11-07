@@ -132,8 +132,8 @@ tenant may have its `maxStreams` (20) event streams open at once on a replica, a
 top-level `maxStreams` (200) across tenants. Past either, a stream is refused before any of its events is read,
 with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open, the most it may", "limit":
 20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
-goes away. Each replica counts its own, in memory: behind a load balancer, a tenant may have its
-`maxStreams` open on each replica.
+goes away, even one asked for behind another request on the same connection. Each replica counts its own,
+in memory: behind a load balancer, a tenant may have its `maxStreams` open on each replica.
 
 A task is `queued`, then `running`, then one of:
 

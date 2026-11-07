@@ -10,6 +10,7 @@ import { createLog } from "../server/log.ts";
 import type { Runner } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { ROUTES, routeOf, serviceMetrics } from "../server/service-metrics.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 import { parseYaml } from "./yaml.ts";
@@ -278,13 +279,13 @@ const observeTests = () => {
 };
 
 for (const { name, skip } of BACKENDS) {
-  describe(`the task service's metrics (${name})`, { skip }, () => {
+  describe(`the task service's metrics (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => void (backend = name));
     observeTests();
   });
 }
 
-describe("the task service's metrics listener, request ids and logs", () => {
+describe("the task service's metrics listener, request ids and logs", { skip: sandboxProblem() }, () => {
   beforeEach(() => void (backend = "SQLite"));
 
   it("serves the metrics only on a listener of their own, which is off without the config's block", async () => {
