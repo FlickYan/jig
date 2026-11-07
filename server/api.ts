@@ -529,6 +529,9 @@ function databasePoolProblem(pool: unknown, database: string): string | undefine
   if (pool === undefined) return undefined;
   if (!isObject(pool)) return "databasePool must be an object, {max, acquireTimeoutMs}";
   if (!/^postgres(ql)?:\/\//.test(database)) return "databasePool is for a Postgres database (postgres://...): SQLite has no pool";
+  // The pool's other options (its query timeout among them) are the service's to set, not the config's.
+  const other = Object.keys(pool).find((key) => !["max", "acquireTimeoutMs"].includes(key));
+  if (other !== undefined) return `databasePool.${other} isn't a pool setting: max or acquireTimeoutMs`;
   for (const [name, least, most] of [["max", 1, 1_000], ["acquireTimeoutMs", 100, 600_000]] as const) {
     const value = pool[name];
     if (value !== undefined && !(Number.isInteger(value) && (value as number) >= least && (value as number) <= most)) return `databasePool.${name} must be a whole number from ${least} to ${most}, not ${JSON.stringify(value)}`;

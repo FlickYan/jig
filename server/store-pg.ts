@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { type Client, type Listener, Pool, type PoolOptions, type PoolStats, redactUrl, type Row } from "./pg.ts";
+import { type Client, type Listener, Pool, type PoolStats, redactUrl, type Row } from "./pg.ts";
 import {
   type Answer,
   type Approval,
@@ -11,6 +11,7 @@ import {
   COUNT_TASKS,
   type Counts,
   countsOf,
+  type DatabasePool,
   ENDED,
   type Given,
   isoDay,
@@ -131,10 +132,12 @@ export class PostgresStore implements Store {
    * Connects, moves the schema on to this version's and starts listening; with a region, its tasks' ids
    * carry it. `options` size the pool (the config's databasePool).
    */
-  static async open(url: string, region?: string, options?: PoolOptions): Promise<PostgresStore> {
+  static async open(url: string, region?: string, options: DatabasePool = {}): Promise<PostgresStore> {
     let pool: Pool | undefined;
     try {
-      pool = new Pool(url, options);
+      // Only these two, whatever else a caller's object holds: the query timeout stays the pool's own.
+      const { max, acquireTimeoutMs } = options;
+      pool = new Pool(url, { max, acquireTimeoutMs });
       await migrate(pool);
       const listener = pool.listen([EVENTS, CANCELS, APPROVALS]);
       await listener.ready;

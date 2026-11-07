@@ -1404,6 +1404,7 @@ describe("the service's config", () => {
     assert.equal(problem({ database: postgres, databasePool: 20 }), "The config's databasePool must be an object, {max, acquireTimeoutMs}");
     assert.equal(problem({ database: postgres, databasePool: { max: 0 } }), "The config's databasePool.max must be a whole number from 1 to 1000, not 0");
     assert.equal(problem({ database: postgres, databasePool: { acquireTimeoutMs: 50 } }), "The config's databasePool.acquireTimeoutMs must be a whole number from 100 to 600000, not 50");
+    assert.equal(problem({ database: postgres, databasePool: { queryTimeoutMs: 0 } }), "The config's databasePool.queryTimeoutMs isn't a pool setting: max or acquireTimeoutMs");
     assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
     assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
     // An entry is matched to a URL's hostname: one with a scheme, port, path or trailing dot would match none.

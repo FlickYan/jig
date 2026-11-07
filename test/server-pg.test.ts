@@ -389,6 +389,21 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.equal(sqlite.poolStats, undefined);
   });
 
+  it("takes only max and acquireTimeoutMs from openStore's pool, and keeps the default max for one left undefined", async () => {
+    // A library caller's object may hold more than the config allows, or an explicit undefined.
+    const options = { max: undefined, acquireTimeoutMs: 5000, queryTimeoutMs: 0, idleInTransactionMs: 0 };
+    const store = await openStore(await postgresDatabase(), { pool: options });
+    closers.push(() => store.close());
+    const db = (store as unknown as { pool: Pool }).pool;
+    // 15 at once: the default 10 open, and the rest wait.
+    const slow = Array.from({ length: 15 }, () => db.query("SELECT pg_sleep(0.3)"));
+    await until(() => store.poolStats!().waiting === 5, "five queries to wait");
+    assert.deepEqual(store.poolStats!(), { open: 10, idle: 0, waiting: 5 });
+    await Promise.all(slow);
+    // The server still ends a session left idle in a transaction: twice the default 30 s query timeout.
+    assert.equal((await db.query("SHOW idle_in_transaction_session_timeout")).rows[0].idle_in_transaction_session_timeout, "1min");
+  });
+
   it("reads a task's events a page at a time, and all of them without a limit", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());

@@ -583,7 +583,9 @@ export class Pool implements Client {
     this.config = typeof url === "string" ? parseUrl(url) : url;
     const queryTimeoutMs = options.queryTimeoutMs ?? 30_000;
     const acquireTimeoutMs = queryTimeoutMs > 0 ? Math.min(queryTimeoutMs, 10_000) : 10_000;
-    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs, connectTimeoutMs: 10_000, idleInTransactionMs: 2 * queryTimeoutMs, acquireTimeoutMs, ...options };
+    // An option given as undefined keeps its default: `max: undefined` would otherwise be no limit at all.
+    const given = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
+    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs, connectTimeoutMs: 10_000, idleInTransactionMs: 2 * queryTimeoutMs, acquireTimeoutMs, ...given };
   }
 
   stats(): PoolStats {

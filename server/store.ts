@@ -294,11 +294,14 @@ export interface Store {
   close(): Promise<void>;
 }
 
+/** What sizes Postgres's pool (the config's databasePool); its other options stay the pool's defaults. */
+export type DatabasePool = Pick<PoolOptions, "max" | "acquireTimeoutMs">;
+
 /**
  * Opens the store: Postgres for a postgres:// URL, else SQLite at the path (":memory:" for one in memory).
  * With a region, the ids of the tasks it makes carry it; `pool` sizes Postgres's pool of connections.
  */
-export async function openStore(database: string, { region, pool }: { region?: string; pool?: PoolOptions } = {}): Promise<Store> {
+export async function openStore(database: string, { region, pool }: { region?: string; pool?: DatabasePool } = {}): Promise<Store> {
   if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database, region, pool);
   return new SqliteStore(database, region);
 }

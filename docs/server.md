@@ -197,7 +197,7 @@ renewed.
 Each replica opens at most 10 connections to Postgres (and one more, which listens), and a query waits for
 one while all are in use, 10 seconds at most: past that it fails as one that took too long does, so the
 scheduler tries it again within its lease's deadline rather than wait on, and a request gets a 500. `"databasePool": {"max": 20, "acquireTimeoutMs": 5000}` sets both (`max` 1 to 1,000,
-`acquireTimeoutMs` 100 to 600,000); it is only for a Postgres database. Count `max` plus one per replica
+`acquireTimeoutMs` 100 to 600,000; no other key); it is only for a Postgres database. Count `max` plus one per replica
 against the server's `max_connections`. `jig_service_db_pool_connections` (Metrics and logs) shows the
 connections open and idle, and the queries waiting for one.
 
