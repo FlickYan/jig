@@ -695,6 +695,37 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     await until(async () => (await api.store.task(theirs))?.status === "running", "globex's task to run");
     for (const task of [mine, theirs]) await writeFile(join(work(api, task), "go"), "");
   });
+
+  it("counts no event stream whose client went away while its task was being read", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 1 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    // The task is read only once the stream's client has gone, as with a slow store and a quick client.
+    let gone: Promise<unknown> | undefined;
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && (gone ??= once(res, "close"))));
+    let read: Promise<unknown> | undefined;
+    const task = api.store.task.bind(api.store);
+    api.store.task = async (id) => {
+      if (!gone) return task(id);
+      await gone;
+      const found = task(id);
+      read ??= found;
+      return found;
+    };
+    const aborts = new AbortController();
+    const asked = fetch(`${api.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` }, signal: aborts.signal }).catch(() => {});
+    await until(() => gone !== undefined, "the stream to be asked for");
+    aborts.abort();
+    await asked;
+    // What the request does once the task is read is done in the same turn.
+    await until(() => read, "the task to be read");
+    await new Promise((done) => setImmediate(done));
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 0);
+    const stream = await openStream(api, KEYS.acme, id);
+    assert.equal(stream.res.status, 200);
+    await writeFile(join(work(api, id), "go"), "");
+    assert.equal((await collect(framesOf(stream.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
 };
 
 /** A task's event stream, as the response to its request, and a way for its client to go away. */

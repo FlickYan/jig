@@ -900,6 +900,9 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  */
 async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, tenant: Tenant, context: Context, request: ServedRequest): Promise<void> {
   const { store, scheduler, heartbeatMs, metrics, maxStreams, streams } = context;
+  // A client that went away while its tenant and task were read has had its response's close already: a
+  // stream counted now, or followed, would never be let go.
+  if (res.destroyed) return;
   // Counted and taken in one go, with no wait between, so streams asked for at once can't all slip past.
   const mine = streams.byTenant.get(tenant.id) ?? 0;
   const most = tenant.limits.maxStreams ?? DEFAULT_LIMITS.maxStreams;
