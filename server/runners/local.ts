@@ -4,7 +4,7 @@ import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createLog, type Log } from "../log.ts";
-import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, workspaceProblem } from "../runner.ts";
+import { type JigEvent, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
@@ -67,7 +67,7 @@ export class LocalRunner implements Runner {
     await rm(this.dir(id), { recursive: true, force: true });
   }
 
-  leftovers(): Promise<string[]> {
+  leftovers(): Promise<Leftover[]> {
     return taskFolders(this.config.dataDir);
   }
 

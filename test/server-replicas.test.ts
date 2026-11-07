@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
-import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomBytes } from "node:crypto";
+import { access, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { type Config, type Service, startService } from "../server/api.ts";
-import { type RunHandle, type Runner, taskFolders } from "../server/runner.ts";
+import { type Leftover, type RunHandle, type Runner, taskFolders } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { Scheduler } from "../server/scheduler.ts";
@@ -272,7 +272,7 @@ class QuietRunner implements Runner {
   ends = new Map<string, () => void>();
   cancelled: string[] = [];
   abandoned: string[] = [];
-  private dataDir: string;
+  readonly dataDir: string;
   constructor(dataDir = "") {
     this.dataDir = dataDir;
   }
@@ -292,8 +292,12 @@ class QuietRunner implements Runner {
     };
   }
 
-  leftovers(): Promise<string[]> {
-    return taskFolders(this.dataDir);
+  /** How many times the folders were listed: a sweep's. */
+  listed = 0;
+  async leftovers(): Promise<Leftover[]> {
+    const folders = await taskFolders(this.dataDir);
+    this.listed++;
+    return folders;
   }
 
   async abandon(id: string): Promise<void> {
@@ -308,6 +312,22 @@ class QuietRunner implements Runner {
 const QUIET = { prompt: "x", maxSteps: 10, timeLimit: 600, model: "claude-x" };
 const LIMITS = { concurrency: 2, maxSteps: 10, timeLimit: 600, budgetUsd: null };
 const exists = (path: string) => access(path).then(() => true, () => false);
+const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+/**
+ * A folder left for a task the store doesn't have (another service's on the same dataDir, or a task the
+ * store forgot), with a run's work folder in it, last changed `ago` ms back; with `events`, a run still writes
+ * its events.jsonl.
+ */
+async function unknownFolder(dataDir: string, ago: number, events = false): Promise<string> {
+  const folder = join(dataDir, "tasks", `task_${randomBytes(16).toString("hex")}`);
+  await mkdir(join(folder, "work"), { recursive: true });
+  const then = new Date(Date.now() - ago);
+  await utimes(join(folder, "work"), then, then);
+  if (events) await writeFile(join(folder, "events.jsonl"), "{}\n");
+  await utimes(folder, then, then);
+  return folder;
+}
 
 // How a replica's store behaves while the database is down: its calls fail, as in a Postgres failover, or
 // they hang until its link heals and then go through, as in a network partition or a paused server.
@@ -370,51 +390,114 @@ describe("replicas that lose the database", () => {
     });
   }
 
-  it("remove at start the folders that tasks which ended long ago left, and no running task's", async () => {
+  it("remove at start the folders of tasks that ended over a lease ago, or that the store lacks and are stale, and no other", async () => {
     const base = await tempDir("jig-replicas-");
     const file = join(base, "jig.db");
     const dataDir = join(base, "data");
     const store = await sqliteStore(file);
-    await store.putTenant({ id: "acme", limits: LIMITS }, []);
-    // A replica crashes before it removes the folder of a task that finished; another task still runs on it.
+    await store.putTenant({ id: "acme", limits: { ...LIMITS, concurrency: 3 } }, []);
+    // A replica crashes before it removes the folders of two tasks that finished; another task still runs on it.
     const crashed = new QuietRunner(dataDir);
     crashed.removeFiles = async () => {};
-    const a = newScheduler(store, crashed, { concurrency: 2, replicaId: "A" });
-    const [done, running] = [await store.createTask("acme", QUIET), await store.createTask("acme", QUIET)];
+    const a = newScheduler(store, crashed, { concurrency: 3, replicaId: "A" });
+    const [done, recent, running] = [await store.createTask("acme", QUIET), await store.createTask("acme", QUIET), await store.createTask("acme", QUIET)];
     await a.start();
-    await until(() => crashed.ends.size === 2, "both runs to start");
+    // Its own sweep at start has listed what was there by then.
+    await until(() => crashed.ends.size === 3 && crashed.listed === 1, "the runs to start, and the sweep to list the folders");
     crashed.ends.get(done.id)!();
+    crashed.ends.get(recent.id)!();
     await a.settled();
-    assert.equal((await store.task(done.id))!.status, "succeeded");
-    // It ended a minute ago, longer than a lease.
+    for (const task of [done, recent]) assert.equal((await store.task(task.id))!.status, "succeeded");
+    // One ended a minute ago, longer than a lease; the other just now, within one.
     const db = new DatabaseSync(file);
     db.exec("PRAGMA busy_timeout = 5000");
     db.prepare("UPDATE tasks SET ended = ? WHERE id = ?").run(new Date(Date.now() - 60_000).toISOString(), done.id);
     db.close();
+    // Folders of tasks the store lacks: one unchanged for 11 minutes, one just made, and one whose run still
+    // writes its events, in a folder unchanged for 11 minutes.
+    const stale = await unknownFolder(dataDir, 11 * 60_000);
+    const fresh = await unknownFolder(dataDir, 0);
+    const busy = await unknownFolder(dataDir, 11 * 60_000, true);
     // A warm worker's folder isn't a task's.
     const pool = join(dataDir, "tasks", "pool_0123456789abcdef01234567");
     await mkdir(pool);
-    const folders = [join(dataDir, "tasks", done.id), join(dataDir, "tasks", running.id), pool];
-    // The runners that keep the folders on this machine list them so.
-    const listed = [done.id, running.id].sort();
+    const folders = [...[done, recent, running].map((task) => join(dataDir, "tasks", task.id)), stale, fresh, busy, pool];
+    // The runners that keep the folders on this machine list them so, with when each last changed.
+    const ids = (leftovers: Leftover[]) => leftovers.map(({ id }) => id).sort();
+    const listed = folders.slice(0, -1).map((folder) => folder.split("/").pop()!).sort();
     const local = new LocalRunner({ dataDir, jig: [], gatewayBaseUrl: "", gatewaySecret: "", graceSeconds: 0 });
     const docker = new DockerRunner({ dataDir, image: "", network: "", gatewayBaseUrl: "", gatewaySecret: "", graceSeconds: 0 });
-    assert.deepEqual([(await local.leftovers()).sort(), (await docker.leftovers()).sort()], [listed, listed]);
+    assert.deepEqual([ids(await local.leftovers()), ids(await docker.leftovers())], [listed, listed]);
+    const changed = new Map((await local.leftovers()).map(({ id, changed }) => [join(dataDir, "tasks", id), changed]));
+    assert.ok(changed.get(stale)! < Date.now() - 10 * 60_000, "the stale folder's time");
+    assert.ok(changed.get(busy)! > Date.now() - 60_000, "the busy folder's time, its events.jsonl's");
     assert.deepEqual(await taskFolders(join(base, "nowhere")), []);
 
     // With keepTaskDirs, every folder stays.
     const kept = serviceMetrics();
     const keeping = new QuietRunner(dataDir);
     await newScheduler(store, keeping, { concurrency: 2, replicaId: "C", keepTaskDirs: true, metrics: kept }).start();
-    assert.deepEqual(await Promise.all(folders.map(exists)), [true, true, true]);
+    assert.deepEqual(await Promise.all(folders.map(exists)), folders.map(() => true));
     assert.equal(kept.foldersRemoved.get(), 0);
+    assert.equal(keeping.listed, 0);
 
     const metrics = serviceMetrics();
     const sweeper = new QuietRunner(dataDir);
-    await newScheduler(store, sweeper, { concurrency: 2, replicaId: "B", metrics }).start();
-    assert.deepEqual(await Promise.all(folders.map(exists)), [false, true, true]);
-    assert.equal(metrics.foldersRemoved.get(), 1);
-    assert.deepEqual(sweeper.abandoned, [done.id]);
+    const b = newScheduler(store, sweeper, { concurrency: 2, replicaId: "B", metrics });
+    await b.start();
+    await until(() => metrics.foldersRemoved.get() === 2, "the sweep to remove two folders");
+    // Once it has closed, its sweep is done.
+    await b.close();
+    assert.deepEqual(await Promise.all(folders.map(exists)), [false, true, true, false, true, true, true]);
+    assert.equal(metrics.foldersRemoved.get(), 2);
+    assert.deepEqual(sweeper.abandoned.sort(), [done.id, stale.split("/").pop()!].sort());
     assert.deepEqual(keeping.abandoned, []);
+  });
+
+  it("start without waiting for the sweep, which stops at the next folder once the service stops", async () => {
+    const base = await tempDir("jig-replicas-");
+    const dataDir = join(base, "data");
+    const store = await sqliteStore(join(base, "jig.db"));
+    const folders = [await unknownFolder(dataDir, 11 * 60_000), await unknownFolder(dataDir, 11 * 60_000)];
+    // Stopping each run left takes as long as it takes (a docker kill on a slow daemon, say).
+    const runner = new QuietRunner(dataDir);
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    runner.abandon = async (id) => {
+      runner.abandoned.push(id);
+      await held;
+    };
+    const metrics = serviceMetrics();
+    const scheduler = newScheduler(store, runner, { concurrency: 1, replicaId: "A", metrics });
+    // Released before the scheduler is closed after the test, should it fail.
+    opened.push(async () => release());
+    const started = await Promise.race([scheduler.start().then(() => true), sleep(2000).then(() => false)]);
+    assert.ok(started, "start waited for the sweep");
+    await until(() => runner.abandoned.length === 1, "the sweep to stop the first run");
+    let closed = false;
+    const closing = scheduler.close().then(() => (closed = true));
+    await sleep(200);
+    assert.equal(closed, false, "close didn't wait for the folder being removed");
+    release();
+    await closing;
+    assert.equal(metrics.foldersRemoved.get(), 1);
+    assert.equal(runner.abandoned.length, 1);
+    assert.deepEqual((await Promise.all(folders.map(exists))).sort(), [false, true]);
+  });
+
+  it("sweep the folders runs left every tenth round of renewals", async () => {
+    const base = await tempDir("jig-replicas-");
+    const dataDir = join(base, "data");
+    const store = await sqliteStore(join(base, "jig.db"));
+    const runner = new QuietRunner(dataDir);
+    const metrics = serviceMetrics();
+    // A round every 100 ms.
+    await newScheduler(store, runner, { concurrency: 1, replicaId: "A", leaseMs: 300, metrics }).start();
+    await until(() => runner.listed === 1, "the sweep at start");
+    const folder = await unknownFolder(dataDir, 11 * 60_000);
+    await until(() => metrics.foldersRemoved.get() === 1, "a sweep to remove the folder");
+    assert.equal(await exists(folder), false);
+    // One sweep since the start's, not one a round.
+    assert.equal(runner.listed, 2);
   });
 });

@@ -20,8 +20,9 @@ import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, 
 // renewals that failed or hung past a tick, the next that gets through ends no task: the database may have
 // been away from every replica for longer than a lease, and the others are owed a round to renew theirs first.
 //
-// A run's folder is removed as it ends; one a crashed replica left is removed at the next start, or by the
-// sweep every tenth round, once its task has ended over a lease ago, or the store no longer has it.
+// A run's folder is removed as it ends; one a crashed replica left is removed by the sweep at the next start,
+// or every tenth round, once its task has ended over a lease ago, or the store doesn't have it and the folder
+// hasn't changed for a lease (ten minutes at least).
 
 /** What followers of a task hear: each event once it is stored, then the status it ended with. */
 export type Update = { event: JigEvent } | { done: TaskStatus };
@@ -64,6 +65,8 @@ interface Run {
 const SHUTDOWN = "the task service stopped while it ran";
 const EXPIRED = `${SHUTDOWN} (the replica running it stopped renewing its lease: it crashed, was killed or lost the database)`;
 const LOST = "the replica running it lost its lease on it, and stopped it";
+/** How long a folder whose task the store doesn't have must be left unchanged before it is swept, at the least. */
+const UNKNOWN_MS = 10 * 60_000;
 
 export class Scheduler {
   /** Emits a task's updates under its id. */
@@ -126,15 +129,16 @@ export class Scheduler {
   };
 
   /**
-   * Ends the tasks whose replica is gone, removes the folders runs left, starts what is queued, and from then
-   * on, every third of a lease, renews this replica's leases, ends the tasks whose lease ran out and looks for
-   * work again.
+   * Ends the tasks whose replica is gone, starts removing the folders runs left (not waited for), starts what
+   * is queued, and from then on, every third of a lease, renews this replica's leases, ends the tasks whose
+   * lease ran out and looks for work again.
    */
   async start(): Promise<string[]> {
     await this.store.heartbeat(this.replicaId, this.leaseMs);
     // At once, where keep waits a round after a failure: a replica that starts holds no lease to renew.
     const expired = await this.expire();
-    await this.sweep();
+    // Not waited for: a disk full of left folders, each run stopped in turn, mustn't hold up the API.
+    void this.sweep();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
     return expired;
@@ -218,16 +222,21 @@ export class Scheduler {
    * Removes the folders runs left on this machine for tasks that ended over a lease ago, or that the store
    * doesn't have: those a replica that crashed, or was killed, never removed. A task that ended within a lease
    * is left to its replica, which removes its folder as it stores its outcome, and a queued or running one's
-   * is kept, as replicas may share dataDir. What the run may have left going is stopped first. One at a time;
-   * a failure is logged, and the next sweep tries again.
+   * is kept, as replicas may share dataDir. One the store doesn't have is removed only once it hasn't changed
+   * for a lease, ten minutes at least, so a run of another service on the same dataDir with a database of its
+   * own (which it shouldn't share, docs/server.md) is spared while it writes. What the run may have left going
+   * is stopped first. One at a time, stopping at the next folder once the service starts to stop; a failure is
+   * logged, and the next sweep tries again.
    */
   private sweep(): Promise<void> {
     if (this.keepTaskDirs || !this.runner.leftovers) return Promise.resolve();
     this.sweeping ??= (async () => {
-      for (const id of await this.runner.leftovers!()) {
+      for (const { id, changed } of await this.runner.leftovers!()) {
+        if (this.paused) break;
         if (this.runs.has(id)) continue;
         const task = await this.store.task(id);
-        if (task && !(FINISHED.has(task.status) && task.ended && Date.now() - Date.parse(task.ended) > this.leaseMs)) continue;
+        const left = task ? FINISHED.has(task.status) && task.ended && Date.now() - Date.parse(task.ended) > this.leaseMs : Date.now() - changed > Math.max(this.leaseMs, UNKNOWN_MS);
+        if (!left) continue;
         await this.runner.abandon?.(id).catch((err: unknown) => this.log.warn("couldn't stop the run of a task whose folder was left", { task: id, err }));
         try {
           await this.runner.removeFiles?.(id);
