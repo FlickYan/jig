@@ -76,8 +76,16 @@ it is). A tenant's `concurrency` 0 holds its tasks queued.
 
 ### The API
 
-Every request but `GET /healthz` takes a tenant's key, `Authorization: Bearer <key>` (401 without one). A
-tenant sees only its own tasks: another's is a 404, as one that doesn't exist is.
+Every request but `GET /healthz` and `GET /readyz` takes a tenant's key, `Authorization: Bearer <key>` (401
+without one). A tenant sees only its own tasks: another's is a 404, as one that doesn't exist is.
+
+`GET /healthz` says only that the process is up: always 200, `{"ok": true, "region"}`. `GET /readyz` says
+whether to send it requests: 200 `{"ok": true, "region"}` once its scheduler has started and while its
+store answers a `SELECT 1` within 2 seconds (what it said is kept for a second, however many ask), else
+503 `{"ok": false, "region", "why"}`: still starting, stopping (from the moment it is told to stop), or
+the database can't be reached or didn't answer in time. The database's own error goes to the log, not to
+`why`, as anyone may ask. A replica whose Postgres is down still answers its `/healthz`, but would answer
+the tenants with 500s: a load balancer, Kubernetes and the router (Several regions, below) go by `/readyz`.
 
 ```bash
 # A task: the prompt, and maybe its files or a repository to clone; maxSteps, timeLimit (seconds) and model
@@ -185,6 +193,13 @@ replica that crashes leaves its runs going until another ends its tasks as `erro
 out, and stops their Jobs or containers (above); the others go on. SQLite takes several processes on one
 machine too, with no announcements: streams read it every second, and a cancel is found as leases are
 renewed.
+
+Each replica opens at most 10 connections to Postgres (and one more, which listens), and a query waits for
+one while all are in use, 10 seconds at most: past that it fails as one that took too long does, so the
+scheduler tries it again within its lease's deadline rather than wait on, and a request gets a 500. `"databasePool": {"max": 20, "acquireTimeoutMs": 5000}` sets both (`max` 1 to 1,000,
+`acquireTimeoutMs` 100 to 600,000); it is only for a Postgres database. Count `max` plus one per replica
+against the server's `max_connections`. `jig_service_db_pool_connections` (Metrics and logs) shows the
+connections open and idle, and the queries waiting for one.
 
 ### Approvals
 
@@ -306,6 +321,7 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
+| `jig_service_db_pool_connections{state}` | on Postgres, the replica's connections to it: `open` (in use or idle), `idle`, and `waiting`, the queries waiting for one |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
@@ -920,9 +936,11 @@ it as `task`; a client that leaves before its new task's body is read gets no an
   answered nor counted.
 - Anything else goes to the home.
 
-**Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails
+**Health and failover.** The router asks each region's `/readyz` every `intervalMs`; one that fails
 `failures` times in a row (no answer in 2 seconds, not 200, or another region's name) is down until it
-answers again. While a tenant's home is down, a new task that names no region goes, if the tenant has
+answers again. So a region whose database is down is down, though its `/healthz` answers. A region whose
+`/readyz` answers 404 or 401, a service from before it, is asked its `/healthz` instead, and the router
+logs that once. While a tenant's home is down, a new task that names no region goes, if the tenant has
 `failover`, to the first region in `regions` that is up and that it may use; otherwise, and for a task that
 names the region that is down, it is 503 with the region and `retry-after`. A task never fails over: it
 runs where it was made, and while its region is down it can't be read, streamed or cancelled (503), since
@@ -951,7 +969,9 @@ account with a Role to run Jobs, the tasks' account with none, the NetworkPolici
 the tasks may reach, and who may reach the service and the gateway), a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
-are yours to make. The service runs two replicas on that database. The gateway runs two replicas too,
+are yours to make. The service runs two replicas on that database, each ready (its readinessProbe, `GET
+/readyz`) only while it reaches it, so the Service sends requests to those that do; there is no liveness
+probe, as a restart wouldn't bring the database back. The gateway runs two replicas too,
 sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts,
 as a lone gateway's restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one

@@ -539,6 +539,26 @@ export interface PoolOptions {
    * its locks then, not when the server's TCP keepalive notices, hours later.
    */
   idleInTransactionMs?: number;
+  /**
+   * How long a query waits for a connection when all `max` are in use, in milliseconds (default the
+   * smaller of queryTimeoutMs and 10 s, or 10 s with no query timeout; 0 for no limit): past it, it fails
+   * as a query that took too long does, so its caller's own deadline holds.
+   */
+  acquireTimeoutMs?: number;
+}
+
+/** A pool's connections: open (in use or idle, or opening), idle, and the queries waiting for one. */
+export interface PoolStats {
+  open: number;
+  idle: number;
+  waiting: number;
+}
+
+/** A query waiting for a connection, and its timer. */
+interface Waiter {
+  done: (connection: Connection) => void;
+  fail: (err: unknown) => void;
+  timer?: NodeJS.Timeout;
 }
 
 /** What a transaction's function gets: its connection's queries. */
@@ -555,14 +575,19 @@ export class Pool implements Client {
   private options: Required<PoolOptions>;
   private idle: { connection: Connection; timer: NodeJS.Timeout }[] = [];
   private open = 0;
-  private waiting: { done: (connection: Connection) => void; fail: (err: unknown) => void }[] = [];
+  private waiting: Waiter[] = [];
   private listeners = new Set<Listener>();
   private closed = false;
 
   constructor(url: string | PgConfig, options: PoolOptions = {}) {
     this.config = typeof url === "string" ? parseUrl(url) : url;
     const queryTimeoutMs = options.queryTimeoutMs ?? 30_000;
-    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs, connectTimeoutMs: 10_000, idleInTransactionMs: 2 * queryTimeoutMs, ...options };
+    const acquireTimeoutMs = queryTimeoutMs > 0 ? Math.min(queryTimeoutMs, 10_000) : 10_000;
+    this.options = { max: 10, idleMs: 30_000, queryTimeoutMs, connectTimeoutMs: 10_000, idleInTransactionMs: 2 * queryTimeoutMs, acquireTimeoutMs, ...options };
+  }
+
+  stats(): PoolStats {
+    return { open: this.open, idle: this.idle.length, waiting: this.waiting.length };
   }
 
   async query(text: string, params: unknown[] = []): Promise<Result> {
@@ -616,8 +641,33 @@ export class Pool implements Client {
       if (!entry.connection.broken) return entry.connection;
       this.open--;
     }
-    if (this.open >= this.options.max) return new Promise((done, fail) => this.waiting.push({ done, fail }));
+    if (this.open >= this.options.max) return this.wait();
     return this.connect();
+  }
+
+  /**
+   * Waits for a connection another query gives back, for acquireTimeoutMs at most. The error is a plain
+   * one, not a PgError: the database refused nothing, so a caller that tries again may do so.
+   */
+  private wait(): Promise<Connection> {
+    const { acquireTimeoutMs, max } = this.options;
+    return new Promise((done, fail) => {
+      const waiter: Waiter = { done, fail };
+      if (acquireTimeoutMs > 0) {
+        waiter.timer = setTimeout(() => {
+          this.waiting.splice(this.waiting.indexOf(waiter), 1);
+          fail(new Error(`no database connection was free within ${acquireTimeoutMs} ms (pool max ${max})`));
+        }, acquireTimeoutMs);
+      }
+      this.waiting.push(waiter);
+    });
+  }
+
+  /** The query that has waited longest for a connection, no longer timed. */
+  private nextWaiter(): Waiter | undefined {
+    const waiter = this.waiting.shift();
+    clearTimeout(waiter?.timer);
+    return waiter;
   }
 
   private async connect(): Promise<Connection> {
@@ -636,11 +686,11 @@ export class Pool implements Client {
       this.open--;
       connection.destroy();
       // One that was waiting for this connection gets a new one.
-      const waiter = this.waiting.shift();
+      const waiter = this.nextWaiter();
       if (waiter) this.connect().then(waiter.done, waiter.fail);
       return;
     }
-    const waiter = this.waiting.shift();
+    const waiter = this.nextWaiter();
     if (waiter) return waiter.done(connection);
     const entry = {
       connection,
@@ -661,7 +711,7 @@ export class Pool implements Client {
       this.open--;
       connection.end();
     }
-    for (const waiter of this.waiting.splice(0)) waiter.fail(new Error("The database's pool is closed"));
+    for (let waiter; (waiter = this.nextWaiter()); ) waiter.fail(new Error("The database's pool is closed"));
     await Promise.all([...this.listeners].map((listener) => listener.close()));
   }
 }

@@ -650,6 +650,79 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
     assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
   });
+
+  it("is ready (/readyz) while its store answers, not while it doesn't or as it stops, and alive (/healthz) all along", async () => {
+    // A runner whose close waits for the test: the service stops with its listeners still up meanwhile.
+    let release!: () => void;
+    const runnerClosed = new Promise<void>((done) => (release = done));
+    const base = await tempDir("jig-service-readyz-");
+    const lines: string[] = [];
+    const api = await startService(
+      {
+        port: 0,
+        internal: { port: 0 },
+        region: "eu",
+        database: await database(base),
+        ...(name === "Postgres" && { databasePool: { max: 2, acquireTimeoutMs: 5000 } }),
+        dataDir: join(base, "data"),
+        gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
+        tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }],
+      },
+      { secret: SECRET, runner: { ...endsWith(0), close: () => runnerClosed }, log: createLog("service", { format: "text", write: (line) => lines.push(line) }) },
+    );
+    let closed: Promise<void> | undefined;
+    opened.push(async () => {
+      release();
+      await (closed ??= api.close());
+    });
+    const ask = async (path: string) => {
+      const res = await fetch(api.url + path);
+      return [res.status, await res.json()];
+    };
+    const alive = [200, { ok: true, region: "eu" }];
+    assert.deepEqual(await ask("/readyz"), [200, { ok: true, region: "eu" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+
+    // On Postgres, its pool's connections, which the config's databasePool caps.
+    const pool = (await api.metrics.registry.render()).match(/^jig_service_db_pool_connections\{state="\w+"\} \d+$/gm) ?? [];
+    if (name === "Postgres") {
+      assert.equal(pool.length, 3);
+      assert.match(pool.join("\n"), /^jig_service_db_pool_connections\{state="open"\} [12]$/m);
+      assert.match(pool.join("\n"), /^jig_service_db_pool_connections\{state="waiting"\} 0$/m);
+    } else assert.deepEqual(pool, []);
+
+    // A store that can't be reached: 503 within the second its answer is kept, the error itself only in the log.
+    const ping = api.store.ping!.bind(api.store);
+    api.store.ping = async () => {
+      throw new Error("connect ECONNREFUSED 10.0.0.5:5432");
+    };
+    const notReady = await until(async () => {
+      const answer = await ask("/readyz");
+      return answer[0] === 503 && answer;
+    }, "/readyz to answer 503");
+    assert.deepEqual(notReady, [503, { ok: false, region: "eu", why: "the database can't be reached" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+    assert.ok(lines.some((line) => line.includes("not ready: the database can't be reached") && line.includes("10.0.0.5:5432")), lines.join("\n"));
+
+    // One that doesn't answer at all: 503 once the ping has had 2 seconds.
+    api.store.ping = () => new Promise(() => {});
+    const slow = await until(async () => {
+      const answer = await ask("/readyz");
+      return answer[1].why !== "the database can't be reached" && answer;
+    }, "/readyz to give up on the ping");
+    assert.deepEqual(slow, [503, { ok: false, region: "eu", why: "the database didn't answer within 2000 ms" }]);
+
+    api.store.ping = ping;
+    await until(async () => (await ask("/readyz"))[0] === 200, "/readyz to answer 200 again");
+    assert.ok(lines.some((line) => line.includes("ready again")), lines.join("\n"));
+
+    // Once it is stopping, it isn't ready, though it still answers.
+    closed = api.close();
+    assert.deepEqual(await ask("/readyz"), [503, { ok: false, region: "eu", why: "the service is stopping" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+    release();
+    await closed;
+  });
 };
 
 for (const { name, skip } of BACKENDS) {
@@ -1324,6 +1397,13 @@ describe("the service's config", () => {
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    // Postgres's pool, which SQLite hasn't.
+    const postgres = "postgres://jig@db.example.com/jig";
+    assert.equal(problem({ databasePool: { max: 20 } }), "The config's databasePool is for a Postgres database (postgres://...): SQLite has no pool");
+    assert.equal(problem({ database: postgres, databasePool: { max: 20, acquireTimeoutMs: 5000 } }), undefined);
+    assert.equal(problem({ database: postgres, databasePool: 20 }), "The config's databasePool must be an object, {max, acquireTimeoutMs}");
+    assert.equal(problem({ database: postgres, databasePool: { max: 0 } }), "The config's databasePool.max must be a whole number from 1 to 1000, not 0");
+    assert.equal(problem({ database: postgres, databasePool: { acquireTimeoutMs: 50 } }), "The config's databasePool.acquireTimeoutMs must be a whole number from 100 to 600000, not 50");
     assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
     assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
     // An entry is matched to a URL's hostname: one with a scheme, port, path or trailing dot would match none.

@@ -200,6 +200,38 @@ describe("the Postgres client", () => {
     }
   });
 
+  it("gives up on a connection that none frees within acquireTimeoutMs, with an error a caller may retry", async () => {
+    // A server that takes connections and never answers: the pool's one connection is never ready.
+    const sockets = new Set<Socket>();
+    const server = createServer((socket) => {
+      sockets.add(socket);
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    closers.push(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((done) => server.close(done));
+    });
+    const url = `postgres://jig:secret@127.0.0.1:${(server.address() as { port: number }).port}/jig`;
+    for (const [options, ms] of [[{ acquireTimeoutMs: 300 }, 300], [{ queryTimeoutMs: 400 }, 400]] as const) {
+      const db = pool(url, { max: 1, connectTimeoutMs: 1500, ...options });
+      const first = db.query("SELECT 1").then(() => undefined, (err: Error) => err);
+      const began = Date.now();
+      const second = db.query("SELECT 2").then(() => undefined, (err: Error) => err);
+      assert.deepEqual(db.stats(), { open: 1, idle: 0, waiting: 1 });
+      const err = await second;
+      const waited = Date.now() - began;
+      assert.ok(waited >= ms - 20 && waited < 1500, `waited ${waited} ms`);
+      // Not a PgError, which the scheduler would take for one not worth trying again.
+      assert.equal(err?.constructor, Error);
+      assert.equal(err?.message, `no database connection was free within ${ms} ms (pool max 1)`);
+      assert.deepEqual(db.stats(), { open: 1, idle: 0, waiting: 0 });
+      // The first gives up once its connection hasn't logged in within connectTimeoutMs.
+      assert.ok((await first) instanceof Error);
+      assert.deepEqual(db.stats(), { open: 0, idle: 0, waiting: 0 });
+    }
+  });
+
   it("with sslmode=require, speaks TLS only to a server whose certificate it can check", async () => {
     const server = await standIn("cleartext", true);
     const connection = await Connection.connect(parseUrl(server.url("secret", `?sslmode=require&sslrootcert=${join(FIXTURES, "k8s-api.crt")}`)));
@@ -269,6 +301,16 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     assert.equal(new Set(pids).size, 2);
   });
 
+  it("lets a query wait for a connection held by another only acquireTimeoutMs, and the next gets it once it is free", async () => {
+    const db = pool(url, { max: 1, acquireTimeoutMs: 300 });
+    const holding = db.query("SELECT pg_sleep(1)");
+    await until(() => db.stats().open === 1, "the first query's connection");
+    await assert.rejects(db.query("SELECT 1"), /^Error: no database connection was free within 300 ms \(pool max 1\)$/);
+    await holding;
+    assert.deepEqual(db.stats(), { open: 1, idle: 1, waiting: 0 });
+    assert.equal((await db.query("SELECT 2 AS two")).rows[0].two, 2);
+  });
+
   it("drops a connection lost mid-query, and the next query gets another", async () => {
     const db = pool(url, { max: 1 });
     const admin = pool(url);
@@ -336,6 +378,17 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
 });
 
 describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => {
+  it("sizes its pool by the options openStore is given, and pings the database", async () => {
+    const store = await openStore(await postgresDatabase(), { pool: { max: 1, acquireTimeoutMs: 5000 } });
+    closers.push(() => store.close());
+    await Promise.all([store.ping!(), store.ping!(), store.ping!()]);
+    assert.deepEqual(store.poolStats!(), { open: 1, idle: 1, waiting: 0 });
+    const sqlite = await openStore(":memory:");
+    closers.push(() => sqlite.close());
+    await sqlite.ping!();
+    assert.equal(sqlite.poolStats, undefined);
+  });
+
   it("reads a task's events a page at a time, and all of them without a limit", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());
