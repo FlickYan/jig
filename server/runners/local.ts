@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
-import { closeSync, constants, openSync } from "node:fs";
+import { closeSync, constants, openSync, readFileSync, writeFileSync } from "node:fs";
 import { type FileHandle, mkdir, open, rm, writeFile } from "node:fs/promises";
+import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createLog, type Log } from "../log.ts";
@@ -16,8 +17,9 @@ import type { Task, Tenant, Workspace } from "../store.ts";
 // out of their reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so
 // that is the task's own: in a shared one, other tasks' commands could read them, and write them. What they
 // still share is the machine: its kernel, /tmp and /var/tmp by their paths, its Unix sockets, the rest of
-// what the service's user can read, and on macOS its processes and localhost. Without a sandbox
-// (sandboxProblem), commands run directly on it.
+// what the service's user can read, and on macOS its processes and localhost. jig runs with --sandbox, so
+// one that can't make its sandbox fails, rather than run the task's commands directly on the machine, unless
+// the config turns that off (sandbox: false, local.allowUnsandboxed).
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -39,8 +41,21 @@ export interface LocalRunnerConfig {
   pollMs?: number;
   /** What else tasks' commands can't read, beside dataDir: the database's files and the config's folder, say. */
   hidden?: string[];
+  /** Run jig with --sandbox, so a task whose jig can't make one fails (default: yes). */
+  sandbox?: boolean;
   /** Where the runner's lines go (default: the service's log). */
   log?: Log;
+}
+
+/**
+ * A run's process, in its folder's run.json, for the service that comes after a crash: its pid and host and,
+ * on Linux, the boot and the process's start time, which tell it from another that has the pid since.
+ */
+interface RunFile {
+  pid: number;
+  host: string;
+  bootId?: string;
+  starttime?: number;
 }
 
 // The service's environment holds its own secrets (and maybe real provider keys): jig gets only these of it.
@@ -98,8 +113,11 @@ export class LocalRunner implements Runner {
     const out = openSync(log, "w");
     const [program, ...first] = this.config.jig;
     // A process group of its own, so a cancel or the time limit reaches what jig started too.
-    const child = spawn(program, [...first, ...jigArgs(task, tenant, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })], { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
+    const sandbox = (this.config.sandbox ?? true) ? ["--sandbox"] : [];
+    const child = spawn(program, [...first, ...sandbox, ...jigArgs(task, tenant, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })], { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
     closeSync(out);
+    // At once, before jig can have exited and its pid gone to another process.
+    if (child.pid) this.record(join(dir, "run.json"), child.pid);
     child.stdin!.on("error", () => {}); // a jig that exits before reading its task
     child.stdin!.end(task.spec.prompt);
 
@@ -137,6 +155,72 @@ export class LocalRunner implements Runner {
       message: result.message ?? (result.exitCode === 0 ? undefined : await lastLine(log)),
     }));
     return { events: tail(events, () => exited, pollMs), wait: () => exit, cancel: stop };
+  }
+
+  /**
+   * Writes run.json, for abandon. A run whose file can't be written goes on all the same: it just can't be
+   * stopped after a crash.
+   */
+  private record(file: string, pid: number): void {
+    const run: RunFile = { pid, host: hostname() };
+    if (process.platform === "linux") Object.assign(run, { bootId: bootId(), starttime: startTime(pid) });
+    try {
+      writeFileSync(file, `${JSON.stringify(run)}\n`);
+    } catch (err) {
+      this.log.warn("couldn't write the run's run.json", { err });
+    }
+  }
+
+  /**
+   * Stops the jig a gone service (this one, before a crash) left running for the task, which is detached and
+   * would spend until its time limit: SIGTERM to its process group, then SIGKILL after TERM_MS. Only on Linux,
+   * and only if run.json names this machine, this boot and a process that started when the run's did: the
+   * pid may be another's by now. Anything else, a missing file included, is nothing to stop.
+   */
+  async abandon(id: string): Promise<void> {
+    // Read as the stats file is: a regular file, or nothing.
+    const run = (await readStats(join(this.dir(id), "run.json"))) as Partial<RunFile> | null | undefined;
+    if (process.platform !== "linux" || !run || run.host !== hostname() || run.bootId === undefined || run.bootId !== bootId()) return;
+    const { pid } = run;
+    // 0 and 1 as a group would be the service's own and every process.
+    if (!Number.isInteger(pid) || pid! <= 1 || run.starttime === undefined || startTime(pid!) !== run.starttime) return;
+    const signal = (name: NodeJS.Signals | 0) => {
+      try {
+        process.kill(-pid!, name);
+        return true;
+      } catch {
+        return false; // the group is gone
+      }
+    };
+    this.log.warn("stopping the jig a gone service left running", { task: id, pid });
+    if (!signal("SIGTERM")) return;
+    const deadline = Date.now() + TERM_MS;
+    while (signal(0)) {
+      if (Date.now() >= deadline) return void signal("SIGKILL");
+      await new Promise((done) => setTimeout(done, 50));
+    }
+  }
+}
+
+/** This boot of the machine's id, on Linux. */
+function bootId(): string | undefined {
+  try {
+    return readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/** When the process started, in clock ticks since the boot (field 22 of /proc/<pid>/stat), on Linux. */
+function startTime(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // The fields after the command's name, which is in parentheses and may hold spaces and parentheses itself.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const starttime = Number(fields[22 - 3]);
+    return Number.isInteger(starttime) ? starttime : undefined;
+  } catch {
+    return undefined;
   }
 }
 
