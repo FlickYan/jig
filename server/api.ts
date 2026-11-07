@@ -59,6 +59,8 @@ export interface TenantConfig {
   webhookSecretEnv?: string;
   /** The most tasks it may create in a UTC day, and USD its tasks may spend in a UTC day or month. */
   quotas?: Quotas;
+  /** The most event streams of its that may be open at once on each replica. */
+  maxStreams?: number;
 }
 
 export interface Config {
@@ -111,13 +113,17 @@ export interface Config {
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
   metrics?: { host?: string; port: number };
+  /** The most event streams that may be open at once on this replica, across tenants. */
+  maxStreams?: number;
   tenants: TenantConfig[];
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
 type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
 
-const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
+const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {}, maxStreams: 20 };
+/** The most event streams open at once on a replica, across tenants, unless the config says. */
+const MAX_STREAMS = 200;
 /** The longest time limit or approval timeout, in seconds: under jig's 24 days, and a timer's 2^31 ms. */
 const MAX_SECONDS = 2_000_000;
 const MAX_PROMPT = 100_000;
@@ -197,6 +203,7 @@ export async function startService(
   const metrics = serviceMetrics();
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  for (const { id } of config.tenants) metrics.eventStreams.set({ tenant: id }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
   const answers = new Answers(store);
@@ -342,6 +349,8 @@ export async function startService(
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
     now,
     metrics,
+    maxStreams: config.maxStreams ?? MAX_STREAMS,
+    streams: { open: 0, byTenant: new Map() },
   });
   return { url, internalUrl, metricsUrl, metrics, server, store, scheduler, close };
 }
@@ -635,6 +644,7 @@ function configProblem(config: Config): string | undefined {
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
+    whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
@@ -668,6 +678,7 @@ function configProblem(config: Config): string | undefined {
       (tenant.budgetUsd === null ? undefined : positive(`${at}.budgetUsd`, tenant.budgetUsd)) ??
       whole(`${at}.maxQueued`, tenant.maxQueued, 0) ??
       whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1, MAX_SECONDS) ??
+      whole(`${at}.maxStreams`, tenant.maxStreams, 1) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
       text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
       (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
@@ -700,6 +711,10 @@ interface Context {
   adminKey?: Buffer;
   now: () => Date;
   metrics: ServiceMetrics;
+  /** The most event streams open at once on this replica, across tenants. */
+  maxStreams: number;
+  /** The event streams open on this replica: in all, and each tenant's. */
+  streams: { open: number; byTenant: Map<string, number> };
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest();
@@ -748,7 +763,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   if (req.method !== "GET") return reply(res, 405, { error: "Use GET" });
   const after = req.headers["last-event-id"] ?? url.searchParams.get("after") ?? "0";
   if (typeof after !== "string" || !/^\d{1,9}$/.test(after)) return reply(res, 400, { error: "Last-Event-ID and after must be an event's seq" });
-  return streamEvents(req, res, task, Number(after), context, request);
+  return streamEvents(req, res, task, Number(after), tenant, context, request);
 }
 
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
@@ -985,9 +1000,31 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
  * (SQLite, or a lost connection to Postgres), the store is read again every second. Stored events are read
  * a page at a time (EVENTS_PAGE of them, or PAGE_BYTES), and the next page only once the client has taken
- * the last: a slow client or one that stops reading holds a page, not the task's events.
+ * the last: a slow client or one that stops reading holds a page, not the task's events. So that many
+ * such streams can't run the replica out of memory, and every tenant's runs on it with it, a tenant may have
+ * its maxStreams open on the replica at once, and the replica the config's: past either, it is a 429.
  */
-async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
+async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, tenant: Tenant, context: Context, request: ServedRequest): Promise<void> {
+  const { store, scheduler, heartbeatMs, metrics, maxStreams, streams } = context;
+  // A client that went away while its tenant and task were read has had its response's close already: a
+  // stream counted now, or followed, would never be let go.
+  if (res.destroyed) return;
+  // Counted and taken in one go, with no wait between, so streams asked for at once can't all slip past.
+  const mine = streams.byTenant.get(tenant.id) ?? 0;
+  const most = tenant.limits.maxStreams ?? DEFAULT_LIMITS.maxStreams;
+  const full = mine >= most ? { error: `The tenant has ${most} event streams open, the most it may`, limit: most, open: mine } : streams.open >= maxStreams ? { error: `The service has ${maxStreams} event streams open, the most it may`, limit: maxStreams, open: streams.open } : undefined;
+  if (full) return reply(res, 429, full, { "retry-after": "5" });
+  streams.open++;
+  streams.byTenant.set(tenant.id, mine + 1);
+  metrics.eventStreams.inc({ tenant: tenant.id });
+  // A response closes once, whether the stream ended or its client went away.
+  res.once("close", () => {
+    streams.open--;
+    const left = streams.byTenant.get(tenant.id)! - 1;
+    if (left) streams.byTenant.set(tenant.id, left);
+    else streams.byTenant.delete(tenant.id);
+    metrics.eventStreams.dec({ tenant: tenant.id });
+  });
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
   let last = after;
   let ended = false;
@@ -1018,31 +1055,43 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   // asked for while another waits to start is that one, which will read what this would.
   let reading = Promise.resolve();
   let waiting = false;
+  // The last read failed: it is made again on the next second, as the store may announce nothing more (a
+  // task that has ended), and the stream would never end.
+  let failed = false;
   const pull = () => {
     if (waiting) return;
     waiting = true;
     reading = reading
       .then(async () => {
         waiting = false;
+        failed = false;
         if (ended || res.destroyed) return;
         const { status } = (await store.task(task.id))!;
         for (;;) {
-          const events = await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES);
-          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
-          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          // As JSON, with the parsed events let go, and each event let go once written: a stream that waits
+          // for its client holds only what it has yet to write, not the whole page beside what it wrote.
           let bytes = 0;
-          for (const { seq, event } of events) {
+          const page: ({ seq: number; json: string } | undefined)[] = (await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES)).map(({ seq, event }) => {
             const json = JSON.stringify(event);
             bytes += Buffer.byteLength(json);
+            return { seq, json };
+          });
+          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
+          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          const final = page.length < EVENTS_PAGE && bytes < PAGE_BYTES;
+          for (let i = 0; i < page.length; i++) {
+            const { seq, json } = page[i]!;
+            page[i] = undefined;
             if (!send(seq, json)) await drained();
           }
           if (ended || res.destroyed) return;
-          if (events.length < EVENTS_PAGE && bytes < PAGE_BYTES) break;
+          if (final) break;
         }
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
-        metrics.storeErrors.inc({ retried: "false" });
+        failed = true;
+        metrics.storeErrors.inc({ retried: "true" });
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
@@ -1055,7 +1104,7 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   store.changes.on("done", changed);
   store.changes.on("resync", pull);
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), heartbeatMs);
-  const poll = setInterval(() => store.live || pull(), 1000);
+  const poll = setInterval(() => (store.live && !failed) || pull(), 1000);
   const cleanup = () => {
     scheduler.updates.off(task.id, follow);
     store.changes.off("event", changed);

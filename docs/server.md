@@ -124,7 +124,16 @@ ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
 the last. So it goes at the client's pace, and a client that reads slowly or not at all holds a page of
 events in the service, not all of them. Events that come as the task runs wait in the store too while
-the client is behind.
+the client is behind. A read of the store that fails is made again a second later, so a stream still ends
+once its task has.
+
+So that enough such streams can't run a replica out of memory, and every tenant's runs on it with it, a
+tenant may have its `maxStreams` (20) event streams open at once on a replica, and a replica the config's
+top-level `maxStreams` (200) across tenants. Past either, a stream is refused before any of its events is read,
+with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open, the most it may", "limit":
+20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
+goes away. Each replica counts its own, in memory: behind a load balancer, a tenant may have its
+`maxStreams` open on each replica.
 
 A task is `queued`, then `running`, then one of:
 
@@ -352,6 +361,7 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above) |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_db_pool_connections{state}` | on Postgres, the replica's connections to it: `open` (in use or idle), `idle`, and `waiting`, the queries waiting for one |
+| `jig_service_event_streams{tenant}` | event streams open on this replica (`maxStreams`), the config's tenants at 0 from the start |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
@@ -1019,12 +1029,13 @@ the service's config; the gateway's config (`jig-gateway-config`) is beside the 
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
 are yours to make. The service runs two replicas on that database, each ready (its readinessProbe, `GET
 /readyz`, which waits 3 seconds for the answer) only while it reaches it, so the Service sends requests to
-those that do; there is no liveness probe, as a restart wouldn't bring the database back. The gateway runs
-two replicas too, sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its restart
-forgets the counts, as a lone gateway's restart would. For spending that must last, use a managed Redis
-(not in cluster mode) instead, or give that one a volume and `--appendonly yes`, and set its URL in the
-gateway's config. The Compose file runs one gateway, with a Redis that keeps its data in a volume, so a
-restart of either forgets nothing.
+those that do; there is no liveness probe, as a restart wouldn't bring the database back. Each has 2 GiB of
+memory at most and Node's heap held to 1.5 GiB (`NODE_OPTIONS`), which `maxStreams` streams of 4 MiB pages
+fit in: raise them together. The gateway runs two replicas too, sharing the Redis in
+`deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts, as a lone gateway's
+restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
+one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one
+gateway, with a Redis that keeps its data in a volume, so a restart of either forgets nothing.
 
 Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sha256sum`) in place of the
 placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
