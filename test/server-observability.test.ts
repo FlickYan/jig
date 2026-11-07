@@ -312,6 +312,14 @@ describe("the task service's metrics listener, request ids and logs", () => {
     }
   });
 
+  it("starts at 0 the counters without labels that a panel or an alert takes increase() of", async () => {
+    // A series that first shows up at N adds nothing to increase(): the sweep at start removes folders before the first scrape.
+    const lines = (await serviceMetrics().registry.render()).split("\n");
+    for (const series of ["jig_service_lease_errors_total", "jig_service_task_folders_removed_total", 'jig_service_store_errors_total{retried="true"}', 'jig_service_store_errors_total{retried="false"}']) {
+      assert.ok(lines.includes(`${series} 0`), series);
+    }
+  });
+
   it("counts requests under their route's template", () => {
     const paths: [string, string][] = [
       ["/v1/tasks", "/v1/tasks"],

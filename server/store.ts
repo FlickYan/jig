@@ -243,8 +243,8 @@ export interface Store {
   claim(tenant: string, terms: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined>;
   /** Extends the owner's leases on these running tasks; those it still holds, and whether a cancel was asked for. */
   renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]>;
-  /** Ends, as errors, the running tasks whose lease ran out: their replica is gone. Their ids. */
-  expire(error: string): Promise<string[]>;
+  /** Ends, as errors, the running tasks whose lease ran out over `graceMs` ago (0): their replica is gone. Their ids. */
+  expire(error: string, graceMs?: number): Promise<string[]>;
   /** Asks the replica running the task to cancel it; false if it isn't running. */
   requestCancel(id: string): Promise<boolean>;
   /** Moves a queued task to cancelled; false if it was no longer queued. */
@@ -513,11 +513,13 @@ class SqliteStore implements Store {
     return rows.map((row) => ({ id: String(row.id), cancel: Boolean(row.cancel_requested) }));
   }
 
-  async expire(error: string): Promise<string[]> {
-    const now = new Date().toISOString();
+  async expire(error: string, graceMs = 0): Promise<string[]> {
+    const now = new Date();
     return this.atomically(() => {
       // A task left running by a version of the service without leases has none: it is as gone.
-      const rows = this.db.prepare(`UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING ${ENDED}`).all(error, now, now) as Row[];
+      const rows = this.db
+        .prepare(`UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING ${ENDED}`)
+        .all(error, now.toISOString(), new Date(now.getTime() - graceMs).toISOString()) as Row[];
       this.ledger(rows);
       return rows.map((row) => String(row.id));
     });

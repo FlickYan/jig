@@ -162,17 +162,23 @@ caps together (below).
 
 A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the lease
 is renewed every third of that while the run goes on. A task whose lease ran out has lost its replica (it
-crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it first, at its
-start or as it renews its own; it isn't run again, since its workspace is half changed, and what was still
-queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a service that
-restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran out while the
-database was away) stops the run. After a round of renewals that failed, or that took longer than a third
-of `leaseSeconds` (its queries hung while the database was cut off, and went through once it came back), a
-replica's next round that gets through in time renews its leases and ends no task; the round after ends
-those whose lease ran out. So when the database was lost or hung for every replica for longer than a lease,
-each has a third of `leaseSeconds` after the first gets through again to renew its own before another ends
-them. And while rounds fail on and off, with never two in a row getting through, a crashed replica's tasks
-aren't ended until two do, or a replica starts. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
+crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it first, as it
+renews its own; it isn't run again, since its workspace is half changed, and what was still queued runs. So
+a crashed service's tasks end up to `leaseSeconds` after it is gone, and a service that restarts ends them
+in its first round, a third of `leaseSeconds` after it starts. A replica that finds it no longer holds a
+task it runs (its lease ran out while the database was away) stops the run. After a round of renewals that
+failed, or that took longer than two thirds of `leaseSeconds` (its queries hung while the database was cut
+off, and went through once it came back), a replica's next round that gets through in time renews its
+leases and ends no task; the round after ends those whose lease ran out. A replica that starts ends no task
+before its first round either. So when the database was lost or hung for every replica for longer than a
+lease, each has a third of `leaseSeconds` after the first gets through again to renew its own before
+another ends them, and that holds for a replica that starts as it comes back too. A round that takes longer
+than a third of `leaseSeconds` is logged as a warning. One that takes up to two thirds still ends tasks,
+but not those whose lease ran out within what it took past a third: its queries may have hung while the
+database was cut off for a shorter time, which another replica's lease ran out in. So a database that is
+always slow still has a crashed replica's tasks ended, that much later. And while rounds fail
+on and off, a crashed replica's tasks aren't ended until two in a row get through, or a replica's start
+and its first round do. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
 reach of the run (a Kubernetes Job, a Docker container on its own daemon, or on Linux a local jig on its own
@@ -225,9 +231,9 @@ lock holds up the others' claims for that long at most, not until the server's T
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
 out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
 longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
-ends another's (above), and the folders a crashed replica left are swept (above). SQLite takes several
-processes on one machine too, with no announcements: streams read it every second, and a cancel is found
-as leases are renewed.
+ends another's, as does one that starts then (above), and the folders a crashed replica left are swept
+(above). SQLite takes several processes on one machine too, with no announcements: streams read it every
+second, and a cancel is found as leases are renewed.
 
 Each replica opens at most 10 connections to Postgres (and one more, which listens), and a query waits for
 one while all are in use, 10 seconds at most: past that it fails as one that took too long does, so the
@@ -358,7 +364,7 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
-| `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above) |
+| `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above), at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_db_pool_connections{state}` | on Postgres, the replica's connections to it: `open` (in use or idle), `idle`, and `waiting`, the queries waiting for one |
 | `jig_service_event_streams{tenant}` | event streams open on this replica (`maxStreams`), the config's tenants at 0 from the start |

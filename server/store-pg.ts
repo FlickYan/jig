@@ -260,11 +260,11 @@ export class PostgresStore implements Store {
     return rows.map((row: Row) => ({ id: String(row.id), cancel: row.cancel_requested === true }));
   }
 
-  async expire(error: string): Promise<string[]> {
+  async expire(error: string, graceMs = 0): Promise<string[]> {
     // The database's clock, not the replicas', says when a lease ran out.
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now()) RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
-      [error],
+      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now() - $2 * interval '1 millisecond') RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
+      [error, graceMs],
     );
     return rows.map((row) => String(row.id));
   }
