@@ -72,6 +72,8 @@ export interface Config {
   internalBaseUrl?: string;
   /** The SQLite file, or a Postgres URL (postgres://...), which replicas of the service share. */
   database: string;
+  /** Postgres's pool: the most connections this replica opens (10), and how long a query waits for one (ms). */
+  databasePool?: { max?: number; acquireTimeoutMs?: number };
   /** Where each task's folder goes. */
   dataDir: string;
   /** Tasks that may run at once, across tenants (and across replicas sharing the database). */
@@ -132,6 +134,10 @@ const EVENTS_PAGE = 100;
  * MiB, the runners' MAX_LINE), and 100 of them would be 100 MB.
  */
 const PAGE_BYTES = 4 * 1024 * 1024;
+/** How long /readyz uses what the store's ping said, however many ask. */
+const READY_CACHE_MS = 1_000;
+/** How long /readyz waits for the store's ping. */
+const READY_PING_MS = 2_000;
 /** A client's x-request-id that is used as it is; any other gets one of the service's own. */
 const REQUEST_ID = /^[\w.-]{1,128}$/;
 
@@ -192,7 +198,7 @@ export async function startService(
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
-  const store = await openStore(config.database, { region: config.region });
+  const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
   const answers = new Answers(store);
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
@@ -243,9 +249,37 @@ export async function startService(
   let failed!: (err: unknown) => void;
   const ready = new Promise<Context>((done, fail) => ((started = done), (failed = fail)));
   ready.catch(() => {});
-  const server = createServer(handler(async (req, res, request) => handle(req, res, await ready, request), true));
+  // GET /readyz says whether to send this replica requests: not while it starts or stops, nor while its
+  // store doesn't answer. /healthz says only that the process is up. Asked without a key, and at once.
+  let serving = false;
+  let closing = false;
+  let probe: { at: number; why: Promise<string | undefined> } | undefined;
+  let notReady: string | undefined;
+  const storeProblem = storeChecker(store);
+  const readyz = async (res: ServerResponse) => {
+    if (!closing && serving && (!probe || Date.now() - probe.at >= READY_CACHE_MS)) {
+      probe = {
+        at: Date.now(),
+        why: storeProblem().then(({ why, err }) => {
+          if (why && why !== notReady) log.warn(`not ready: ${why}`, { err });
+          else if (!why && notReady) log.info("ready again: the store answers");
+          notReady = why;
+          return why;
+        }),
+      };
+    }
+    const why = closing ? "the service is stopping" : !serving ? "the service is starting" : await probe!.why;
+    reply(res, why ? 503 : 200, { ok: !why, region: config.region ?? null, ...(why && { why }) });
+  };
+  const server = createServer(
+    handler(async (req, res, request) => {
+      if (req.method === "GET" && URL.parse(req.url ?? "/", "http://service")?.pathname === "/readyz") return readyz(res);
+      return handle(req, res, await ready, request);
+    }, true),
+  );
   let scheduler: Scheduler | undefined;
   const close = async () => {
+    closing = true;
     // No task is claimed from here on: one posted while the runner closes stays queued, rather than start
     // cold and be stopped as an error.
     scheduler?.pause();
@@ -295,6 +329,7 @@ export async function startService(
     throw err;
   }
   collect(metrics, { store, runner, tenants: config.tenants.map((tenant) => tenant.id), countsMs });
+  serving = true;
   started({
     store,
     scheduler,
@@ -400,6 +435,43 @@ function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: 
   metrics.poolIdle.onCollect(() => {
     if (runner.pool) metrics.poolIdle.set({}, runner.pool.stats().idle);
   });
+  // Only a store with a pool (Postgres's) has these.
+  metrics.dbPool.onCollect(() => {
+    const stats = store.poolStats?.();
+    if (stats) for (const state of ["open", "idle", "waiting"] as const) metrics.dbPool.set({ state }, stats[state]);
+  });
+}
+
+/**
+ * What says why the store can't serve requests, for /readyz: its ping failed, or took over READY_PING_MS.
+ * One ping at a time: while one hangs, as with a database that doesn't answer, each probe waits on it rather
+ * than start another, which would take another of the pool's connections; the pool's own timeouts end it.
+ * The error itself goes only to the log: /readyz answers anyone, and a connection's error can name the
+ * database's host.
+ */
+function storeChecker(store: Store): () => Promise<{ why?: string; err?: unknown }> {
+  let out: { at: number; ping: Promise<void> } | undefined;
+  return async () => {
+    if (!store.ping) return {};
+    if (!out) {
+      const ping = Promise.resolve().then(() => store.ping!());
+      out = { at: Date.now(), ping };
+      ping.then(
+        () => (out = undefined),
+        () => (out = undefined),
+      );
+    }
+    const { at, ping } = out;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<"late">((done) => (timer = setTimeout(() => done("late"), Math.max(0, at + READY_PING_MS - Date.now()))));
+    try {
+      return (await Promise.race([ping, late])) === "late" ? { why: `the database didn't answer within ${READY_PING_MS} ms` } : {};
+    } catch (err) {
+      return { why: "the database can't be reached", err };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }
 
 /** Listens, and gives the address it listens on as a URL. */
@@ -482,6 +554,21 @@ function notHostname(host: string): boolean {
   return host.endsWith(".") || URL.parse(`http://${host}/`)?.hostname !== host.toLowerCase();
 }
 
+/** What is wrong with the config's databasePool: it sizes Postgres's pool, and SQLite has none. */
+function databasePoolProblem(pool: unknown, database: string): string | undefined {
+  if (pool === undefined) return undefined;
+  if (!isObject(pool)) return "databasePool must be an object, {max, acquireTimeoutMs}";
+  if (!/^postgres(ql)?:\/\//.test(database)) return "databasePool is for a Postgres database (postgres://...): SQLite has no pool";
+  // The pool's other options (its query timeout among them) are the service's to set, not the config's.
+  const other = Object.keys(pool).find((key) => !["max", "acquireTimeoutMs"].includes(key));
+  if (other !== undefined) return `databasePool.${other} isn't a pool setting: max or acquireTimeoutMs`;
+  for (const [name, least, most] of [["max", 1, 1_000], ["acquireTimeoutMs", 100, 600_000]] as const) {
+    const value = pool[name];
+    if (value !== undefined && !(Number.isInteger(value) && (value as number) >= least && (value as number) <= most)) return `databasePool.${name} must be a whole number from ${least} to ${most}, not ${JSON.stringify(value)}`;
+  }
+  return undefined;
+}
+
 /** Throws with what is wrong if the config isn't one the service can run with. */
 export function checkConfig(config: Config): void {
   const problem = configProblem(config);
@@ -514,6 +601,7 @@ function configProblem(config: Config): string | undefined {
   const problem =
     (config.region === undefined || (typeof config.region === "string" && /^[a-z0-9]{1,16}$/.test(config.region)) ? undefined : `region must be 1 to 16 lowercase letters and digits, not ${JSON.stringify(config.region)}`) ??
     text("database", config.database, true) ??
+    databasePoolProblem(config.databasePool, config.database) ??
     text("dataDir", config.dataDir, true) ??
     text("gatewayBaseUrl", config.gatewayBaseUrl, true) ??
     http("gatewayBaseUrl", config.gatewayBaseUrl) ??

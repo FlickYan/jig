@@ -322,7 +322,9 @@ describe("the task service's metrics listener, request ids and logs", () => {
       ["/v1/tasks/task_1/approvals/ap_1", "/v1/tasks/:id/approvals/:aid"],
       ["/v1/usage", "/v1/usage"],
       ["/admin/usage", "/admin/usage"],
-      ["/healthz", "other"],
+      ["/healthz", "/healthz"],
+      ["/readyz", "/readyz"],
+      ["/readyz/x", "other"],
       ["/v1/tasks/task_1/stats", "other"],
       ["/v1/tasks/a b", "other"],
       ["/favicon.ico", "other"],
@@ -487,6 +489,8 @@ describe("the observability deploy files", () => {
     const rule = (name: string) => alerts.find((each: any) => each.alert === name);
     assert.deepEqual([rule("JigStoreErrors").expr, rule("JigStoreErrors").labels.severity], ['sum(increase(jig_service_store_errors_total{retried="false"}[5m])) > 0', "critical"]);
     assert.deepEqual([rule("JigStoreDegraded").expr, rule("JigStoreDegraded").labels.severity], ["sum(increase(jig_service_store_errors_total[5m])) > 0", "warning"]);
+    // A replica whose database is down answers its /readyz with 503s, which aren't the tenants' requests failing.
+    assert.equal(rule("JigApiErrors").expr, 'sum(rate(jig_service_http_requests_total{route!~"/healthz|/readyz",status=~"5.."}[5m])) / sum(rate(jig_service_http_requests_total{route!~"/healthz|/readyz"}[5m])) > 0.05');
     // What the proposal asks to be told of, each part's.
     const exprs = alerts.map((rule: any) => rule.expr).join("\n");
     for (const name of ["jig_service_queue_oldest_seconds", "jig_service_queue_seconds_bucket", "jig_service_tasks_ended_total", "jig_service_store_errors_total", "jig_service_lease_errors_total", "jig_service_tasks_refused_total", "jig_gateway_requests_total", "jig_gateway_failovers_total", "jig_gateway_upstream_open", "jig_gateway_keys", "jig_gateway_refused_total", "jig_router_region_up"]) {

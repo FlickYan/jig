@@ -1,5 +1,5 @@
 import { EventEmitter } from "node:events";
-import { type Client, type Listener, Pool, redactUrl, type Row } from "./pg.ts";
+import { type Client, type Listener, Pool, type PoolStats, redactUrl, type Row } from "./pg.ts";
 import {
   type Answer,
   type Approval,
@@ -11,6 +11,7 @@ import {
   COUNT_TASKS,
   type Counts,
   countsOf,
+  type DatabasePool,
   ENDED,
   type Given,
   isoDay,
@@ -127,11 +128,16 @@ export class PostgresStore implements Store {
     listener.on("connected", () => this.changes.emit("resync"));
   }
 
-  /** Connects, moves the schema on to this version's and starts listening; with a region, its tasks' ids carry it. */
-  static async open(url: string, region?: string): Promise<PostgresStore> {
+  /**
+   * Connects, moves the schema on to this version's and starts listening; with a region, its tasks' ids
+   * carry it. `options` size the pool (the config's databasePool).
+   */
+  static async open(url: string, region?: string, options: DatabasePool = {}): Promise<PostgresStore> {
     let pool: Pool | undefined;
     try {
-      pool = new Pool(url);
+      // Only these two, whatever else a caller's object holds: the query timeout stays the pool's own.
+      const { max, acquireTimeoutMs } = options;
+      pool = new Pool(url, { max, acquireTimeoutMs });
       await migrate(pool);
       const listener = pool.listen([EVENTS, CANCELS, APPROVALS]);
       await listener.ready;
@@ -380,6 +386,14 @@ export class PostgresStore implements Store {
     const [pending] = (await this.pool.query(COUNT_PENDING)).rows;
     const [replicas] = (await this.pool.query("SELECT count(*) AS n FROM replicas WHERE seen_until >= now()")).rows;
     return countsOf(tasks, Number(pending.n), Number(replicas.n));
+  }
+
+  async ping(): Promise<void> {
+    await this.pool.query("SELECT 1");
+  }
+
+  poolStats(): PoolStats {
+    return this.pool.stats();
   }
 
   async close(): Promise<void> {

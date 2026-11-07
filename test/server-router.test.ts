@@ -136,10 +136,22 @@ async function raw(base: string, head: string, body = ""): Promise<{ status: num
   return { status: Number(/^HTTP\/1\.1 (\d+)/.exec(text)?.[1]), text };
 }
 
-/** A stand-in for a region's service: its /healthz says it is `name`, and `serve` answers the rest. */
-async function fakeRegion(name: string, serve: (req: IncomingMessage, res: ServerResponse) => void): Promise<string> {
+/**
+ * A stand-in for a region's service: its /healthz says it is `name`, its /readyz answers `readyz` (a 503
+ * says the database can't be reached; a 404 or 401 is a service from before /readyz) after `readyzMs`, and
+ * `serve` answers the rest.
+ */
+async function fakeRegion(name: string, serve: (req: IncomingMessage, res: ServerResponse) => void, readyz: 200 | 503 | 404 | 401 = 200, readyzMs = 0): Promise<string> {
   const server = createServer((req, res) => {
-    if (req.url === "/healthz") return void res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ ok: true, region: name }));
+    const json = (status: number, body: object) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
+    if (req.url === "/healthz") return json(200, { ok: true, region: name });
+    if (req.url === "/readyz") {
+      return void setTimeout(() => {
+        if (readyz === 200) return json(200, { ok: true, region: name });
+        if (readyz === 503) return json(503, { ok: false, region: name, why: "the database can't be reached" });
+        return json(readyz, { error: readyz === 404 ? "Not found" : "A tenant's API key is needed: Authorization: Bearer <key>" });
+      }, readyzMs);
+    }
     serve(req, res);
   });
   fakes.push(server);
@@ -340,7 +352,48 @@ describe("the router", () => {
     const front = await router({ eu, us }, lines);
     await until(() => front.regions().eu === false, "eu to be down");
     assert.equal(front.regions().us, true);
-    assert.ok(lines.some((line) => line.includes('its /healthz says it is region \\"us\\"')));
+    assert.ok(lines.some((line) => line.includes('its /readyz says it is region \\"us\\"')));
+  });
+
+  it("counts a region whose /readyz fails as down, though its /healthz answers, and fails new tasks over from it", async () => {
+    const lines: string[] = [];
+    const posted: string[] = [];
+    const eu = await fakeRegion("eu", (_req, res) => res.writeHead(500).end(), 503);
+    const us = await fakeRegion("us", (req, res) => {
+      posted.push(`${req.method} ${req.url}`);
+      res.writeHead(201, { "content-type": "application/json" }).end(JSON.stringify({ id: `task_us_${"f".repeat(32)}`, status: "queued" }));
+    });
+    const front = await router({ eu, us }, lines);
+    await until(() => front.regions().eu === false, "eu to be down");
+    assert.ok(lines.some((line) => line.includes("region eu is down: 2 health checks failed in a row") && line.includes("its /readyz answered 503: the database can't be reached")), lines.join("\n"));
+    const moved = await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.equal(moved.status, 201);
+    assert.equal(moved.headers.get("x-jig-region"), "us");
+    assert.deepEqual(posted, ["POST /v1/tasks"]);
+    assert.equal((await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 503);
+  });
+
+  it("waits for a /readyz as long as a service's waits for its database, so it hears why the region is down", async () => {
+    // A service's /readyz answers within the 2 s it gives its database's ping, and a little more.
+    const lines: string[] = [];
+    const front = await router({ eu: await fakeRegion("eu", () => {}, 503, 2100), us: await fakeRegion("us", () => {}) }, lines);
+    await until(() => front.regions().eu === false, "eu to be down");
+    assert.ok(lines.some((line) => line.includes("region eu is down") && line.includes("its /readyz answered 503: the database can't be reached")), lines.join("\n"));
+  });
+
+  it("asks the /healthz of a region with no /readyz, a service from before it, and says so once", async () => {
+    for (const status of [404, 401] as const) {
+      const lines: string[] = [];
+      const front = await router({ eu: await fakeRegion("eu", () => {}, status), us: await fakeRegion("eu", () => {}, status) }, lines);
+      // Several rounds of checks, every 50 ms.
+      await new Promise((done) => setTimeout(done, 400));
+      assert.deepEqual(front.regions(), { eu: true, us: false });
+      const said = lines.filter((line) => line.includes(`region eu has no /readyz (its /readyz answered ${status}): its /healthz is asked instead`));
+      assert.equal(said.length, 1, lines.join("\n"));
+      // Its /healthz must still name the region.
+      assert.ok(lines.some((line) => line.includes('its /healthz says it is region \\"eu\\"')), lines.join("\n"));
+      await (routers.splice(routers.indexOf(front), 1), front.close());
+    }
   });
 
   it("adds up the usage of every region the tenant may use for region=all, and passes the rest on as it is", async () => {
