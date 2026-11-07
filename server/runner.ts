@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
+import { readdir, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { Task, TaskStatus, Tenant } from "./store.ts";
 
 // What runs a task: the interface every runner keeps (runners/local.ts, docker.ts and k8s.ts),
@@ -42,6 +43,8 @@ export interface Runner {
   readonly pool?: { stats(): { idle: number } };
   /** Removes what a task's run left on this machine (its folder), once the run has ended. */
   removeFiles?(id: string): Promise<void>;
+  /** The task folders on this machine (taskFolders), run by any replica that shares it. */
+  leftovers?(): Promise<Leftover[]>;
   /**
    * Stops what may still run of a task whose replica is gone (its container or Job), as far as this
    * replica can reach it: the task has ended as an error, and the run would spend until its deadline.
@@ -53,6 +56,37 @@ export interface Runner {
   claim?(req: IncomingMessage, res: ServerResponse): Promise<void>;
   /** Stops the workers it keeps warm, and settles once they are gone: the service is shutting down. */
   close?(): Promise<void>;
+}
+
+/** A task's id (store.ts's newTaskId), with its region or without: a warm worker's pool_<hex> folder isn't one. */
+const TASK_ID = /^task_(?:[a-z0-9]{1,16}_)?[0-9a-f]{32}$/;
+
+/** A task's folder on this machine, and when it last changed. */
+export interface Leftover {
+  id: string;
+  /** The latest mtime of the folder and of what is directly in it (a run's events.jsonl and output.log), in ms. */
+  changed: number;
+}
+
+/** The task folders under dataDir/tasks, none if it has none yet. */
+export async function taskFolders(dataDir: string): Promise<Leftover[]> {
+  const tasks = join(dataDir, "tasks");
+  const names = await readdir(tasks).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  });
+  const folders = await Promise.all(
+    names
+      .filter((name) => TASK_ID.test(name))
+      .map(async (id) => {
+        const folder = join(tasks, id);
+        const paths = [folder, ...(await readdir(folder).catch(() => [])).map((name) => join(folder, name))];
+        // A folder removed meanwhile is left out; a file that is counts for nothing.
+        const times = await Promise.all(paths.map((path) => stat(path).then((stats) => stats.mtimeMs, () => undefined)));
+        return times[0] === undefined ? undefined : { id, changed: Math.max(...times.filter((time) => time !== undefined)) };
+      }),
+  );
+  return folders.filter((folder) => folder !== undefined);
 }
 
 /** A gateway token's payload (the token contract). */

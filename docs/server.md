@@ -139,18 +139,38 @@ queue doesn't slow the service. A task is claimed in the store (`queued` to `run
 it never runs twice, and the running tasks are counted there, so replicas sharing the store keep to the
 caps together (below).
 
-A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the
-lease is renewed every third of that while the run goes on. A task whose lease ran out has lost its
-replica (it crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it
-first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
-what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
-service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
+A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the lease
+is renewed every third of that while the run goes on. A task whose lease ran out has lost its replica (it
+crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it first, at its
+start or as it renews its own; it isn't run again, since its workspace is half changed, and what was still
+queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a service that
+restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran out while the
+database was away) stops the run. After a round of renewals that failed, or that took longer than a third
+of `leaseSeconds` (its queries hung while the database was cut off, and went through once it came back), a
+replica's next round that gets through in time renews its leases and ends no task; the round after ends
+those whose lease ran out. So when the database was lost or hung for every replica for longer than a lease,
+each has a third of `leaseSeconds` after the first gets through again to renew its own before another ends
+them. And while rounds fail on and off, with never two in a row getting through, a crashed replica's tasks
+aren't ended until two do, or a replica starts. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
 reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
 go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
 it.
+
+A task's folder (`dataDir/tasks/<id>`) is removed as its outcome is stored, so a service that crashed, was
+killed or lost its machine leaves the folders of the tasks it ran. The scheduler sweeps them, with the
+local and Docker runners, which list the folders: at each start, and every tenth round of renewals (none
+while a replica waits out a round after a failure, above). A folder whose task ended over `leaseSeconds`
+ago is removed. So is one whose task the store doesn't have, once neither the folder nor a file directly in
+it has changed for `leaseSeconds`, or 10 minutes if that is longer. Before it removes a folder, the
+scheduler has its runner's `abandon` stop what it can reach of the run, where the runner has one. A queued
+or running task's folder is kept, as is a warm worker's (`pool_<hex>`, below), and with `keepTaskDirs` none
+is removed. The sweep at start runs while the service already takes requests, one folder at a time, and a
+stop waits for the folder it is on. Each removal is counted in `jig_service_task_folders_removed_total`.
+Replicas that share a `dataDir` must share the database too: a service with a database of its own takes the
+others' folders for leftovers, and removes those that haven't changed for 10 minutes, a quiet run's among
+them.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
 again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
@@ -182,9 +202,11 @@ and it connects again. Each connection asks the server to end a transaction left
 (`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
 lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
-out, and stops their Jobs or containers (above); the others go on. SQLite takes several processes on one
-machine too, with no announcements: streams read it every second, and a cancel is found as leases are
-renewed.
+out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
+longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
+ends another's (above), and the folders a crashed replica left are swept (above). SQLite takes several
+processes on one machine too, with no announcements: streams read it every second, and a cancel is found
+as leases are renewed.
 
 ### Approvals
 
@@ -305,6 +327,7 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
+| `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above) |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
