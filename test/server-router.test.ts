@@ -138,17 +138,19 @@ async function raw(base: string, head: string, body = ""): Promise<{ status: num
 
 /**
  * A stand-in for a region's service: its /healthz says it is `name`, its /readyz answers `readyz` (a 503
- * says the database can't be reached; a 404 or 401 is a service from before /readyz), and `serve` answers
- * the rest.
+ * says the database can't be reached; a 404 or 401 is a service from before /readyz) after `readyzMs`, and
+ * `serve` answers the rest.
  */
-async function fakeRegion(name: string, serve: (req: IncomingMessage, res: ServerResponse) => void, readyz: 200 | 503 | 404 | 401 = 200): Promise<string> {
+async function fakeRegion(name: string, serve: (req: IncomingMessage, res: ServerResponse) => void, readyz: 200 | 503 | 404 | 401 = 200, readyzMs = 0): Promise<string> {
   const server = createServer((req, res) => {
     const json = (status: number, body: object) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body));
     if (req.url === "/healthz") return json(200, { ok: true, region: name });
     if (req.url === "/readyz") {
-      if (readyz === 200) return json(200, { ok: true, region: name });
-      if (readyz === 503) return json(503, { ok: false, region: name, why: "the database can't be reached" });
-      return json(readyz, { error: readyz === 404 ? "Not found" : "A tenant's API key is needed: Authorization: Bearer <key>" });
+      return void setTimeout(() => {
+        if (readyz === 200) return json(200, { ok: true, region: name });
+        if (readyz === 503) return json(503, { ok: false, region: name, why: "the database can't be reached" });
+        return json(readyz, { error: readyz === 404 ? "Not found" : "A tenant's API key is needed: Authorization: Bearer <key>" });
+      }, readyzMs);
     }
     serve(req, res);
   });
@@ -369,6 +371,14 @@ describe("the router", () => {
     assert.equal(moved.headers.get("x-jig-region"), "us");
     assert.deepEqual(posted, ["POST /v1/tasks"]);
     assert.equal((await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 503);
+  });
+
+  it("waits for a /readyz as long as a service's waits for its database, so it hears why the region is down", async () => {
+    // A service's /readyz answers within the 2 s it gives its database's ping, and a little more.
+    const lines: string[] = [];
+    const front = await router({ eu: await fakeRegion("eu", () => {}, 503, 2100), us: await fakeRegion("us", () => {}) }, lines);
+    await until(() => front.regions().eu === false, "eu to be down");
+    assert.ok(lines.some((line) => line.includes("region eu is down") && line.includes("its /readyz answered 503: the database can't be reached")), lines.join("\n"));
   });
 
   it("asks the /healthz of a region with no /readyz, a service from before it, and says so once", async () => {

@@ -60,8 +60,11 @@ const REGIONAL_ID = /^task_([a-z0-9]{1,16})_[0-9a-f]{32}$/;
 const LEGACY_ID = /^task_[0-9a-f]{32}$/;
 const REGION_NAME = /^[a-z0-9]{1,16}$/;
 const REQUEST_ID = /^[\w.-]{1,128}$/;
-/** A region's /readyz (or /healthz) that takes longer has failed. */
-const HEALTH_TIMEOUT_MS = 2000;
+/**
+ * A region's /readyz (or /healthz) that takes longer has failed. Over the 2 s a service's /readyz waits for
+ * its database's ping (api.ts's READY_PING_MS), so its 503 and the reason come before this.
+ */
+const HEALTH_TIMEOUT_MS = 3000;
 // Not forwarded either way: they describe one connection, not the request.
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host"]);
 

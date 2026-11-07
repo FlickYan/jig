@@ -246,11 +246,12 @@ export async function startService(
   let closing = false;
   let probe: { at: number; why: Promise<string | undefined> } | undefined;
   let notReady: string | undefined;
+  const storeProblem = storeChecker(store);
   const readyz = async (res: ServerResponse) => {
     if (!closing && serving && (!probe || Date.now() - probe.at >= READY_CACHE_MS)) {
       probe = {
         at: Date.now(),
-        why: storeProblem(store).then(({ why, err }) => {
+        why: storeProblem().then(({ why, err }) => {
           if (why && why !== notReady) log.warn(`not ready: ${why}`, { err });
           else if (!why && notReady) log.info("ready again: the store answers");
           notReady = why;
@@ -428,20 +429,35 @@ function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: 
 }
 
 /**
- * Why the store can't serve requests, for /readyz: its ping failed, or took over READY_PING_MS. The error
- * itself goes only to the log: /readyz answers anyone, and a connection's error can name the database's host.
+ * What says why the store can't serve requests, for /readyz: its ping failed, or took over READY_PING_MS.
+ * One ping at a time: while one hangs, as with a database that doesn't answer, each probe waits on it rather
+ * than start another, which would take another of the pool's connections; the pool's own timeouts end it.
+ * The error itself goes only to the log: /readyz answers anyone, and a connection's error can name the
+ * database's host.
  */
-async function storeProblem(store: Store): Promise<{ why?: string; err?: unknown }> {
-  if (!store.ping) return {};
-  let timer: NodeJS.Timeout | undefined;
-  const late = new Promise<"late">((done) => (timer = setTimeout(() => done("late"), READY_PING_MS)));
-  try {
-    return (await Promise.race([store.ping(), late])) === "late" ? { why: `the database didn't answer within ${READY_PING_MS} ms` } : {};
-  } catch (err) {
-    return { why: "the database can't be reached", err };
-  } finally {
-    clearTimeout(timer);
-  }
+function storeChecker(store: Store): () => Promise<{ why?: string; err?: unknown }> {
+  let out: { at: number; ping: Promise<void> } | undefined;
+  return async () => {
+    if (!store.ping) return {};
+    if (!out) {
+      const ping = Promise.resolve().then(() => store.ping!());
+      out = { at: Date.now(), ping };
+      ping.then(
+        () => (out = undefined),
+        () => (out = undefined),
+      );
+    }
+    const { at, ping } = out;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<"late">((done) => (timer = setTimeout(() => done("late"), Math.max(0, at + READY_PING_MS - Date.now()))));
+    try {
+      return (await Promise.race([ping, late])) === "late" ? { why: `the database didn't answer within ${READY_PING_MS} ms` } : {};
+    } catch (err) {
+      return { why: "the database can't be reached", err };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }
 
 /** Listens, and gives the address it listens on as a URL. */

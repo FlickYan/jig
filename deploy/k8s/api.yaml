@@ -62,11 +62,13 @@ spec:
             - name: JIG_POOL_BASE_URL
               value: "http://$(POD_IP):8082"
           # Ready while the database answers: a replica that can't reach it is taken out of the Service
-          # rather than answer 500s. No liveness probe: a restart wouldn't bring the database back.
+          # rather than answer 500s. /readyz waits 2 s at most for the database, so 3 s here (not the default
+          # 1) hears its answer. No liveness probe: a restart wouldn't bring the database back.
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8080
+            timeoutSeconds: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

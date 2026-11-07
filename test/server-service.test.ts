@@ -703,14 +703,29 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(notReady, [503, { ok: false, region: "eu", why: "the database can't be reached" }]);
     assert.deepEqual(await ask("/healthz"), alive);
     assert.ok(lines.some((line) => line.includes("not ready: the database can't be reached") && line.includes("10.0.0.5:5432")), lines.join("\n"));
+    // Counted as the probe's, apart from the tenants' requests that fail.
+    assert.match(await api.metrics.registry.render(), /^jig_service_http_requests_total\{route="\/readyz",status="503"\} [1-9]\d*$/m);
 
     // One that doesn't answer at all: 503 once the ping has had 2 seconds.
-    api.store.ping = () => new Promise(() => {});
+    let pings = 0;
+    let hung!: (err: Error) => void;
+    api.store.ping = () => (pings++, new Promise((_, fail) => (hung = fail)));
     const slow = await until(async () => {
       const answer = await ask("/readyz");
       return answer[1].why !== "the database can't be reached" && answer;
     }, "/readyz to give up on the ping");
     assert.deepEqual(slow, [503, { ok: false, region: "eu", why: "the database didn't answer within 2000 ms" }]);
+    // Asked again past the second its answer is kept, it starts no other ping while that one hangs (each
+    // would take a connection of the pool), and answers at once.
+    for (let i = 0; i < 3; i++) {
+      await new Promise((done) => setTimeout(done, 600));
+      const asked = Date.now();
+      assert.deepEqual(await ask("/readyz"), slow);
+      assert.ok(Date.now() - asked < 500, `/readyz took ${Date.now() - asked} ms`);
+    }
+    assert.equal(pings, 1);
+    // The pool's query timeout ends the ping at last.
+    hung(new Error("Query read timeout"));
 
     api.store.ping = ping;
     await until(async () => (await ask("/readyz"))[0] === 200, "/readyz to answer 200 again");
@@ -722,6 +737,46 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(await ask("/healthz"), alive);
     release();
     await closed;
+  });
+
+  it("isn't ready (/readyz) while it starts, before its scheduler has", async () => {
+    const base = await tempDir("jig-service-starting-");
+    const db = await database(base);
+    // The scheduler's start waits at its first heartbeat until the test lets it go on.
+    const opening = await openStore(db);
+    const proto = Object.getPrototypeOf(opening) as Pick<Store, "heartbeat">;
+    await opening.close();
+    const heartbeat = proto.heartbeat;
+    let go!: () => void;
+    const held = new Promise<void>((done) => (go = done));
+    proto.heartbeat = async function (this: Store, ...args) {
+      await held;
+      return heartbeat.apply(this, args);
+    };
+    try {
+      // The service's URL comes once it has started: the port is picked here.
+      const picked = createServer().listen(0, "127.0.0.1");
+      await once(picked, "listening");
+      const port = (picked.address() as AddressInfo).port;
+      await new Promise((done) => picked.close(done));
+      const starting = startService(
+        { port, internal: { port: 0 }, region: "eu", database: db, dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+        { secret: SECRET, runner: endsWith(0), log: createLog("service", { format: "text", write: () => {} }) },
+      );
+      opened.push(async () => (await starting).close());
+      const ask = async () => {
+        const res = await fetch(`http://127.0.0.1:${port}/readyz`);
+        return [res.status, await res.json()];
+      };
+      const answer = await until(() => ask().catch(() => undefined), "the API to listen");
+      assert.deepEqual(answer, [503, { ok: false, region: "eu", why: "the service is starting" }]);
+      go();
+      await starting;
+      assert.deepEqual(await ask(), [200, { ok: true, region: "eu" }]);
+    } finally {
+      proto.heartbeat = heartbeat;
+      go();
+    }
   });
 };
 

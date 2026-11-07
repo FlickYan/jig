@@ -311,6 +311,25 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     assert.equal((await db.query("SELECT 2 AS two")).rows[0].two, 2);
   });
 
+  it("stops the timer of a query that got its connection in time, so it can't drop another that waits", async () => {
+    const db = pool(url, { max: 1, acquireTimeoutMs: 1500 });
+    const first = db.query("SELECT pg_sleep(0.2)");
+    const began = Date.now();
+    // The second waits for the first, gets its connection at about 0.2 s, and holds it past its 1.5 s.
+    const second = db.query("SELECT pg_sleep(1.6)");
+    assert.equal(db.stats().waiting, 1);
+    await first;
+    await new Promise((done) => setTimeout(done, began + 1000 - Date.now()));
+    assert.deepEqual(db.stats(), { open: 1, idle: 0, waiting: 0 });
+    // The third waits from 1 s, past the second's 1.5 s, and gets the connection at about 1.8 s: well before
+    // its own time runs out, at 2.5 s.
+    const third = db.query("SELECT 3 AS three");
+    assert.equal(db.stats().waiting, 1);
+    assert.equal((await third).rows[0].three, 3);
+    await second;
+    assert.deepEqual(db.stats(), { open: 1, idle: 1, waiting: 0 });
+  });
+
   it("drops a connection lost mid-query, and the next query gets another", async () => {
     const db = pool(url, { max: 1 });
     const admin = pool(url);

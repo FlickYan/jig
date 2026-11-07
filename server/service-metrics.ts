@@ -5,11 +5,14 @@ import { Registry } from "./metrics.ts";
 // tasks spent. A label is never a key, a token, a prompt or a task's id: tenant, status and route are.
 
 /** The routes of the API as their requests are counted: templates, never a task's id. */
-export const ROUTES = ["/v1/tasks", "/v1/tasks/:id", "/v1/tasks/:id/events", "/v1/tasks/:id/cancel", "/v1/tasks/:id/approvals", "/v1/tasks/:id/approvals/:aid", "/v1/usage", "/admin/usage", "other"];
+export const ROUTES = ["/v1/tasks", "/v1/tasks/:id", "/v1/tasks/:id/events", "/v1/tasks/:id/cancel", "/v1/tasks/:id/approvals", "/v1/tasks/:id/approvals/:aid", "/v1/usage", "/admin/usage", "/healthz", "/readyz", "other"];
 
-/** The route a request's path is counted under. */
+/**
+ * The route a request's path is counted under. The probes have their own: a /readyz that answers 503 while
+ * the database is down isn't a request of a tenant's that failed (JigApiErrors leaves them out).
+ */
 export function routeOf(path: string): string {
-  if (["/v1/tasks", "/v1/usage", "/admin/usage"].includes(path)) return path;
+  if (["/v1/tasks", "/v1/usage", "/admin/usage", "/healthz", "/readyz"].includes(path)) return path;
   const match = /^\/v1\/tasks\/[\w-]+(\/cancel|\/events|\/approvals(\/[\w-]{1,100})?)?$/.exec(path);
   if (!match) return "other";
   return `/v1/tasks/:id${match[2] ? "/approvals/:aid" : (match[1] ?? "")}`;
