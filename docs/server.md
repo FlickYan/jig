@@ -573,6 +573,18 @@ a label's value (over 63 characters, with characters other than letters, digits,
 starting and ending with a letter or digit) is labelled `h-` and 40 hex digits of its SHA-256 instead, and
 the id itself is in the Job's `jig.dev/tenant` annotation.
 
+A POST of a Job or its Secret that the API server answers 429 (API Priority and Fairness, while a backlog
+drains), 500, 502, 503 or 504, or that gets no answer in 30 s or a dropped connection, is asked again:
+after 250 ms, doubling up to 5 s, or after the `Retry-After` of a 429 or 503 if that is longer (at most
+10 s). Each retry is a warning in the log. No retry is made that would start 60 s or more after the first
+POST, but the last one made can still take its own 30 s past that. None is made once the service is
+stopping either. A POST that failed may still have made the object, so a 409 after a retry is taken as its
+doing: the Job is read back and used only if it has the task's labels, and the Secret, which the service
+may make but not read, is taken by its name. A 409 to the first POST, or any other refusal, fails the task
+at once. If the Job can't be made after a retry, it is read back and deleted if it has the task's labels.
+If its Secret can't be made, the Job is deleted. So no pod waits for a Secret until its deadline holding
+what it requests. A warm worker's Job and Secret are made the same way.
+
 ```json
 "runner": "kubernetes",
 "kubernetes": { "image": "registry.example.com/jig-worker:0.1.0", "runtimeClassName": "gvisor",
