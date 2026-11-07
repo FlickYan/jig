@@ -238,11 +238,12 @@ describe("the local runner's abandon", () => {
     await store.close();
     await new Promise((done) => setTimeout(done, 350));
 
-    const config: Config = { port: 0, internal: { port: 0 }, database, dataDir, keepTaskDirs: true, gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [] }] };
+    const config: Config = { port: 0, internal: { port: 0 }, database, dataDir, keepTaskDirs: true, gatewayBaseUrl: "http://127.0.0.1:9/anthropic", leaseSeconds: 1, tenants: [{ id: "acme", keys: [] }] };
     const service = await startService(config, { secret: SECRET, runner: runner(dataDir, script, join(dir, "argv"), 300), log: createLog("service", { write: () => {} }) });
     services.push(service);
-    assert.equal((await service.store.task(claimed.id))!.status, "error");
-    // Stopped as the service starts, though not waited for there.
+    // Ended in the service's first round of renewals, a third of a lease after it starts.
+    for (const deadline = Date.now() + 15_000; (await service.store.task(claimed.id))!.status !== "error"; await new Promise((done) => setTimeout(done, 20))) assert.ok(Date.now() < deadline, "the task is ended");
+    // Stopped as it is ended, though not waited for there.
     for (const deadline = Date.now() + 15_000; groupAlive(pid); await new Promise((done) => setTimeout(done, 20))) assert.ok(Date.now() < deadline, "the crashed service's jig is stopped");
     assert.equal((await handle.wait()).exitCode, null);
   });

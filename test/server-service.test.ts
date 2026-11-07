@@ -501,9 +501,9 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     await store.close();
     await new Promise((done) => setTimeout(done, 150));
 
-    const api = await service({ database: db }, base);
-    const task = (await call(api, KEYS.acme, "GET", `/v1/tasks/${left.id}`)).body;
-    assert.equal(task.status, "error");
+    // Ended in its first round of renewals, a third of a lease after it starts.
+    const api = await service({ database: db, leaseSeconds: 1 }, base);
+    const task = await statusOf(api, left.id, "error");
     assert.match(task.error, /the task service stopped while it ran/);
     assert.ok(task.ended);
     await statusOf(api, queued.id, "succeeded");
@@ -1505,10 +1505,13 @@ const schedulerTests = () => {
     });
     const metrics = serviceMetrics();
     const lines: string[] = [];
-    const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
-    assert.deepEqual(await scheduler.start(), [left.id]);
+    const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, leaseMs: 300, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
+    await scheduler.start();
+    // Ended in the first round, a third of a lease after the start, not at it.
+    assert.equal((await store.task(left.id))!.status, "running");
+    await until(() => lines.some((line) => line.includes("couldn't read an expired task to count it")), "the first round to end the task");
     assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [0, 1]);
-    assert.ok(lines.some((line) => line.includes("couldn't read an expired task to count it")), lines.join("\n"));
+    assert.ok(lines.some((line) => line.includes("1 task(s) whose replica is gone (a crash, or a kill) marked as errors")), lines.join("\n"));
     assert.equal((await store.task(left.id))!.status, "error");
     await scheduler.close();
     await store.close();

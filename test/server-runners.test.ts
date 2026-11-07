@@ -52,10 +52,10 @@ afterEach(async () => {
  * The service with the given runner and one tenant, acme (or `tenant`), with its key, on a database of its
  * own (or `database`). It keeps the task folders, which the tests look in.
  */
-async function service(runner: Runner, tenant = "acme", database?: string): Promise<Service> {
+async function service(runner: Runner, tenant = "acme", database?: string, config: Partial<Config> = {}): Promise<Service> {
   const base = await tempDir("jig-runners-");
   const started = await startService(
-    { port: 0, internal: { port: 0 }, database: database ?? join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: tenant, keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }] },
+    { port: 0, internal: { port: 0 }, database: database ?? join(base, "jig.db"), dataDir: join(base, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://gateway:8081/anthropic", graceSeconds: 5, tenants: [{ id: tenant, keys: [createHash("sha256").update(KEY).digest("hex")], budgetUsd: 2.5 }], ...config },
     { secret: SECRET, runner },
   );
   services.push(started);
@@ -83,6 +83,11 @@ async function crashingReplica(database: string) {
       await new Promise((done) => setTimeout(done, 350));
     },
   };
+}
+
+/** Waits for the tasks to be ended as errors, as a replica's first round of renewals does those whose lease ran out. */
+async function endedAsGone(service: Service, ids: string[]): Promise<void> {
+  for (const id of ids) await until(async () => (await service.store.task(id))!.status === "error", `task ${id} to end as an error`);
 }
 
 /** A log whose JSON lines go to `lines`. */
@@ -311,8 +316,8 @@ describe("the Docker runner", () => {
     await replica.crash();
 
     // Another replica, on the same daemon, ends the task and kills its container.
-    const api = await service(new DockerRunner(options(base, state)), "acme", database);
-    assert.equal((await api.store.task(task.id))!.status, "error");
+    const api = await service(new DockerRunner(options(base, state)), "acme", database, { leaseSeconds: 1 });
+    await endedAsGone(api, [task.id]);
     await until(() => !alive(pid) && !alive(child), "the container's processes to be gone");
     assert.deepEqual(await kills(state), [{ signal: "KILL", name: `jig-${task.id}` }]);
     assert.equal((await handle.wait()).exitCode, 137);
@@ -452,8 +457,8 @@ describe("the Docker runner", () => {
     await replica.crash();
     assert.ok([worker, record.pid, record.child].every(alive));
 
-    const api = await service(new DockerRunner(options(base, state)), "acme", database);
-    assert.equal((await api.store.task(task.id))!.status, "error");
+    const api = await service(new DockerRunner(options(base, state)), "acme", database, { leaseSeconds: 1 });
+    await endedAsGone(api, [task.id]);
     await until(() => ![worker, record.pid, record.child].some(alive), "the container's processes to be gone");
     assert.deepEqual((await kills(state)).filter((kill) => kill.name === `jig-${task.id}`), [{ signal: "KILL", name: `jig-${task.id}` }]);
     assert.equal((await handle.wait()).exitCode, 137);
@@ -1090,8 +1095,8 @@ describe("the Kubernetes runner", () => {
     await replica.crash();
 
     // Another replica ends both tasks, and deletes their Jobs, which would run and spend until their deadlines.
-    const api = await service(another(), "acme", database);
-    for (const task of [cold, warm]) assert.equal((await api.store.task(task.id))!.status, "error");
+    const api = await service(another(), "acme", database, { leaseSeconds: 1 });
+    await endedAsGone(api, [cold.id, warm.id]);
     await until(() => cluster.jobs.size === 1, "the crashed replica's Jobs deleted");
     assert.deepEqual([...cluster.jobs.keys()], ["jig-task-elsewhere"]);
     const deletes = cluster.requests.filter((request) => request.method === "DELETE").map((request) => request.path);

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { type Config, type Service, startService } from "../server/api.ts";
+import { createLog } from "../server/log.ts";
 import { type Leftover, type RunHandle, type Runner, taskFolders } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { LocalRunner } from "../server/runners/local.ts";
@@ -389,6 +390,71 @@ describe("replicas that lose the database", () => {
       for (const task of tasks) assert.equal((await base.task(task.id))!.status, "succeeded");
     });
   }
+
+  it("don't end each other's tasks when one starts just as the database comes back after a lease", async () => {
+    const file = join(await tempDir("jig-replicas-"), "jig.db");
+    let down = false;
+    const flaky = (store: Store): Store =>
+      new Proxy(store, {
+        get(target, name, receiver) {
+          const value = Reflect.get(target, name, receiver);
+          if (typeof value !== "function") return value;
+          return async (...args: unknown[]) => {
+            if (down) throw new Error("the database went away");
+            return value.apply(target, args);
+          };
+        },
+      });
+    const base = await sqliteStore(file);
+    await base.putTenant({ id: "acme", limits: LIMITS }, []);
+    const lease = 3000;
+    const runner = new QuietRunner();
+    const a = newScheduler(flaky(await sqliteStore(file)), runner, { concurrency: 2, replicaId: "A", leaseMs: lease });
+    await a.start();
+    // A's rounds come every third of a lease from here.
+    const began = Date.now();
+    const task = await base.createTask("acme", QUIET);
+    await a.poke();
+    assert.equal(a.running(), 1);
+
+    // Down for longer than a lease, and back halfway between two of A's rounds. A replica that couldn't
+    // start meanwhile (a pod crash-looping on the database) starts as it comes back.
+    down = true;
+    await sleep(lease + 1000);
+    await sleep(lease / 3 - ((Date.now() - began) % (lease / 3)) + lease / 6);
+    down = false;
+    const c = newScheduler(await sqliteStore(file), new QuietRunner(), { concurrency: 2, replicaId: "C", leaseMs: lease, keepTaskDirs: true });
+    await c.start();
+    // C's first round comes after A's has renewed its lease, and a round of A's later, it still holds it.
+    await sleep(lease);
+    assert.equal((await base.task(task.id))!.status, "running");
+    assert.deepEqual(runner.cancelled, []);
+    runner.ends.get(task.id)!();
+    await a.settled();
+    assert.equal((await base.task(task.id))!.status, "succeeded");
+  });
+
+  it("end a gone replica's tasks while every round of renewals takes over a third of a lease", async () => {
+    const store = await sqliteStore(join(await tempDir("jig-replicas-"), "jig.db"));
+    await store.putTenant({ id: "acme", limits: LIMITS }, []);
+    const task = await store.createTask("acme", QUIET);
+    // Its lease runs out a second after the start, so only the rounds of renewals can end it.
+    await store.claim("acme", { owner: "a crashed replica", leaseMs: 1000, concurrency: 2, tenantConcurrency: 2 });
+    // A database that is slow but works: each heartbeat takes 250 ms, past a third of the 600 ms lease, not two.
+    const slow = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name === "heartbeat") return async (...args: unknown[]) => (await sleep(250), value.apply(target, args));
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const lines: string[] = [];
+    const log = createLog("service", { write: (line) => lines.push(line) });
+    await newScheduler(slow, new QuietRunner(), { concurrency: 2, replicaId: "B", leaseMs: 600, keepTaskDirs: true, log }).start();
+    await until(async () => (await store.task(task.id))!.status === "error", "the gone replica's task to end");
+    assert.ok(lines.some((line) => line.includes("took longer than a third of a lease")), lines.join("\n"));
+    await until(() => lines.some((line) => line.includes("1 task(s) whose replica is gone (a crash, or a kill) marked as errors")), "the warning");
+  });
 
   it("remove at start the folders of tasks that ended over a lease ago, or that the store lacks and are stale, and no other", async () => {
     const base = await tempDir("jig-replicas-");
