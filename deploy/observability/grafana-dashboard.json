@@ -626,7 +626,7 @@
       "id": 14,
       "type": "timeseries",
       "title": "Errors and replicas",
-      "description": "Failed tries of reads and writes of the database (retried true: tried again; false: given up on), failed lease renewals, and the replicas whose heartbeat is in it.",
+      "description": "Failed tries of reads and writes of the database (retried true: tried again; false: given up on), failed lease renewals, the replicas whose heartbeat is in it, and the folders crashed replicas' runs left that were swept.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -681,6 +681,15 @@
           "expr": "max by (region) (jig_service_replicas{region=~\"$region\"})",
           "legendFormat": "replicas {{region}}",
           "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(increase(jig_service_task_folders_removed_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "leftover folders removed",
+          "refId": "D"
         }
       ]
     },

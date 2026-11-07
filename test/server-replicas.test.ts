@@ -1,12 +1,17 @@
 import assert from "node:assert/strict";
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { type Config, type Service, startService } from "../server/api.ts";
-import type { RunHandle, Runner } from "../server/runner.ts";
-import type { Task, Tenant } from "../server/store.ts";
+import { type RunHandle, type Runner, taskFolders } from "../server/runner.ts";
+import { DockerRunner } from "../server/runners/docker.ts";
+import { LocalRunner } from "../server/runners/local.ts";
+import { Scheduler } from "../server/scheduler.ts";
+import { serviceMetrics } from "../server/service-metrics.ts";
+import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -24,7 +29,10 @@ const sha256 = (text: string) => createHash("sha256").update(text).digest("hex")
 const services: Service[] = [];
 const children: ChildProcess[] = [];
 const pids: number[] = [];
+/** Stores and schedulers a test opened itself, closed after it, the last opened first. */
+const opened: (() => Promise<void>)[] = [];
 afterEach(async () => {
+  for (const close of opened.splice(0).reverse()) await close();
   for (const child of children.splice(0)) child.kill("SIGKILL");
   // What a crashed replica's runs left behind.
   for (const pid of pids.splice(0)) {
@@ -244,3 +252,154 @@ for (const { name, skip } of BACKENDS) {
     });
   });
 }
+
+/** A store on the SQLite file, closed after the test. */
+async function sqliteStore(file: string): Promise<Store> {
+  const store = await openStore(file);
+  opened.push(() => store.close());
+  return store;
+}
+
+/** A scheduler, closed after the test. */
+function newScheduler(...args: ConstructorParameters<typeof Scheduler>): Scheduler {
+  const scheduler = new Scheduler(...args);
+  opened.push(() => scheduler.close());
+  return scheduler;
+}
+
+/** Runs that write no events (waiting on an approval, or a long build) until they are ended or cancelled, each in a folder of its own. */
+class QuietRunner implements Runner {
+  ends = new Map<string, () => void>();
+  cancelled: string[] = [];
+  abandoned: string[] = [];
+  private dataDir: string;
+  constructor(dataDir = "") {
+    this.dataDir = dataDir;
+  }
+
+  async start(task: Task): Promise<RunHandle> {
+    if (this.dataDir) await mkdir(join(this.dataDir, "tasks", task.id, "work"), { recursive: true });
+    let end!: () => void;
+    const ended = new Promise<void>((done) => (end = done));
+    this.ends.set(task.id, end);
+    return {
+      events: (async function* () {})(),
+      wait: async () => (await ended, { exitCode: 0, timedOut: false }),
+      cancel: () => {
+        this.cancelled.push(task.id);
+        end();
+      },
+    };
+  }
+
+  leftovers(): Promise<string[]> {
+    return taskFolders(this.dataDir);
+  }
+
+  async abandon(id: string): Promise<void> {
+    this.abandoned.push(id);
+  }
+
+  async removeFiles(id: string): Promise<void> {
+    await rm(join(this.dataDir, "tasks", id), { recursive: true, force: true });
+  }
+}
+
+const QUIET = { prompt: "x", maxSteps: 10, timeLimit: 600, model: "claude-x" };
+const LIMITS = { concurrency: 2, maxSteps: 10, timeLimit: 600, budgetUsd: null };
+const exists = (path: string) => access(path).then(() => true, () => false);
+
+describe("replicas that lose the database", () => {
+  it("don't end each other's tasks when all lose it for longer than a lease", async () => {
+    const file = join(await tempDir("jig-replicas-"), "jig.db");
+    // Every replica's store fails while the database is down, as in a Postgres failover.
+    let down = false;
+    const flaky = (store: Store): Store =>
+      new Proxy(store, {
+        get(target, name, receiver) {
+          const value = Reflect.get(target, name, receiver);
+          if (typeof value !== "function") return value;
+          return async (...args: unknown[]) => {
+            if (down) throw new Error("the database went away");
+            return value.apply(target, args);
+          };
+        },
+      });
+    const base = await sqliteStore(file);
+    for (const id of ["acme", "beta"]) await base.putTenant({ id, limits: { ...LIMITS, concurrency: 1 } }, []);
+    const lease = 3000;
+    const runners = [new QuietRunner(), new QuietRunner()];
+    const a = newScheduler(flaky(await sqliteStore(file)), runners[0], { concurrency: 2, replicaId: "A", leaseMs: lease });
+    const b = newScheduler(flaky(await sqliteStore(file)), runners[1], { concurrency: 2, replicaId: "B", leaseMs: lease });
+    await a.start();
+    // Their renewals out of step, as two pods' are.
+    await new Promise((done) => setTimeout(done, lease / 6));
+    await b.start();
+    // A task runs on each.
+    const tasks = [await base.createTask("acme", QUIET)];
+    await a.poke();
+    tasks.push(await base.createTask("beta", QUIET));
+    await b.poke();
+    assert.deepEqual([a.running(), b.running()], [1, 1]);
+    await new Promise((done) => setTimeout(done, 500));
+
+    // Down for longer than a lease: every lease has run out by the time it comes back.
+    down = true;
+    await new Promise((done) => setTimeout(done, lease + 1000));
+    down = false;
+    await new Promise((done) => setTimeout(done, lease));
+    for (const task of tasks) assert.equal((await base.task(task.id))!.status, "running", `${task.tenant}'s task`);
+    assert.deepEqual(runners.flatMap((runner) => runner.cancelled), []);
+    for (const runner of runners) for (const end of runner.ends.values()) end();
+    await Promise.all([a.settled(), b.settled()]);
+    for (const task of tasks) assert.equal((await base.task(task.id))!.status, "succeeded");
+  });
+
+  it("remove at start the folders that tasks which ended long ago left, and no running task's", async () => {
+    const base = await tempDir("jig-replicas-");
+    const file = join(base, "jig.db");
+    const dataDir = join(base, "data");
+    const store = await sqliteStore(file);
+    await store.putTenant({ id: "acme", limits: LIMITS }, []);
+    // A replica crashes before it removes the folder of a task that finished; another task still runs on it.
+    const crashed = new QuietRunner(dataDir);
+    crashed.removeFiles = async () => {};
+    const a = newScheduler(store, crashed, { concurrency: 2, replicaId: "A" });
+    const [done, running] = [await store.createTask("acme", QUIET), await store.createTask("acme", QUIET)];
+    await a.start();
+    await until(() => crashed.ends.size === 2, "both runs to start");
+    crashed.ends.get(done.id)!();
+    await a.settled();
+    assert.equal((await store.task(done.id))!.status, "succeeded");
+    // It ended a minute ago, longer than a lease.
+    const db = new DatabaseSync(file);
+    db.exec("PRAGMA busy_timeout = 5000");
+    db.prepare("UPDATE tasks SET ended = ? WHERE id = ?").run(new Date(Date.now() - 60_000).toISOString(), done.id);
+    db.close();
+    // A warm worker's folder isn't a task's.
+    const pool = join(dataDir, "tasks", "pool_0123456789abcdef01234567");
+    await mkdir(pool);
+    const folders = [join(dataDir, "tasks", done.id), join(dataDir, "tasks", running.id), pool];
+    // The runners that keep the folders on this machine list them so.
+    const listed = [done.id, running.id].sort();
+    const local = new LocalRunner({ dataDir, jig: [], gatewayBaseUrl: "", gatewaySecret: "", graceSeconds: 0 });
+    const docker = new DockerRunner({ dataDir, image: "", network: "", gatewayBaseUrl: "", gatewaySecret: "", graceSeconds: 0 });
+    assert.deepEqual([(await local.leftovers()).sort(), (await docker.leftovers()).sort()], [listed, listed]);
+    assert.deepEqual(await taskFolders(join(base, "nowhere")), []);
+
+    // With keepTaskDirs, every folder stays.
+    const kept = serviceMetrics();
+    const keeping = new QuietRunner(dataDir);
+    await newScheduler(store, keeping, { concurrency: 2, replicaId: "C", keepTaskDirs: true, metrics: kept }).start();
+    assert.deepEqual(await Promise.all(folders.map(exists)), [true, true, true]);
+    assert.equal(kept.foldersRemoved.get(), 0);
+
+    const metrics = serviceMetrics();
+    const sweeper = new QuietRunner(dataDir);
+    await newScheduler(store, sweeper, { concurrency: 2, replicaId: "B", metrics }).start();
+    assert.deepEqual(await Promise.all(folders.map(exists)), [false, true, true]);
+    assert.equal(metrics.foldersRemoved.get(), 1);
+    assert.deepEqual(sweeper.abandoned, [done.id]);
+    assert.deepEqual(keeping.abandoned, []);
+  });
+});

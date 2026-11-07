@@ -145,12 +145,22 @@ replica (it crashed, was killed, or lost the database) and is marked `error` by 
 first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
-the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
+out while the database was away) stops the run. After a round of renewals that failed, a replica's next
+round that gets through renews its leases and ends no task; the round after ends those whose lease ran
+out. So when the database was away from every replica for longer than a lease, each has a third of
+`leaseSeconds` to renew its own before another ends them. A SIGTERM or Ctrl+C kills the runs and marks
+them `error`; the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
 reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
 go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
 it.
+
+A task's folder (`dataDir/tasks/<id>`) is removed as its outcome is stored, so a service that crashed, was
+killed or lost its machine leaves the folders of the tasks it ran. The local and Docker runners sweep them
+at each start, and every tenth round of renewals: a folder whose task ended over `leaseSeconds` ago, or
+that the store doesn't have, is removed, after its runner stops what it can reach of the run. A queued or
+running task's is kept, as is a warm worker's (`pool_<hex>`, below), and with `keepTaskDirs` none is
+removed. Each removal is counted in `jig_service_task_folders_removed_total`.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
 again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
@@ -182,9 +192,11 @@ and it connects again. Each connection asks the server to end a transaction left
 (`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
 lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
-out, and stops their Jobs or containers (above); the others go on. SQLite takes several processes on one
-machine too, with no announcements: streams read it every second, and a cancel is found as leases are
-renewed.
+out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
+longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
+ends another's (above), and the folders a crashed replica left are swept (above). SQLite takes several
+processes on one machine too, with no announcements: streams read it every second, and a cancel is found
+as leases are renewed.
 
 ### Approvals
 
