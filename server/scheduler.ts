@@ -17,8 +17,8 @@ import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, 
 // A running task is leased to the replica that runs it, which renews the lease while the run goes on: a
 // task whose lease ran out has lost its replica (it crashed, or lost the database), and any replica ends it
 // as an error, and has its runner stop the container or Job it may have left running. After a round of
-// renewals that failed, the next that gets through ends no task: the database may have been away from every
-// replica for longer than a lease, and the others are owed a round to renew theirs first.
+// renewals that failed or hung past a tick, the next that gets through ends no task: the database may have
+// been away from every replica for longer than a lease, and the others are owed a round to renew theirs first.
 //
 // A run's folder is removed as it ends; one a crashed replica left is removed at the next start, or by the
 // sweep every tenth round, once its task has ended over a lease ago, or the store no longer has it.
@@ -83,7 +83,7 @@ export class Scheduler {
   private lastTenant = "";
   private timer?: NodeJS.Timeout;
   private keeping?: Promise<void>;
-  /** Set by a round of renewals that failed, until one gets through: no task is ended as gone meanwhile. */
+  /** Set by a round of renewals that failed or hung, until one gets through in time: no task is ended as gone meanwhile. */
   private recovering = false;
   /** The rounds of renewals that got through and ended what was gone: every tenth sweeps the folders. */
   private rounds = 0;
@@ -143,14 +143,20 @@ export class Scheduler {
   private keep(): Promise<void> {
     // One at a time: a slow database doesn't pile them up.
     this.keeping ??= (async () => {
+      const began = Date.now();
       try {
         await this.renew();
         await this.store.heartbeat(this.replicaId, this.leaseMs);
         // The first round through after a failure only renews. Every replica's leases may have run out while
         // the database was away, and the store renews a lapsed lease its replica holds: ending tasks now would
         // end those of the replicas whose round hasn't come yet. A round later, each has had a third of a lease
-        // to renew its own, and one that didn't is gone.
-        if (this.recovering) this.recovering = false;
+        // to renew its own, and one that didn't is gone. A round that took longer than a tick counts as failed:
+        // its calls may have hung while the database was cut off (a partition, a paused server) and gone
+        // through once it came back, with the others' leases run out just the same.
+        if (Date.now() - began > this.leaseMs / 3) {
+          this.recovering = true;
+          this.log.warn("renewing the leases on its runs took longer than a third of a lease", { ms: Date.now() - began });
+        } else if (this.recovering) this.recovering = false;
         else {
           await this.expire();
           // Not waited for: a slow disk mustn't hold up the renewals.

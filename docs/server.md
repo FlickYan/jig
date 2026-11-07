@@ -145,10 +145,12 @@ replica (it crashed, was killed, or lost the database) and is marked `error` by 
 first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
 what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
 service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. After a round of renewals that failed, a replica's next
-round that gets through renews its leases and ends no task; the round after ends those whose lease ran
-out. So when the database was away from every replica for longer than a lease, each has a third of
-`leaseSeconds` to renew its own before another ends them. A SIGTERM or Ctrl+C kills the runs and marks
+out while the database was away) stops the run. After a round of renewals that failed, or that took longer
+than a third of `leaseSeconds` (its queries hung while the database was cut off, and went through once it
+came back), a replica's next round that gets through in time renews its leases and ends no task; the round
+after ends those whose lease ran out. So when the database was lost or hung for every replica for longer
+than a lease, each has a third of `leaseSeconds` after the first gets through again to renew its own
+before another ends them. A SIGTERM or Ctrl+C kills the runs and marks
 them `error`; the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
 reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise

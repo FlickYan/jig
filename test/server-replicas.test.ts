@@ -309,51 +309,66 @@ const QUIET = { prompt: "x", maxSteps: 10, timeLimit: 600, model: "claude-x" };
 const LIMITS = { concurrency: 2, maxSteps: 10, timeLimit: 600, budgetUsd: null };
 const exists = (path: string) => access(path).then(() => true, () => false);
 
-describe("replicas that lose the database", () => {
-  it("don't end each other's tasks when all lose it for longer than a lease", async () => {
-    const file = join(await tempDir("jig-replicas-"), "jig.db");
-    // Every replica's store fails while the database is down, as in a Postgres failover.
-    let down = false;
-    const flaky = (store: Store): Store =>
-      new Proxy(store, {
-        get(target, name, receiver) {
-          const value = Reflect.get(target, name, receiver);
-          if (typeof value !== "function") return value;
-          return async (...args: unknown[]) => {
-            if (down) throw new Error("the database went away");
-            return value.apply(target, args);
-          };
-        },
-      });
-    const base = await sqliteStore(file);
-    for (const id of ["acme", "beta"]) await base.putTenant({ id, limits: { ...LIMITS, concurrency: 1 } }, []);
-    const lease = 3000;
-    const runners = [new QuietRunner(), new QuietRunner()];
-    const a = newScheduler(flaky(await sqliteStore(file)), runners[0], { concurrency: 2, replicaId: "A", leaseMs: lease });
-    const b = newScheduler(flaky(await sqliteStore(file)), runners[1], { concurrency: 2, replicaId: "B", leaseMs: lease });
-    await a.start();
-    // Their renewals out of step, as two pods' are.
-    await new Promise((done) => setTimeout(done, lease / 6));
-    await b.start();
-    // A task runs on each.
-    const tasks = [await base.createTask("acme", QUIET)];
-    await a.poke();
-    tasks.push(await base.createTask("beta", QUIET));
-    await b.poke();
-    assert.deepEqual([a.running(), b.running()], [1, 1]);
-    await new Promise((done) => setTimeout(done, 500));
+// How a replica's store behaves while the database is down: its calls fail, as in a Postgres failover, or
+// they hang until its link heals and then go through, as in a network partition or a paused server.
+const OUTAGES = [
+  { name: "fail", hang: false },
+  { name: "hang", hang: true },
+] as const;
 
-    // Down for longer than a lease: every lease has run out by the time it comes back.
-    down = true;
-    await new Promise((done) => setTimeout(done, lease + 1000));
-    down = false;
-    await new Promise((done) => setTimeout(done, lease));
-    for (const task of tasks) assert.equal((await base.task(task.id))!.status, "running", `${task.tenant}'s task`);
-    assert.deepEqual(runners.flatMap((runner) => runner.cancelled), []);
-    for (const runner of runners) for (const end of runner.ends.values()) end();
-    await Promise.all([a.settled(), b.settled()]);
-    for (const task of tasks) assert.equal((await base.task(task.id))!.status, "succeeded");
-  });
+describe("replicas that lose the database", () => {
+  for (const { name: outage, hang } of OUTAGES) {
+    it(`don't end each other's tasks when all lose it for longer than a lease (calls ${outage})`, async () => {
+      const file = join(await tempDir("jig-replicas-"), "jig.db");
+      let down = false;
+      let back!: () => void;
+      const up = new Promise<void>((done) => (back = done));
+      const flaky = (store: Store, heal: number): Store => {
+        // Each replica's link heals at its own time after the database is back.
+        const healed = up.then(() => new Promise<void>((done) => setTimeout(done, heal)));
+        return new Proxy(store, {
+          get(target, name, receiver) {
+            const value = Reflect.get(target, name, receiver);
+            if (typeof value !== "function") return value;
+            return async (...args: unknown[]) => {
+              if (down && !hang) throw new Error("the database went away");
+              if (down) await healed;
+              return value.apply(target, args);
+            };
+          },
+        });
+      };
+      const base = await sqliteStore(file);
+      for (const id of ["acme", "beta"]) await base.putTenant({ id, limits: { ...LIMITS, concurrency: 1 } }, []);
+      const lease = 3000;
+      const runners = [new QuietRunner(), new QuietRunner()];
+      const a = newScheduler(flaky(await sqliteStore(file), 0), runners[0], { concurrency: 2, replicaId: "A", leaseMs: lease });
+      const b = newScheduler(flaky(await sqliteStore(file), 300), runners[1], { concurrency: 2, replicaId: "B", leaseMs: lease });
+      await a.start();
+      // Their renewals out of step, as two pods' are.
+      await new Promise((done) => setTimeout(done, lease / 6));
+      await b.start();
+      // A task runs on each.
+      const tasks = [await base.createTask("acme", QUIET)];
+      await a.poke();
+      tasks.push(await base.createTask("beta", QUIET));
+      await b.poke();
+      assert.deepEqual([a.running(), b.running()], [1, 1]);
+      await new Promise((done) => setTimeout(done, 500));
+
+      // Down for longer than a lease: every lease has run out by the time it comes back.
+      down = true;
+      await new Promise((done) => setTimeout(done, lease + 1000));
+      down = false;
+      back();
+      await new Promise((done) => setTimeout(done, lease + 300));
+      for (const task of tasks) assert.equal((await base.task(task.id))!.status, "running", `${task.tenant}'s task`);
+      assert.deepEqual(runners.flatMap((runner) => runner.cancelled), []);
+      for (const runner of runners) for (const end of runner.ends.values()) end();
+      await Promise.all([a.settled(), b.settled()]);
+      for (const task of tasks) assert.equal((await base.task(task.id))!.status, "succeeded");
+    });
+  }
 
   it("remove at start the folders that tasks which ended long ago left, and no running task's", async () => {
     const base = await tempDir("jig-replicas-");
