@@ -150,7 +150,8 @@ out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the ru
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
 reach of the run (a Kubernetes Job, a Docker container on its own daemon, or on Linux a local jig on its own
-machine, below), which would otherwise go on spending.
+machine, below), which would otherwise go on spending. For a local jig that means the same machine and the
+same `dataDir`: the run's `run.json` is in its task's folder there.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
 again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
@@ -403,14 +404,15 @@ commands, with `--yes`, directly on the machine, where they could read and write
 other tasks' folders. For the same reason the service doesn't start on the local runner where jig has no
 sandbox, and says why. `"local": {"allowUnsandboxed": true}` lets it, and runs jig without `--sandbox`
 (which uses its sandbox where it can, and runs the commands on the machine where it can't): only with a
-single tenant, whose tasks may then reach the service's files.
+single tenant, whose tasks may then reach the service's files. The other runners don't read it.
 
 The runner writes the run's process to `run.json` in the task's folder: its pid and host, and on Linux the
 boot's id and the process's start time. jig runs detached, so a service that crashes, or is killed, leaves
 it running; when the task's lease has run out, the service that ends it (the same one restarted, say)
-sends jig's process group SIGTERM, then SIGKILL after 5 seconds, if it is on the same host and boot and a
-process by that pid started when jig did (so not another that has its pid since). On macOS, where there is
-no start time to check, it does nothing, and the run goes on until jig's own `--time-limit` stops it.
+reads `run.json` from its own `dataDir`, so it has to have the same one. It sends jig's process group
+SIGTERM, then SIGKILL after 5 seconds, if it is on the same host and boot and a process by that pid started
+when jig did (so not another that has its pid since). On macOS, where there is no start time to check, it
+does nothing, and the run goes on until jig's own `--time-limit` stops it.
 
 jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
@@ -442,8 +444,9 @@ tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (
 
 The service warns at the start of what the tasks' commands can still read and connect to, when the local
 runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
-home, whose git config jig's own git reads outside the sandbox), and, with `local.allowUnsandboxed`, when
-there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the machine. It also
+home, whose git config jig's own git reads outside the sandbox), and when `local.allowUnsandboxed` is set.
+Then it says that a task whose jig can't make its sandbox runs its commands directly on the machine, or,
+when there is no sandbox at all (`bubblewrap` missing, say), that every task's commands do. It also
 warns when the config's folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's
 home directory: hiding it would break the tasks' commands, so keep the config in a folder of its own and
 `dataDir` out of that checkout.

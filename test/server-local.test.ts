@@ -11,6 +11,7 @@ import { type Config, checkConfig, type Service, startService } from "../server/
 import { createLog } from "../server/log.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { openStore, type Task, type Tenant } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
 // The local runner and jig's sandbox: the runner's jig runs with --sandbox, so one that can't make a sandbox
@@ -81,8 +82,12 @@ describe("the local runner's sandbox", () => {
       local: { allowUnsandboxed: true },
       tenants: [{ id: "acme", keys: [createHash("sha256").update(KEY).digest("hex")] }],
     };
-    const service = await startService(config, { secret: SECRET, log: createLog("service", { write: () => {} }) });
+    const lines: string[] = [];
+    const service = await startService(config, { secret: SECRET, log: createLog("service", { format: "text", write: (line) => lines.push(line) }) });
     services.push(service);
+    // The operator is told, sandbox or not.
+    const warning = sandboxProblem() ? /^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/ : /^jig service: local\.allowUnsandboxed is set, so a local task whose jig can't make its sandbox .* runs its commands directly on this machine/;
+    assert.ok(lines.some((line) => warning.test(line)), lines.join("\n"));
     const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
     const { id } = await (await fetch(`${service.url}/v1/tasks`, { method: "POST", headers, body: JSON.stringify({ prompt: "hi" }) })).json();
     for (const deadline = Date.now() + 15_000; !(await (await fetch(`${service.url}/v1/tasks/${id}`, { headers })).json()).ended; ) {
@@ -94,12 +99,14 @@ describe("the local runner's sandbox", () => {
     assert.ok(!args.includes("--sandbox"));
   });
 
-  it("refuses local.allowUnsandboxed that isn't true or false, or with more than one tenant", () => {
+  it("refuses local.allowUnsandboxed that isn't true or false, or with more than one tenant on the local runner", () => {
     const base: Config = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [] }] };
     assert.throws(() => checkConfig({ ...base, local: { allowUnsandboxed: "yes" as never } }), /^Error: The config's local\.allowUnsandboxed must be true or false$/);
     assert.throws(() => checkConfig({ ...base, local: { allowUnsandboxed: true }, tenants: [{ id: "acme", keys: [] }, { id: "globex", keys: [] }] }), /The config's local\.allowUnsandboxed needs a single tenant/);
     checkConfig({ ...base, local: { allowUnsandboxed: true } });
     checkConfig({ ...base, local: { allowUnsandboxed: false }, tenants: [{ id: "acme", keys: [] }, { id: "globex", keys: [] }] });
+    // The other runners don't read it.
+    checkConfig({ ...base, runner: "kubernetes", kubernetes: { image: "jig-worker" }, local: { allowUnsandboxed: true }, tenants: [{ id: "acme", keys: [] }, { id: "globex", keys: [] }] });
   });
 
   // On macOS the sandbox is /usr/bin/sandbox-exec, which no PATH hides.
@@ -203,6 +210,10 @@ describe("the local runner's abandon", () => {
     await writeFile(file, JSON.stringify({ ...JSON.parse(recorded), host: `${hostname()}-not` }));
     await next.abandon("task_orphan");
     assert.ok(groupAlive(pid), "another host's run is left alone");
+    // The same pid and start time, but counted from another boot: another process.
+    await writeFile(file, JSON.stringify({ ...JSON.parse(recorded), bootId: "00000000-0000-0000-0000-000000000000" }));
+    await next.abandon("task_orphan");
+    assert.ok(groupAlive(pid), "another boot's run is left alone");
 
     await writeFile(file, recorded);
     await next.abandon("task_orphan");

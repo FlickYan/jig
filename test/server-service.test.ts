@@ -1459,7 +1459,8 @@ describe("the service's start", () => {
     });
   }
 
-  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", async () => {
+  // Without a sandbox the service doesn't start on the local runner (test/server-local.test.ts).
+  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", { skip: sandboxProblem() }, async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
@@ -1469,19 +1470,17 @@ describe("the service's start", () => {
     const started = await startService(config, { secret: SECRET, log, configFile });
     services.push(started);
     const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
-    if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
-    else {
-      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
-      // What else they read and connect to, and where the clones go, which gitHosts would limit.
-      warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
-      warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
-      // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
-      // elsewhere), as each task has its own.
-      const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
-      const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
-      if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
-      else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
-    }
+    warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
+    // What else they read and connect to, and where the clones go, which gitHosts would limit.
+    warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
+    warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
+    // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
+    // elsewhere), as each task has its own.
+    const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
+    const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
+    if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
+    else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
+    assert.ok(!lines.some((line) => /local\.allowUnsandboxed/.test(line)), lines.join("\n"));
     // Each task's jig gets user settings that hide them from its commands, but for its project and home.
     const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
     await statusOf(started, id, "succeeded");

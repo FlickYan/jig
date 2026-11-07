@@ -314,13 +314,13 @@ export async function startService(
 /**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
  * from their commands, but for the task's own project and home, and the database and the config's folder
- * (see runners/local.ts); without one (local.allowUnsandboxed), they run directly on the machine. With one,
- * they share its kernel, /tmp and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes
- * and localhost; they read whatever else the service's user can, and connect to the Unix sockets there,
- * which a read-only file system doesn't stop. And with dataDir in one of those, which they can write, a
- * task's commands can change its home there, whose git config jig's own git reads, outside the sandbox. A
- * hidden folder (`folders`) that is the machine's root, /etc, /usr or the service user's home hides what
- * their commands need.
+ * (see runners/local.ts); without one (local.allowUnsandboxed), they run directly on the machine, as do
+ * those of a task whose jig fails to make one with it. With one, they share its kernel, /tmp and /var/tmp
+ * (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read whatever else
+ * the service's user can, and connect to the Unix sockets there, which a read-only file system doesn't stop.
+ * And with dataDir in one of those, which they can write, a task's commands can change its home there, whose
+ * git config jig's own git reads, outside the sandbox. A hidden folder (`folders`) that is the machine's
+ * root, /etc, /usr or the service user's home hides what their commands need.
  */
 function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
@@ -334,6 +334,10 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
+    // jig without --sandbox uses its sandbox where it can, and runs the commands on the machine where it can't.
+    ...(config.local?.allowUnsandboxed
+      ? ["local.allowUnsandboxed is set, so a local task whose jig can't make its sandbox (a check of it that fails or takes over 5 seconds) runs its commands directly on this machine, where they can read and write the database and the config: unset it to have such a task fail instead"]
+      : []),
     "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
     ...folders.flatMap(({ what, path }) => {
       const real = realOrSame(path);
@@ -534,8 +538,9 @@ function configProblem(config: Config): string | undefined {
       ? undefined
       : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
     (config.local?.allowUnsandboxed === undefined || typeof config.local.allowUnsandboxed === "boolean" ? undefined : "local.allowUnsandboxed must be true or false") ??
-    // Without a sandbox a task's commands can read and write every other task's folder.
-    (config.local?.allowUnsandboxed && Array.isArray(config.tenants) && config.tenants.length > 1 ? "local.allowUnsandboxed needs a single tenant: without a sandbox, a task's commands can read and change the other tenants' tasks" : undefined) ??
+    // Without a sandbox a task's commands can read and write every other task's folder. The docker and
+    // kubernetes runners don't read it.
+    (runner === "local" && config.local?.allowUnsandboxed && Array.isArray(config.tenants) && config.tenants.length > 1 ? "local.allowUnsandboxed needs a single tenant: without a sandbox, a task's commands can read and change the other tenants' tasks" : undefined) ??
     whole("maxBodyBytes", config.maxBodyBytes, 1) ??
     positive("heartbeatSeconds", config.heartbeatSeconds, false, 3_600) ??
     text("replicaId", config.replicaId, false) ??
