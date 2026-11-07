@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
+import { setMaxListeners } from "node:events";
 import { readFile } from "node:fs/promises";
 import { type IncomingMessage, request as httpRequest, type ServerResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
+import { setTimeout as sleep } from "node:timers/promises";
 import { createLog, type Log } from "../log.ts";
 import { type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
 import { type JigEvent, jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
@@ -59,6 +61,8 @@ export interface KubernetesRunnerConfig {
   log?: Log;
   /** How long a Job or a Secret the API server fails to make is asked for again, in milliseconds (tests; default: 60000). */
   createRetryMs?: number;
+  /** How long a request to the API server may go unanswered, in milliseconds (tests; default: 30000). */
+  requestTimeoutMs?: number;
 }
 
 const ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -138,10 +142,14 @@ export class KubernetesRunner implements Runner {
   /** Where the warm workers claim their tasks. */
   private poolUrl = "";
   private log: Log;
+  /** Aborted once close() has begun: a Job or a Secret that fails to be made is then not asked for again. */
+  private closing = new AbortController();
 
   constructor(config: KubernetesRunnerConfig) {
     this.config = config;
     this.log = config.log ?? createLog("service");
+    // Each create() waiting to ask again listens for the close, and many tasks may be starting at once.
+    setMaxListeners(0, this.closing.signal);
     if (config.pool?.size) this.pool = new WarmPool(config.pool, (ticket) => this.launchWarm(ticket), this.log);
   }
 
@@ -156,6 +164,8 @@ export class KubernetesRunner implements Runner {
   }
 
   async close(): Promise<void> {
+    // A start or a warm worker's launch asking again would hold the service's stop for up to a minute.
+    this.closing.abort();
     await this.pool?.close();
   }
 
@@ -274,11 +284,20 @@ export class KubernetesRunner implements Runner {
   /**
    * Makes a Job. One a POST that failed may have made all the same is deleted if it can't be made after
    * all: its pod would otherwise wait for a Secret that never comes, holding what it requests, until its
-   * deadline.
+   * deadline. It is read first, and deleted only if it has this one's labels, by its uid: a Job of the
+   * same name with others is another's.
    */
   private async makeJob(ns: string, job: Manifest): Promise<Resource> {
+    const path = `/apis/batch/v1/namespaces/${ns}/jobs/${job.metadata.name}`;
     return this.create(`/apis/batch/v1/namespaces/${ns}/jobs`, job).catch(async (err: unknown) => {
-      if (err instanceof MaybeMade) await this.remove(`/apis/batch/v1/namespaces/${ns}/jobs/${job.metadata.name}`).catch(() => {});
+      if (!(err instanceof MaybeMade)) throw err;
+      try {
+        const there = await this.get(path);
+        const uid = there?.metadata?.uid;
+        if (uid && labelled(there, job.metadata.labels)) await this.remove(path, uid);
+      } catch (cause) {
+        this.log.warn("couldn't delete a Job that a POST that failed may have made", { path, err: cause });
+      }
       throw err;
     });
   }
@@ -286,10 +305,10 @@ export class KubernetesRunner implements Runner {
   /**
    * POSTs an object to `path`, asked for again while the API server is overloaded or failing for now (429,
    * 5xx, or a connection that fails or gets no answer): after 250 ms, twice as long each time up to 5 s, or
-   * as a 429's or 503's Retry-After says (10 s at most), for up to a minute in all. A POST that failed may
-   * have made the object all the same, so a 409 after one is taken to be its doing: the object there is
-   * read back and taken if it has this one's labels, or, unless `read`, taken as it is. Any other refusal
-   * ends it at once. Its error is a MaybeMade once a try has failed in a way that may have made it.
+   * longer if a 429's or 503's Retry-After says so (10 s at most), while a minute hasn't passed, and not
+   * once the runner is closing. A POST that failed may have made the object all the same, so a 409 after
+   * one is taken to be its doing: the object there is read back and taken if it has this one's labels, or,
+   * unless `read`, taken as it is. Any other refusal ends it at once. Its error is a MaybeMade once a try has failed in a way that may have made it.
    */
   private async create(path: string, body: Manifest, read = true): Promise<Resource> {
     const { kind, metadata } = body;
@@ -306,16 +325,19 @@ export class KubernetesRunner implements Runner {
           const there = await this.get(`${path}/${metadata.name}`).catch((cause: unknown) => {
             throw new MaybeMade(`${message}, and reading it back failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
           });
-          if (there && Object.entries(metadata.labels).every(([key, value]) => there.metadata?.labels?.[key] === value)) return there;
+          if (labelled(there, metadata.labels)) return there;
           throw new Error(`${message}: the ${kind} there isn't this one`);
         }
         const transient = status === undefined ? DROPPED.includes((err as NodeJS.ErrnoException).code ?? "") : TRANSIENT.includes(status);
         if (!transient && tries === 1) throw err;
         const after = err instanceof ApiError && (status === 429 || status === 503) && err.retryAfter ? Number(err.retryAfter) : Number.NaN;
-        const wait = after >= 0 ? Math.min(after * 1000, 10_000) : backoff;
-        if (!transient || Date.now() + wait >= end) throw new MaybeMade(`${message} (tried ${tries} times)`, { cause: err });
+        // Never less than the backoff: a Retry-After of 0 would otherwise ask again hundreds of times a second.
+        const wait = after >= 0 ? Math.max(backoff, Math.min(after * 1000, 10_000)) : backoff;
+        const { signal } = this.closing;
+        if (!transient || Date.now() + wait >= end || signal.aborted) throw new MaybeMade(`${message} (tried ${tries} times${signal.aborted ? ", and the runner is closing" : ""})`, { cause: err });
         this.log.warn("the API server didn't make an object, which is asked for again", { verb: "POST", path, status, kind, name: metadata.name, err, waitMs: wait });
-        await new Promise((done) => setTimeout(done, wait));
+        await sleep(wait, undefined, { signal }).catch(() => {});
+        if (signal.aborted) throw new MaybeMade(`${message} (tried ${tries} times, and the runner is closing)`, { cause: err });
         backoff = Math.min(backoff * 2, 5000);
       }
     }
@@ -535,9 +557,9 @@ export class KubernetesRunner implements Runner {
     }
   }
 
-  /** Deletes the Job, and with it (in the background) its pod and Secret. */
-  private async remove(jobPath: string): Promise<void> {
-    await this.call("DELETE", `${jobPath}?propagationPolicy=Background`, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Background" }, [404]);
+  /** Deletes the Job (only the one with this `uid`, if given), and with it (in the background) its pod and Secret. */
+  private async remove(jobPath: string, uid?: string): Promise<void> {
+    await this.call("DELETE", `${jobPath}?propagationPolicy=Background`, { apiVersion: "v1", kind: "DeleteOptions", propagationPolicy: "Background", ...(uid && { preconditions: { uid } }) }, [404]);
   }
 
   private namespace(): Promise<string> {
@@ -552,7 +574,7 @@ export class KubernetesRunner implements Runner {
 
   /** A request's answer as JSON; undefined for the statuses in `missing`, an error for any other but 2xx. */
   private async call<T>(method: string, path: string, body?: object, missing: number[] = [], type = "application/json"): Promise<T> {
-    const res = await this.send(method, path, body, 30_000, type);
+    const res = await this.send(method, path, body, this.config.requestTimeoutMs ?? 30_000, type);
     let text = "";
     for await (const chunk of res) text += chunk;
     const status = res.statusCode ?? 0;
@@ -583,6 +605,11 @@ export class KubernetesRunner implements Runner {
       req.end(data);
     });
   }
+}
+
+/** Whether the object has each of the labels, with its value. */
+function labelled(object: Resource | undefined, labels: Record<string, string>): object is Resource {
+  return object !== undefined && Object.entries(labels).every(([key, value]) => object.metadata?.labels?.[key] === value);
 }
 
 /** A task's labels: its id, and its tenant's as a label value. */

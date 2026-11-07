@@ -11,7 +11,7 @@ import { afterEach, describe, it } from "node:test";
 import { type Config, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { type Exited, WarmPool } from "../server/pool.ts";
-import type { JigEvent, Runner } from "../server/runner.ts";
+import type { JigEvent, Runner, RunHandle } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { openStore, type Task, type Tenant } from "../server/store.ts";
 import { Channel, KubernetesRunner, labelValue, objectName, POOL_LABEL, ROLE_LABELS, TASK_LABEL } from "../server/runners/k8s.ts";
@@ -651,9 +651,9 @@ class FakeCluster {
   /**
    * How the API server answers the nth POST of a Job or a Secret (from 1), when not as it should: with this
    * status and Retry-After, the object made all the same if `made` (as when it times out on etcd after
-   * storing it).
+   * storing it), or with no answer at all if `hang`.
    */
-  postFault?: (kind: "jobs" | "secrets", n: number) => { status: number; retryAfter?: string; made?: boolean } | undefined;
+  postFault?: (kind: "jobs" | "secrets", n: number) => { status: number; retryAfter?: string; made?: boolean; hang?: boolean } | undefined;
   private posts = { jobs: 0, secrets: 0 };
   private server!: Server;
 
@@ -689,6 +689,7 @@ class FakeCluster {
       const fault = this.postFault?.("jobs", ++this.posts.jobs);
       if (fault) {
         if (fault.made && !this.jobs.has(name)) this.jobs.set(name, job);
+        if (fault.hang) return;
         return reply(fault.status, { kind: "Status", message: `the scripted ${fault.status}`, code: fault.status }, fault.retryAfter ? { "retry-after": fault.retryAfter } : {});
       }
       if (this.jobs.has(name)) return reply(409, { kind: "Status", message: `jobs.batch "${name}" already exists`, reason: "AlreadyExists", code: 409 });
@@ -725,6 +726,8 @@ class FakeCluster {
       }
       if (req.method === "DELETE") {
         if (this.failDeletes && this.failDeletes--) return reply(500, { kind: "Status", message: "etcdserver: request timed out", code: 500 });
+        const uid = body?.preconditions?.uid;
+        if (uid && uid !== job.metadata.uid) return reply(409, { kind: "Status", message: `Precondition failed: UID in precondition: ${uid}, UID in object meta: ${job.metadata.uid}`, reason: "Conflict", code: 409 });
         this.jobs.delete(match[1]);
         for (const [name, pod] of this.pods) {
           if (pod.job !== match[1]) continue;
@@ -821,6 +824,17 @@ function logOf(code: number | undefined, stop: string | undefined): string[] {
 }
 
 describe("the Kubernetes runner", () => {
+  /** The runs the runners started, cancelled after each test while its cluster is still up, should it fail before their end. */
+  const runs: RunHandle[] = [];
+  afterEach(async () => {
+    await Promise.all(
+      runs.splice(0).map(async (handle) => {
+        handle.cancel();
+        await handle.wait().catch(() => {});
+      }),
+    );
+  });
+
   /** The runner on a fake cluster, with no service: the tests start tasks on it themselves. */
   async function bare(config: Partial<ConstructorParameters<typeof KubernetesRunner>[0]> = {}) {
     const cluster = await FakeCluster.start();
@@ -828,8 +842,15 @@ describe("the Kubernetes runner", () => {
     const tokenFile = join(base, "token");
     await writeFile(tokenFile, `${cluster.token}\n`);
     const options = { apiUrl: cluster.url, tokenFile, caFile: join(FIXTURES, "k8s-api.crt"), namespace: "jig", image: "registry.example.com/jig-worker:1", gatewayBaseUrl: "http://jig-gateway.jig.svc:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, ...config };
+    const runner = new KubernetesRunner(options);
+    const start = runner.start.bind(runner);
+    runner.start = async (task, tenant) => {
+      const handle = await start(task, tenant);
+      runs.push(handle);
+      return handle;
+    };
     // `another` is a second replica's runner on the same cluster.
-    return { cluster, tokenFile, runner: new KubernetesRunner(options), another: () => new KubernetesRunner(options) };
+    return { cluster, tokenFile, runner, another: () => new KubernetesRunner(options) };
   }
 
   async function kubernetes(config: Partial<ConstructorParameters<typeof KubernetesRunner>[0]> = {}, tenant?: string) {
@@ -1290,6 +1311,83 @@ describe("the Kubernetes runner", () => {
     const [task, tenant] = aTask();
     await assert.rejects(runner.start(task, tenant), /422 the scripted 422/);
     assert.deepEqual(cluster.requests.map(({ method, path }) => `${method} ${path}`), [`POST ${JOBS}`]);
+  });
+
+  it("waits at least the backoff between tries when a 429 says Retry-After: 0", async () => {
+    // Taken as it says, it would ask again hundreds of times a second.
+    const { cluster, runner } = await bare();
+    const times: number[] = [];
+    cluster.postFault = (kind, n) => {
+      if (kind !== "jobs") return undefined;
+      times.push(Date.now());
+      return n <= 2 ? { status: 429, retryAfter: "0" } : undefined;
+    };
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    assert.equal(times.length, 3);
+    assert.ok(times[1] - times[0] >= 250, `${times[1] - times[0]} ms after the first 429`);
+    assert.ok(times[2] - times[1] >= 500, `${times[2] - times[1]} ms after the second 429, the backoff doubled`);
+  });
+
+  it("takes no Job of the same name and the task's labels that was there before its first POST", async () => {
+    // A 409 to a first POST can't be its own doing: the Job is another run's, of this task (a replica's whose lease ran out, say).
+    const { cluster, runner } = await bare();
+    const [task, tenant] = aTask();
+    const name = objectName(task.id);
+    const labels = { ...ROLE_LABELS, [TASK_LABEL]: task.id, "jig.dev/tenant": tenant.id };
+    cluster.jobs.set(name, { metadata: { name, labels, uid: randomUUID() }, spec: { template: { metadata: { labels }, spec: { containers: [{ command: [] }] } } }, status: {} });
+    await assert.rejects(runner.start(task, tenant), /^Error: POST \/apis\/batch\/v1\/namespaces\/jig\/jobs: 409 jobs.batch ".*" already exists$/);
+    assert.deepEqual(cluster.requests.map(({ method, path }) => `${method} ${path}`), [`POST ${JOBS}`]);
+    assert.ok(cluster.jobs.has(name));
+  });
+
+  it("deletes no Job of the same name with another task's labels when creation gives up", async () => {
+    const { cluster, runner } = await bare({ createRetryMs: 600 });
+    const [task, tenant] = aTask();
+    const name = objectName(task.id);
+    const labels = { ...ROLE_LABELS, [TASK_LABEL]: "task_another" };
+    cluster.jobs.set(name, { metadata: { name, labels, uid: randomUUID() }, spec: { template: { metadata: { labels } } }, status: {} });
+    cluster.postFault = (kind) => (kind === "jobs" ? { status: 503 } : undefined);
+    await assert.rejects(runner.start(task, tenant), /503 the scripted 503/);
+    assert.ok(cluster.requests.some((request) => request.method === "GET" && request.path === `${JOBS}/${name}`), "read back");
+    assert.ok(!cluster.requests.some((request) => request.method === "DELETE"));
+    assert.equal(cluster.jobs.get(name).metadata.labels[TASK_LABEL], "task_another");
+  });
+
+  it("asks again for a Job whose POST got no answer in time", async () => {
+    const { cluster, runner } = await bare({ requestTimeoutMs: 300 });
+    cluster.postFault = (kind, n) => (kind === "jobs" && n === 1 ? { status: 0, hang: true } : undefined);
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    const before = Date.now();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    assert.ok(Date.now() - before >= 300);
+    assert.equal(cluster.requests.filter((request) => request.method === "POST" && request.path === JOBS).length, 2);
+  });
+
+  it("stops asking for a task's Job once the runner closes, and deletes the one a failed POST made", async () => {
+    const { cluster, runner } = await bare();
+    cluster.postFault = (kind, n) => (kind === "jobs" ? { status: 503, made: n === 1 } : undefined);
+    const [task, tenant] = aTask();
+    const starting = runner.start(task, tenant);
+    void starting.catch(() => {});
+    await until(() => cluster.requests.filter((request) => request.method === "POST").length === 2, "a second POST");
+    const before = Date.now();
+    await runner.close();
+    await assert.rejects(starting, /503 the scripted 503 \(tried \d times, and the runner is closing\)/);
+    assert.ok(Date.now() - before < 1000, "not after the minute's retries");
+    assert.equal(cluster.jobs.size, 0);
+  });
+
+  it("stops asking for a warm worker's Job once the runner closes", async () => {
+    const { cluster, runner } = await bare({ pool: { size: 1 }, log: logTo([]) });
+    cluster.postFault = (kind) => (kind === "jobs" ? { status: 503 } : undefined);
+    runner.warm("http://127.0.0.1:9");
+    await until(() => cluster.requests.some((request) => request.method === "POST"), "a POST");
+    const before = Date.now();
+    await runner.close();
+    assert.ok(Date.now() - before < 1000, "not after the minute's retries");
   });
 
   it("reads the pod's log no faster than the events are taken, and a cancel lets the run end all the same", async () => {
