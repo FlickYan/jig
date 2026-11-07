@@ -57,6 +57,8 @@ export interface KubernetesRunnerConfig {
   pollMs?: number;
   /** Where the runner's pool and its warm hand-offs log (default: the service's log). */
   log?: Log;
+  /** How long a Job or a Secret the API server fails to make is asked for again, in milliseconds (tests; default: 60000). */
+  createRetryMs?: number;
 }
 
 const ACCOUNT = "/var/run/secrets/kubernetes.io/serviceaccount";
@@ -77,6 +79,12 @@ const TERMINATION_GRACE_SECONDS = 30;
 const SECRET_BYTES = 1024 * 1024;
 /** The longest a poll waits while a task's pod hasn't started yet, in milliseconds. */
 const PENDING_POLL_MS = 5000;
+/** How long a Job or a Secret the API server fails to make is asked for again, in milliseconds. */
+const CREATE_RETRY_MS = 60_000;
+/** The statuses of an API server that is overloaded (429, from API Priority and Fairness) or failing for now. */
+const TRANSIENT = [429, 500, 502, 503, 504];
+/** The errors of a connection that failed, or got no answer in time, which a moment later may not. */
+const DROPPED = ["ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"];
 
 /** A warm worker's Job: its name, where it is, when it was made, and the selector its pod is found by. */
 interface Slot {
@@ -89,7 +97,7 @@ interface Slot {
 
 /** A Kubernetes object, as much of it as the runner reads. */
 interface Resource {
-  metadata?: { name?: string; uid?: string; creationTimestamp?: string };
+  metadata?: { name?: string; uid?: string; creationTimestamp?: string; labels?: Record<string, string> };
   status?: {
     conditions?: { type: string; status: string; reason?: string; message?: string }[];
     phase?: string;
@@ -98,6 +106,28 @@ interface Resource {
   items?: Resource[];
   message?: string;
 }
+
+/** An object to make, as much of it as create() reads. */
+interface Manifest {
+  kind: string;
+  metadata: { name: string; labels: Record<string, string>; [key: string]: unknown };
+  [key: string]: unknown;
+}
+
+/** A request the API server answered with a status other than 2xx. */
+class ApiError extends Error {
+  status: number;
+  retryAfter: string | undefined;
+
+  constructor(message: string, status: number, retryAfter: string | undefined) {
+    super(message);
+    this.status = status;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/** create()'s failure after a try that failed, which may have made the object all the same. */
+class MaybeMade extends Error {}
 
 export class KubernetesRunner implements Runner {
   /** The workers started ahead of tasks, if the config asks for any. */
@@ -154,7 +184,7 @@ export class KubernetesRunner implements Runner {
     // Checked before the Job is made, which the API server would otherwise make and the Secret then fail.
     const bytes = Object.values(data).reduce((sum, value) => sum + Buffer.byteLength(value), 0);
     if (bytes > SECRET_BYTES) throw new Error(`The task's prompt and workspace are ${bytes} bytes with its token, more than the 1 MiB a Kubernetes Secret holds`);
-    const job = await this.call<Resource>("POST", `/apis/batch/v1/namespaces/${ns}/jobs`, this.job(name, taskLabels(task, tenant), command, env, task.spec.timeLimit + graceSeconds, true, tenantAnnotation(tenant)));
+    const job = await this.makeJob(ns, this.job(name, taskLabels(task, tenant), command, env, task.spec.timeLimit + graceSeconds, true, tenantAnnotation(tenant)));
     // Made after the Job, whose uid it needs to be deleted with it; the pod waits for it to mount.
     await this.secret(ns, name, job, { [TASK_LABEL]: task.id }, data);
     return this.followed(ns, jobPath, `${TASK_LABEL}=${task.id}`, task);
@@ -208,7 +238,7 @@ export class KubernetesRunner implements Runner {
     const labels = { [POOL_LABEL]: id };
     const env = [{ name: "JIG_POOL_TICKET", valueFrom: { secretKeyRef: { name, key: "ticket" } } }];
     const created = Date.now();
-    const job = await this.call<Resource>("POST", `/apis/batch/v1/namespaces/${ns}/jobs`, this.job(name, labels, [...this.worker(), "--pool", this.poolUrl], env, (this.config.pool?.maxIdleSeconds ?? 600) + SLACK_MS / 1000, false));
+    const job = await this.makeJob(ns, this.job(name, labels, [...this.worker(), "--pool", this.poolUrl], env, (this.config.pool?.maxIdleSeconds ?? 600) + SLACK_MS / 1000, false));
     await this.secret(ns, name, job, labels, { ticket });
     // The pool hears of a worker that goes from its claim, so this one is gone once its Job is deleted.
     let gone!: () => void;
@@ -226,17 +256,69 @@ export class KubernetesRunner implements Runner {
 
   /** Makes the Secret the Job `name` owns, so it is deleted with it; the Job is deleted if it can't be made. */
   private async secret(ns: string, name: string, job: Resource, labels: Record<string, string>, stringData: Record<string, string>): Promise<void> {
-    const secret = {
+    const secret: Manifest = {
       apiVersion: "v1",
       kind: "Secret",
       metadata: { name, labels, ownerReferences: [{ apiVersion: "batch/v1", kind: "Job", name, uid: job.metadata?.uid }] },
       type: "Opaque",
       stringData,
     };
-    await this.call("POST", `/api/v1/namespaces/${ns}/secrets`, secret).catch(async (err: unknown) => {
+    // The service may make Secrets but not read them, as they hold tokens (deploy/k8s/rbac.yaml): one there
+    // after a POST that failed is taken as that POST's, its name being the Job's, which only this one has.
+    await this.create(`/api/v1/namespaces/${ns}/secrets`, secret, false).catch(async (err: unknown) => {
       await this.remove(`/apis/batch/v1/namespaces/${ns}/jobs/${name}`).catch(() => {});
       throw err;
     });
+  }
+
+  /**
+   * Makes a Job. One a POST that failed may have made all the same is deleted if it can't be made after
+   * all: its pod would otherwise wait for a Secret that never comes, holding what it requests, until its
+   * deadline.
+   */
+  private async makeJob(ns: string, job: Manifest): Promise<Resource> {
+    return this.create(`/apis/batch/v1/namespaces/${ns}/jobs`, job).catch(async (err: unknown) => {
+      if (err instanceof MaybeMade) await this.remove(`/apis/batch/v1/namespaces/${ns}/jobs/${job.metadata.name}`).catch(() => {});
+      throw err;
+    });
+  }
+
+  /**
+   * POSTs an object to `path`, asked for again while the API server is overloaded or failing for now (429,
+   * 5xx, or a connection that fails or gets no answer): after 250 ms, twice as long each time up to 5 s, or
+   * as a 429's or 503's Retry-After says (10 s at most), for up to a minute in all. A POST that failed may
+   * have made the object all the same, so a 409 after one is taken to be its doing: the object there is
+   * read back and taken if it has this one's labels, or, unless `read`, taken as it is. Any other refusal
+   * ends it at once. Its error is a MaybeMade once a try has failed in a way that may have made it.
+   */
+  private async create(path: string, body: Manifest, read = true): Promise<Resource> {
+    const { kind, metadata } = body;
+    const end = Date.now() + (this.config.createRetryMs ?? CREATE_RETRY_MS);
+    let backoff = 250;
+    for (let tries = 1; ; tries++) {
+      try {
+        return await this.call<Resource>("POST", path, body);
+      } catch (err) {
+        const status = err instanceof ApiError ? err.status : undefined;
+        const message = err instanceof Error ? err.message : String(err);
+        if (status === 409 && tries > 1) {
+          if (!read) return body as Resource;
+          const there = await this.get(`${path}/${metadata.name}`).catch((cause: unknown) => {
+            throw new MaybeMade(`${message}, and reading it back failed: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+          });
+          if (there && Object.entries(metadata.labels).every(([key, value]) => there.metadata?.labels?.[key] === value)) return there;
+          throw new Error(`${message}: the ${kind} there isn't this one`);
+        }
+        const transient = status === undefined ? DROPPED.includes((err as NodeJS.ErrnoException).code ?? "") : TRANSIENT.includes(status);
+        if (!transient && tries === 1) throw err;
+        const after = err instanceof ApiError && (status === 429 || status === 503) && err.retryAfter ? Number(err.retryAfter) : Number.NaN;
+        const wait = after >= 0 ? Math.min(after * 1000, 10_000) : backoff;
+        if (!transient || Date.now() + wait >= end) throw new MaybeMade(`${message} (tried ${tries} times)`, { cause: err });
+        this.log.warn("the API server didn't make an object, which is asked for again", { verb: "POST", path, status, kind, name: metadata.name, err, waitMs: wait });
+        await new Promise((done) => setTimeout(done, wait));
+        backoff = Math.min(backoff * 2, 5000);
+      }
+    }
   }
 
   /**
@@ -287,7 +369,7 @@ export class KubernetesRunner implements Runner {
    * A Job: one pod, run once, ended at `deadline` seconds, kept for the ttl, locked down as every task's
    * pod is. `input` mounts the task's input from the Secret named as the Job.
    */
-  private job(name: string, labels: Record<string, string>, command: string[], env: object[], deadline: number, input: boolean, annotations?: Record<string, string>): object {
+  private job(name: string, labels: Record<string, string>, command: string[], env: object[], deadline: number, input: boolean, annotations?: Record<string, string>): Manifest {
     const { image, user = 10001, terminationGraceSeconds: grace = TERMINATION_GRACE_SECONDS } = this.config;
     const all = { ...ROLE_LABELS, ...labels };
     return {
@@ -479,7 +561,7 @@ export class KubernetesRunner implements Runner {
     try {
       answer = JSON.parse(text);
     } catch {}
-    if (status < 200 || status > 299) throw new Error(`${method} ${path.split("?")[0]}: ${status} ${answer?.message ?? text.slice(0, 200)}`);
+    if (status < 200 || status > 299) throw new ApiError(`${method} ${path.split("?")[0]}: ${status} ${answer?.message ?? text.slice(0, 200)}`, status, res.headers["retry-after"]);
     return answer as T;
   }
 
@@ -496,7 +578,8 @@ export class KubernetesRunner implements Runner {
       const headers = { authorization: `Bearer ${token}`, accept: "application/json", ...(data && { "content-type": type, "content-length": Buffer.byteLength(data) }) };
       const req = (https ? httpsRequest : httpRequest)(url, { method, headers, ca }, done);
       req.on("error", fail);
-      if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(new Error(`no answer in ${timeoutMs / 1000} seconds`)));
+      // Coded as a connection's own timeout is, which create() asks again after.
+      if (timeoutMs) req.setTimeout(timeoutMs, () => req.destroy(Object.assign(new Error(`no answer in ${timeoutMs / 1000} seconds`), { code: "ETIMEDOUT" })));
       req.end(data);
     });
   }

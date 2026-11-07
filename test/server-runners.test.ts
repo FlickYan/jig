@@ -648,6 +648,13 @@ class FakeCluster {
   script: (prompt: string) => Script = () => ({ lines: [] });
   /** DELETEs answered 500, as by an API server having a blip. */
   failDeletes = 0;
+  /**
+   * How the API server answers the nth POST of a Job or a Secret (from 1), when not as it should: with this
+   * status and Retry-After, the object made all the same if `made` (as when it times out on etcd after
+   * storing it).
+   */
+  postFault?: (kind: "jobs" | "secrets", n: number) => { status: number; retryAfter?: string; made?: boolean } | undefined;
+  private posts = { jobs: 0, secrets: 0 };
   private server!: Server;
 
   static async start(): Promise<FakeCluster> {
@@ -665,7 +672,7 @@ class FakeCluster {
     const url = new URL(req.url!, "https://cluster");
     const body = text ? JSON.parse(text) : undefined;
     this.requests.push({ method: req.method!, path: url.pathname + url.search, auth: req.headers.authorization, type: req.headers["content-type"], body });
-    const reply = (status: number, value: object) => void res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(value));
+    const reply = (status: number, value: object, headers: Record<string, string> = {}) => void res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(value));
     const missing = () => reply(404, { kind: "Status", message: "not found", code: 404 });
     if (req.headers.authorization !== `Bearer ${this.token}`) return reply(401, { kind: "Status", message: "Unauthorized", code: 401 });
     const ns = `/namespaces/${this.namespace}/`;
@@ -679,7 +686,13 @@ class FakeCluster {
     let match;
     if (req.method === "POST" && url.pathname === `/apis/batch/v1${ns}jobs`) {
       const job = { ...body, metadata: { ...body.metadata, uid: randomUUID() }, status: {} };
-      this.jobs.set(job.metadata.name, job);
+      const fault = this.postFault?.("jobs", ++this.posts.jobs);
+      if (fault) {
+        if (fault.made && !this.jobs.has(name)) this.jobs.set(name, job);
+        return reply(fault.status, { kind: "Status", message: `the scripted ${fault.status}`, code: fault.status }, fault.retryAfter ? { "retry-after": fault.retryAfter } : {});
+      }
+      if (this.jobs.has(name)) return reply(409, { kind: "Status", message: `jobs.batch "${name}" already exists`, reason: "AlreadyExists", code: 409 });
+      this.jobs.set(name, job);
       return reply(201, job);
     }
     if (req.method === "GET" && url.pathname === `/apis/batch/v1${ns}jobs`) {
@@ -688,6 +701,12 @@ class FakeCluster {
       return reply(200, { kind: "JobList", items: items.map((job) => ({ metadata: job.metadata })) });
     }
     if (req.method === "POST" && url.pathname === `/api/v1${ns}secrets`) {
+      const fault = this.postFault?.("secrets", ++this.posts.secrets);
+      if (fault) {
+        if (fault.made && !this.secrets.has(name)) this.secrets.set(name, body);
+        return reply(fault.status, { kind: "Status", message: `the scripted ${fault.status}`, code: fault.status });
+      }
+      if (this.secrets.has(name)) return reply(409, { kind: "Status", message: `secrets "${name}" already exists`, reason: "AlreadyExists", code: 409 });
       this.secrets.set(body.metadata.name, body);
       // A warm worker's pod starts, and claims, before anyone looks for it.
       const job = this.jobs.get(body.metadata.name);
@@ -1196,6 +1215,81 @@ describe("the Kubernetes runner", () => {
     const [task, tenant] = aTask({ workspace: { files: { "data.txt": "x".repeat(1024 * 1024) } } });
     await assert.rejects(runner.start(task, tenant), /are \d+ bytes with its token, more than the 1 MiB a Kubernetes Secret holds/);
     assert.deepEqual(cluster.requests, []);
+  });
+
+  const JOBS = "/apis/batch/v1/namespaces/jig/jobs";
+
+  it("asks again for a Job the API server throttled, after the Retry-After it gave, and logs the retry", async () => {
+    // API Priority and Fairness answers 429 while a backlog of tasks drains after a restart, say.
+    const lines: any[] = [];
+    const { cluster, runner } = await bare({ log: logTo(lines) });
+    cluster.postFault = (kind, n) => (kind === "jobs" && n === 1 ? { status: 429, retryAfter: "1" } : undefined);
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    const before = Date.now();
+    const handle = await runner.start(task, tenant);
+    assert.ok(Date.now() - before >= 950, "a second after the 429");
+    assert.equal((await handle.wait()).exitCode, 0);
+    assert.equal(cluster.requests.filter((request) => request.method === "POST" && request.path === JOBS).length, 2);
+    const warned = lines.filter((line) => line.level === "warn");
+    assert.deepEqual(warned.map(({ msg, verb, path, status }) => ({ msg, verb, path, status })), [{ msg: "the API server didn't make an object, which is asked for again", verb: "POST", path: JOBS, status: 429 }]);
+  });
+
+  it("takes the task's Job when a POST that timed out made it, and the retry is told it exists", async () => {
+    // A 504 can come after the API server stored the Job: the Secret, with its uid, is still to be made.
+    const { cluster, runner } = await bare();
+    cluster.postFault = (kind, n) => (kind === "jobs" && n === 1 ? { status: 504, made: true } : undefined);
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    const name = objectName(task.id);
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    const made = cluster.requests.filter((request) => request.method !== "GET" || request.path === `${JOBS}/${name}`).slice(0, 4);
+    assert.deepEqual(made.map(({ method, path }) => `${method} ${path}`), [`POST ${JOBS}`, `POST ${JOBS}`, `GET ${JOBS}/${name}`, "POST /api/v1/namespaces/jig/secrets"]);
+    assert.equal(cluster.secrets.get(name).metadata.ownerReferences[0].uid, cluster.jobs.get(name).metadata.uid);
+  });
+
+  it("takes no Job of the same name that another task's labels say isn't this one's", async () => {
+    const { cluster, runner } = await bare();
+    const [task, tenant] = aTask();
+    const name = objectName(task.id);
+    cluster.postFault = (kind, n) => (kind === "jobs" && n === 1 ? { status: 504 } : undefined);
+    cluster.jobs.set(name, { metadata: { name, labels: { ...ROLE_LABELS, [TASK_LABEL]: "task_another" }, uid: randomUUID() }, spec: { template: { metadata: { labels: {} } } }, status: {} });
+    await assert.rejects(runner.start(task, tenant), /409 .*already exists: the Job there isn't this one/);
+    assert.ok(!cluster.secrets.has(name));
+    // Nor is it deleted: no POST of this one's made it.
+    assert.ok(!cluster.requests.some((request) => request.method === "DELETE"));
+    assert.equal(cluster.jobs.get(name).metadata.labels[TASK_LABEL], "task_another");
+  });
+
+  it("asks again for a Secret the API server failed, and takes one that a POST that timed out made", async () => {
+    // The service may make Secrets but not read them, as they hold tokens: the name, the Job's, says it is this one.
+    const { cluster, runner } = await bare();
+    cluster.postFault = (kind, n) => (kind !== "secrets" ? undefined : n === 1 ? { status: 504, made: true } : n === 2 ? { status: 500 } : undefined);
+    cluster.script = () => ({ lines: logOf(0, "end_turn") });
+    const [task, tenant] = aTask();
+    assert.equal((await (await runner.start(task, tenant)).wait()).exitCode, 0);
+    assert.equal(cluster.requests.filter((request) => request.method === "POST" && request.path === "/api/v1/namespaces/jig/secrets").length, 3);
+    assert.ok(!cluster.requests.some((request) => request.method === "GET" && request.path.includes("/secrets")));
+  });
+
+  it("deletes the Job a failed POST may have made once the API server has failed for the whole retry budget", async () => {
+    const { cluster, runner } = await bare({ createRetryMs: 1500 });
+    cluster.postFault = (kind, n) => (kind === "jobs" ? { status: 503, made: n === 1 } : undefined);
+    const [task, tenant] = aTask();
+    const before = Date.now();
+    await assert.rejects(runner.start(task, tenant), /503 the scripted 503/);
+    assert.ok(Date.now() - before < 5000);
+    assert.ok(cluster.requests.filter((request) => request.method === "POST").length >= 3, "asked again, backing off");
+    assert.deepEqual(cluster.requests.filter((request) => request.method === "DELETE").map((request) => request.path), [`${JOBS}/${objectName(task.id)}?propagationPolicy=Background`]);
+    assert.equal(cluster.jobs.size, 0, "no pod left waiting for a Secret until the Job's deadline");
+  });
+
+  it("gives up at once on a Job the API server refuses as invalid", async () => {
+    const { cluster, runner } = await bare();
+    cluster.postFault = () => ({ status: 422 });
+    const [task, tenant] = aTask();
+    await assert.rejects(runner.start(task, tenant), /422 the scripted 422/);
+    assert.deepEqual(cluster.requests.map(({ method, path }) => `${method} ${path}`), [`POST ${JOBS}`]);
   });
 
   it("reads the pod's log no faster than the events are taken, and a cancel lets the run end all the same", async () => {
