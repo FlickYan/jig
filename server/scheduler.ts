@@ -19,7 +19,8 @@ import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, 
 // as an error, and has its runner stop the container or Job it may have left running. After a round of
 // renewals that failed or hung past two ticks, the next that gets through ends no task, and nor does a start:
 // the database may have been away from every replica for longer than a lease, and the others are owed a round
-// to renew theirs first.
+// to renew theirs first. A round slower than a tick, but not two, ends only the tasks whose lease ran out
+// before a cut-off it may have hung through could have cost the others theirs.
 //
 // A run's folder is removed as it ends; one a crashed replica left is removed by the sweep at the next start,
 // or every tenth round, once its task has ended over a lease ago, or the store doesn't have it and the folder
@@ -156,14 +157,18 @@ export class Scheduler {
         // end those of the replicas whose round hasn't come yet. A round later, each has had a third of a lease
         // to renew its own, and one that didn't is gone. A round that took longer than two ticks counts as
         // failed: its calls may have hung while the database was cut off (a partition, a paused server) and
-        // gone through once it came back, with the others' leases run out just the same. One that took less is
-        // only slow, and ends what is gone as ever: a database always that slow still has tasks ended.
+        // gone through once it came back, with the others' leases run out just the same. One that took less
+        // may be only slow, so it still ends tasks, but not those a cut-off it hung through could have ended:
+        // a cut-off began at most a tick before the round (the last one got through), when another replica had
+        // renewed its leases at most a tick before. So a lease that ran out within the round's time past a
+        // tick may be a live replica's, and is left for a later round. A database always that slow still has
+        // a gone replica's tasks ended, that much later.
         const took = Date.now() - began;
         if (took > this.leaseMs / 3) this.log.warn("renewing the leases on its runs took longer than a third of a lease", { ms: took });
         if (took > (2 * this.leaseMs) / 3) this.recovering = true;
         else if (this.recovering) this.recovering = false;
         else {
-          await this.expire();
+          await this.expire(Math.max(0, took - this.leaseMs / 3));
           // Not waited for: a slow disk mustn't hold up the renewals.
           if (++this.rounds % 10 === 0) void this.sweep();
         }
@@ -195,9 +200,9 @@ export class Scheduler {
     }
   }
 
-  /** Ends, as errors, the tasks whose lease ran out, and stops what their runs left going. */
-  private async expire(): Promise<string[]> {
-    const expired = await this.store.expire(EXPIRED);
+  /** Ends, as errors, the tasks whose lease ran out over `graceMs` ago, and stops what their runs left going. */
+  private async expire(graceMs = 0): Promise<string[]> {
+    const expired = await this.store.expire(EXPIRED, graceMs);
     if (expired.length) this.log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
     for (const id of expired) this.updates.emit(id, { done: "error" } satisfies Update);
     // Not waited for here: a slow API server mustn't hold up the renewal of this replica's own leases.

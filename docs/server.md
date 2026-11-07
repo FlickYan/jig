@@ -173,8 +173,10 @@ leases and ends no task; the round after ends those whose lease ran out. A repli
 before its first round either. So when the database was lost or hung for every replica for longer than a
 lease, each has a third of `leaseSeconds` after the first gets through again to renew its own before
 another ends them, and that holds for a replica that starts as it comes back too. A round that takes longer
-than a third of `leaseSeconds` is logged as a warning. One that takes up to two thirds still ends what it
-finds, so a database that is always slow still has a crashed replica's tasks ended. And while rounds fail
+than a third of `leaseSeconds` is logged as a warning. One that takes up to two thirds still ends tasks,
+but not those whose lease ran out within what it took past a third: its queries may have hung while the
+database was cut off for a shorter time, which another replica's lease ran out in. So a database that is
+always slow still has a crashed replica's tasks ended, that much later. And while rounds fail
 on and off, a crashed replica's tasks aren't ended until two in a row get through, or a replica's start
 and its first round do. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
