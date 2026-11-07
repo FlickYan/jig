@@ -949,29 +949,43 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   // asked for while another waits to start is that one, which will read what this would.
   let reading = Promise.resolve();
   let waiting = false;
+  // The last read failed: it is made again on the next second, as the store may announce nothing more (a
+  // task that has ended), and the stream would never end.
+  let failed = false;
   const pull = () => {
     if (waiting) return;
     waiting = true;
     reading = reading
       .then(async () => {
         waiting = false;
+        failed = false;
         if (ended || res.destroyed) return;
         const { status } = (await store.task(task.id))!;
         for (;;) {
           // As JSON, with the parsed events let go, and each event let go once written: a stream that waits
           // for its client holds only what it has yet to write, not the whole page beside what it wrote.
-          const page = (await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES)).map(({ seq, event }) => ({ seq, json: JSON.stringify(event) }));
+          let bytes = 0;
+          const page: ({ seq: number; json: string } | undefined)[] = (await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES)).map(({ seq, event }) => {
+            const json = JSON.stringify(event);
+            bytes += Buffer.byteLength(json);
+            return { seq, json };
+          });
           // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
           // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
-          const final = page.length < EVENTS_PAGE && page.reduce((bytes, { json }) => bytes + Buffer.byteLength(json), 0) < PAGE_BYTES;
-          for (let next; (next = page.shift()); ) if (!send(next.seq, next.json)) await drained();
+          const final = page.length < EVENTS_PAGE && bytes < PAGE_BYTES;
+          for (let i = 0; i < page.length; i++) {
+            const { seq, json } = page[i]!;
+            page[i] = undefined;
+            if (!send(seq, json)) await drained();
+          }
           if (ended || res.destroyed) return;
           if (final) break;
         }
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
-        metrics.storeErrors.inc({ retried: "false" });
+        failed = true;
+        metrics.storeErrors.inc({ retried: "true" });
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
@@ -984,7 +998,7 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   store.changes.on("done", changed);
   store.changes.on("resync", pull);
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), heartbeatMs);
-  const poll = setInterval(() => store.live || pull(), 1000);
+  const poll = setInterval(() => (store.live && !failed) || pull(), 1000);
   const cleanup = () => {
     scheduler.updates.off(task.id, follow);
     store.changes.off("event", changed);

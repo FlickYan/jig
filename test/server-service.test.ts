@@ -169,9 +169,9 @@ async function collect(frames: AsyncGenerator<Frame>): Promise<Frame[]> {
 
 /**
  * A service whose tasks each write `count` events of 128 KiB, with a pause of a millisecond after every
- * tenth: the first, then, once `go` has resolved, the rest.
+ * tenth: the first, then, once `go` has resolved, the rest. Its one tenant, acme, may have `maxStreams`.
  */
-async function bigEvents(name: string, count: number, go: () => Promise<void>): Promise<Service> {
+async function bigEvents(name: string, count: number, go: () => Promise<void>, maxStreams?: number): Promise<Service> {
   const text = "y".repeat(128 * 1024);
   const runner: Runner = {
     async start() {
@@ -191,7 +191,7 @@ async function bigEvents(name: string, count: number, go: () => Promise<void>): 
   };
   const base = await tempDir(`jig-service-${name}-`);
   const api = await startService(
-    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams }] },
     { secret: SECRET, runner },
   );
   services.push(api);
@@ -214,8 +214,11 @@ function watchStreams(): { most: () => number } {
   return { most: () => most };
 }
 
-/** A task's event stream whose client reads the first chunk, then nothing until it reads the frames. */
-async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame> }> {
+/**
+ * A task's event stream whose client reads the first chunk, then nothing until it reads the frames, and a
+ * way for the client to go away.
+ */
+async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame>; destroy: () => void }> {
   const res = await new Promise<IncomingMessage>((done, fail) => get(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
   const first = await new Promise<Buffer>((done) =>
     res.once("data", (chunk: Buffer) => {
@@ -231,6 +234,7 @@ async function pausedStream(service: Service, id: string): Promise<{ frames: () 
           yield* res;
         })(),
       ),
+    destroy: () => void res.destroy(),
   };
 }
 
@@ -725,6 +729,85 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.equal(stream.res.status, 200);
     await writeFile(join(work(api, id), "go"), "");
     assert.equal((await collect(framesOf(stream.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of an event stream whose reads of the store fail, when its client goes and when its task ends", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 1 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    const open = () => api.metrics.eventStreams.get({ tenant: "acme" });
+    const events = api.store.events.bind(api.store);
+    let failing = true;
+    let failed = 0;
+    api.store.events = async (...args) => {
+      if (!failing) return events(...args);
+      failed++;
+      throw new Error("the store is down");
+    };
+
+    // Its client goes away while its reads fail.
+    const first = await openStream(api, KEYS.acme, id);
+    assert.equal(first.res.status, 200);
+    await until(() => failed > 0, "a read of the stream's to fail");
+    first.abort();
+    await until(() => open() === 0, "the stream to be counted no more");
+
+    // Its task ends, and the reads made once it has fail; then the store is back.
+    failing = false;
+    const second = await openStream(api, KEYS.acme, id);
+    assert.equal(second.res.status, 200);
+    const frames = collect(framesOf(second.res.body as unknown as AsyncIterable<Uint8Array>));
+    const task = api.store.task.bind(api.store);
+    let ended = false;
+    api.store.task = async (id) => {
+      const found = await task(id);
+      if (found?.status === "succeeded") failing = ended = true;
+      return found;
+    };
+    const before = failed;
+    await writeFile(join(work(api, id), "go"), "");
+    await until(() => ended && failed > before, "a read of the ended task's events to fail");
+    // Each read the task's end set off has failed by now; no other is set off.
+    await new Promise((done) => setTimeout(done, 300));
+    api.store.task = task;
+    failing = false;
+    await until(() => open() === 0, "the stream to end and be counted no more");
+    assert.equal((await frames).at(-1)?.event, "done");
+    assert.ok(api.metrics.storeErrors.get({ retried: "true" }) >= 2);
+    const third = await openStream(api, KEYS.acme, id);
+    assert.equal(third.res.status, 200);
+    assert.equal((await collect(framesOf(third.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of an event stream whose client goes while the stream waits for it to read", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    const api = await bigEvents(name, 200, async () => {}, 1);
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await statusOf(api, id, "succeeded");
+    let served: ServerResponse | undefined;
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && (served ??= res)));
+    const stream = await pausedStream(api, id);
+    await until(() => served?.writableNeedDrain, "the stream to wait for its client");
+    stream.destroy();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the stream to be counted no more");
+    const again = await openStream(api, KEYS.acme, id);
+    assert.equal(again.res.status, 200);
+    assert.equal((await collect(framesOf(again.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of the event streams open when the service closes", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    const api = await bigEvents(name, 200, async () => {});
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await statusOf(api, id, "succeeded");
+    const served: ServerResponse[] = [];
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && served.push(res)));
+    const streams = [await pausedStream(api, id), await pausedStream(api, id)];
+    await until(() => served.length === 2 && served.every((res) => res.writableNeedDrain), "the streams to wait for their clients");
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 2);
+    services.splice(services.indexOf(api), 1);
+    await api.close();
+    // Each response has its close a moment after its connection's.
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
+    for (const stream of streams) stream.destroy();
   });
 };
 

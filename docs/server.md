@@ -112,11 +112,12 @@ ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
 the last. So it goes at the client's pace, and a client that reads slowly or not at all holds a page of
 events in the service, not all of them. Events that come as the task runs wait in the store too while
-the client is behind.
+the client is behind. A read of the store that fails is made again a second later, so a stream still ends
+once its task has.
 
 So that enough such streams can't run a replica out of memory, and every tenant's runs on it with it, a
 tenant may have its `maxStreams` (20) event streams open at once on a replica, and a replica the config's
-top-level `maxStreams` (200) across tenants. Past either, a stream is refused before anything is read,
+top-level `maxStreams` (200) across tenants. Past either, a stream is refused before any of its events is read,
 with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open, the most it may", "limit":
 20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
 goes away. Each replica counts its own, in memory: behind a load balancer, a tenant may have its
