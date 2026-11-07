@@ -56,6 +56,7 @@ start: its keys stop working, and its queued tasks are cancelled. Also: `graceSe
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
 (`["https"]`), `gitHosts` (the hosts a `workspace.git` may be on: any, without it; another is a 400; below),
 `local.hiddenPaths` (absolute paths the local runner's tasks' commands can't read either, below),
+`local.allowUnsandboxed` (false: whether the local runner may run with no sandbox, below),
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
 the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the most bytes of them, as JSON:
@@ -148,9 +149,8 @@ service that restarts finds them so. A replica that finds it no longer holds a t
 out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
-reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
-go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
-it.
+reach of the run (a Kubernetes Job, a Docker container on its own daemon, or on Linux a local jig on its own
+machine, below), which would otherwise go on spending.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
 again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
@@ -382,7 +382,7 @@ jig printed. The folder is removed once the task has ended and its outcome is st
 `keepTaskDirs`), as the Docker runner's is. jig runs as
 
 ```
-jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
+jig --sandbox --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
     --events <dir>/events.jsonl --stats <dir>/stats.json -C <dir>/work -
 ```
 
@@ -396,6 +396,21 @@ in, the service's checkout say, for the task's, and the sandbox doesn't let comm
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
+
+`--sandbox` makes jig fail with `No sandbox: ...` when it can't make its sandbox (bubblewrap missing, or a
+check of it that fails or takes over 5 seconds), so the task ends as an `error` rather than run its
+commands, with `--yes`, directly on the machine, where they could read and write the database and the
+other tasks' folders. For the same reason the service doesn't start on the local runner where jig has no
+sandbox, and says why. `"local": {"allowUnsandboxed": true}` lets it, and runs jig without `--sandbox`
+(which uses its sandbox where it can, and runs the commands on the machine where it can't): only with a
+single tenant, whose tasks may then reach the service's files.
+
+The runner writes the run's process to `run.json` in the task's folder: its pid and host, and on Linux the
+boot's id and the process's start time. jig runs detached, so a service that crashes, or is killed, leaves
+it running; when the task's lease has run out, the service that ends it (the same one restarted, say)
+sends jig's process group SIGTERM, then SIGKILL after 5 seconds, if it is on the same host and boot and a
+process by that pid started when jig did (so not another that has its pid since). On macOS, where there is
+no start time to check, it does nothing, and the run goes on until jig's own `--time-limit` stops it.
 
 jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
@@ -427,11 +442,11 @@ tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (
 
 The service warns at the start of what the tasks' commands can still read and connect to, when the local
 runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
-home, whose git config jig's own git reads outside the sandbox), and when there is no sandbox
-(`bubblewrap` missing, say), as then commands run directly on the machine. It also warns when the config's
-folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's home directory: hiding it
-would break the tasks' commands, so keep the config in a folder of its own and `dataDir` out of that
-checkout.
+home, whose git config jig's own git reads outside the sandbox), and, with `local.allowUnsandboxed`, when
+there is no sandbox (`bubblewrap` missing, say), as then commands run directly on the machine. It also
+warns when the config's folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's
+home directory: hiding it would break the tasks' commands, so keep the config in a folder of its own and
+`dataDir` out of that checkout.
 
 ### The Docker runner
 

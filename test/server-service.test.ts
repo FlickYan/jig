@@ -454,8 +454,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       const { args, env, task } = await record(api, id);
       assert.equal(task, "the task, on stdin");
       assert.ok(!args.includes("the task, on stdin"), "the task stays out of the process list");
-      assert.deepEqual(args.slice(0, 4), ["--yes", "--model", "claude-haiku-4-5", "--base-url"]);
-      assert.equal(args[4], "http://127.0.0.1:9/anthropic");
+      assert.deepEqual(args.slice(0, 5), ["--sandbox", "--yes", "--model", "claude-haiku-4-5", "--base-url"]);
+      assert.equal(args[5], "http://127.0.0.1:9/anthropic");
       assert.equal(args.at(-1), "-");
 
       // The token contract's check, written out here as the gateway does it.

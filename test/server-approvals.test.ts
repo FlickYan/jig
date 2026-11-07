@@ -153,7 +153,7 @@ const approvalTests = () => {
 
     // jig asked at the internal listener, with the task's token, and got each answer by its long poll.
     const { args, polls } = await record(api, id);
-    assert.deepEqual(args.slice(0, 6), ["--mode", "ask", "--approve-via", `${api.internalUrl}/internal/approvals`, "--approval-timeout", "120"]);
+    assert.deepEqual(args.slice(0, 7), ["--sandbox", "--mode", "ask", "--approve-via", `${api.internalUrl}/internal/approvals`, "--approval-timeout", "120"]);
     assert.ok(!args.includes("--yes"));
     assert.equal(polls.filter((status: unknown) => status === 200).length, 2);
     assert.ok(polls.every((status: unknown) => status === 200 || status === 204), String(polls));
@@ -166,7 +166,7 @@ const approvalTests = () => {
     assert.equal(task.mode, "edits");
     const [timedOut] = await approvals(api, id);
     assert.deepEqual([timedOut.decision, timedOut.always, timedOut.by, typeof timedOut.decidedAt], ["deny", false, "timeout", "string"]);
-    assert.deepEqual((await record(api, id)).args.slice(0, 6), ["--mode", "edits", "--approve-via", `${api.internalUrl}/internal/approvals`, "--approval-timeout", "1"]);
+    assert.deepEqual((await record(api, id)).args.slice(0, 7), ["--sandbox", "--mode", "edits", "--approve-via", `${api.internalUrl}/internal/approvals`, "--approval-timeout", "1"]);
     const late = await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" });
     assert.equal(late.status, 409);
 
@@ -352,7 +352,7 @@ const approvalTests = () => {
     const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", approvals: false })).body.id;
     const task = await statusOf(api, id, "succeeded");
     assert.deepEqual([task.approvals, "mode" in task, task.pendingApprovals], [false, false, 0]);
-    assert.equal((await record(api, id)).args[0], "--yes");
+    assert.deepEqual((await record(api, id)).args.slice(0, 2), ["--sandbox", "--yes"]);
     assert.deepEqual(await approvals(api, id), []);
   });
 };
