@@ -1284,22 +1284,31 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
   });
 
   it("counts a task's spending once for all gateways, and keeps it through a restart", async () => {
+    // A write to Redis that takes a while, as on a busy one.
+    const spend = RedisState.prototype.spend;
+    RedisState.prototype.spend = async function (this: RedisState, ...args: Parameters<RedisState["spend"]>) {
+      await new Promise((done) => setTimeout(done, 100));
+      return spend.apply(this, args);
+    };
+    closing.push(() => (RedisState.prototype.spend = spend));
     const provider = await fakeProvider();
     const state = { redis: REDIS!, prefix: prefix() };
     const [a, b] = [await gateway(provider.url, { state }), await gateway(provider.url, { state })];
     // Each reply costs $0.00007: two, one through each, spend the task's $0.0001.
     const credential = token({ task: "capped", budgetUsd: 0.0001 });
-    assert.deepEqual([(await ask(a, credential)).status, (await ask(b, credential)).status, (await ask(a, credential)).status], [200, 200, 402]);
+    // Each reply read to its end, as jig reads it: a reply is counted by when it ends, not by its headers.
+    const status = async (gw: Gateway, credential: string) => (await outcome(ask(gw, credential)))[0];
+    assert.deepEqual([await status(a, credential), await status(b, credential), await status(a, credential)], [200, 200, 402]);
     const read = (gw: Gateway) => fetch(`${gw.url}/usage/capped`, { headers: { "x-api-key": credential } }).then((r) => r.json());
     assert.deepEqual([(await read(b)).requests, (await read(b)).usage.output, (await read(b)).upstreams], [2, 10, { default: 2 }]);
     await a.close();
     await b.close();
     const again = await gateway(provider.url, { state });
     assert.equal((await read(again)).requests, 2);
-    assert.equal((await ask(again, credential)).status, 402);
+    assert.equal(await status(again, credential), 402);
     assert.equal(provider.seen.length, 2);
     // Another tenant's task of the same id is another task.
-    assert.equal((await ask(again, token({ tenant: "rival", task: "capped", budgetUsd: 0.0001 }))).status, 200);
+    assert.equal(await status(again, token({ tenant: "rival", task: "capped", budgetUsd: 0.0001 })), 200);
     const shared = new RedisState(REDIS!, { prefix: state.prefix });
     closing.push(() => shared.close());
     assert.deepEqual([(await shared.spentOn("acme", utcDay()))?.requests, (await shared.spentOn("rival", utcDay()))?.requests], [2, 1]);
