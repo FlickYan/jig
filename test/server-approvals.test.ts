@@ -10,6 +10,7 @@ import { Webhooks } from "../server/approvals.ts";
 import { createLog } from "../server/log.ts";
 import type { Approval, Task } from "../server/store.ts";
 import { mintToken } from "../server/token.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -358,7 +359,7 @@ const approvalTests = () => {
 };
 
 for (const { name, skip } of BACKENDS) {
-  describe(`approvals through the task service (${name})`, { skip }, () => {
+  describe(`approvals through the task service (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => void (backend = name));
     approvalTests();
   });
@@ -437,7 +438,7 @@ describe("the approvals' webhooks", () => {
     }
   });
 
-  it("counts deliveries by tenant: delivered, or failed once the last try fails", async () => {
+  it("counts deliveries by tenant: delivered, or failed once the last try fails", { skip: sandboxProblem() }, async () => {
     // acme's endpoint always answers 503; globex's twice, then takes it.
     const receiver = (status: (n: number) => number) => {
       let n = 0;
@@ -497,7 +498,7 @@ describe("the approvals' config", () => {
     assert.equal(problem({ tenants: [{ ...ACME, approvalWebhook: "hooks", webhookSecretEnv: "X" }] }), 'The config\'s tenants[0].approvalWebhook must be an http or https URL, not "hooks"');
     const unset = "JIG_TEST_A_VARIABLE_NOT_SET";
     await assert.rejects(
-      startService({ ...base, internal: { port: 0 }, tenants: [{ ...ACME, approvalWebhook: "https://hooks.example.com/jig", webhookSecretEnv: unset }] }, { secret: SECRET }),
+      startService({ ...base, internal: { port: 0 }, local: { allowUnsandboxed: true }, tenants: [{ ...ACME, approvalWebhook: "https://hooks.example.com/jig", webhookSecretEnv: unset }] }, { secret: SECRET }),
       new RegExp(`Set ${unset}, the secret tenant acme's approval webhook is signed with`),
     );
   });

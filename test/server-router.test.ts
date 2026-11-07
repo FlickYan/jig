@@ -8,6 +8,7 @@ import { afterEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { checkRouterConfig, type Router, type RouterConfig, startRouter } from "../server/router.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -164,7 +165,7 @@ const BACKENDS = [
   { name: "Postgres", skip: NO_POSTGRES },
 ] as const;
 
-describe("a service in a region", () => {
+describe("a service in a region", { skip: sandboxProblem() }, () => {
   for (const { name, skip } of BACKENDS) {
     it(`puts its region in its tasks' ids, their view and its /healthz, and takes only its own in a spec, on ${name}`, { skip }, async () => {
       const eu = await region("eu", { database: name === "Postgres" ? await postgresDatabase() : undefined });
@@ -203,7 +204,7 @@ describe("a service in a region", () => {
 });
 
 describe("the router", () => {
-  it("sends a tenant's new tasks to its home region, or to an allowed one its spec names, with the region and a request id on each answer", async () => {
+  it("sends a tenant's new tasks to its home region, or to an allowed one its spec names, with the region and a request id on each answer", { skip: sandboxProblem() }, async () => {
     const eu = await region("eu");
     const us = await region("us");
     const front = await router({ eu: eu.url, us: us.url });
@@ -254,7 +255,7 @@ describe("the router", () => {
     await statusOf(front.url, KEYS.acme, named.body.id, "succeeded");
   });
 
-  it("routes a task's view, its live events and its cancel by the region in its id, and lists a region's tasks", async () => {
+  it("routes a task's view, its live events and its cancel by the region in its id, and lists a region's tasks", { skip: sandboxProblem() }, async () => {
     const eu = await region("eu");
     const us = await region("us");
     const lines: string[] = [];
@@ -300,7 +301,7 @@ describe("the router", () => {
     assert.equal((await call(front.url, KEYS.initech, "GET", `/v1/tasks/${waiting}`)).status, 404);
   });
 
-  it("sends new tasks to another region while the home is down if the tenant allows it, never a task's reads, and takes the region back once it answers", async () => {
+  it("sends new tasks to another region while the home is down if the tenant allows it, never a task's reads, and takes the region back once it answers", { skip: sandboxProblem() }, async () => {
     const eu = await region("eu");
     const us = await region("us");
     const lines: string[] = [];
@@ -630,7 +631,7 @@ describe("the router", () => {
     assert.deepEqual(elsewhere, []);
   });
 
-  it("serves its metrics and health on a listener of their own", async () => {
+  it("serves its metrics and health on a listener of their own", { skip: sandboxProblem() }, async () => {
     const eu = await region("eu");
     const front = await router({ eu: eu.url, us: await fakeRegion("us", () => {}) });
     await call(front.url, KEYS.acme, "GET", "/v1/tasks");

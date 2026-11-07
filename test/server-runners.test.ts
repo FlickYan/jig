@@ -128,7 +128,7 @@ const alive = (pid: number) => {
   }
 };
 
-describe("the local runner", () => {
+describe("the local runner", { skip: sandboxProblem() }, () => {
   /**
    * The service as `node server/api.ts --config` starts it, on the local runner with the fake jig: its config
    * file and a gateway-secret beside it in etc/, dataDir in a git checkout, and `config` added. Runs one

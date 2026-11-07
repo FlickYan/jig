@@ -12,6 +12,7 @@ import { LocalRunner } from "../server/runners/local.ts";
 import { Scheduler } from "../server/scheduler.ts";
 import { serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -150,7 +151,7 @@ class SharedRunner implements Runner {
 }
 
 for (const { name, skip } of BACKENDS) {
-  describe(`replicas of the task service on one database (${name})`, { skip }, () => {
+  describe(`replicas of the task service on one database (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => void (backend = name));
 
     it("keep to the global and each tenant's cap together, with many tasks posted to each", async () => {
