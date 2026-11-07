@@ -28,6 +28,8 @@ export interface Limits {
   approvalTimeout?: number;
   /** What the tenant may start in a UTC day, and spend in a UTC day or month: none when missing. */
   quotas?: Quotas;
+  /** Event streams of the tenant's that may be open at once on each replica; the service's default when missing. */
+  maxStreams?: number;
 }
 
 export interface Quotas {

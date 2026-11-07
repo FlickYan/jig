@@ -650,7 +650,59 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
     assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
   });
+
+  it("refuses a tenant's event stream past its maxStreams open, and counts one no more once its client has gone", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 2 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    const first = await openStream(api, KEYS.acme, id);
+    const second = await openStream(api, KEYS.acme, id);
+    assert.deepEqual([first.res.status, second.res.status], [200, 200]);
+    const third = await openStream(api, KEYS.acme, id);
+    assert.equal(third.res.status, 429);
+    assert.equal(third.res.headers.get("retry-after"), "5");
+    assert.deepEqual(await third.res.json(), { error: "The tenant has 2 event streams open, the most it may", limit: 2, open: 2 });
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 2);
+
+    // A client that goes away frees its stream.
+    first.abort();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 1, "the stream to be counted no more");
+    const fourth = await openStream(api, KEYS.acme, id);
+    assert.equal(fourth.res.status, 200);
+    // Streams that end are counted no more either.
+    await writeFile(join(work(api, id), "go"), "");
+    for (const { res } of [second, fourth]) assert.equal((await collect(framesOf(res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
+    assert.equal((await collect(sse(api, `/v1/tasks/${id}/events`))).at(-1)?.event, "done");
+  });
+
+  it("refuses an event stream past the replica's maxStreams open, whichever tenant's", async () => {
+    const api = await service({ maxStreams: 1 });
+    const mine = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    await statusOf(api, mine, "running");
+    const first = await openStream(api, KEYS.acme, mine);
+    assert.equal(first.res.status, 200);
+    const second = await openStream(api, KEYS.globex, theirs);
+    assert.equal(second.res.status, 429);
+    assert.equal(second.res.headers.get("retry-after"), "5");
+    assert.deepEqual(await second.res.json(), { error: "The service has 1 event streams open, the most it may", limit: 1, open: 1 });
+    first.abort();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the stream to be counted no more");
+    const third = await openStream(api, KEYS.globex, theirs);
+    assert.equal(third.res.status, 200);
+    third.abort();
+    await until(async () => (await api.store.task(theirs))?.status === "running", "globex's task to run");
+    for (const task of [mine, theirs]) await writeFile(join(work(api, task), "go"), "");
+  });
 };
+
+/** A task's event stream, as the response to its request, and a way for its client to go away. */
+async function openStream(service: Service, key: string, id: string): Promise<{ res: Response; abort: () => void }> {
+  const aborts = new AbortController();
+  const res = await fetch(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${key}` }, signal: aborts.signal });
+  return { res, abort: () => aborts.abort() };
+}
 
 for (const { name, skip } of BACKENDS) {
   describe(`the task service's API (${name})`, { skip }, () => {
@@ -1343,6 +1395,9 @@ describe("the service's config", () => {
     assert.match(problem({ tenants: [{ id: "acme", keys: [KEYS.acme] }] })!, /tenants\[0\]\.keys\[0\] must be a key's SHA-256 hash/);
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], concurrency: -1 }] }), "The config's tenants[0].concurrency must be a whole number from 0 up, not -1");
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], budgetUsd: null, maxQueued: 0 }] }), undefined);
+    assert.equal(problem({ maxStreams: 0 }), "The config's maxStreams must be a whole number from 1 up, not 0");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], maxStreams: 0 }] }), "The config's tenants[0].maxStreams must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxStreams: 500, tenants: [{ id: "acme", keys: [], maxStreams: 50 }] }), undefined);
     await assert.rejects(startService({ ...base, concurrency: 0 }, { secret: SECRET }), /concurrency must be a whole number from 1 up/);
   });
 

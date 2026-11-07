@@ -431,8 +431,8 @@
     {
       "id": 10,
       "type": "timeseries",
-      "title": "Warm workers idle",
-      "description": "Per replica.",
+      "title": "Warm workers idle, event streams open",
+      "description": "Per replica: warm workers waiting for a task, and the event streams open (which maxStreams caps).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -467,8 +467,17 @@
             "uid": "${datasource}"
           },
           "expr": "sum by (instance) (jig_service_pool_idle{region=~\"$region\"})",
-          "legendFormat": "{{instance}}",
+          "legendFormat": "idle {{instance}}",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (instance) (jig_service_event_streams{region=~\"$region\"})",
+          "legendFormat": "streams {{instance}}",
+          "refId": "B"
         }
       ]
     },

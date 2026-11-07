@@ -39,6 +39,7 @@ export function serviceMetrics(registry = new Registry()) {
     replicas: registry.gauge("jig_service_replicas", "Replicas of the service whose heartbeat is in the store."),
     cost: registry.counter("jig_service_cost_usd_total", "USD the tasks this replica ended spent, by tenant, from their end events.", ["tenant"]),
     tokens: registry.counter("jig_service_tokens_total", "Tokens the tasks this replica ended used, by tenant and kind, from their end events.", ["tenant", "kind"]),
+    eventStreams: registry.gauge("jig_service_event_streams", "Event streams open on this replica, by tenant.", ["tenant"]),
   };
   // At 0 from the start, so the first failure of each is counted by increase().
   for (const retried of ["true", "false"]) metrics.storeErrors.inc({ retried }, 0);

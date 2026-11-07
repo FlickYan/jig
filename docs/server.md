@@ -114,6 +114,14 @@ the last. So it goes at the client's pace, and a client that reads slowly or not
 events in the service, not all of them. Events that come as the task runs wait in the store too while
 the client is behind.
 
+So that enough such streams can't run a replica out of memory, and every tenant's runs on it with it, a
+tenant may have its `maxStreams` (20) event streams open at once on a replica, and a replica the config's
+top-level `maxStreams` (200) across tenants. Past either, a stream is refused before anything is read,
+with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open, the most it may", "limit":
+20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
+goes away. Each replica counts its own, in memory: behind a load balancer, a tenant may have its
+`maxStreams` open on each replica.
+
 A task is `queued`, then `running`, then one of:
 
 | status | when |
@@ -306,6 +314,7 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
+| `jig_service_event_streams{tenant}` | event streams open on this replica (`maxStreams`), the config's tenants at 0 from the start |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
@@ -951,7 +960,9 @@ account with a Role to run Jobs, the tasks' account with none, the NetworkPolici
 the tasks may reach, and who may reach the service and the gateway), a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
-are yours to make. The service runs two replicas on that database. The gateway runs two replicas too,
+are yours to make. The service runs two replicas on that database, each with 2 GiB of memory at most and
+Node's heap held to 1.5 GiB (`NODE_OPTIONS`), which `maxStreams` streams of 4 MiB pages fit in: raise them
+together. The gateway runs two replicas too,
 sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts,
 as a lone gateway's restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one

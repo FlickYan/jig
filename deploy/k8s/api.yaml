@@ -42,6 +42,10 @@ spec:
             - containerPort: 9180
               name: metrics
           env:
+            # The heap a quarter under the memory limit (below), which leaves room for what is outside it
+            # (sockets' buffers, what streams have written), so Node collects its garbage in time.
+            - name: NODE_OPTIONS
+              value: "--max-old-space-size=1536"
             - name: JIG_GATEWAY_SECRET
               valueFrom:
                 secretKeyRef:
@@ -70,6 +74,14 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+          # Each open event stream holds up to a page of events (4 MiB) while its client is behind: maxStreams
+          # (200 a replica, 20 a tenant, by default) keeps them within this.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              memory: 2Gi
           volumeMounts:
             - name: config
               mountPath: /etc/jig
