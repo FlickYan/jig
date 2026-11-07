@@ -491,13 +491,21 @@ describe("replicas that lose the database", () => {
     const store = await sqliteStore(join(base, "jig.db"));
     const runner = new QuietRunner(dataDir);
     const metrics = serviceMetrics();
+    // The start and each round renew the heartbeat; a sweep's listing notes how many had been renewed by then.
+    let beats = 0;
+    const heartbeat = store.heartbeat.bind(store);
+    store.heartbeat = (replica, ms) => (beats++, heartbeat(replica, ms));
+    const listings: number[] = [];
+    const list = runner.leftovers.bind(runner);
+    runner.leftovers = () => (listings.push(beats), list());
     // A round every 100 ms.
     await newScheduler(store, runner, { concurrency: 1, replicaId: "A", leaseMs: 300, metrics }).start();
     await until(() => runner.listed === 1, "the sweep at start");
     const folder = await unknownFolder(dataDir, 11 * 60_000);
     await until(() => metrics.foldersRemoved.get() === 1, "a sweep to remove the folder");
     assert.equal(await exists(folder), false);
-    // One sweep since the start's, not one a round.
+    // One sweep since the start's, not one a round: it came after the start's heartbeat and ten rounds'.
     assert.equal(runner.listed, 2);
+    assert.ok(listings[1]! >= 11, `the second sweep came after ${listings[1]} heartbeats`);
   });
 });
