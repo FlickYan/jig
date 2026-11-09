@@ -384,8 +384,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       return forward(x, region, url.pathname + url.search);
     }
 
-    // The tenant's list, and its usage, are each region's own: ?region= picks one (the home by default).
-    const listed = url.pathname === "/v1/tasks" ? "list" : url.pathname === "/v1/usage" ? "usage" : undefined;
+    // The tenant's list, its usage and its limits are each region's own: ?region= picks one (the home by default).
+    const listed = url.pathname === "/v1/tasks" ? "list" : url.pathname === "/v1/usage" ? "usage" : url.pathname === "/v1/limits" ? "limits" : undefined;
     x.route = listed ?? "other";
     // Read once, as the service reads its own: region=us&region=eu would otherwise answer for us alone.
     if (listed && url.searchParams.getAll("region").length > 1) return reply(x, 400, { error: "region may be given once" });

@@ -728,27 +728,41 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   request.tenant = tenant.id;
 
   if (url.pathname === "/v1/usage") return req.method === "GET" ? usage(res, url, context, { tenant: tenant.id }) : reply(res, 405, { error: "Use GET" });
+  if (url.pathname === "/v1/limits") return req.method === "GET" ? limits(res, url, tenant, context) : reply(res, 405, { error: "Use GET" });
 
   if (url.pathname === "/v1/tasks") {
     if (req.method === "POST") return createTask(req, res, tenant, context);
     if (req.method !== "GET") return reply(res, 405, { error: "Use GET or POST" });
-    const status = url.searchParams.get("status") ?? undefined;
-    if (status !== undefined && !STATUSES.includes(status as TaskStatus)) return reply(res, 400, { error: `status must be one of: ${STATUSES.join(", ")}` });
+    // A misspelt filter (?stauts=running) would otherwise list every task as if it had been applied.
+    const bad = badParams(url.searchParams, ["status", "before", "limit", "full"]);
+    if (bad) return reply(res, 400, { error: bad });
+    // One status or several, separated by commas.
+    const statuses = url.searchParams.get("status")?.split(",") as TaskStatus[] | undefined;
+    if (statuses?.some((status) => !STATUSES.includes(status))) return reply(res, 400, { error: `status must be one or more of: ${STATUSES.join(", ")}, separated by commas` });
     const before = url.searchParams.get("before") ?? undefined;
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
     const limit = Number(url.searchParams.get("limit") ?? 100);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
     // The prompts can be long: a list leaves them out unless asked.
-    const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
-    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
+    const asked = url.searchParams.get("full") ?? "0";
+    if (!["1", "true", "0", "false"].includes(asked)) return reply(res, 400, { error: "full must be 1 or 0" });
+    const full = asked === "1" || asked === "true";
+    // An id that leads nowhere would give an empty page, which reads as the list's end. One answer for an
+    // id that never was, another tenant's and another region's. This reads the task's whole row, prompt
+    // and all, once a page.
+    const cursor = before === undefined ? undefined : await context.store.task(before);
+    if (before !== undefined && cursor?.tenant !== tenant.id) return reply(res, 400, { error: "before must be the id of one of your tasks here" });
+    const tasks = await context.store.tasks(tenant.id, { status: statuses && [...new Set(statuses)], before, limit, prompts: full });
     const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
     // A full page may have more after it: the next is read with before=<next>.
     return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
+  // A path that is no route says so, whatever the method, before any task is read.
+  if (!match) return reply(res, 404, { error: "No such route" });
   // Another tenant's task is as missing as one that never was.
-  const task = match && (await context.store.task(match[1]));
-  if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
+  const task = await context.store.task(match[1]);
+  if (!task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
   if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
@@ -822,6 +836,35 @@ async function admin(req: IncomingMessage, res: ServerResponse, url: URL, key: s
   return usage(res, url, context, { byTenant: true, ...(tenant !== null && { tenant }) }, ["tenant"]);
 }
 
+/** What is wrong with a query's parameters, if one isn't among `allowed` or is there twice. */
+function badParams(params: URLSearchParams, allowed: string[]): string | undefined {
+  const unknown = [...params.keys()].find((name) => !allowed.includes(name));
+  if (unknown) return `Unknown parameter: ${unknown}`;
+  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
+  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
+  return twice && `${twice} may be given once`;
+}
+
+/**
+ * The tenant's limits (the service's defaults where it has none of its own; only the quotas it has) and
+ * what it has used of them in this region now, with when the day's and the month's counts start again.
+ * Counted as a new task's admission counts them, but outside its lock: it may be a task behind.
+ */
+async function limits(res: ServerResponse, url: URL, tenant: Tenant, { store, now, region }: Context): Promise<void> {
+  const bad = badParams(url.searchParams, []);
+  if (bad) return reply(res, 400, { error: bad });
+  const at = now();
+  const used = await store.standing(tenant.id, at);
+  const { nextDay, nextMonth } = periods(at);
+  reply(res, 200, {
+    tenant: tenant.id,
+    region,
+    limits: { ...DEFAULT_LIMITS, ...tenant.limits },
+    used: { ...used, usdToday: roundUsd(used.usdToday), usdThisMonth: roundUsd(used.usdThisMonth) },
+    resets: { day: nextDay.toISOString(), month: nextMonth.toISOString() },
+  });
+}
+
 const DAY = /^(\d{4})-(\d\d)-(\d\d)$/;
 const MAX_DAYS = 366;
 
@@ -832,11 +875,8 @@ const MAX_DAYS = 366;
  */
 async function usage(res: ServerResponse, url: URL, { store, now }: Context, scope: Pick<UsageQuery, "tenant" | "byTenant">, allowed: string[] = []): Promise<void> {
   const params = url.searchParams;
-  const unknown = [...params.keys()].find((name) => !["from", "to", "group", "format", ...allowed].includes(name));
-  if (unknown) return reply(res, 400, { error: `Unknown parameter: ${unknown}` });
-  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
-  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
-  if (twice) return reply(res, 400, { error: `${twice} may be given once` });
+  const bad = badParams(params, ["from", "to", "group", "format", ...allowed]);
+  if (bad) return reply(res, 400, { error: bad });
   const today = now();
   const from = params.get("from") ?? isoDay(periods(today).monthStart);
   const to = params.get("to") ?? isoDay(today);

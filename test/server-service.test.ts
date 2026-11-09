@@ -16,7 +16,7 @@ import { PgError } from "../server/pg.ts";
 import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { outcomeOf, Scheduler } from "../server/scheduler.ts";
-import { serviceMetrics } from "../server/service-metrics.ts";
+import { routeOf, serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
@@ -81,9 +81,9 @@ function newScheduler(...args: ConstructorParameters<typeof Scheduler>): Schedul
 
 /**
  * A service on a port of its own, with the fake jig, two tenants and a database in a new folder (a new
- * schema, on Postgres). It keeps each task's folder, which the tests look in.
+ * schema, on Postgres). It keeps each task's folder, which the tests look in. `now` is its clock, if given.
  */
-async function service(config: Partial<Config> = {}, base?: string): Promise<Service & { dataDir: string }> {
+async function service(config: Partial<Config> = {}, base?: string, now?: () => Date): Promise<Service & { dataDir: string }> {
   base ??= await tempDir("jig-service-");
   const dataDir = join(base, "data");
   const started = await startService(
@@ -102,7 +102,7 @@ async function service(config: Partial<Config> = {}, base?: string): Promise<Ser
       ],
       ...config,
     },
-    { secret: SECRET },
+    { secret: SECRET, ...(now && { now }) },
   );
   services.push(started);
   return { ...started, dataDir };
@@ -560,10 +560,112 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     const last = (await call(api, KEYS.acme, "GET", `/v1/tasks?limit=2&before=${second.next}&full=1`)).body;
     assert.deepEqual(last, { tasks: [{ ...last.tasks[0], id: ids[4], prompt: "task 0" }] });
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.length, 4);
-    // Another tenant's task leads nowhere, and a page is 1 to 100 tasks.
-    assert.deepEqual((await call(api, KEYS.globex, "GET", `/v1/tasks?before=${ids[0]}`)).body, { tasks: [] });
+    // A page is 1 to 100 tasks.
     for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).status, 400, query);
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${ids[0]}`)).body.prompt, "task 4");
+  });
+
+  it("refuses a list's parameters it doesn't know, one given twice, and a full that is neither 1 nor 0", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    // A misspelt filter isn't taken for no filter, and a region is the router's to read.
+    for (const name of ["stauts", "state", "region"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks?${name}=running`), { status: 400, body: { error: `Unknown parameter: ${name}` } });
+    }
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued&status=running"), { status: 400, body: { error: "status may be given once" } });
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/tasks?full=yes"), { status: 400, body: { error: "full must be 1 or 0" } });
+    for (const [full, prompt] of [["1", true], ["true", true], ["0", false], ["false", false]] as const) {
+      const { status, body } = await call(api, KEYS.acme, "GET", `/v1/tasks?full=${full}&limit=5&status=queued`);
+      assert.deepEqual([status, "prompt" in body.tasks[0]], [200, prompt], full);
+    }
+  });
+
+  it("lists the tasks in any of several statuses, newest first, a page at a time", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.unshift((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: `task ${i}` })).body.id);
+    // Every other one is cancelled, so the two statuses interleave.
+    for (const id of [ids[1], ids[3], ids[5]]) assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`)).status, 200);
+    const listed = async (query: string) => (await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).body;
+    assert.deepEqual((await listed("status=queued,cancelled")).tasks.map((task: Task) => [task.id, task.status]), ids.map((id, i) => [id, i % 2 ? "cancelled" : "queued"]));
+    assert.deepEqual((await listed("status=cancelled,queued,cancelled")).tasks.map((task: Task) => task.id), ids);
+    assert.deepEqual((await listed("status=cancelled,running")).tasks.map((task: Task) => task.id), [ids[1], ids[3], ids[5]]);
+    assert.deepEqual((await listed("status=running,error")).tasks, []);
+    const walked: string[] = [];
+    for (let page = await listed("status=queued,cancelled&limit=1"); page.tasks.length; page = page.next ? await listed(`status=queued,cancelled&limit=1&before=${page.next}`) : { tasks: [] }) {
+      assert.equal(page.tasks.length, 1);
+      walked.push(page.tasks[0].id);
+    }
+    assert.deepEqual(walked, ids);
+    for (const status of ["queued,nope", "", "queued,,running", "queued,", "queued, running"]) {
+      const { status: code, body } = await call(api, KEYS.acme, "GET", `/v1/tasks?status=${status}`);
+      assert.deepEqual([code, body.error], [400, "status must be one or more of: queued, running, succeeded, failed, stopped, cancelled, error, separated by commas"], status);
+    }
+  });
+
+  it("refuses a before that is no task of the tenant's, rather than answer with an empty page", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] });
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) ids.unshift((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id);
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    // One answer for another tenant's task and one that never was: it tells nothing of the first.
+    for (const before of [theirs, "task_nope"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks?before=${before}`), { status: 400, body: { error: "before must be the id of one of your tasks here" } }, before);
+    }
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.map((task: Task) => task.id), [ids[1]]);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[1]}`)).body, { tasks: [] });
+  });
+
+  it("answers 404 No such route for a path that is none, and No such task only on a task's routes", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    for (const path of ["/v1/nope", "/v1/tasks/", `/v1/tasks/${id}/result`, `/v1/tasks/${id}/events/1`, "/v2/tasks", "/"]) {
+      for (const method of ["GET", "POST", "DELETE"]) assert.deepEqual(await call(api, KEYS.acme, method, path), { status: 404, body: { error: "No such route" } }, `${method} ${path}`);
+    }
+    for (const path of ["/v1/tasks/task_missing", `/v1/tasks/${theirs}`, `/v1/tasks/${theirs}/cancel`, "/v1/tasks/task_missing/approvals/ap_1"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", path), { status: 404, body: { error: "No such task" } }, path);
+    }
+    // A wrong method on a route is a 405, and a key is asked for before anything is said of the path.
+    assert.equal((await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`)).status, 405);
+    assert.equal((await call(api, undefined, "GET", "/v1/nope")).status, 401);
+    // The routes the API has are the ones its requests are counted under.
+    for (const path of ["/v1/nope", "/v1/tasks/", "/v1/task", `/v1/tasks/${id}`, `/v1/tasks/${id}/cancel`, `/v1/tasks/${id}/cancel/`, `/v1/tasks/${id}/approvals`, `/v1/tasks/${id}/approvals/ap_1`, `/v1/tasks/${id}/approvals/ap_1/x`, "/v1/usage", "/v1/limits", "/v1/limits/"]) {
+      const { status, body } = await call(api, KEYS.acme, "GET", path);
+      assert.equal(status === 404 && body.error === "No such route", routeOf(path) === "other", path);
+    }
+  });
+
+  it("tells a tenant its limits and what it has used of them (/v1/limits)", async () => {
+    const clock = new Date("2026-12-31T22:00:00Z");
+    const tenants = [
+      { id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, maxQueued: 5, quotas: { tasksPerDay: 10 } },
+      { id: "globex", keys: [sha256(KEYS.globex)] },
+    ];
+    const api = await service({ tenants }, undefined, () => clock);
+    for (let i = 0; i < 2; i++) assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    const resets = { day: "2027-01-01T00:00:00.000Z", month: "2027-01-01T00:00:00.000Z" };
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/limits"), {
+      status: 200,
+      body: {
+        tenant: "acme",
+        region: null,
+        limits: { concurrency: 0, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 5, approvalTimeout: 600, maxStreams: 20, quotas: { tasksPerDay: 10 } },
+        used: { queued: 2, running: 0, tasksToday: 2, usdToday: 0, usdThisMonth: 0 },
+        resets,
+      },
+    });
+    // Another tenant's are its own: the defaults, and nothing used.
+    const theirs = (await call(api, KEYS.globex, "GET", "/v1/limits")).body;
+    assert.deepEqual([theirs.tenant, theirs.limits.concurrency, theirs.limits.maxQueued, theirs.limits.quotas], ["globex", 2, 1000, {}]);
+    assert.deepEqual(theirs.used, { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/limits?x=1"), { status: 400, body: { error: "Unknown parameter: x" } });
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/limits", {})).status, 405);
+    assert.equal((await call(api, undefined, "GET", "/v1/limits")).status, 401);
+    // A cancelled task is queued no more, and still one created today.
+    const [id] = (await call(api, KEYS.acme, "GET", "/v1/tasks?limit=1")).body.tasks.map((task: Task) => task.id);
+    await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/limits")).body.used, { queued: 1, running: 0, tasksToday: 2, usdToday: 0, usdThisMonth: 0 });
   });
 
   it("stores a run's events up to maxEvents, then one notice and its end, and the run goes on", async () => {
@@ -1114,6 +1216,47 @@ const schedulerTests = () => {
     await store.close();
   });
 
+  it("lists a tenant's tasks in several statuses a page at a time, with no gap or repeat, and counts its standing", async () => {
+    const store = await newStore();
+    const limits = { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+    for (const id of ["a", "b"]) await store.putTenant({ id, limits }, []);
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const now = new Date();
+    // a's tasks, newest first, with what became of each: queued, cancelled and running, interleaved with b's.
+    const made: [string, string][] = [];
+    for (let i = 0; i < 30; i++) {
+      const task = (await store.createTask(i % 5 === 4 ? "b" : "a", spec, { now })) as Task;
+      if (task.tenant === "a") made.unshift([task.id, i % 3 ? "queued" : "cancelled"]);
+      if (i % 3 === 0) assert.ok(await store.cancelQueued(task.id));
+    }
+    // The oldest queued of a's runs.
+    const running = (await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 5, tenantConcurrency: 5 })) as Task;
+    made.find(([id]) => id === running.id)![1] = "running";
+    const of = (...statuses: string[]) => made.filter(([, status]) => statuses.includes(status)).map(([id]) => id);
+    const ids = async (options: Parameters<Store["tasks"]>[1]) => (await store.tasks("a", options)).map((task) => task.id);
+    assert.deepEqual(await ids({ status: ["queued", "cancelled"] }), of("queued", "cancelled"));
+    assert.deepEqual(await ids({ status: ["cancelled", "running", "queued"] }), of("queued", "cancelled", "running"));
+    assert.deepEqual(await ids({ status: ["running", "error"] }), [running.id]);
+    assert.deepEqual(await ids({ status: ["queued"] }), of("queued"));
+    assert.deepEqual(await ids({ status: [] }), of("queued", "cancelled", "running"));
+    for (const limit of [1, 4, 7]) {
+      const walked: string[] = [];
+      for (let page = await ids({ status: ["queued", "cancelled"], limit }); page.length; page = await ids({ status: ["queued", "cancelled"], limit, before: page.at(-1) })) {
+        assert.ok(page.length <= limit);
+        walked.push(...page);
+      }
+      assert.deepEqual(walked, of("queued", "cancelled"), `limit ${limit}`);
+    }
+    assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 2, prompts: true }))[0].spec.prompt, "x");
+    assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 2 }))[0].spec.prompt, "");
+    // 24 of a's were made today: 8 cancelled, one running, and the rest queued.
+    assert.deepEqual(await store.standing("a", now), { queued: 15, running: 1, tasksToday: 24, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await store.standing("b", now), { queued: 4, running: 0, tasksToday: 6, usdToday: 0, usdThisMonth: 0 });
+    // The next day's count starts again; the queue is as long as it was.
+    assert.deepEqual(await store.standing("a", new Date(now.getTime() + 86_400_000)), { queued: 15, running: 1, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await store.standing("nobody", now), { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+  });
+
   it("reads only the tasks it starts, however many are queued", async () => {
     const store = await newStore();
     for (const id of ["a", "b"]) await store.putTenant({ id, limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
@@ -1616,6 +1759,34 @@ describe("the SQLite store's reads", () => {
     }
     assert.equal(plans.length, 2);
     for (const plan of plans) assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
+  });
+
+  it("lists a tenant's tasks in several statuses through the index a single status is read through", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await store.createTask("a", spec)).id);
+    for (const id of ids.filter((_, i) => i % 2)) await store.cancelQueued(id);
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const prepare = DatabaseSync.prototype.prepare;
+    const plans: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (/ FROM tasks WHERE tenant = \?/.test(sql)) plans.push((prepare.call(this, `EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((row) => row.detail).join("; "));
+      return prepare.call(this, sql);
+    };
+    try {
+      assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 5 })).length, 5);
+      assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 5, before: ids.at(-1) })).length, 5);
+    } finally {
+      DatabaseSync.prototype.prepare = prepare;
+    }
+    assert.equal(plans.length, 2);
+    // Each status is a search of (tenant, status), in rowid order: never a walk of the tenant's whole history.
+    for (const plan of plans) {
+      assert.equal(plan.match(/SEARCH tasks USING (COVERING )?INDEX tasks_by_tenant \(tenant=\? AND status=\?/g)?.length, 2, plan);
+      assert.doesNotMatch(plan, /tasks_by_tenant_n|SCAN tasks/, plan);
+    }
   });
 });
 

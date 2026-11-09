@@ -102,8 +102,12 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
 curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost and stats
 # The tenant's latest 100 (or ?limit=), newest first, without their prompts unless ?full=1; with "next"
 # when the page is full, the id that ?before= takes for the page after it.
+# ?status= takes one status or several, separated by commas.
 curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
+curl -s 'localhost:8080/v1/tasks?status=queued,running' -H "Authorization: Bearer $KEY"
 curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Bearer $KEY"
+# The tenant's limits, and what it has used of them (Quotas and usage, below).
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8080/v1/tasks/$ID/cancel -H "Authorization: Bearer $KEY"
 
 # Its events (jig's --events lines) as server-sent events, each one's id its seq: those so far, the rest
@@ -118,7 +122,14 @@ Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file'
 through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
 character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
-quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
+quotas (below). The list takes four parameters, `status`, `before`, `limit` and `full` (1, true, 0 or
+false): any other, such as a misspelt `?stauts=running`, or one given twice, is a 400 rather than a list
+of everything. A `before` that isn't the id of one of the tenant's tasks in this service is a 400 too,
+`{"error": "before must be the id of one of your tasks here"}`, the same for an id that never was and
+another tenant's; it used to be an empty page, which reads as the end of the list. A path that is no
+route is a 404 `{"error": "No such route"}`, whatever the method; on a task's routes, a task that doesn't
+exist or is another tenant's is a 404 `{"error": "No such task"}`, and a wrong method a 405. A cancel
+answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
@@ -149,6 +160,17 @@ A task is `queued`, then `running`, then one of:
 cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
 that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
 U+FFFD.
+
+What the API doesn't have, and why. An error is a sentence in `error`, with no `code` beside it: codes
+would be a contract across every route's refusals, which nothing here needs yet. There is no OpenAPI
+description, and a 405 names the method in its `error` but sends no `Allow` header. Only the list,
+`/v1/usage` and `/v1/limits` refuse parameters they don't know: the other routes read one at most. The
+list filters by status only, not by when a task was created or ended, which would need an index of its
+own to page through. A list in several statuses is read a status at a time, each through the index one
+status uses, and merged: one query for all of them would walk the tenant's whole history. The list has no
+`?region=all`, as a page across regions would need a cursor for each. `/v1/limits` leaves out the regions
+a tenant may use, which only the router knows, and its open streams, which each replica counts for
+itself. And the check of `before` reads the task's whole row, prompt included, once a page.
 
 ### Scheduling
 
@@ -336,6 +358,20 @@ curl -s 'localhost:8080/v1/usage?group=model&format=csv' -H "Authorization: Bear
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&format=csv' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 ```
+
+```bash
+# What the tenant may do, and where it stands:
+# {"tenant", "region", "limits": {"concurrency", "maxSteps", "timeLimit", "budgetUsd", "maxQueued", "approvalTimeout", "maxStreams", "quotas"},
+#  "used": {"queued", "running", "tasksToday", "usdToday", "usdThisMonth"}, "resets": {"day", "month"}}
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
+```
+
+`GET /v1/limits` lets a tenant read its caps before it is refused at one. `limits` holds the tenant's own
+and the service's defaults where it has none, with only the quotas it has; `used` always holds all five
+counts; `resets` is when the next UTC day and month start. The counts are read with the queries a new
+task is admitted by, but outside its lock, so they can be a task behind. `usdToday` and `usdThisMonth`
+count ended tasks only, as the quotas do. `maxStreams` is per replica, and the streams open now aren't
+reported. Each region answers for itself. It takes no parameter (400).
 
 Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
 that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
@@ -1004,7 +1040,9 @@ it as `task`; a client that leaves before its new task's body is read gets no an
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
-- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default; given twice, a 400).
+- `GET /v1/tasks`, `GET /v1/usage` and `GET /v1/limits` go to `?region=` (the home by default; given
+  twice, a 400). The router takes `region` off before it passes the request on: sent straight to a
+  region's service, `?region=` is an unknown parameter of the list and of the limits, a 400.
   `GET /v1/usage?region=all` asks every region the tenant may use and adds up their answers, the rows with
   the same day and model and the total, with `regions`, those that answered (502 if none did); it is JSON
   only. A client that leaves, or the router closing, ends those requests, and the client is neither

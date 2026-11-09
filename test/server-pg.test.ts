@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { TLSSocket } from "node:tls";
 import { Connection, parseUrl, Pool, redactUrl, Scram } from "../server/pg.ts";
-import { openStore } from "../server/store.ts";
+import { openStore, type Store, type Task } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, POSTGRES_URL, postgresDatabase } from "./postgres.ts";
 
 // The Postgres client (server/pg.ts): SCRAM against RFC 7677's example, the other logins and TLS against a
@@ -434,6 +434,29 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual(await seqs(100, 100), Array.from({ length: 100 }, (_, i) => i + 101));
     assert.deepEqual(await seqs(200, 100), Array.from({ length: 50 }, (_, i) => i + 201));
     assert.equal((await seqs(0)).length, 250);
+  });
+
+  it("lists tasks in several statuses and counts a tenant's standing as the SQLite store does", async () => {
+    const stores = [await openStore(await postgresDatabase()), await openStore(":memory:")];
+    // A task's cost is counted on the day it ended, by the clock: so the tasks are made by it too.
+    const now = new Date();
+    const seen: unknown[] = [];
+    for (const store of stores) {
+      closers.push(() => store.close());
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      // Numbered in their prompts, as the ids differ from store to store.
+      const tasks: Task[] = [];
+      for (let i = 0; i < 12; i++) tasks.push((await store.createTask("a", { prompt: String(i), maxSteps: 5, timeLimit: 60, model: "deepseek-flash" }, { now })) as Task);
+      for (const task of tasks.filter((_, i) => i % 3 === 0)) await store.cancelQueued(task.id);
+      const claimed = (await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 1, tenantConcurrency: 1 })) as Task;
+      await store.finish(claimed.id, "r1", { status: "succeeded", exitCode: 0, stop: "done", error: null, stats: null, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, cost: 0.25 });
+      const prompts = async (options: Parameters<Store["tasks"]>[1]) => (await store.tasks("a", { ...options, prompts: true })).map((task) => Number(task.spec.prompt));
+      const page = await prompts({ status: ["queued", "cancelled"], limit: 4 });
+      const second = await store.tasks("a", { status: ["queued", "cancelled"], limit: 4, before: tasks[page.at(-1)!].id, prompts: true });
+      seen.push([page, second.map((task) => Number(task.spec.prompt)), await prompts({ status: ["succeeded", "cancelled", "error"] }), await store.standing("a", now), await store.standing("a", new Date("2100-01-01T00:00:00Z"))]);
+    }
+    assert.deepEqual(seen[0], seen[1]);
+    assert.deepEqual(seen[1], [[11, 10, 9, 8], [7, 6, 5, 4], [9, 6, 3, 1, 0], { queued: 7, running: 0, tasksToday: 12, usdToday: 0.25, usdThisMonth: 0.25 }, { queued: 7, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 }]);
   });
 
   it("stops a page of a task's events once their JSON comes to the bytes asked for, in UTF-8", async () => {
