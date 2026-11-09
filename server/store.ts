@@ -350,6 +350,16 @@ const MIGRATIONS = [
 
 type Row = Record<string, unknown>;
 
+/**
+ * Whether a store's error is SQLite's SQLITE_FULL (13, whatever its extended code): the database's disk had
+ * no room for a write. Only that: a quota, a -shm file that can't grow and a journal that can't be made are
+ * other codes, and are retried like any failure. Postgres's 53100 isn't one either: its disk is its server's.
+ */
+export function diskFull(err: unknown): boolean {
+  const { code, errcode } = (err ?? {}) as { code?: unknown; errcode?: unknown };
+  return code === "ERR_SQLITE_ERROR" && typeof errcode === "number" && (errcode & 0xff) === 13;
+}
+
 /** A task's columns but its prompt, which a list leaves out. */
 export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost";
 
@@ -385,7 +395,7 @@ class SqliteStore implements Store {
         this.db.exec(`PRAGMA user_version = ${next + 1}`);
         this.db.exec("COMMIT");
       } catch (err) {
-        this.db.exec("ROLLBACK");
+        this.rollback();
         throw err;
       }
     }
@@ -399,7 +409,7 @@ class SqliteStore implements Store {
       for (const hash of keyHashes) this.db.prepare("INSERT OR REPLACE INTO api_keys (hash, tenant) VALUES (?, ?)").run(hash, tenant.id);
       this.db.exec("COMMIT");
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }
@@ -501,7 +511,7 @@ class SqliteStore implements Store {
       this.db.exec("COMMIT");
       return result;
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }
@@ -584,6 +594,15 @@ class SqliteStore implements Store {
     return countsOf(tasks, Number(pending.n), Number(replicas.n));
   }
 
+  /**
+   * Rolls back the transaction a failed write left open, if it left one. On a full disk SQLite has already
+   * rolled back when COMMIT fails, and a second ROLLBACK throws "no transaction is active" in place of the
+   * real error.
+   */
+  private rollback(): void {
+    if (this.db.isTransaction) this.db.exec("ROLLBACK");
+  }
+
   /** Runs `body` in a transaction: committed if it returns, rolled back if it throws. It must not wait. */
   private atomically<T>(body: () => T, begin = "BEGIN"): T {
     this.db.exec(begin);
@@ -592,7 +611,7 @@ class SqliteStore implements Store {
       this.db.exec("COMMIT");
       return result;
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }

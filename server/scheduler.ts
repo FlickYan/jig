@@ -6,7 +6,7 @@ import { createLog, type Log } from "./log.ts";
 import { PgError } from "./pg.ts";
 import { checkedGit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
-import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
+import { type Approval, diskFull, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
 // Starts queued tasks as slots free up: never more than `concurrency` at once, nor more of a tenant's than
 // its own limit, and round-robin across the tenants with work queued, so one that queues a thousand tasks
@@ -67,6 +67,8 @@ interface Run {
 const SHUTDOWN = "the task service stopped while it ran";
 const EXPIRED = `${SHUTDOWN} (the replica running it stopped renewing its lease: it crashed, was killed or lost the database)`;
 const LOST = "the replica running it lost its lease on it, and stopped it";
+/** A run stopped because its events couldn't be stored, the database's disk being full. */
+export const DB_FULL = "the service's database couldn't be written: its disk is full (the task was stopped)";
 /** How long a folder whose task the store doesn't have must be left unchanged before it is swept, at the least. */
 const UNKNOWN_MS = 10 * 60_000;
 
@@ -455,7 +457,8 @@ export class Scheduler {
       }
       exit = await run.handle.wait();
     } catch (err) {
-      failure = err instanceof Error ? err.message : String(err);
+      // SQLite's own words for a full disk ("database or disk is full") would read as the task's doing.
+      failure = diskFull(err) ? DB_FULL : err instanceof Error ? err.message : String(err);
       // A run whose events couldn't be read or stored may still be going: it is stopped, and keeps its
       // slot until it has ended, so a failing reader never lets a tenant run more than its limit.
       if (run.handle) {
@@ -510,7 +513,9 @@ export class Scheduler {
    * of that, however it was stopped, as it holds what the run spent. An error the database says is in the data
    * (a value out of range, a constraint broken) is thrown at once, as it would fail every time. Each failure
    * is counted, as retried or as given up on. The write must be one that is kept once however often it is
-   * made, as one that failed may have been made.
+   * made, as one that failed may have been made. A full disk (SQLite's SQLITE_FULL) is tried again like any
+   * failure: stopping the run can't make a full disk worse, and the task that filled it is stopped by its
+   * disk cap and its folder removed, which the other runs' tries ride out.
    */
   private async retrying<T>(write: () => Promise<T>, run: Run): Promise<T> {
     const deadline = Date.now() + this.leaseMs / 2;
@@ -529,12 +534,28 @@ export class Scheduler {
 
   private async record(task: Task, run: Run, outcome: Outcome): Promise<void> {
     const { id, tenant } = task;
+    // Once: when the database's disk is full, before the outcome is tried again, as the folder may be what
+    // filled it (the SQLite file is often on dataDir's file system); and at the end, however it went.
+    let removed = false;
+    const remove = async () => {
+      if (removed || this.keepTaskDirs) return;
+      removed = true;
+      await this.runner.removeFiles?.(id).catch((err: unknown) => this.log.warn("couldn't remove the task's folder", { tenant, task: id, err }));
+    };
+    const finish = async () => {
+      try {
+        return await this.store.finish(id, this.replicaId, outcome);
+      } catch (err) {
+        if (diskFull(err)) await remove();
+        throw err;
+      }
+    };
     try {
       // One this replica no longer held was ended by another, which counted it. Tried again on a failure
       // while the slot is held, so the limits hold; a task given up on ends when its lease runs out. A try
       // whose write was made but whose reply was lost leaves the next one false, as the task has ended: the
       // outcome and the ledger are right, but the task isn't counted in the metrics, nor its cost.
-      if (await this.retrying(() => this.store.finish(id, this.replicaId, outcome), run)) {
+      if (await this.retrying(finish, run)) {
         this.ended(task, outcome.status, Date.now() - run.claimed);
         const spent = spentOf(outcome);
         if (spent.costUsd) this.metrics.cost.inc({ tenant }, spent.costUsd);
@@ -546,7 +567,7 @@ export class Scheduler {
       // runs out, and it ends as an error.
       this.runs.delete(id);
       if (!this.closed) void this.poke();
-      if (!this.keepTaskDirs) await this.runner.removeFiles?.(id).catch((err: unknown) => this.log.warn("couldn't remove the task's folder", { tenant, task: id, err }));
+      await remove();
     }
   }
 }
@@ -555,10 +576,20 @@ export class Scheduler {
 export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"]): Outcome {
   const status = stopping === "shutdown" || stopping === "lost" ? "error" : stopping === "cancelled" ? "cancelled" : failure ? "error" : statusFor(exit!);
   const exitCode = exit?.exitCode ?? null;
-  // A run that was stopped and wrote no end of its own (jig, sent SIGTERM, exits 143 without one) was interrupted.
-  const stop = typeof end?.stop === "string" ? end.stop : stopping ? "interrupted" : exit?.timedOut ? "time_limit" : exit ? stopFor(exitCode) : null;
+  // The runner stopped it at the disk cap, and nothing else was stopping it.
+  const capped = !stopping && exit?.overDisk;
+  // A run stopped at the cap says disk_limit, though jig, sent SIGTERM, writes an end with stop interrupted:
+  // any other stop in its end is the run's own, reached first. One that was stopped otherwise and wrote no
+  // end of its own (killed before it could) was interrupted.
+  const stop =
+    capped && (typeof end?.stop !== "string" || end.stop === "interrupted") ? "disk_limit"
+    : typeof end?.stop === "string" ? end.stop
+    : stopping ? "interrupted"
+    : exit?.timedOut ? "time_limit"
+    : exit ? stopFor(exitCode)
+    : null;
   const error =
-    stopping === "shutdown" ? SHUTDOWN : stopping === "lost" ? LOST : failure ?? (status === "error" ? `jig exited with ${exitCode ?? "a signal"}${exit?.message ? `: ${exit.message}` : ""}` : null);
+    stopping === "shutdown" ? SHUTDOWN : stopping === "lost" ? LOST : failure ?? (status === "error" ? (exit?.overDisk ?? `jig exited with ${exitCode ?? "a signal"}${exit?.message ? `: ${exit.message}` : ""}`) : null);
   return {
     status,
     exitCode,
