@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
+import type { PoolOptions, PoolStats } from "./pg.ts";
 
 // The task service's state: tenants and their API keys, tasks, each task's events and the approvals its jig
 // asked for. Two stores keep to
@@ -28,6 +29,8 @@ export interface Limits {
   approvalTimeout?: number;
   /** What the tenant may start in a UTC day, and spend in a UTC day or month: none when missing. */
   quotas?: Quotas;
+  /** Event streams of the tenant's that may be open at once on each replica; the service's default when missing. */
+  maxStreams?: number;
 }
 
 export interface Quotas {
@@ -240,8 +243,8 @@ export interface Store {
   claim(tenant: string, terms: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined>;
   /** Extends the owner's leases on these running tasks; those it still holds, and whether a cancel was asked for. */
   renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]>;
-  /** Ends, as errors, the running tasks whose lease ran out: their replica is gone. Their ids. */
-  expire(error: string): Promise<string[]>;
+  /** Ends, as errors, the running tasks whose lease ran out over `graceMs` ago (0): their replica is gone. Their ids. */
+  expire(error: string, graceMs?: number): Promise<string[]>;
   /** Asks the replica running the task to cancel it; false if it isn't running. */
   requestCancel(id: string): Promise<boolean>;
   /** Moves a queued task to cancelled; false if it was no longer queued. */
@@ -286,15 +289,22 @@ export interface Store {
   readonly changes: Changes;
   /** Whether changes are heard as they happen now: if not, whoever waits on them must look again itself. */
   readonly live: boolean;
+  /** Asks the database something trivial: throws if it can't answer (the service's /readyz). */
+  ping?(): Promise<void>;
+  /** The connections to the database, for a store that pools them (Postgres's). */
+  poolStats?(): PoolStats;
   close(): Promise<void>;
 }
 
+/** What sizes Postgres's pool (the config's databasePool); its other options stay the pool's defaults. */
+export type DatabasePool = Pick<PoolOptions, "max" | "acquireTimeoutMs">;
+
 /**
  * Opens the store: Postgres for a postgres:// URL, else SQLite at the path (":memory:" for one in memory).
- * With a region, the ids of the tasks it makes carry it.
+ * With a region, the ids of the tasks it makes carry it; `pool` sizes Postgres's pool of connections.
  */
-export async function openStore(database: string, { region }: { region?: string } = {}): Promise<Store> {
-  if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database, region);
+export async function openStore(database: string, { region, pool }: { region?: string; pool?: DatabasePool } = {}): Promise<Store> {
+  if (/^postgres(ql)?:\/\//.test(database)) return (await import("./store-pg.ts")).PostgresStore.open(database, region, pool);
   return new SqliteStore(database, region);
 }
 
@@ -503,11 +513,13 @@ class SqliteStore implements Store {
     return rows.map((row) => ({ id: String(row.id), cancel: Boolean(row.cancel_requested) }));
   }
 
-  async expire(error: string): Promise<string[]> {
-    const now = new Date().toISOString();
+  async expire(error: string, graceMs = 0): Promise<string[]> {
+    const now = new Date();
     return this.atomically(() => {
       // A task left running by a version of the service without leases has none: it is as gone.
-      const rows = this.db.prepare(`UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING ${ENDED}`).all(error, now, now) as Row[];
+      const rows = this.db
+        .prepare(`UPDATE tasks SET status = 'error', error = ?, ended = ? WHERE status = 'running' AND (lease_until IS NULL OR lease_until < ?) RETURNING ${ENDED}`)
+        .all(error, now.toISOString(), new Date(now.getTime() - graceMs).toISOString()) as Row[];
       this.ledger(rows);
       return rows.map((row) => String(row.id));
     });
@@ -646,6 +658,10 @@ class SqliteStore implements Store {
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
     const rows = this.db.prepare("SELECT task, count(*) AS n FROM approvals WHERE task IN (SELECT value FROM json_each(?)) AND decision IS NULL GROUP BY task").all(JSON.stringify(tasks)) as Row[];
     return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
+  async ping(): Promise<void> {
+    this.db.prepare("SELECT 1").get();
   }
 
   async close(): Promise<void> {

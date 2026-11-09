@@ -6,7 +6,7 @@ import { createLog, type Log } from "./log.ts";
 import { PgError } from "./pg.ts";
 import { checkedGit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
-import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
+import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
 // Starts queued tasks as slots free up: never more than `concurrency` at once, nor more of a tenant's than
 // its own limit, and round-robin across the tenants with work queued, so one that queues a thousand tasks
@@ -16,7 +16,15 @@ import { type Approval, type Outcome, spentOf, type Store, type Task, type TaskS
 //
 // A running task is leased to the replica that runs it, which renews the lease while the run goes on: a
 // task whose lease ran out has lost its replica (it crashed, or lost the database), and any replica ends it
-// as an error, and has its runner stop the container or Job it may have left running.
+// as an error, and has its runner stop the container or Job it may have left running. After a round of
+// renewals that failed or hung past two ticks, the next that gets through ends no task, and nor does a start:
+// the database may have been away from every replica for longer than a lease, and the others are owed a round
+// to renew theirs first. A round slower than a tick, but not two, ends only the tasks whose lease ran out
+// before a cut-off it may have hung through could have cost the others theirs.
+//
+// A run's folder is removed as it ends; one a crashed replica left is removed by the sweep at the next start,
+// or every tenth round, once its task has ended over a lease ago, or the store doesn't have it and the folder
+// hasn't changed for a lease (ten minutes at least).
 
 /** What followers of a task hear: each event once it is stored, then the status it ended with. */
 export type Update = { event: JigEvent } | { done: TaskStatus };
@@ -59,6 +67,8 @@ interface Run {
 const SHUTDOWN = "the task service stopped while it ran";
 const EXPIRED = `${SHUTDOWN} (the replica running it stopped renewing its lease: it crashed, was killed or lost the database)`;
 const LOST = "the replica running it lost its lease on it, and stopped it";
+/** How long a folder whose task the store doesn't have must be left unchanged before it is swept, at the least. */
+const UNKNOWN_MS = 10 * 60_000;
 
 export class Scheduler {
   /** Emits a task's updates under its id. */
@@ -78,6 +88,11 @@ export class Scheduler {
   private lastTenant = "";
   private timer?: NodeJS.Timeout;
   private keeping?: Promise<void>;
+  /** Set by a round of renewals that failed or hung past two ticks, until one gets through in time: no task is ended as gone meanwhile. */
+  private recovering = false;
+  /** The rounds of renewals that got through and ended what was gone: every tenth sweeps the folders. */
+  private rounds = 0;
+  private sweeping?: Promise<void>;
 
   private store: Store;
   private runner: Runner;
@@ -116,27 +131,51 @@ export class Scheduler {
   };
 
   /**
-   * Ends the tasks whose replica is gone, starts what is queued, and from then on, every third of a lease,
-   * renews this replica's leases, ends the tasks whose lease ran out and looks for work again.
+   * Starts removing the folders runs left (not waited for), starts what is queued, and from then on, every
+   * third of a lease, renews this replica's leases, ends the tasks whose lease ran out and looks for work again.
    */
-  async start(): Promise<string[]> {
+  async start(): Promise<void> {
     await this.store.heartbeat(this.replicaId, this.leaseMs);
-    const expired = await this.expire();
+    // No task is ended here, but in the first round, a third of a lease on: the database may have just come
+    // back from an outage that every replica's leases ran out in (a replica that couldn't start meanwhile
+    // starts as it comes back), and the live ones are owed a round to renew theirs.
+    // Not waited for: a disk full of left folders, each run stopped in turn, mustn't hold up the API.
+    void this.sweep();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
-    return expired;
   }
 
   private keep(): Promise<void> {
     // One at a time: a slow database doesn't pile them up.
     this.keeping ??= (async () => {
+      const began = Date.now();
       try {
         await this.renew();
         await this.store.heartbeat(this.replicaId, this.leaseMs);
-        await this.expire();
+        // The first round through after a failure only renews. Every replica's leases may have run out while
+        // the database was away, and the store renews a lapsed lease its replica holds: ending tasks now would
+        // end those of the replicas whose round hasn't come yet. A round later, each has had a third of a lease
+        // to renew its own, and one that didn't is gone. A round that took longer than two ticks counts as
+        // failed: its calls may have hung while the database was cut off (a partition, a paused server) and
+        // gone through once it came back, with the others' leases run out just the same. One that took less
+        // may be only slow, so it still ends tasks, but not those a cut-off it hung through could have ended:
+        // a cut-off began at most a tick before the round (the last one got through), when another replica had
+        // renewed its leases at most a tick before. So a lease that ran out within the round's time past a
+        // tick may be a live replica's, and is left for a later round. A database always that slow still has
+        // a gone replica's tasks ended, that much later.
+        const took = Date.now() - began;
+        if (took > this.leaseMs / 3) this.log.warn("renewing the leases on its runs took longer than a third of a lease", { ms: took });
+        if (took > (2 * this.leaseMs) / 3) this.recovering = true;
+        else if (this.recovering) this.recovering = false;
+        else {
+          await this.expire(Math.max(0, took - this.leaseMs / 3));
+          // Not waited for: a slow disk mustn't hold up the renewals.
+          if (++this.rounds % 10 === 0) void this.sweep();
+        }
         // A slot another replica freed, or a task it queued, is looked for here.
         void this.poke();
       } catch (err) {
+        this.recovering = true;
         this.metrics.leaseErrors.inc();
         this.log.error("couldn't renew the leases on its runs", { err });
       }
@@ -161,9 +200,10 @@ export class Scheduler {
     }
   }
 
-  /** Ends, as errors, the tasks whose lease ran out, and stops what their runs left going. */
-  private async expire(): Promise<string[]> {
-    const expired = await this.store.expire(EXPIRED);
+  /** Ends, as errors, the tasks whose lease ran out over `graceMs` ago, and stops what their runs left going. */
+  private async expire(graceMs = 0): Promise<string[]> {
+    const expired = await this.store.expire(EXPIRED, graceMs);
+    if (expired.length) this.log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
     for (const id of expired) this.updates.emit(id, { done: "error" } satisfies Update);
     // Not waited for here: a slow API server mustn't hold up the renewal of this replica's own leases.
     for (const id of expired) {
@@ -183,6 +223,40 @@ export class Scheduler {
       if (task) this.ended(task, "error", task.started && task.ended ? Date.parse(task.ended) - Date.parse(task.started) : undefined);
     }
     return expired;
+  }
+
+  /**
+   * Removes the folders runs left on this machine for tasks that ended over a lease ago, or that the store
+   * doesn't have: those a replica that crashed, or was killed, never removed. A task that ended within a lease
+   * is left to its replica, which removes its folder as it stores its outcome, and a queued or running one's
+   * is kept, as replicas may share dataDir. One the store doesn't have is removed only once it hasn't changed
+   * for a lease, ten minutes at least, so a run of another service on the same dataDir with a database of its
+   * own (which it shouldn't share, docs/server.md) is spared while it writes. What the run may have left going
+   * is stopped first. One at a time, stopping at the next folder once the service starts to stop; a failure is
+   * logged, and the next sweep tries again.
+   */
+  private sweep(): Promise<void> {
+    if (this.keepTaskDirs || !this.runner.leftovers) return Promise.resolve();
+    this.sweeping ??= (async () => {
+      for (const { id, changed } of await this.runner.leftovers!()) {
+        if (this.paused) break;
+        if (this.runs.has(id)) continue;
+        const task = await this.store.task(id);
+        const left = task ? FINISHED.has(task.status) && task.ended && Date.now() - Date.parse(task.ended) > this.leaseMs : Date.now() - changed > Math.max(this.leaseMs, UNKNOWN_MS);
+        if (!left) continue;
+        await this.runner.abandon?.(id).catch((err: unknown) => this.log.warn("couldn't stop the run of a task whose folder was left", { task: id, err }));
+        try {
+          await this.runner.removeFiles?.(id);
+          this.metrics.foldersRemoved.inc();
+          this.log.info("removed the folder a run left", { task: id });
+        } catch (err) {
+          this.log.warn("couldn't remove the folder a run left", { task: id, err });
+        }
+      }
+    })()
+      .catch((err: unknown) => this.log.error("couldn't look for the folders runs left", { err }))
+      .finally(() => (this.sweeping = undefined));
+    return this.sweeping;
   }
 
   /** Counts a task that this replica ended, and how long it ran (in milliseconds) if it started. */
@@ -262,6 +336,7 @@ export class Scheduler {
     await Promise.all([...this.runs.values()].map((run) => run.done));
     await this.settled();
     await this.keeping;
+    await this.sweeping;
     await Promise.all(this.abandoning);
     // Counted no more among the replicas up; one that can't say so is forgotten when its heartbeat runs out.
     await this.store.leave(this.replicaId).catch(() => {});

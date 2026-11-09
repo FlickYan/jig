@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
 import { Pool } from "../server/pg.ts";
 import { openStore } from "../server/store.ts";
+import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
 
@@ -228,6 +229,8 @@ const quotaTests = () => {
       const odd = await store.createTask("acme", { prompt: "a1", maxSteps: 5, timeLimit: 60, model: "claude-haiku-4-5" });
       for (let i = 0; i < 2; i++) await store.claim("acme", { owner: i ? "slow" : "gone", leaseMs: i ? 60_000 : 1, concurrency: 4, tenantConcurrency: 2 });
       await new Promise((done) => setTimeout(done, 20));
+      // Not while its lease ran out within the grace.
+      assert.deepEqual(await store.expire("its replica is gone", 60_000), []);
       assert.deepEqual(await store.expire("its replica is gone"), [lost.id]);
       const spent = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: { input: 5, cacheRead: 0, cacheWrite: 0, output: 5 }, cost: 1 };
       await store.finish(lost.id, "gone", spent);
@@ -342,7 +345,7 @@ const quotaTests = () => {
 };
 
 for (const { name, skip } of BACKENDS) {
-  describe(`quotas and usage (${name})`, { skip }, () => {
+  describe(`quotas and usage (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => {
       backend = name;
       clock = undefined;

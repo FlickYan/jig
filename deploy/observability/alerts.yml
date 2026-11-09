@@ -31,13 +31,13 @@ groups:
           summary: "Over 10% of tasks end in error"
           description: "error is jig's own failure, a workspace that couldn't be made, or a replica lost while it ran: the tasks' error fields say which."
       - alert: JigApiErrors
-        expr: sum(rate(jig_service_http_requests_total{status=~"5.."}[5m])) / sum(rate(jig_service_http_requests_total[5m])) > 0.05
+        expr: sum(rate(jig_service_http_requests_total{route!~"/healthz|/readyz",status=~"5.."}[5m])) / sum(rate(jig_service_http_requests_total{route!~"/healthz|/readyz"}[5m])) > 0.05
         for: 5m
         labels:
           severity: warning
         annotations:
           summary: "Over 5% of the task service's requests fail with a 5xx"
-          description: "Its error lines (level error, with the request's id) say why."
+          description: "Its error lines (level error, with the request's id) say why. Its probes, /healthz and /readyz, aren't counted: a /readyz that answers 503 is a replica that can't reach its database."
       - alert: JigStoreErrors
         expr: sum(increase(jig_service_store_errors_total{retried="false"}[5m])) > 0
         for: 5m

@@ -2,7 +2,7 @@
 // The router in front of several regions, each a whole stack of its own (the task service's replicas, its
 // database, gateway, Redis and runners). It keeps nothing: it maps a tenant's key to the tenant, and sends
 // each request to a region by what it names: a new task to the tenant's home region (or the one its spec
-// names), a task to the region in its id. A region whose /healthz fails is down; a tenant that allows it
+// names), a task to the region in its id. A region whose /readyz fails is down; a tenant that allows it
 // has its new tasks sent to another region meanwhile, but a task stays where it was made, since no task's
 // data leaves its region. docs/server.md's "Several regions" describes the routes and the config.
 //
@@ -27,7 +27,7 @@ export interface RouterConfig {
   /** The regions, each its task service's public URL; failover takes them in this order. */
   regions: { name: string; url: string }[];
   tenants: RouterTenant[];
-  /** How often each region's /healthz is asked (default 5000 ms), and how many failures in a row make it down (default 2). */
+  /** How often each region's /readyz is asked (default 5000 ms), and how many failures in a row make it down (default 2). */
   health?: { intervalMs?: number; failures?: number };
   /** The largest new task body the router reads (default 1 MiB, the services' default; set it to the largest any region's maxBodyBytes allows). */
   maxBodyBytes?: number;
@@ -60,8 +60,11 @@ const REGIONAL_ID = /^task_([a-z0-9]{1,16})_[0-9a-f]{32}$/;
 const LEGACY_ID = /^task_[0-9a-f]{32}$/;
 const REGION_NAME = /^[a-z0-9]{1,16}$/;
 const REQUEST_ID = /^[\w.-]{1,128}$/;
-/** A region's /healthz that takes longer has failed. */
-const HEALTH_TIMEOUT_MS = 2000;
+/**
+ * A region's /readyz (or /healthz) that takes longer has failed. Over the 2 s a service's /readyz waits for
+ * its database's ping (api.ts's READY_PING_MS), so its 503 and the reason come before this.
+ */
+const HEALTH_TIMEOUT_MS = 3000;
 // Not forwarded either way: they describe one connection, not the request.
 const HOP_BY_HOP = new Set(["connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host"]);
 
@@ -69,9 +72,11 @@ interface Region {
   name: string;
   url: URL;
   up: boolean;
-  /** /healthz failures in a row. */
+  /** Health checks failed in a row. */
   failures: number;
   checking: boolean;
+  /** Whether it has no /readyz (a service from before it), so its /healthz is asked instead. */
+  older: boolean;
 }
 
 interface Tenant {
@@ -157,7 +162,7 @@ function configProblem(config: RouterConfig): string | undefined {
 /** Checks the config, starts asking the regions' health, and listens (and on the metrics listener, if it has one). */
 export async function startRouter(config: RouterConfig, { log = createLog("router") }: { log?: Log } = {}): Promise<Router> {
   checkRouterConfig(config);
-  const regions = new Map<string, Region>(config.regions.map(({ name, url }) => [name, { name, url: new URL(url), up: true, failures: 0, checking: false }]));
+  const regions = new Map<string, Region>(config.regions.map(({ name, url }) => [name, { name, url: new URL(url), up: true, failures: 0, checking: false, older: false }]));
   const order = [...regions.keys()];
   const tenants = new Map<string, Tenant>();
   for (const tenant of config.tenants) {
@@ -171,24 +176,37 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
   const registry = new Registry();
   const requests = registry.counter("jig_router_requests_total", "Requests the router answered, by the region that answered (empty for the router's own answers), route and status.", ["region", "route", "status"]);
   const seconds = registry.histogram("jig_router_request_seconds", "Seconds from a request to its answer's headers.", ["region", "route"]);
-  const up = registry.gauge("jig_router_region_up", "Whether the region's /healthz answers (1) or has failed health.failures times in a row (0).", ["region"]);
+  const up = registry.gauge("jig_router_region_up", "Whether the region's /readyz answers (1) or has failed health.failures times in a row (0).", ["region"]);
   const failovers = registry.counter("jig_router_failovers_total", "New tasks sent to another region while their home was down.", ["from", "to"]);
   for (const name of order) up.set({ region: name }, 1);
 
   const standing = () => Object.fromEntries([...regions.values()].map((region) => [region.name, region.up]));
 
-  // A region is up until its /healthz fails `most` times in a row, and up again at its first answer. One
-  // that answers as another region is down too: its tasks' ids would send their reads elsewhere.
+  // A region is up until its /readyz fails `most` times in a row, and up again at its first answer: a
+  // region whose database is down answers its /healthz, but can't take a task. One that answers as another
+  // region is down too: its tasks' ids would send their reads elsewhere.
   const probes = new AbortController();
+  const ask = async (region: Region, path: string) => {
+    const res = await fetch(new URL(path, withSlash(region.url)), { signal: AbortSignal.any([probes.signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)]) });
+    return { status: res.status, body: (await res.json().catch(() => undefined)) as { region?: unknown; why?: unknown } | undefined };
+  };
   const check = async (region: Region) => {
     if (region.checking) return;
     region.checking = true;
     let problem: string | undefined;
     try {
-      const res = await fetch(new URL("healthz", withSlash(region.url)), { signal: AbortSignal.any([probes.signal, AbortSignal.timeout(HEALTH_TIMEOUT_MS)]) });
-      const body = (await res.json().catch(() => undefined)) as { region?: unknown } | undefined;
-      if (res.status !== 200) problem = `its /healthz answered ${res.status}`;
-      else if (body?.region !== region.name) problem = `its /healthz says it is region ${JSON.stringify(body?.region ?? null)}`;
+      let path = "readyz";
+      let answer = await ask(region, path);
+      // A service from before /readyz has none: a 404, or a 401, as it asks for a key on any other path.
+      if (answer.status === 404 || answer.status === 401) {
+        if (!region.older) log.info(`region ${region.name} has no /readyz (its /readyz answered ${answer.status}): its /healthz is asked instead`, { region: region.name });
+        region.older = true;
+        path = "healthz";
+        answer = await ask(region, path);
+      } else region.older = false;
+      const { status, body } = answer;
+      if (status !== 200) problem = `its /${path} answered ${status}${typeof body?.why === "string" ? `: ${body.why}` : ""}`;
+      else if (body?.region !== region.name) problem = `its /${path} says it is region ${JSON.stringify(body?.region ?? null)}`;
     } catch (err) {
       problem = err instanceof Error ? err.message : String(err);
     } finally {

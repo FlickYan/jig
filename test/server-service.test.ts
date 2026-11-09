@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createServer, get, type IncomingMessage, ServerResponse } from "node:http";
-import type { AddressInfo } from "node:net";
+import { type AddressInfo, connect } from "node:net";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -169,9 +169,9 @@ async function collect(frames: AsyncGenerator<Frame>): Promise<Frame[]> {
 
 /**
  * A service whose tasks each write `count` events of 128 KiB, with a pause of a millisecond after every
- * tenth: the first, then, once `go` has resolved, the rest.
+ * tenth: the first, then, once `go` has resolved, the rest. Its one tenant, acme, may have `maxStreams`.
  */
-async function bigEvents(name: string, count: number, go: () => Promise<void>): Promise<Service> {
+async function bigEvents(name: string, count: number, go: () => Promise<void>, maxStreams?: number): Promise<Service> {
   const text = "y".repeat(128 * 1024);
   const runner: Runner = {
     async start() {
@@ -191,7 +191,7 @@ async function bigEvents(name: string, count: number, go: () => Promise<void>): 
   };
   const base = await tempDir(`jig-service-${name}-`);
   const api = await startService(
-    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+    { port: 0, internal: { port: 0 }, database: await database(base), dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams }] },
     { secret: SECRET, runner },
   );
   services.push(api);
@@ -214,8 +214,11 @@ function watchStreams(): { most: () => number } {
   return { most: () => most };
 }
 
-/** A task's event stream whose client reads the first chunk, then nothing until it reads the frames. */
-async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame> }> {
+/**
+ * A task's event stream whose client reads the first chunk, then nothing until it reads the frames, and a
+ * way for the client to go away.
+ */
+async function pausedStream(service: Service, id: string): Promise<{ frames: () => AsyncGenerator<Frame>; destroy: () => void }> {
   const res = await new Promise<IncomingMessage>((done, fail) => get(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` } }, done).on("error", fail));
   const first = await new Promise<Buffer>((done) =>
     res.once("data", (chunk: Buffer) => {
@@ -231,6 +234,7 @@ async function pausedStream(service: Service, id: string): Promise<{ frames: () 
           yield* res;
         })(),
       ),
+    destroy: () => void res.destroy(),
   };
 }
 
@@ -454,8 +458,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       const { args, env, task } = await record(api, id);
       assert.equal(task, "the task, on stdin");
       assert.ok(!args.includes("the task, on stdin"), "the task stays out of the process list");
-      assert.deepEqual(args.slice(0, 4), ["--yes", "--model", "claude-haiku-4-5", "--base-url"]);
-      assert.equal(args[4], "http://127.0.0.1:9/anthropic");
+      assert.deepEqual(args.slice(0, 5), ["--sandbox", "--yes", "--model", "claude-haiku-4-5", "--base-url"]);
+      assert.equal(args[5], "http://127.0.0.1:9/anthropic");
       assert.equal(args.at(-1), "-");
 
       // The token contract's check, written out here as the gateway does it.
@@ -497,9 +501,9 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     await store.close();
     await new Promise((done) => setTimeout(done, 150));
 
-    const api = await service({ database: db }, base);
-    const task = (await call(api, KEYS.acme, "GET", `/v1/tasks/${left.id}`)).body;
-    assert.equal(task.status, "error");
+    // Ended in its first round of renewals, a third of a lease after it starts.
+    const api = await service({ database: db, leaseSeconds: 1 }, base);
+    const task = await statusOf(api, left.id, "error");
     assert.match(task.error, /the task service stopped while it ran/);
     assert.ok(task.ended);
     await statusOf(api, queued.id, "succeeded");
@@ -650,10 +654,320 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.ok(held.most() < 1024 * 1024, `the stream held ${Math.round(held.most() / 1024)} KiB written for its client`);
     assert.deepEqual(await idsAndEnd(stream.frames()), { ids: Array.from({ length: 200 }, (_, i) => String(i + 1)), done: { event: "done", data: JSON.stringify({ status: "succeeded" }) } });
   });
+
+  it("is ready (/readyz) while its store answers, not while it doesn't or as it stops, and alive (/healthz) all along", async () => {
+    // A runner whose close waits for the test: the service stops with its listeners still up meanwhile.
+    let release!: () => void;
+    const runnerClosed = new Promise<void>((done) => (release = done));
+    const base = await tempDir("jig-service-readyz-");
+    const lines: string[] = [];
+    const api = await startService(
+      {
+        port: 0,
+        internal: { port: 0 },
+        region: "eu",
+        database: await database(base),
+        ...(name === "Postgres" && { databasePool: { max: 2, acquireTimeoutMs: 5000 } }),
+        dataDir: join(base, "data"),
+        gatewayBaseUrl: "http://127.0.0.1:9/anthropic",
+        tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }],
+      },
+      { secret: SECRET, runner: { ...endsWith(0), close: () => runnerClosed }, log: createLog("service", { format: "text", write: (line) => lines.push(line) }) },
+    );
+    let closed: Promise<void> | undefined;
+    opened.push(async () => {
+      release();
+      await (closed ??= api.close());
+    });
+    const ask = async (path: string) => {
+      const res = await fetch(api.url + path);
+      return [res.status, await res.json()];
+    };
+    const alive = [200, { ok: true, region: "eu" }];
+    assert.deepEqual(await ask("/readyz"), [200, { ok: true, region: "eu" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+
+    // On Postgres, its pool's connections, which the config's databasePool caps.
+    const pool = (await api.metrics.registry.render()).match(/^jig_service_db_pool_connections\{state="\w+"\} \d+$/gm) ?? [];
+    if (name === "Postgres") {
+      assert.equal(pool.length, 3);
+      assert.match(pool.join("\n"), /^jig_service_db_pool_connections\{state="open"\} [12]$/m);
+      assert.match(pool.join("\n"), /^jig_service_db_pool_connections\{state="waiting"\} 0$/m);
+    } else assert.deepEqual(pool, []);
+
+    // A store that can't be reached: 503 within the second its answer is kept, the error itself only in the log.
+    const ping = api.store.ping!.bind(api.store);
+    api.store.ping = async () => {
+      throw new Error("connect ECONNREFUSED 10.0.0.5:5432");
+    };
+    const notReady = await until(async () => {
+      const answer = await ask("/readyz");
+      return answer[0] === 503 && answer;
+    }, "/readyz to answer 503");
+    assert.deepEqual(notReady, [503, { ok: false, region: "eu", why: "the database can't be reached" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+    assert.ok(lines.some((line) => line.includes("not ready: the database can't be reached") && line.includes("10.0.0.5:5432")), lines.join("\n"));
+    // Counted as the probe's, apart from the tenants' requests that fail.
+    assert.match(await api.metrics.registry.render(), /^jig_service_http_requests_total\{route="\/readyz",status="503"\} [1-9]\d*$/m);
+
+    // One that doesn't answer at all: 503 once the ping has had 2 seconds.
+    let pings = 0;
+    let hung!: (err: Error) => void;
+    api.store.ping = () => (pings++, new Promise((_, fail) => (hung = fail)));
+    const slow = await until(async () => {
+      const answer = await ask("/readyz");
+      return answer[1].why !== "the database can't be reached" && answer;
+    }, "/readyz to give up on the ping");
+    assert.deepEqual(slow, [503, { ok: false, region: "eu", why: "the database didn't answer within 2000 ms" }]);
+    // Asked again past the second its answer is kept, it starts no other ping while that one hangs (each
+    // would take a connection of the pool), and answers at once.
+    for (let i = 0; i < 3; i++) {
+      await new Promise((done) => setTimeout(done, 600));
+      const asked = Date.now();
+      assert.deepEqual(await ask("/readyz"), slow);
+      assert.ok(Date.now() - asked < 500, `/readyz took ${Date.now() - asked} ms`);
+    }
+    assert.equal(pings, 1);
+    // The pool's query timeout ends the ping at last.
+    hung(new Error("Query read timeout"));
+
+    api.store.ping = ping;
+    await until(async () => (await ask("/readyz"))[0] === 200, "/readyz to answer 200 again");
+    assert.ok(lines.some((line) => line.includes("ready again")), lines.join("\n"));
+
+    // Once it is stopping, it isn't ready, though it still answers.
+    closed = api.close();
+    assert.deepEqual(await ask("/readyz"), [503, { ok: false, region: "eu", why: "the service is stopping" }]);
+    assert.deepEqual(await ask("/healthz"), alive);
+    release();
+    await closed;
+  });
+
+  it("isn't ready (/readyz) while it starts, before its scheduler has", async () => {
+    const base = await tempDir("jig-service-starting-");
+    const db = await database(base);
+    // The scheduler's start waits at its first heartbeat until the test lets it go on.
+    const opening = await openStore(db);
+    const proto = Object.getPrototypeOf(opening) as Pick<Store, "heartbeat">;
+    await opening.close();
+    const heartbeat = proto.heartbeat;
+    let go!: () => void;
+    const held = new Promise<void>((done) => (go = done));
+    proto.heartbeat = async function (this: Store, ...args) {
+      await held;
+      return heartbeat.apply(this, args);
+    };
+    try {
+      // The service's URL comes once it has started: the port is picked here.
+      const picked = createServer().listen(0, "127.0.0.1");
+      await once(picked, "listening");
+      const port = (picked.address() as AddressInfo).port;
+      await new Promise((done) => picked.close(done));
+      const starting = startService(
+        { port, internal: { port: 0 }, region: "eu", database: db, dataDir: join(base, "data"), gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [sha256(KEYS.acme)] }] },
+        { secret: SECRET, runner: endsWith(0), log: createLog("service", { format: "text", write: () => {} }) },
+      );
+      opened.push(async () => (await starting).close());
+      const ask = async () => {
+        const res = await fetch(`http://127.0.0.1:${port}/readyz`);
+        return [res.status, await res.json()];
+      };
+      const answer = await until(() => ask().catch(() => undefined), "the API to listen");
+      assert.deepEqual(answer, [503, { ok: false, region: "eu", why: "the service is starting" }]);
+      go();
+      await starting;
+      assert.deepEqual(await ask(), [200, { ok: true, region: "eu" }]);
+    } finally {
+      proto.heartbeat = heartbeat;
+      go();
+    }
+  });
+
+  it("refuses a tenant's event stream past its maxStreams open, and counts one no more once its client has gone", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 2 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    const first = await openStream(api, KEYS.acme, id);
+    const second = await openStream(api, KEYS.acme, id);
+    assert.deepEqual([first.res.status, second.res.status], [200, 200]);
+    const third = await openStream(api, KEYS.acme, id);
+    assert.equal(third.res.status, 429);
+    assert.equal(third.res.headers.get("retry-after"), "5");
+    assert.deepEqual(await third.res.json(), { error: "The tenant has 2 event streams open, the most it may", limit: 2, open: 2 });
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 2);
+
+    // A client that goes away frees its stream.
+    first.abort();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 1, "the stream to be counted no more");
+    const fourth = await openStream(api, KEYS.acme, id);
+    assert.equal(fourth.res.status, 200);
+    // Streams that end are counted no more either.
+    await writeFile(join(work(api, id), "go"), "");
+    for (const { res } of [second, fourth]) assert.equal((await collect(framesOf(res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
+    assert.equal((await collect(sse(api, `/v1/tasks/${id}/events`))).at(-1)?.event, "done");
+  });
+
+  it("refuses an event stream past the replica's maxStreams open, whichever tenant's", async () => {
+    const api = await service({ maxStreams: 1 });
+    const mine = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    await statusOf(api, mine, "running");
+    const first = await openStream(api, KEYS.acme, mine);
+    assert.equal(first.res.status, 200);
+    const second = await openStream(api, KEYS.globex, theirs);
+    assert.equal(second.res.status, 429);
+    assert.equal(second.res.headers.get("retry-after"), "5");
+    assert.deepEqual(await second.res.json(), { error: "The service has 1 event streams open, the most it may", limit: 1, open: 1 });
+    first.abort();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the stream to be counted no more");
+    const third = await openStream(api, KEYS.globex, theirs);
+    assert.equal(third.res.status, 200);
+    third.abort();
+    await until(async () => (await api.store.task(theirs))?.status === "running", "globex's task to run");
+    for (const task of [mine, theirs]) await writeFile(join(work(api, task), "go"), "");
+  });
+
+  it("counts no event stream whose client went away while its task was being read", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 1 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    // The task is read only once the stream's client has gone, as with a slow store and a quick client.
+    let gone: Promise<unknown> | undefined;
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && (gone ??= once(res, "close"))));
+    let read: Promise<unknown> | undefined;
+    const task = api.store.task.bind(api.store);
+    api.store.task = async (id) => {
+      if (!gone) return task(id);
+      await gone;
+      const found = task(id);
+      read ??= found;
+      return found;
+    };
+    const aborts = new AbortController();
+    const asked = fetch(`${api.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${KEYS.acme}` }, signal: aborts.signal }).catch(() => {});
+    await until(() => gone !== undefined, "the stream to be asked for");
+    aborts.abort();
+    await asked;
+    // What the request does once the task is read is done in the same turn.
+    await until(() => read, "the task to be read");
+    await new Promise((done) => setImmediate(done));
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 0);
+    const stream = await openStream(api, KEYS.acme, id);
+    assert.equal(stream.res.status, 200);
+    await writeFile(join(work(api, id), "go"), "");
+    assert.equal((await collect(framesOf(stream.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of event streams asked for one behind another on a connection that then goes", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 3 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    // Three requests in one write: the second and third wait behind the first's response, and Node closes
+    // no response that waits when its connection goes.
+    const socket = connect(Number(new URL(api.url).port), "127.0.0.1");
+    await once(socket, "connect");
+    const ask = `GET /v1/tasks/${id}/events HTTP/1.1\r\nhost: 127.0.0.1\r\nauthorization: Bearer ${KEYS.acme}\r\n\r\n`;
+    socket.write(ask.repeat(3));
+    socket.resume();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 3, "the streams to be counted");
+    socket.destroy();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
+    const stream = await openStream(api, KEYS.acme, id);
+    assert.equal(stream.res.status, 200);
+    await writeFile(join(work(api, id), "go"), "");
+    assert.equal((await collect(framesOf(stream.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of an event stream whose reads of the store fail, when its client goes and when its task ends", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], maxStreams: 1 }] });
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body;
+    await statusOf(api, id, "running");
+    const open = () => api.metrics.eventStreams.get({ tenant: "acme" });
+    const events = api.store.events.bind(api.store);
+    let failing = true;
+    let failed = 0;
+    api.store.events = async (...args) => {
+      if (!failing) return events(...args);
+      failed++;
+      throw new Error("the store is down");
+    };
+
+    // Its client goes away while its reads fail.
+    const first = await openStream(api, KEYS.acme, id);
+    assert.equal(first.res.status, 200);
+    await until(() => failed > 0, "a read of the stream's to fail");
+    first.abort();
+    await until(() => open() === 0, "the stream to be counted no more");
+
+    // Its task ends, and the reads made once it has fail; then the store is back.
+    failing = false;
+    const second = await openStream(api, KEYS.acme, id);
+    assert.equal(second.res.status, 200);
+    const frames = collect(framesOf(second.res.body as unknown as AsyncIterable<Uint8Array>));
+    const task = api.store.task.bind(api.store);
+    let ended = false;
+    api.store.task = async (id) => {
+      const found = await task(id);
+      if (found?.status === "succeeded") failing = ended = true;
+      return found;
+    };
+    const before = failed;
+    await writeFile(join(work(api, id), "go"), "");
+    await until(() => ended && failed > before, "a read of the ended task's events to fail");
+    // Each read the task's end set off has failed by now; no other is set off.
+    await new Promise((done) => setTimeout(done, 300));
+    api.store.task = task;
+    failing = false;
+    await until(() => open() === 0, "the stream to end and be counted no more");
+    assert.equal((await frames).at(-1)?.event, "done");
+    assert.ok(api.metrics.storeErrors.get({ retried: "true" }) >= 2);
+    const third = await openStream(api, KEYS.acme, id);
+    assert.equal(third.res.status, 200);
+    assert.equal((await collect(framesOf(third.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of an event stream whose client goes while the stream waits for it to read", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    const api = await bigEvents(name, 200, async () => {}, 1);
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await statusOf(api, id, "succeeded");
+    let served: ServerResponse | undefined;
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && (served ??= res)));
+    const stream = await pausedStream(api, id);
+    await until(() => served?.writableNeedDrain, "the stream to wait for its client");
+    stream.destroy();
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the stream to be counted no more");
+    const again = await openStream(api, KEYS.acme, id);
+    assert.equal(again.res.status, 200);
+    assert.equal((await collect(framesOf(again.res.body as unknown as AsyncIterable<Uint8Array>))).at(-1)?.event, "done");
+  });
+
+  it("lets go of the event streams open when the service closes", { skip: name !== "SQLite" && "SQLite's: the stream is the same on either store" }, async () => {
+    const api = await bigEvents(name, 200, async () => {});
+    const { id } = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "talk" })).body;
+    await statusOf(api, id, "succeeded");
+    const served: ServerResponse[] = [];
+    api.server.on("request", (req: IncomingMessage, res: ServerResponse) => void (req.url?.endsWith("/events") && served.push(res)));
+    const streams = [await pausedStream(api, id), await pausedStream(api, id)];
+    await until(() => served.length === 2 && served.every((res) => res.writableNeedDrain), "the streams to wait for their clients");
+    assert.equal(api.metrics.eventStreams.get({ tenant: "acme" }), 2);
+    services.splice(services.indexOf(api), 1);
+    await api.close();
+    // Each response has its close a moment after its connection's.
+    await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
+    for (const stream of streams) stream.destroy();
+  });
 };
 
+/** A task's event stream, as the response to its request, and a way for its client to go away. */
+async function openStream(service: Service, key: string, id: string): Promise<{ res: Response; abort: () => void }> {
+  const aborts = new AbortController();
+  const res = await fetch(`${service.url}/v1/tasks/${id}/events`, { headers: { authorization: `Bearer ${key}` }, signal: aborts.signal });
+  return { res, abort: () => aborts.abort() };
+}
+
 for (const { name, skip } of BACKENDS) {
-  describe(`the task service's API (${name})`, { skip }, () => {
+  describe(`the task service's API (${name})`, { skip: skip || sandboxProblem() }, () => {
     beforeEach(() => void (backend = name));
     apiTests(name);
   });
@@ -1211,10 +1525,13 @@ const schedulerTests = () => {
     });
     const metrics = serviceMetrics();
     const lines: string[] = [];
-    const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
-    assert.deepEqual(await scheduler.start(), [left.id]);
+    const scheduler = newScheduler(unreadable, new FakeRunner(), { concurrency: 4, leaseMs: 300, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
+    await scheduler.start();
+    // Ended in the first round, a third of a lease after the start, not at it.
+    assert.equal((await store.task(left.id))!.status, "running");
+    await until(() => lines.some((line) => line.includes("couldn't read an expired task to count it")), "the first round to end the task");
     assert.deepEqual([metrics.storeErrors.get({ retried: "true" }), metrics.storeErrors.get({ retried: "false" })], [0, 1]);
-    assert.ok(lines.some((line) => line.includes("couldn't read an expired task to count it")), lines.join("\n"));
+    assert.ok(lines.some((line) => line.includes("1 task(s) whose replica is gone (a crash, or a kill) marked as errors")), lines.join("\n"));
     assert.equal((await store.task(left.id))!.status, "error");
     await scheduler.close();
     await store.close();
@@ -1324,6 +1641,14 @@ describe("the service's config", () => {
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
+    // Postgres's pool, which SQLite hasn't.
+    const postgres = "postgres://jig@db.example.com/jig";
+    assert.equal(problem({ databasePool: { max: 20 } }), "The config's databasePool is for a Postgres database (postgres://...): SQLite has no pool");
+    assert.equal(problem({ database: postgres, databasePool: { max: 20, acquireTimeoutMs: 5000 } }), undefined);
+    assert.equal(problem({ database: postgres, databasePool: 20 }), "The config's databasePool must be an object, {max, acquireTimeoutMs}");
+    assert.equal(problem({ database: postgres, databasePool: { max: 0 } }), "The config's databasePool.max must be a whole number from 1 to 1000, not 0");
+    assert.equal(problem({ database: postgres, databasePool: { acquireTimeoutMs: 50 } }), "The config's databasePool.acquireTimeoutMs must be a whole number from 100 to 600000, not 50");
+    assert.equal(problem({ database: postgres, databasePool: { queryTimeoutMs: 0 } }), "The config's databasePool.queryTimeoutMs isn't a pool setting: max or acquireTimeoutMs");
     assert.equal(problem({ gitHosts: ["github.com"], local: { hiddenPaths: ["/srv/secrets"] } }), undefined);
     assert.equal(problem({ gitHosts: "github.com" }), "The config's gitHosts must be a list of strings");
     // An entry is matched to a URL's hostname: one with a scheme, port, path or trailing dot would match none.
@@ -1343,6 +1668,9 @@ describe("the service's config", () => {
     assert.match(problem({ tenants: [{ id: "acme", keys: [KEYS.acme] }] })!, /tenants\[0\]\.keys\[0\] must be a key's SHA-256 hash/);
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], concurrency: -1 }] }), "The config's tenants[0].concurrency must be a whole number from 0 up, not -1");
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], budgetUsd: null, maxQueued: 0 }] }), undefined);
+    assert.equal(problem({ maxStreams: 0 }), "The config's maxStreams must be a whole number from 1 up, not 0");
+    assert.equal(problem({ tenants: [{ id: "acme", keys: [], maxStreams: 0 }] }), "The config's tenants[0].maxStreams must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxStreams: 500, tenants: [{ id: "acme", keys: [], maxStreams: 50 }] }), undefined);
     await assert.rejects(startService({ ...base, concurrency: 0 }, { secret: SECRET }), /concurrency must be a whole number from 1 up/);
   });
 
@@ -1459,7 +1787,8 @@ describe("the service's start", () => {
     });
   }
 
-  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", async () => {
+  // Without a sandbox the service doesn't start on the local runner (test/server-local.test.ts).
+  it("hides dataDir, the database and the config's folder from the local runner's tasks, and warns of what they still share", { skip: sandboxProblem() }, async () => {
     const lines: string[] = [];
     const log = createLog("service", { format: "text", write: (line) => lines.push(line) });
     const dir = await tempDir("jig-service-");
@@ -1469,19 +1798,17 @@ describe("the service's start", () => {
     const started = await startService(config, { secret: SECRET, log, configFile });
     services.push(started);
     const warned = (start: RegExp) => assert.ok(lines.some((line) => start.test(line)), lines.join("\n"));
-    if (sandboxProblem()) warned(/^jig service: jig has no sandbox here \(.+\), so a local task's commands run directly on this machine/);
-    else {
-      warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
-      // What else they read and connect to, and where the clones go, which gitHosts would limit.
-      warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
-      warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
-      // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
-      // elsewhere), as each task has its own.
-      const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
-      const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
-      if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
-      else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
-    }
+    warned(/^jig service: the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share/);
+    // What else they read and connect to, and where the clones go, which gitHosts would limit.
+    warned(/^jig service: a local task's commands can read whatever the service's user can, .* and connect to the Unix sockets on this machine .*: run the service as a user of its own/);
+    warned(/^jig service: a local task's workspace\.git is cloned by the service, on this machine's network, from any host a tenant names/);
+    // Only where the sandbox lets commands write: /tmp and /var/tmp, not the service's TMPDIR (macOS's is
+    // elsewhere), as each task has its own.
+    const temps = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"];
+    const dataDirWarning = /^jig service: dataDir is in a temp folder, where a local task's commands can write their task's home/;
+    if (temps.some((temp) => realpathSync(dir).startsWith(`${temp}/`))) warned(dataDirWarning);
+    else assert.ok(!lines.some((line) => dataDirWarning.test(line)), lines.join("\n"));
+    assert.ok(!lines.some((line) => /local\.allowUnsandboxed/.test(line)), lines.join("\n"));
     // Each task's jig gets user settings that hide them from its commands, but for its project and home.
     const { id } = (await call(started, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body;
     await statusOf(started, id, "succeeded");
@@ -1490,7 +1817,7 @@ describe("the service's start", () => {
     assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
   });
 
-  it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", async () => {
+  it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", { skip: sandboxProblem() }, async () => {
     const limited = await service({ database: join(await tempDir("jig-service-"), "jig.db"), gitHosts: ["example.com"] });
     const posted = await call(limited, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { git: "https://127.0.0.1:1/x.git" } });
     assert.deepEqual([posted.status, posted.body.error], [400, "workspace.git must be on one of the config's gitHosts: example.com"]);
@@ -1524,7 +1851,7 @@ describe("the service's start", () => {
     assert.match((await statusOf(started, refused, "error")).error, /^git clone failed \(exit \d+\)$/);
   });
 
-  it("follows a redirect on a clone's first request without gitHosts, as git does, since any host may be named", async () => {
+  it("follows a redirect on a clone's first request without gitHosts, as git does, since any host may be named", { skip: sandboxProblem() }, async () => {
     // GitLab redirects a project's URL without .git to the one with it.
     const asked: string[] = [];
     const moved = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
@@ -1539,7 +1866,7 @@ describe("the service's start", () => {
     assert.deepEqual(asked, ["/group/project.git/info/refs?service=git-upload-pack"]);
   });
 
-  it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", async () => {
+  it("clones a workspace.git on gitHosts as it was checked, so a backslash can't send git to another host", { skip: sandboxProblem() }, async () => {
     // git's curl reads what is before the `@` as userinfo, and would connect to the inside server; URL reads
     // the backslash as a slash, so the host checked is localhost, and that is the host git is given.
     const asked: string[] = [];
@@ -1558,7 +1885,7 @@ describe("the service's start", () => {
     assert.deepEqual(asked, []);
   });
 
-  it("checks a queued task's workspace.git against gitHosts again when it starts", async () => {
+  it("checks a queued task's workspace.git against gitHosts again when it starts", { skip: sandboxProblem() }, async () => {
     const asked: string[] = [];
     const inside = createServer((req, res) => (asked.push(req.url!), res.writeHead(403).end()));
     const allowed = createServer((_req, res) => res.writeHead(404).end());
@@ -1601,7 +1928,7 @@ describe("the service's start", () => {
     assert.ok(!lines.some((line) => clones.test(line)), lines.join("\n"));
   });
 
-  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in, with an old git too", async () => {
+  it("hides the main checkout of a worktree and the superproject of a submodule dataDir is in, with an old git too", { skip: sandboxProblem() }, async () => {
     const dir = realpathSync(await tempDir("jig-service-"));
     const git = (cwd: string, ...args: string[]) => promisify(execFile)("git", ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always", "-c", "init.defaultBranch=main", ...args], { cwd });
     const repo = async (path: string) => {

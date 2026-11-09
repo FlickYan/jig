@@ -6,7 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { createLog, type Log } from "../log.ts";
 import { type Exited, type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
-import { jigArgs, keyVariable, type RunExit, type RunHandle, type Runner, taskToken } from "../runner.ts";
+import { jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
 import type { PoolAnswer } from "../worker.ts";
 import { lastLine, prepareWorkspace, readStats, TERM_MS, tail } from "./local.ts";
@@ -83,6 +83,11 @@ export class DockerRunner implements Runner {
   async removeFiles(id: string): Promise<void> {
     await rm(this.dir(id), { recursive: true, force: true });
     this.folders.delete(id);
+  }
+
+  /** The cold tasks' folders: a warm worker's (pool_<hex>) is its slot's, and stays (docs/server.md). */
+  leftovers(): Promise<Leftover[]> {
+    return taskFolders(this.config.dataDir);
   }
 
   warm(internalBaseUrl: string): void {

@@ -150,7 +150,7 @@ async function events(service: Service, id: string): Promise<{ id: string; event
   });
 }
 
-describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gateway", () => {
+describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gateway", { skip: sandboxProblem() }, () => {
   it("runs a task with the real jig through the gateway, and its events, usage and cost agree everywhere", async () => {
     const { service, gateway, seen, dataDir } = await stack([[{ tool: "bash", input: { command: "cat note.txt" } }], [{ text: "The note says hello." }]]);
     const posted = await call(service, "POST", "/v1/tasks", { prompt: "what does note.txt say?", workspace: { files: { "note.txt": "hello\n" } }, maxSteps: 5 });
@@ -316,7 +316,7 @@ for (const { name, backends, skip } of [
   { name: "SQLite and memory", backends: {}, skip: false },
   { name: "Postgres and Redis", backends: { postgres: true, redis: true }, skip: NO_POSTGRES || (!REDIS && "JIG_TEST_REDIS_URL isn't set") },
 ]) {
-  describe(`Phase 2 end to end, the state in ${name}: the real jig asks through the API before a command`, { skip }, () => {
+  describe(`Phase 2 end to end, the state in ${name}: the real jig asks through the API before a command`, { skip: skip || sandboxProblem() }, () => {
     /** Posts a task that asks before its command, and waits until the approval waits for an answer. */
     async function asking(service: Service): Promise<{ id: string; approval: any }> {
       const posted = await call(service, "POST", "/v1/tasks", { prompt: "write the file", approvals: true, mode: "ask", maxSteps: 5 });
@@ -421,7 +421,7 @@ for (const { name, backends, skip } of [
   { name: "SQLite and memory", backends: {} as Backends, skip: false },
   { name: "Postgres and Redis", backends: { postgres: true, redis: true } as Backends, skip: NO_POSTGRES || (!REDIS && "JIG_TEST_REDIS_URL isn't set") },
 ]) {
-  describe(`Phase 3 end to end, the state in ${name}: router, two regions, failover, quotas and metrics`, { skip }, () => {
+  describe(`Phase 3 end to end, the state in ${name}: router, two regions, failover, quotas and metrics`, { skip: skip || sandboxProblem() }, () => {
     it("routes tenants' tasks to their regions and fails over, between providers and between regions, within quotas, and counts it all", async () => {
       // Two model calls a task, each of 10 input and 5 output tokens: the gateway's daily quota lets three tasks through.
       const replies: Block[][] = [[{ tool: "bash", input: { command: "echo hi" } }], [{ text: "Done." }]];

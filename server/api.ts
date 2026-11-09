@@ -59,6 +59,8 @@ export interface TenantConfig {
   webhookSecretEnv?: string;
   /** The most tasks it may create in a UTC day, and USD its tasks may spend in a UTC day or month. */
   quotas?: Quotas;
+  /** The most event streams of its that may be open at once on each replica. */
+  maxStreams?: number;
 }
 
 export interface Config {
@@ -72,6 +74,8 @@ export interface Config {
   internalBaseUrl?: string;
   /** The SQLite file, or a Postgres URL (postgres://...), which replicas of the service share. */
   database: string;
+  /** Postgres's pool: the most connections this replica opens (10), and how long a query waits for one (ms). */
+  databasePool?: { max?: number; acquireTimeoutMs?: number };
   /** Where each task's folder goes. */
   dataDir: string;
   /** Tasks that may run at once, across tenants (and across replicas sharing the database). */
@@ -84,8 +88,11 @@ export interface Config {
   gitProtocols?: string[];
   /** The hosts a workspace may be cloned from (default: any). */
   gitHosts?: string[];
-  /** The local runner's: what else its tasks' commands can't read, as absolute paths. */
-  local?: { hiddenPaths?: string[] };
+  /**
+   * The local runner's: what else its tasks' commands can't read, as absolute paths; and whether it may run
+   * them with no sandbox, directly on this machine (one tenant only).
+   */
+  local?: { hiddenPaths?: string[]; allowUnsandboxed?: boolean };
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
   /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
@@ -106,13 +113,17 @@ export interface Config {
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
   metrics?: { host?: string; port: number };
+  /** The most event streams that may be open at once on this replica, across tenants. */
+  maxStreams?: number;
   tenants: TenantConfig[];
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
 type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
 
-const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {} };
+const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {}, maxStreams: 20 };
+/** The most event streams open at once on a replica, across tenants, unless the config says. */
+const MAX_STREAMS = 200;
 /** The longest time limit or approval timeout, in seconds: under jig's 24 days, and a timer's 2^31 ms. */
 const MAX_SECONDS = 2_000_000;
 const MAX_PROMPT = 100_000;
@@ -129,6 +140,10 @@ const EVENTS_PAGE = 100;
  * MiB, the runners' MAX_LINE), and 100 of them would be 100 MB.
  */
 const PAGE_BYTES = 4 * 1024 * 1024;
+/** How long /readyz uses what the store's ping said, however many ask. */
+const READY_CACHE_MS = 1_000;
+/** How long /readyz waits for the store's ping. */
+const READY_PING_MS = 2_000;
 /** A client's x-request-id that is used as it is; any other gets one of the service's own. */
 const REQUEST_ID = /^[\w.-]{1,128}$/;
 
@@ -175,6 +190,12 @@ export async function startService(
   }: { secret: string; runner?: Runner; webhookRetryMs?: number; now?: () => Date; log?: Log; countsMs?: number; configFile?: string },
 ): Promise<Service> {
   checkConfig(config);
+  // The local runner's jig runs with --sandbox, so with none here every task would fail: the service doesn't
+  // start, unless the config lets their commands run on the machine itself.
+  if (!runner && (config.runner ?? "local") === "local" && !config.local?.allowUnsandboxed) {
+    const problem = sandboxProblem();
+    if (problem) throw new Error(`The local runner runs its tasks' commands in jig's sandbox, and there is none here: ${problem}. Fix that, use the docker or kubernetes runner, or, with a single tenant, set local.allowUnsandboxed to run them directly on this machine.`);
+  }
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
   // A Bearer is read up to the first whitespace, so a key with some could never be given.
@@ -182,8 +203,9 @@ export async function startService(
   const metrics = serviceMetrics();
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  for (const { id } of config.tenants) metrics.eventStreams.set({ tenant: id }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
-  const store = await openStore(config.database, { region: config.region });
+  const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
   const answers = new Answers(store);
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
@@ -234,9 +256,37 @@ export async function startService(
   let failed!: (err: unknown) => void;
   const ready = new Promise<Context>((done, fail) => ((started = done), (failed = fail)));
   ready.catch(() => {});
-  const server = createServer(handler(async (req, res, request) => handle(req, res, await ready, request), true));
+  // GET /readyz says whether to send this replica requests: not while it starts or stops, nor while its
+  // store doesn't answer. /healthz says only that the process is up. Asked without a key, and at once.
+  let serving = false;
+  let closing = false;
+  let probe: { at: number; why: Promise<string | undefined> } | undefined;
+  let notReady: string | undefined;
+  const storeProblem = storeChecker(store);
+  const readyz = async (res: ServerResponse) => {
+    if (!closing && serving && (!probe || Date.now() - probe.at >= READY_CACHE_MS)) {
+      probe = {
+        at: Date.now(),
+        why: storeProblem().then(({ why, err }) => {
+          if (why && why !== notReady) log.warn(`not ready: ${why}`, { err });
+          else if (!why && notReady) log.info("ready again: the store answers");
+          notReady = why;
+          return why;
+        }),
+      };
+    }
+    const why = closing ? "the service is stopping" : !serving ? "the service is starting" : await probe!.why;
+    reply(res, why ? 503 : 200, { ok: !why, region: config.region ?? null, ...(why && { why }) });
+  };
+  const server = createServer(
+    handler(async (req, res, request) => {
+      if (req.method === "GET" && URL.parse(req.url ?? "/", "http://service")?.pathname === "/readyz") return readyz(res);
+      return handle(req, res, await ready, request);
+    }, true),
+  );
   let scheduler: Scheduler | undefined;
   const close = async () => {
+    closing = true;
     // No task is claimed from here on: one posted while the runner closes stays queued, rather than start
     // cold and be stopped as an error.
     scheduler?.pause();
@@ -277,8 +327,7 @@ export async function startService(
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
     scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
-    const expired = await scheduler.start();
-    if (expired.length) log.warn(`${expired.length} task(s) whose replica is gone (a crash, or a kill) marked as errors`);
+    await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
     failed(err);
@@ -286,6 +335,7 @@ export async function startService(
     throw err;
   }
   collect(metrics, { store, runner, tenants: config.tenants.map((tenant) => tenant.id), countsMs });
+  serving = true;
   started({
     store,
     scheduler,
@@ -298,6 +348,8 @@ export async function startService(
     adminKey: adminKey === undefined ? undefined : sha256(adminKey),
     now,
     metrics,
+    maxStreams: config.maxStreams ?? MAX_STREAMS,
+    streams: { open: 0, byTenant: new Map() },
   });
   return { url, internalUrl, metricsUrl, metrics, server, store, scheduler, close };
 }
@@ -305,12 +357,13 @@ export async function startService(
 /**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
  * from their commands, but for the task's own project and home, and the database and the config's folder
- * (see runners/local.ts); without one, they run directly on the machine. With one, they share its kernel,
- * /tmp and /var/tmp (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read
- * whatever else the service's user can, and connect to the Unix sockets there, which a read-only file
- * system doesn't stop. And with dataDir in one of those, which they can write, a task's commands can change
- * its home there, whose git config jig's own git reads, outside the sandbox. A hidden folder (`folders`)
- * that is the machine's root, /etc, /usr or the service user's home hides what their commands need.
+ * (see runners/local.ts); without one (local.allowUnsandboxed), they run directly on the machine, as do
+ * those of a task whose jig fails to make one with it. With one, they share its kernel, /tmp and /var/tmp
+ * (each task has a TMPDIR of its own), and on macOS its processes and localhost; they read whatever else
+ * the service's user can, and connect to the Unix sockets there, which a read-only file system doesn't stop.
+ * And with dataDir in one of those, which they can write, a task's commands can change its home there, whose
+ * git config jig's own git reads, outside the sandbox. A hidden folder (`folders`) that is the machine's
+ * root, /etc, /usr or the service user's home hides what their commands need.
  */
 function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
@@ -324,6 +377,10 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
   const problem = sandboxProblem();
   if (problem) return [`jig has no sandbox here (${problem}), so a local task's commands run directly on this machine: they can read and write the other tasks' folders, the database and the config (the docker and kubernetes runners keep them apart)`];
   return [
+    // jig without --sandbox uses its sandbox where it can, and runs the commands on the machine where it can't.
+    ...(config.local?.allowUnsandboxed
+      ? ["local.allowUnsandboxed is set, so a local task whose jig can't make its sandbox (a check of it that fails or takes over 5 seconds) runs its commands directly on this machine, where they can read and write the database and the config: unset it to have such a task fail instead"]
+      : []),
     "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
     ...folders.flatMap(({ what, path }) => {
       const real = realOrSame(path);
@@ -386,6 +443,43 @@ function collect(metrics: ServiceMetrics, { store, runner, tenants, countsMs }: 
   metrics.poolIdle.onCollect(() => {
     if (runner.pool) metrics.poolIdle.set({}, runner.pool.stats().idle);
   });
+  // Only a store with a pool (Postgres's) has these.
+  metrics.dbPool.onCollect(() => {
+    const stats = store.poolStats?.();
+    if (stats) for (const state of ["open", "idle", "waiting"] as const) metrics.dbPool.set({ state }, stats[state]);
+  });
+}
+
+/**
+ * What says why the store can't serve requests, for /readyz: its ping failed, or took over READY_PING_MS.
+ * One ping at a time: while one hangs, as with a database that doesn't answer, each probe waits on it rather
+ * than start another, which would take another of the pool's connections; the pool's own timeouts end it.
+ * The error itself goes only to the log: /readyz answers anyone, and a connection's error can name the
+ * database's host.
+ */
+function storeChecker(store: Store): () => Promise<{ why?: string; err?: unknown }> {
+  let out: { at: number; ping: Promise<void> } | undefined;
+  return async () => {
+    if (!store.ping) return {};
+    if (!out) {
+      const ping = Promise.resolve().then(() => store.ping!());
+      out = { at: Date.now(), ping };
+      ping.then(
+        () => (out = undefined),
+        () => (out = undefined),
+      );
+    }
+    const { at, ping } = out;
+    let timer: NodeJS.Timeout | undefined;
+    const late = new Promise<"late">((done) => (timer = setTimeout(() => done("late"), Math.max(0, at + READY_PING_MS - Date.now()))));
+    try {
+      return (await Promise.race([ping, late])) === "late" ? { why: `the database didn't answer within ${READY_PING_MS} ms` } : {};
+    } catch (err) {
+      return { why: "the database can't be reached", err };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
 }
 
 /** Listens, and gives the address it listens on as a URL. */
@@ -418,7 +512,7 @@ function runnerFor(config: Config, secret: string, internalBaseUrl: string, log:
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
     const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
-    return new LocalRunner({ ...shared, hidden, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+    return new LocalRunner({ ...shared, hidden, sandbox: !config.local?.allowUnsandboxed, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
   if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
@@ -468,6 +562,21 @@ function notHostname(host: string): boolean {
   return host.endsWith(".") || URL.parse(`http://${host}/`)?.hostname !== host.toLowerCase();
 }
 
+/** What is wrong with the config's databasePool: it sizes Postgres's pool, and SQLite has none. */
+function databasePoolProblem(pool: unknown, database: string): string | undefined {
+  if (pool === undefined) return undefined;
+  if (!isObject(pool)) return "databasePool must be an object, {max, acquireTimeoutMs}";
+  if (!/^postgres(ql)?:\/\//.test(database)) return "databasePool is for a Postgres database (postgres://...): SQLite has no pool";
+  // The pool's other options (its query timeout among them) are the service's to set, not the config's.
+  const other = Object.keys(pool).find((key) => !["max", "acquireTimeoutMs"].includes(key));
+  if (other !== undefined) return `databasePool.${other} isn't a pool setting: max or acquireTimeoutMs`;
+  for (const [name, least, most] of [["max", 1, 1_000], ["acquireTimeoutMs", 100, 600_000]] as const) {
+    const value = pool[name];
+    if (value !== undefined && !(Number.isInteger(value) && (value as number) >= least && (value as number) <= most)) return `databasePool.${name} must be a whole number from ${least} to ${most}, not ${JSON.stringify(value)}`;
+  }
+  return undefined;
+}
+
 /** Throws with what is wrong if the config isn't one the service can run with. */
 export function checkConfig(config: Config): void {
   const problem = configProblem(config);
@@ -500,6 +609,7 @@ function configProblem(config: Config): string | undefined {
   const problem =
     (config.region === undefined || (typeof config.region === "string" && /^[a-z0-9]{1,16}$/.test(config.region)) ? undefined : `region must be 1 to 16 lowercase letters and digits, not ${JSON.stringify(config.region)}`) ??
     text("database", config.database, true) ??
+    databasePoolProblem(config.databasePool, config.database) ??
     text("dataDir", config.dataDir, true) ??
     text("gatewayBaseUrl", config.gatewayBaseUrl, true) ??
     http("gatewayBaseUrl", config.gatewayBaseUrl) ??
@@ -523,12 +633,17 @@ function configProblem(config: Config): string | undefined {
     (config.local?.hiddenPaths === undefined || (Array.isArray(config.local.hiddenPaths) && config.local.hiddenPaths.every((path) => typeof path === "string" && isAbsolute(path)))
       ? undefined
       : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
+    (config.local?.allowUnsandboxed === undefined || typeof config.local.allowUnsandboxed === "boolean" ? undefined : "local.allowUnsandboxed must be true or false") ??
+    // Without a sandbox a task's commands can read and write every other task's folder. The docker and
+    // kubernetes runners don't read it.
+    (runner === "local" && config.local?.allowUnsandboxed && Array.isArray(config.tenants) && config.tenants.length > 1 ? "local.allowUnsandboxed needs a single tenant: without a sandbox, a task's commands can read and change the other tenants' tasks" : undefined) ??
     whole("maxBodyBytes", config.maxBodyBytes, 1) ??
     positive("heartbeatSeconds", config.heartbeatSeconds, false, 3_600) ??
     text("replicaId", config.replicaId, false) ??
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
+    whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
     (runner === "docker" ? (text("docker.image", config.docker?.image, true) ?? text("docker.network", config.docker?.network, true)) : undefined) ??
@@ -562,6 +677,7 @@ function configProblem(config: Config): string | undefined {
       (tenant.budgetUsd === null ? undefined : positive(`${at}.budgetUsd`, tenant.budgetUsd)) ??
       whole(`${at}.maxQueued`, tenant.maxQueued, 0) ??
       whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1, MAX_SECONDS) ??
+      whole(`${at}.maxStreams`, tenant.maxStreams, 1) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
       text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
       (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
@@ -594,6 +710,10 @@ interface Context {
   adminKey?: Buffer;
   now: () => Date;
   metrics: ServiceMetrics;
+  /** The most event streams open at once on this replica, across tenants. */
+  maxStreams: number;
+  /** The event streams open on this replica: in all, and each tenant's. */
+  streams: { open: number; byTenant: Map<string, number> };
 }
 
 const sha256 = (text: string) => createHash("sha256").update(text).digest();
@@ -642,7 +762,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   if (req.method !== "GET") return reply(res, 405, { error: "Use GET" });
   const after = req.headers["last-event-id"] ?? url.searchParams.get("after") ?? "0";
   if (typeof after !== "string" || !/^\d{1,9}$/.test(after)) return reply(res, 400, { error: "Last-Event-ID and after must be an event's seq" });
-  return streamEvents(req, res, task, Number(after), context, request);
+  return streamEvents(req, res, task, Number(after), tenant, context, request);
 }
 
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
@@ -879,27 +999,45 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
  * its events as they are stored, or on another, whose events and end the store announces; while it can't
  * (SQLite, or a lost connection to Postgres), the store is read again every second. Stored events are read
  * a page at a time (EVENTS_PAGE of them, or PAGE_BYTES), and the next page only once the client has taken
- * the last: a slow client or one that stops reading holds a page, not the task's events.
+ * the last: a slow client or one that stops reading holds a page, not the task's events. So that many
+ * such streams can't run the replica out of memory, and every tenant's runs on it with it, a tenant may have
+ * its maxStreams open on the replica at once, and the replica the config's: past either, it is a 429.
  */
-async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, { store, scheduler, heartbeatMs, metrics }: Context, request: ServedRequest): Promise<void> {
+async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Task, after: number, tenant: Tenant, context: Context, request: ServedRequest): Promise<void> {
+  const { store, scheduler, heartbeatMs, metrics, maxStreams, streams } = context;
+  // A client that went away while its tenant and task were read has had its response's close, or its
+  // connection's, already: a stream counted now, or followed, would never be let go.
+  if (res.destroyed || req.socket.destroyed) return;
+  // Counted and taken in one go, with no wait between, so streams asked for at once can't all slip past.
+  const mine = streams.byTenant.get(tenant.id) ?? 0;
+  const most = tenant.limits.maxStreams ?? DEFAULT_LIMITS.maxStreams;
+  const full = mine >= most ? { error: `The tenant has ${most} event streams open, the most it may`, limit: most, open: mine } : streams.open >= maxStreams ? { error: `The service has ${maxStreams} event streams open, the most it may`, limit: maxStreams, open: streams.open } : undefined;
+  if (full) return reply(res, 429, full, { "retry-after": "5" });
+  streams.open++;
+  streams.byTenant.set(tenant.id, mine + 1);
+  metrics.eventStreams.inc({ tenant: tenant.id });
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", "x-accel-buffering": "no" });
+  const socket = req.socket;
   let last = after;
   let ended = false;
+  let freed = false;
   // False once what is written waits for the client: no more is written until it has taken it.
   const send = (seq: number, json: string): boolean => {
     if (seq <= last || ended || res.destroyed) return true;
     last = seq;
     return res.write(`id: ${seq}\ndata: ${json}\n\n`);
   };
-  // Until the client has taken what is written, or is gone.
+  // Until the client has taken what is written, or is gone (its response closed, or its connection).
   const drained = () =>
     new Promise<void>((done) => {
-      if (res.closed || !res.writableNeedDrain) return done();
+      if (freed || res.closed || !res.writableNeedDrain) return done();
       const go = () => {
         res.off("drain", go).off("close", go);
+        socket.off("close", go);
         done();
       };
       res.on("drain", go).on("close", go);
+      socket.once("close", go);
     });
   const end = (status: TaskStatus) => {
     if (ended) return;
@@ -912,31 +1050,43 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   // asked for while another waits to start is that one, which will read what this would.
   let reading = Promise.resolve();
   let waiting = false;
+  // The last read failed: it is made again on the next second, as the store may announce nothing more (a
+  // task that has ended), and the stream would never end.
+  let failed = false;
   const pull = () => {
     if (waiting) return;
     waiting = true;
     reading = reading
       .then(async () => {
         waiting = false;
+        failed = false;
         if (ended || res.destroyed) return;
         const { status } = (await store.task(task.id))!;
         for (;;) {
-          const events = await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES);
-          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
-          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          // As JSON, with the parsed events let go, and each event let go once written: a stream that waits
+          // for its client holds only what it has yet to write, not the whole page beside what it wrote.
           let bytes = 0;
-          for (const { seq, event } of events) {
+          const page: ({ seq: number; json: string } | undefined)[] = (await store.events(task.id, last, EVENTS_PAGE, PAGE_BYTES)).map(({ seq, event }) => {
             const json = JSON.stringify(event);
             bytes += Buffer.byteLength(json);
+            return { seq, json };
+          });
+          // A page with fewer events than asked for is the last, unless its JSON came to PAGE_BYTES: the
+          // store may have stopped it there. (An event's JSON is what the store keeps, so it counts the same.)
+          const final = page.length < EVENTS_PAGE && bytes < PAGE_BYTES;
+          for (let i = 0; i < page.length; i++) {
+            const { seq, json } = page[i]!;
+            page[i] = undefined;
             if (!send(seq, json)) await drained();
           }
           if (ended || res.destroyed) return;
-          if (events.length < EVENTS_PAGE && bytes < PAGE_BYTES) break;
+          if (final) break;
         }
         if (FINISHED.has(status)) end(status);
       })
       .catch((err: unknown) => {
-        metrics.storeErrors.inc({ retried: "false" });
+        failed = true;
+        metrics.storeErrors.inc({ retried: "true" });
         request.log.error("couldn't read the task's events", { tenant: task.tenant, task: task.id, err });
       });
   };
@@ -949,7 +1099,7 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
   store.changes.on("done", changed);
   store.changes.on("resync", pull);
   const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), heartbeatMs);
-  const poll = setInterval(() => store.live || pull(), 1000);
+  const poll = setInterval(() => (store.live && !failed) || pull(), 1000);
   const cleanup = () => {
     scheduler.updates.off(task.id, follow);
     store.changes.off("event", changed);
@@ -958,7 +1108,25 @@ async function streamEvents(req: IncomingMessage, res: ServerResponse, task: Tas
     clearInterval(heartbeat);
     clearInterval(poll);
   };
-  res.on("close", cleanup);
+  // Let go once, when the response closes, whether the stream ended or its client went away, or when its
+  // connection does: a response that waits behind another on its connection (requests sent one behind
+  // another) has no close when the connection goes. A connection kept alive serves many requests, so the
+  // listener on it goes too.
+  const free = () => {
+    if (freed) return;
+    freed = true;
+    res.off("close", free);
+    socket.off("close", free);
+    ended = true;
+    cleanup();
+    streams.open--;
+    const left = streams.byTenant.get(tenant.id)! - 1;
+    if (left) streams.byTenant.set(tenant.id, left);
+    else streams.byTenant.delete(tenant.id);
+    metrics.eventStreams.dec({ tenant: tenant.id });
+  };
+  res.once("close", free);
+  socket.once("close", free);
   // Followed before the stored events are read, so none falls between the two.
   pull();
   await reading;

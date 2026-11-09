@@ -56,6 +56,7 @@ start: its keys stop working, and its queued tasks are cancelled. Also: `graceSe
 program and first arguments that start jig: this checkout's `src/cli.ts` by default), `gitProtocols`
 (`["https"]`), `gitHosts` (the hosts a `workspace.git` may be on: any, without it; another is a 400; below),
 `local.hiddenPaths` (absolute paths the local runner's tasks' commands can't read either, below),
+`local.allowUnsandboxed` (false: whether the local runner may run with no sandbox, below),
 `maxBodyBytes` (1 MiB) and `heartbeatSeconds` (15), and `runner`: `local` (the default),
 `docker` or `kubernetes`, with its settings in a `docker` or `kubernetes` block. `maxEvents` (10,000) is
 the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the most bytes of them, as JSON:
@@ -76,8 +77,19 @@ it is). A tenant's `concurrency` 0 holds its tasks queued.
 
 ### The API
 
-Every request but `GET /healthz` takes a tenant's key, `Authorization: Bearer <key>` (401 without one). A
-tenant sees only its own tasks: another's is a 404, as one that doesn't exist is.
+Every request but `GET /healthz` and `GET /readyz` takes a tenant's key, `Authorization: Bearer <key>` (401
+without one). A tenant sees only its own tasks: another's is a 404, as one that doesn't exist is.
+
+`GET /healthz` says only that the process is up: always 200, `{"ok": true, "region"}`. `GET /readyz` says
+whether to send it requests: 200 `{"ok": true, "region"}` once its scheduler has started and while its
+store answers a `SELECT 1` within 2 seconds (what it said is kept for a second, however many ask), else
+503 `{"ok": false, "region", "why"}`: still starting, stopping (from the moment it is told to stop), or
+the database can't be reached or didn't answer in time. The database's own error goes to the log, not to
+`why`, as anyone may ask. One `SELECT 1` is out at a time: while the database doesn't answer, a later ask
+waits on the same one rather than take another of the pool's connections, and once it has had its 2
+seconds the answer is a 503 at once. A replica whose Postgres is down still answers its `/healthz`, but
+would answer the tenants with 500s: a load balancer, Kubernetes and the router (Several regions, below) go
+by `/readyz`.
 
 ```bash
 # A task: the prompt, and maybe its files or a repository to clone; maxSteps, timeLimit (seconds) and model
@@ -112,7 +124,16 @@ ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
 the last. So it goes at the client's pace, and a client that reads slowly or not at all holds a page of
 events in the service, not all of them. Events that come as the task runs wait in the store too while
-the client is behind.
+the client is behind. A read of the store that fails is made again a second later, so a stream still ends
+once its task has.
+
+So that enough such streams can't run a replica out of memory, and every tenant's runs on it with it, a
+tenant may have its `maxStreams` (20) event streams open at once on a replica, and a replica the config's
+top-level `maxStreams` (200) across tenants. Past either, a stream is refused before any of its events is read,
+with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open, the most it may", "limit":
+20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
+goes away, even one asked for behind another request on the same connection. Each replica counts its own,
+in memory: behind a load balancer, a tenant may have its `maxStreams` open on each replica.
 
 A task is `queued`, then `running`, then one of:
 
@@ -139,18 +160,44 @@ queue doesn't slow the service. A task is claimed in the store (`queued` to `run
 it never runs twice, and the running tasks are counted there, so replicas sharing the store keep to the
 caps together (below).
 
-A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the
-lease is renewed every third of that while the run goes on. A task whose lease ran out has lost its
-replica (it crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it
-first, at its start or as it renews its own; it isn't run again, since its workspace is half changed, and
-what was still queued runs. So a crashed service's tasks end up to `leaseSeconds` after it is gone, and a
-service that restarts finds them so. A replica that finds it no longer holds a task it runs (its lease ran
-out while the database was away) stops the run. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
+A running task is leased to the service (the replica) that runs it, for `leaseSeconds` (30), and the lease
+is renewed every third of that while the run goes on. A task whose lease ran out has lost its replica (it
+crashed, was killed, or lost the database) and is marked `error` by whichever replica sees it first, as it
+renews its own; it isn't run again, since its workspace is half changed, and what was still queued runs. So
+a crashed service's tasks end up to `leaseSeconds` after it is gone, and a service that restarts ends them
+in its first round, a third of `leaseSeconds` after it starts. A replica that finds it no longer holds a
+task it runs (its lease ran out while the database was away) stops the run. After a round of renewals that
+failed, or that took longer than two thirds of `leaseSeconds` (its queries hung while the database was cut
+off, and went through once it came back), a replica's next round that gets through in time renews its
+leases and ends no task; the round after ends those whose lease ran out. A replica that starts ends no task
+before its first round either. So when the database was lost or hung for every replica for longer than a
+lease, each has a third of `leaseSeconds` after the first gets through again to renew its own before
+another ends them, and that holds for a replica that starts as it comes back too. A round that takes longer
+than a third of `leaseSeconds` is logged as a warning. One that takes up to two thirds still ends tasks,
+but not those whose lease ran out within what it took past a third: its queries may have hung while the
+database was cut off for a shorter time, which another replica's lease ran out in. So a database that is
+always slow still has a crashed replica's tasks ended, that much later. And while rounds fail
+on and off, a crashed replica's tasks aren't ended until two in a row get through, or a replica's start
+and its first round do. A SIGTERM or Ctrl+C kills the runs and marks them `error`;
 the service claims no more tasks from the moment it starts to stop, so one posted meanwhile stays queued,
 for another replica or the next start. The replica that ends a crashed one's task stops what its runner can
-reach of the run (a Kubernetes Job, or a Docker container on its own daemon, below), which would otherwise
-go on spending; a local run a crashed service started can outlive it, until jig's own `--time-limit` stops
-it.
+reach of the run (a Kubernetes Job, a Docker container on its own daemon, or on Linux a local jig on its own
+machine, below), which would otherwise go on spending. For a local jig that means the same machine and the
+same `dataDir`: the run's `run.json` is in its task's folder there.
+
+A task's folder (`dataDir/tasks/<id>`) is removed as its outcome is stored, so a service that crashed, was
+killed or lost its machine leaves the folders of the tasks it ran. The scheduler sweeps them, with the
+local and Docker runners, which list the folders: at each start, and every tenth round of renewals (none
+while a replica waits out a round after a failure, above). A folder whose task ended over `leaseSeconds`
+ago is removed. So is one whose task the store doesn't have, once neither the folder nor a file directly in
+it has changed for `leaseSeconds`, or 10 minutes if that is longer. Before it removes a folder, the
+scheduler has its runner's `abandon` stop what it can reach of the run, where the runner has one. A queued
+or running task's folder is kept, as is a warm worker's (`pool_<hex>`, below), and with `keepTaskDirs` none
+is removed. The sweep at start runs while the service already takes requests, one folder at a time, and a
+stop waits for the folder it is on. Each removal is counted in `jig_service_task_folders_removed_total`.
+Replicas that share a `dataDir` must share the database too: a service with a database of its own takes the
+others' folders for leftovers, and removes those that haven't changed for 10 minutes, a quiet run's among
+them.
 
 A write of a run's events, approvals or outcome that fails (a dropped connection, a failover) is tried
 again, after 100 ms and then twice as long each time up to 2 s, until half of `leaseSeconds` has gone by
@@ -182,9 +229,19 @@ and it connects again. Each connection asks the server to end a transaction left
 (`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
 lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
-out, and stops their Jobs or containers (above); the others go on. SQLite takes several processes on one
-machine too, with no announcements: streams read it every second, and a cancel is found as leases are
-renewed.
+out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
+longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
+ends another's, as does one that starts then (above), and the folders a crashed replica left are swept
+(above). SQLite takes several processes on one machine too, with no announcements: streams read it every
+second, and a cancel is found as leases are renewed.
+
+Each replica opens at most 10 connections to Postgres (and one more, which listens), and a query waits for
+one while all are in use, 10 seconds at most: past that it fails as one that took too long does, so the
+scheduler tries it again within its lease's deadline rather than wait on, and a request gets a 500.
+`"databasePool": {"max": 20, "acquireTimeoutMs": 5000}` sets both (`max` 1 to 1,000, `acquireTimeoutMs`
+100 to 600,000; no other key); it is only for a Postgres database. Count `max` plus one per replica against
+the server's `max_connections`. `jig_service_db_pool_connections` (Metrics and logs) shows the connections
+open and idle, and the queries waiting for one.
 
 ### Approvals
 
@@ -294,6 +351,8 @@ With a `metrics` block, `{"host", "port"}` (host 127.0.0.1 by default), each rep
 Prometheus's text format on a listener of its own, which answers only `GET /metrics` and `GET /healthz`:
 apart from the tenants' API, and from the internal listener the tasks reach. Without the block there is
 none. A label is never a key, a token, a prompt or a task's id: a route is its template (`/v1/tasks/:id`).
+The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors` leaves them out: a
+`/readyz` that answers 503 is a replica that can't reach its database, not a tenant's request that failed.
 
 | metric | what |
 |--------|------|
@@ -305,7 +364,10 @@ none. A label is never a key, a token, a prompt or a task's id: a route is its t
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
 | `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
+| `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above), at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
+| `jig_service_db_pool_connections{state}` | on Postgres, the replica's connections to it: `open` (in use or idle), `idle`, and `waiting`, the queries waiting for one |
+| `jig_service_event_streams{tenant}` | event streams open on this replica (`maxStreams`), the config's tenants at 0 from the start |
 | `jig_service_tasks{tenant,status}`, `jig_service_queue_oldest_seconds{tenant}` | tasks `queued` and `running`, and how long each tenant's oldest queued task has waited |
 | `jig_service_approvals_pending`, `jig_service_replicas` | approvals of running tasks waiting for an answer, and the replicas up |
 
@@ -382,7 +444,7 @@ jig printed. The folder is removed once the task has ended and its outcome is st
 `keepTaskDirs`), as the Docker runner's is. jig runs as
 
 ```
-jig --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
+jig --sandbox --yes --model <model> --base-url <gatewayBaseUrl> --max-steps <n> --time-limit <s>
     --events <dir>/events.jsonl --stats <dir>/stats.json -C <dir>/work -
 ```
 
@@ -396,6 +458,22 @@ in, the service's checkout say, for the task's, and the sandbox doesn't let comm
 before the dot, keyed by `JIG_GATEWAY_SECRET`), good until the time limit, the grace and a minute more. No
 provider key, and nothing else of the service's, reaches it. The runner reads the events file as jig
 writes it, into the store and to the streams.
+
+`--sandbox` makes jig fail with `No sandbox: ...` when it can't make its sandbox (bubblewrap missing, or a
+check of it that fails or takes over 5 seconds), so the task ends as an `error` rather than run its
+commands, with `--yes`, directly on the machine, where they could read and write the database and the
+other tasks' folders. For the same reason the service doesn't start on the local runner where jig has no
+sandbox, and says why. `"local": {"allowUnsandboxed": true}` lets it, and runs jig without `--sandbox`
+(which uses its sandbox where it can, and runs the commands on the machine where it can't): only with a
+single tenant, whose tasks may then reach the service's files. The other runners don't read it.
+
+The runner writes the run's process to `run.json` in the task's folder: its pid and host, and on Linux the
+boot's id and the process's start time. jig runs detached, so a service that crashes, or is killed, leaves
+it running; when the task's lease has run out, the service that ends it (the same one restarted, say)
+reads `run.json` from its own `dataDir`, so it has to have the same one. It sends jig's process group
+SIGTERM, then SIGKILL after 5 seconds, if it is on the same host and boot and a process by that pid started
+when jig did (so not another that has its pid since). On macOS, where there is no start time to check, it
+does nothing, and the run goes on until jig's own `--time-limit` stops it.
 
 jig's sandbox lets a task's commands read the whole machine and write the temp folders (`/tmp`, `/var/tmp`
 and `$TMPDIR`), so the runner writes the task's jig user settings (`home/.jig/settings.json`) with
@@ -427,11 +505,12 @@ tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (
 
 The service warns at the start of what the tasks' commands can still read and connect to, when the local
 runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
-home, whose git config jig's own git reads outside the sandbox), and when there is no sandbox
-(`bubblewrap` missing, say), as then commands run directly on the machine. It also warns when the config's
-folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's home directory: hiding it
-would break the tasks' commands, so keep the config in a folder of its own and `dataDir` out of that
-checkout.
+home, whose git config jig's own git reads outside the sandbox), and when `local.allowUnsandboxed` is set.
+Then it says that a task whose jig can't make its sandbox runs its commands directly on the machine, or,
+when there is no sandbox at all (`bubblewrap` missing, say), that every task's commands do. It also
+warns when the config's folder or one of the checkouts above is `/`, `/etc`, `/usr` or the service user's
+home directory: hiding it would break the tasks' commands, so keep the config in a folder of its own and
+`dataDir` out of that checkout.
 
 ### The Docker runner
 
@@ -499,6 +578,18 @@ labelled with its task's id (`jig.dev/task`) and its tenant's (`jig.dev/tenant`)
 a label's value (over 63 characters, with characters other than letters, digits, `-`, `_` and `.`, or not
 starting and ending with a letter or digit) is labelled `h-` and 40 hex digits of its SHA-256 instead, and
 the id itself is in the Job's `jig.dev/tenant` annotation.
+
+A POST of a Job or its Secret that the API server answers 429 (API Priority and Fairness, while a backlog
+drains), 500, 502, 503 or 504, or that gets no answer in 30 s or a dropped connection, is asked again:
+after 250 ms, doubling up to 5 s, or after the `Retry-After` of a 429 or 503 if that is longer (at most
+10 s). Each retry is a warning in the log. No retry is made that would start 60 s or more after the first
+POST, but the last one made can still take its own 30 s past that. None is made once the service is
+stopping either. A POST that failed may still have made the object, so a 409 after a retry is taken as its
+doing: the Job is read back and used only if it has the task's labels, and the Secret, which the service
+may make but not read, is taken by its name. A 409 to the first POST, or any other refusal, fails the task
+at once. If the Job can't be made after a retry, it is read back and deleted if it has the task's labels.
+If its Secret can't be made, the Job is deleted. So no pod waits for a Secret until its deadline holding
+what it requests. A warm worker's Job and Secret are made the same way.
 
 ```json
 "runner": "kubernetes",
@@ -920,9 +1011,12 @@ it as `task`; a client that leaves before its new task's body is read gets no an
   answered nor counted.
 - Anything else goes to the home.
 
-**Health and failover.** The router asks each region's `/healthz` every `intervalMs`; one that fails
-`failures` times in a row (no answer in 2 seconds, not 200, or another region's name) is down until it
-answers again. While a tenant's home is down, a new task that names no region goes, if the tenant has
+**Health and failover.** The router asks each region's `/readyz` every `intervalMs`; one that fails
+`failures` times in a row (no answer in 3 seconds, not 200, or another region's name) is down until it
+answers again. So a region whose database is down is down, though its `/healthz` answers; its `/readyz`
+waits 2 seconds at most for the database, so the router hears its 503 and logs why. A region whose
+`/readyz` answers 404 or 401, a service from before it, is asked its `/healthz` instead, and the router
+logs that once. While a tenant's home is down, a new task that names no region goes, if the tenant has
 `failover`, to the first region in `regions` that is up and that it may use; otherwise, and for a task that
 names the region that is down, it is 503 with the region and `retry-after`. A task never fails over: it
 runs where it was made, and while its region is down it can't be read, streamed or cancelled (503), since
@@ -951,9 +1045,13 @@ account with a Role to run Jobs, the tasks' account with none, the NetworkPolici
 the tasks may reach, and who may reach the service and the gateway), a gVisor RuntimeClass and
 the service's config; the gateway's config (`jig-gateway-config`) is beside the service's, and the Secrets
 (`jig-secrets` with `gateway-secret`, `jig-database` with `url`, the Postgres URL, and `jig-provider-keys`)
-are yours to make. The service runs two replicas on that database. The gateway runs two replicas too,
-sharing the Redis in `deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts,
-as a lone gateway's restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
+are yours to make. The service runs two replicas on that database, each ready (its readinessProbe, `GET
+/readyz`, which waits 3 seconds for the answer) only while it reaches it, so the Service sends requests to
+those that do; there is no liveness probe, as a restart wouldn't bring the database back. Each has 2 GiB of
+memory at most and Node's heap held to 1.5 GiB (`NODE_OPTIONS`), which `maxStreams` streams of 4 MiB pages
+fit in: raise them together. The gateway runs two replicas too, sharing the Redis in
+`deploy/k8s/redis.yaml`, which has no disk of its own: its restart forgets the counts, as a lone gateway's
+restart would. For spending that must last, use a managed Redis (not in cluster mode) instead, or give that
 one a volume and `--appendonly yes`, and set its URL in the gateway's config. The Compose file runs one
 gateway, with a Redis that keeps its data in a volume, so a restart of either forgets nothing.
 
