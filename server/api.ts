@@ -962,6 +962,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
       const problem = workspaceProblem(path);
       if (problem) return `workspace.files: ${JSON.stringify(path)} ${problem}`;
       if (typeof contents !== "string") return `workspace.files: ${JSON.stringify(path)} must have a string as its contents`;
+      // As for the prompt. A path with one is refused above; a spec holding one once broke Postgres's ledger.
+      if (contents.includes("\0")) return `workspace.files: ${JSON.stringify(path)} must not hold a NUL character (\\u0000) in its contents`;
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";

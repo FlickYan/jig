@@ -452,4 +452,89 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual(await seqs(0, 2, 100 * size), [1, 2]);
     assert.deepEqual(await seqs(7, 100, 100 * size), [8, 9, 10]);
   });
+
+  // A spec is stored as it came, and a JSON operator over one that holds "\u0000" anywhere is an error
+  // (22P05): the ledger, written in the statement that ends a task, once read the model that way.
+  const LIMITS = { concurrency: 5, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+  const PLAIN = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+  const WITH_NUL = { ...PLAIN, workspace: { files: { "a.bin": "x\u0000y" } } };
+  const TERMS = { owner: "r1", leaseMs: 60_000, concurrency: 10, tenantConcurrency: 10 };
+  const OUTCOME = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: { input: 3, cacheRead: 0, cacheWrite: 0, output: 2 }, cost: 0.25 };
+  const byModel = { from: "2000-01-01", to: "2999-12-31", group: ["model" as const] };
+
+  it("finishes and cancels a task whose files hold a NUL, with its model in the ledger", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const run = await store.createTask("a", WITH_NUL);
+    const queued = await store.createTask("a", WITH_NUL);
+    assert.equal(((await store.claim("a", TERMS)) as { id: string }).id, run.id);
+    assert.equal(await store.finish(run.id, "r1", OUTCOME), true);
+    assert.equal(await store.cancelQueued(queued.id), true);
+    assert.deepEqual((await store.task(run.id))!.spec.workspace, WITH_NUL.workspace);
+    assert.deepEqual((await store.tasks("a")).map((task) => task.status), ["cancelled", "succeeded"]);
+    const [row, ...rest] = await store.usage(byModel);
+    assert.deepEqual(rest, []);
+    assert.deepEqual({ model: row.model, tasks: row.tasks, input: row.input, output: row.output }, { model: "deepseek-flash", tasks: 2, input: 3, output: 2 });
+  });
+
+  it("ends every tenant's lapsed tasks though one tenant's holds a NUL", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "b", limits: LIMITS }, []);
+    const bad = await store.createTask("a", WITH_NUL);
+    const other = await store.createTask("b", PLAIN);
+    // Leases that ran out a second before they were given.
+    for (const tenant of ["a", "b"]) await store.claim(tenant, { ...TERMS, leaseMs: -1000 });
+    assert.deepEqual((await store.expire("its replica is gone")).sort(), [bad.id, other.id].sort());
+    assert.equal((await store.task(other.id))!.status, "error");
+    assert.equal((await store.task(bad.id))!.status, "error");
+    assert.deepEqual(await store.inStatus("running"), []);
+  });
+
+  it("cancels the queued tasks of a tenant removed from the config though one holds a NUL", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "gone", limits: LIMITS }, []);
+    const kept = await store.createTask("a", PLAIN);
+    const bad = await store.createTask("gone", WITH_NUL);
+    const plain = await store.createTask("gone", PLAIN);
+    assert.equal(await store.retireTenants(["a"]), 2);
+    assert.deepEqual([(await store.task(bad.id))!.status, (await store.task(plain.id))!.status, (await store.task(kept.id))!.status], ["cancelled", "cancelled", "queued"]);
+  });
+
+  it("moves a database on whose tasks already hold a NUL, and ends them", async () => {
+    const url = await postgresDatabase();
+    await (await openStore(url)).close();
+    const db = pool(url);
+    // As schema 5 left it: no model column, the model in the spec alone.
+    await db.query("ALTER TABLE tasks DROP COLUMN model");
+    await db.query("UPDATE jig_schema SET version = 5");
+    await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
+    const insert = (id: string, spec: object, status: string) => db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created, started) VALUES ($1, 'a', 'x', $2, $3, now(), now())", [id, JSON.stringify(spec), status]);
+    const { prompt: _, ...plain } = PLAIN;
+    const nul = { ...plain, workspace: WITH_NUL.workspace };
+    await insert("task_1", plain, "queued");
+    await insert("task_2", nul, "queued");
+    await insert("task_3", nul, "running");
+    await insert("task_4", plain, "running");
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 6);
+    // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
+    assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
+      { id: "task_1", model: "deepseek-flash" },
+      { id: "task_2", model: null },
+      { id: "task_3", model: null },
+      { id: "task_4", model: "deepseek-flash" },
+    ]);
+    assert.equal(await store.cancelQueued("task_1"), true);
+    assert.equal(await store.cancelQueued("task_2"), true);
+    assert.deepEqual((await store.expire("its replica is gone")).sort(), ["task_3", "task_4"]);
+    assert.deepEqual((await store.task("task_3"))!.spec.workspace, WITH_NUL.workspace);
+    const rows = await store.usage(byModel);
+    assert.deepEqual(rows.map((row) => [row.model, row.tasks]).sort(), [["", 2], ["deepseek-flash", 2]]);
+  });
 });

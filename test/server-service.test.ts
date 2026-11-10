@@ -436,6 +436,9 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(await refused("{"), /isn't JSON/);
     // Postgres text can't hold a NUL: it is refused on both stores, not stored on one and a 500 on the other.
     assert.match(await refused({ prompt: "hi\u0000there" }), /NUL/);
+    // Nor in a file: a spec that holds one broke Postgres's JSON operators, and git has no path with one.
+    assert.equal(await refused({ prompt: "hi", workspace: { files: { "a.bin": "x\u0000y" } } }), 'workspace.files: "a.bin" must not hold a NUL character (\\u0000) in its contents');
+    assert.match(await refused({ prompt: "hi", workspace: { files: { "a\u0000b": "x" } } }), /^workspace\.files: "a\\u0000b" .*NUL/);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(20_000) })).status, 413);
     assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body, { tasks: [] });
 

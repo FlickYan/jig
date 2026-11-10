@@ -55,7 +55,8 @@ const CREATE_LOCK = 7366;
 
 // Each entry moves the schema one version on (jig_schema counts them). Never edit one that has shipped:
 // add another. JSON is kept as `json`, which holds the text as it came, or as text: jsonb would turn away
-// a "\u0000" in a command's output.
+// a "\u0000" in a command's output. json's operators (->>, json_extract_path) turn one away too, anywhere in
+// the document, so no statement applies one to a document a tenant or a run wrote.
 const MIGRATIONS = [
   `CREATE TABLE tenants (id text PRIMARY KEY, limits json NOT NULL);
    CREATE TABLE api_keys (hash text PRIMARY KEY, tenant text NOT NULL REFERENCES tenants (id));
@@ -86,19 +87,27 @@ const MIGRATIONS = [
   `CREATE TABLE replicas (id text PRIMARY KEY, seen_until timestamptz NOT NULL);`,
   // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
   `CREATE INDEX usage_by_day ON usage (day);`,
+  // A task's model, for the ledger, which read it from the spec: an error (22P05) for a spec holding "\u0000",
+  // in the statement ending the task and so for every task that statement ended. Specs stored with one keep
+  // no model here (their ledger rows say ''): chr(92) is the backslash, however the session reads strings.
+  `ALTER TABLE tasks ADD COLUMN model text;
+   UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u0000') = 0;`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
 const NOTIFY_DONE = `SELECT id, pg_notify('${EVENTS}', json_build_object('task', id, 'done', status)::text) FROM done`;
 const IDS = "SELECT json_array_elements_text($1::json)";
 
+/** What a statement that ends tasks returns of each, for the ledger: the model from its column, not the spec. */
+const DONE = `${ENDED}, model`;
+
 /**
- * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING ENDED), in the statement that ends
+ * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING DONE), in the statement that ends
  * them, so in its transaction; `spent` is the SQL of input, output, cache_read, cache_write and cost_usd.
  */
 const ledger = (spent = "0, 0, 0, 0, 0") =>
   `ledger AS (INSERT INTO usage (task, tenant, day, model, status, input, output, cache_read, cache_write, cost_usd, seconds)
-     SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(spec->>'model', ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
+     SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(model, ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
      FROM done ON CONFLICT DO NOTHING)`;
 
 export class PostgresStore implements Store {
@@ -175,7 +184,7 @@ export class PostgresStore implements Store {
     return this.pool.transaction(async (db) => {
       await db.query(`DELETE FROM api_keys WHERE tenant NOT IN (${IDS})`, [json(keep)]);
       const { rows } = await db.query(
-        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
+        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`,
         [json(keep)],
       );
       return rows.length;
@@ -189,7 +198,7 @@ export class PostgresStore implements Store {
     // With caps, created at their `now`, the clock the quotas' days are read from, so it is counted on the
     // day they say; without, at the database's.
     const insert = async (db: Client) => {
-      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', coalesce($5, now())) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest), caps?.now ?? null]);
+      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, model, status, created) VALUES ($1, $2, $3, $4, $5, 'queued', coalesce($6, now())) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest), spec.model ?? null, caps?.now ?? null]);
       return toTask(rows[0]);
     };
     if (!caps) return insert(this.pool);
@@ -263,7 +272,7 @@ export class PostgresStore implements Store {
   async expire(error: string, graceMs = 0): Promise<string[]> {
     // The database's clock, not the replicas', says when a lease ran out.
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now() - $2 * interval '1 millisecond') RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
+      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now() - $2 * interval '1 millisecond') RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`,
       [error, graceMs],
     );
     return rows.map((row) => String(row.id));
@@ -278,7 +287,7 @@ export class PostgresStore implements Store {
   }
 
   async cancelQueued(id: string): Promise<boolean> {
-    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`, [id]);
+    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`, [id]);
     return rows.length === 1;
   }
 
@@ -286,7 +295,7 @@ export class PostgresStore implements Store {
     const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
     const { rows } = await this.pool.query(
       `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
-       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${ENDED}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
+       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${DONE}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
       [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd],
     );
     return rows.length === 1;
