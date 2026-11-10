@@ -155,7 +155,9 @@ describe("the local runner", { skip: sandboxProblem() }, () => {
     const { id } = (await call(started, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "app.py": "print(1)\n" } } })).body;
     assert.equal((await ended(started, id)).status, "succeeded");
     const task = join(checkout, "data", "tasks", id);
-    const { hiddenPaths } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    const { hiddenPaths, isolation } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    // On Linux the task's commands get a /tmp, /var/tmp and /run of their own, unless the config says shared.
+    assert.equal(isolation, process.platform === "linux" && full.local?.isolation !== "shared" ? "service" : undefined);
     return { etc, checkout, task, hiddenPaths: hiddenPaths as string[] };
   }
 

@@ -1814,7 +1814,8 @@ describe("the service's start", () => {
     await statusOf(started, id, "succeeded");
     const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
     const db = join(dir, "jig.db");
-    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
+    // And, on Linux, that ask jig for a /tmp, /var/tmp and /run of the task's own (see test/server-local.test.ts).
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir], ...(process.platform === "linux" && { isolation: "service" }) });
   });
 
   it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", { skip: sandboxProblem() }, async () => {

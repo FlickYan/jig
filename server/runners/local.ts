@@ -15,11 +15,14 @@ import type { Task, Tenant, Workspace } from "../store.ts";
 // them, all but the task's own project and home (see tools/util.ts's keptIn), and what `hidden` lists (the
 // database, the config's folder): another task's folder, the events and stats files and the database are
 // out of their reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so
-// that is the task's own: in a shared one, other tasks' commands could read them, and write them. What they
-// still share is the machine: its kernel, /tmp and /var/tmp by their paths, its Unix sockets, the rest of
-// what the service's user can read, and on macOS its processes and localhost. jig runs with --sandbox, so
-// one that can't make its sandbox fails, rather than run the task's commands directly on the machine, unless
-// the config turns that off (sandbox: false, local.allowUnsandboxed).
+// that is the task's own: in a shared one, other tasks' commands could read them, and write them. With
+// `isolation` (the config's local.isolation "service", the default on Linux) the settings ask jig for
+// isolation too: its commands then get a /tmp, /var/tmp, /run and IPC of the task's own (see src/sandbox.ts's
+// createSandbox), where without it they share the machine's /tmp and /var/tmp by their paths and every Unix
+// socket on it. What they share either way is the machine: its kernel, the Unix sockets outside those
+// folders, the rest of what the service's user can read, and on macOS its processes and localhost. jig runs
+// with --sandbox, so one that can't make its sandbox fails, rather than run the task's commands directly on
+// the machine, unless the config turns that off (sandbox: false, local.allowUnsandboxed).
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -43,6 +46,8 @@ export interface LocalRunnerConfig {
   hidden?: string[];
   /** Run jig with --sandbox, so a task whose jig can't make one fails (default: yes). */
   sandbox?: boolean;
+  /** Give each task's commands their own /tmp, /var/tmp, /run and IPC: jig's isolation "service" (default: no). */
+  isolation?: boolean;
   /** Where the runner's lines go (default: the service's log). */
   log?: Log;
 }
@@ -96,7 +101,8 @@ export class LocalRunner implements Runner {
     await mkdir(join(home, ".jig"), { recursive: true });
     await mkdir(join(home, "tmp"));
     const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
-    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
+    const settings = { hiddenPaths, ...(this.config.isolation && { isolation: "service" }) };
+    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
     await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
 
     const timeLimit = task.spec.timeLimit;

@@ -2,11 +2,11 @@ import assert from "node:assert/strict";
 import { constants } from "node:buffer";
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { appendFile, mkdir, readdir, readFile, realpath, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink, truncate as setSize, utimes, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { subagentPrompt, systemPrompt } from "../src/prompt.ts";
-import { lockedGitPaths, type Sandbox } from "../src/sandbox.ts";
+import { lockedGitPaths, type Sandbox, sharedPlaces } from "../src/sandbox.ts";
 import type { Mechanism } from "../src/stats.ts";
 import { bashTool, noTestsNote, OutputFiles, runCommand } from "../src/tools/bash.ts";
 import { editTool } from "../src/tools/edit.ts";
@@ -655,6 +655,35 @@ describe("hidden paths", () => {
       assert.equal(await readFile(join(other, "secret.txt"), "utf8"), "the other task's secret\n");
     } finally {
       process.env.HOME = was;
+    }
+  });
+
+  it("follow no link out of the project into the machine's /tmp under isolation, but for the session's own places", { skip: process.platform !== "linux" && "the settings' isolation is Linux's" }, async () => {
+    // With the settings' isolation commands don't see the machine's /tmp, so the file tools, which run
+    // outside the sandbox, hide the shared places too (see run.ts): all but the project and the home beside it.
+    const base = await mkdtemp("/tmp/jig-iso-");
+    const [project, home] = [join(base, "work"), join(base, "home")];
+    await mkdir(project);
+    await mkdir(home);
+    await writeFile(join(base, "theirs"), "another task's\n");
+    await writeFile(join(home, "note"), "the task's own\n");
+    await writeFile(join(project, "a.txt"), "in the project\n");
+    await symlink(join(base, "theirs"), join(project, "out"));
+    await symlink(join(home, "note"), join(project, "note"));
+    const was = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      ctx = { cwd: project, versions: new FileVersions(), hidden: sharedPlaces() };
+      await assert.rejects(read("out"), /^Error: out is hidden by the user's settings/);
+      await assert.rejects(write("out", "x\n"), /hidden by the user's settings/);
+      assert.match(await read("note"), /the task's own/);
+      assert.match(await read("a.txt"), /in the project/);
+      // Without it, such a link is read, as commands read what it leads to.
+      ctx = { cwd: project, versions: new FileVersions() };
+      assert.match(await read("out"), /another task's/);
+    } finally {
+      process.env.HOME = was;
+      await rm(base, { recursive: true, force: true });
     }
   });
 

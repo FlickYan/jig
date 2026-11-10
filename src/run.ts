@@ -28,7 +28,7 @@ import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { overview, type Part } from "./overview.ts";
 import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
 import { reviewer } from "./review.ts";
-import { createSandbox, lockedGitPaths, sandboxProblem } from "./sandbox.ts";
+import { createSandbox, lockedGitPaths, sandboxProblem, sharedPlaces } from "./sandbox.ts";
 import { SessionFile, sessionDir } from "./session.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust, type Hook, type HookEvent, type Settings } from "./settings.ts";
 import { proposeInstructionsTool } from "./instructions-proposals.ts";
@@ -345,8 +345,17 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   // gets one of its own, which ends a command's background jobs with the command. Said once, at the first command.
   const onFallback = () =>
     ui.notice("jig couldn't set up one process namespace for the whole session (bubblewrap is too old, or the kernel refused it), so each command gets its own: a job left in the background then ends with the command that started it.");
-  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths, onFallback }) : undefined;
+  // The settings' isolation: "service" (the local runner's, for each task): commands get a /tmp, /var/tmp,
+  // /run and IPC of the session's own, which only the sandbox can give them, so without one jig stops.
+  const isolated = settings.isolation === "service";
+  const sandbox = wantSandbox ? createSandbox(cwd, { network, dirs, hidden: settings.hiddenPaths, onFallback, isolated }) : undefined;
   if (values.sandbox && !sandbox) throw new Error(`No sandbox: ${sandboxProblem()}.`);
+  if (isolated && !sandbox) throw new Error(`No sandbox: ${wantSandbox ? sandboxProblem() : "it is turned off"}, and the settings' isolation needs one.`);
+  // The file tools run outside the sandbox, and only work in the project and the --add-dir directories. So
+  // all this stops is a symlink in one of those leading into the machine's /tmp, /run or /dev/shm, which
+  // commands no longer see; the session's own places there stay (see tools/util.ts's keptIn). The snapshots
+  // keep the settings' own list: what they leave out is the user's choice.
+  const hiddenForTools = [...settings.hiddenPaths, ...(isolated ? sharedPlaces() : [])];
   // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
   // Only the sandbox can hide paths: without it, commands can read everything the user can.
@@ -360,7 +369,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   const outputs = new OutputFiles();
   // --keep-inputs: the files that were there before each task, watched around its commands; its copies go
   // where the long outputs go. Off until benchmarks show whether it helps.
-  const inputs = values["keep-inputs"] ? new Inputs(cwd, { hidden: settings.hiddenPaths, outputs, count, notice: ui.notice }) : undefined;
+  const inputs = values["keep-inputs"] ? new Inputs(cwd, { hidden: hiddenForTools, outputs, count, notice: ui.notice }) : undefined;
   // When the run ends, the files go, and the session's keeper (sandbox.ts) ends with the whole PID namespace,
   // so a job a command left in the background dies too.
   state.cleanup.push(
@@ -384,7 +393,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
 
   // Extensions: skills, the MCP servers' tools, hooks, and subagents.
   // jig's own skills are for writing skills; a plain one-shot task (a benchmark's, say) sees only yours.
-  const skillOptions = { hidden: values["hide-skill"], hiddenPaths: settings.hiddenPaths, dirs, ...(taskText && !skillsVerb && { builtin: null }) };
+  const skillOptions = { hidden: values["hide-skill"], hiddenPaths: hiddenForTools, dirs, ...(taskText && !skillsVerb && { builtin: null }) };
   let { skills, warnings } = discoverSkills(cwd, undefined, skillOptions);
   for (const warning of warnings) ui.notice(warning);
   const mcp = await connectMcpServers(settings.mcpServers, cwd);
@@ -438,7 +447,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     tools: researchTools,
     cwd,
     dirs,
-    hidden: settings.hiddenPaths,
+    hidden: hiddenForTools,
     maxSteps: SUBAGENT_MAX_STEPS,
     compactAt: compactLimit,
     async authorize(tool, input) {
@@ -614,7 +623,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     tools,
     cwd,
     dirs,
-    hidden: settings.hiddenPaths,
+    hidden: hiddenForTools,
     gitLocked,
     // Not the subagents' or the reviewer's: they don't change files.
     checkWrites: values["check-writes"],
@@ -756,7 +765,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
       const write = own.find((tool) => tool.definition.name === "write_file");
       const decision = write && permissions.decide(write, {});
       const writable = decision === "allow" || decision === "ask";
-      const found = await overview(words, { cwd, dirs, hidden: settings.hiddenPaths, versions: conversation.versions, list, withheld: [...overviewOff.keys()], writable, signal });
+      const found = await overview(words, { cwd, dirs, hidden: hiddenForTools, versions: conversation.versions, list, withheld: [...overviewOff.keys()], writable, signal });
       if (!found) return undefined;
       if (found.text) count?.("overview");
       for (let i = 0; i < found.shown; i++) count?.("overview.file");
@@ -829,7 +838,7 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
    */
   function skillContent(skill: Skill): string | undefined {
     try {
-      return loadSkill(skill, settings.hiddenPaths, [cwd, ...dirs]);
+      return loadSkill(skill, hiddenForTools, [cwd, ...dirs]);
     } catch (err) {
       ui.notice((err as Error).message);
       return undefined;

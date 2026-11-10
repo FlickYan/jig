@@ -20,8 +20,9 @@ queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, ten
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
 own, which is what keeps tenants apart best: jig's sandbox keeps a local task's commands out of the
-database's files, the config's folder and the other tasks' folders (below), but they share the machine's
-kernel, its Unix sockets and whatever else the service's user can read.
+database's files, the config's folder and the other tasks' folders, and on Linux gives each a `/tmp` and
+`/run` of its own (below), but they share the machine's kernel, its other Unix sockets and whatever else
+the service's user can read.
 
 Run it with a config file and the secret it shares with the gateway:
 
@@ -488,22 +489,67 @@ bubblewrap puts an empty folder over `dataDir` and binds the two back as they we
 `dataDir` but for them. jig's file tools refuse the same paths. jig keeps a long command output, and
 `--keep-inputs`' copies, in `$TMPDIR`, which is why each task has its own there, in its home: in a shared
 one the other tasks' commands could read and write them. What the tasks still share is the machine: its
-kernel, `/tmp` and `/var/tmp` (where a command can still leave a file for another, by its path), and on
+kernel, without `local.isolation` (below) `/tmp` and `/var/tmp` (where a command can leave a file for
+another, by its path), and on
 macOS its processes and `localhost`: Seatbelt lets a command see and signal the processes of the user
 it runs as, the service's own among them, whose environment holds `JIG_GATEWAY_SECRET` and the provider
 key. So on macOS the local runner is for one tenant you trust; the Docker and Kubernetes runners keep
 tenants apart. On every system, outside the hidden paths, a command reads whatever the service's user can
 (its `~/.ssh`, `~/.aws`, `.pgpass`), and connects to the Unix sockets there (Docker's, a local Postgres's
-or Redis's, an ssh-agent's), which cutting the network off doesn't close. So run the service as a user of
+or Redis's, an ssh-agent's; with `local.isolation`, only those outside `/tmp`, `/var/tmp` and `/run`),
+which cutting the network off doesn't close. So run the service as a user of
 its own, with nothing it doesn't need, and list what else is secret in `local.hiddenPaths` (that user's home
 directory, say, unless the toolchains the tasks use are installed there). The config's folder is hidden
 when the service starts with `--config`; a program that calls `startService` itself passes the config's
 path as `configFile`.
 
+**`local.isolation`.** On Linux those settings also hold `"isolation": "service"` (README: settings), so a
+task's commands see nothing of the places a machine's users share whatever the file permissions say. This
+is the default there, and a change: local tasks no longer see the machine's `/tmp`, `/var/tmp` or `/run`.
+`"local": {"isolation": "shared"}` gives them back, as before; so does `local.allowUnsandboxed`, since
+only the sandbox can do it, and the two together are refused. With it:
+
+- `/tmp` and `/var/tmp` are the task's own, in one of two ways. With `dataDir` outside them, they are the
+  task's `$TMPDIR` (`home/tmp`), the same folder under three names, kept from one command to the next. With
+  `dataDir` in `/tmp` (or `/var/tmp`), that one is a new, empty folder for each command, with the task's
+  project, home and `$TMPDIR` bound on top: private too, but a file a command leaves in `/tmp` is gone
+  with it, so `$TMPDIR` is where to keep one (jig tells the model which it is). The service warns of it.
+- `/run` is empty (and `/var/run`), and `/dev/shm` each command's own. So there is no D-Bus, no
+  `docker.sock`, no socket in `/run/postgresql`: a database a task needs is one it starts itself. With the
+  network on, the file `/etc/resolv.conf` leads to is bound back if it is in `/run` (systemd-resolved's).
+- Each command has an IPC namespace of its own: System V shared memory, semaphores and queues, and POSIX
+  message queues, don't last from one command to the next, and never reach another task's.
+- The session's first process, whose root a command reaches through `/proc/1/root`, has the same empty
+  folders and a `/dev` of its own.
+- jig's file tools follow no link from the project into the machine's `/tmp`, `/run` or `/dev/shm`.
+
+A task's `/tmp` now lies in its folder, on `dataDir`'s volume, with no quota of its own: put `dataDir` on
+a file system of its own. Where bash or a folder on the service's `PATH` is in `/run` (NixOS keeps the
+system's programs in `/run/current-system`), every command would fail to start, so the service doesn't
+start, and says to set `local.isolation` to `"shared"`. What is left to share: the kernel; Unix sockets
+at paths elsewhere (one in the service user's home, say), which would take seccomp to refuse; whatever
+else the service's user can read; and the machine's loopback, for a task run with the network on. At its
+start the service reads `/proc/net/unix` once and names up to ten sockets that take connections outside
+those folders and the hidden paths: list their folders in `local.hiddenPaths`. macOS has none of this,
+and `"isolation": "service"` is refused there: Seatbelt's profile allows by default, so rules for `/tmp`,
+processes and `localhost` would be a claim nothing here could test, and one that fails to compile fails
+every command. There the local runner stays for one tenant you trust.
+
+Three things that went wrong on the way. The session's first process kept the machine's root, so with a
+private `/tmp` in each command, `cat /proc/1/root/tmp/<file>` still read the machine's, `/dev/shm` and the
+sockets in `/run` likewise: it now has its own. An empty `/tmp` for every command, the simple way, lost
+what a command left there for the next, which build tools do. And binding the task's `$TMPDIR` at `/tmp`
+whatever else was mounted there let a command make directories anywhere the service's user can:
+bubblewrap makes a mount's place if it is missing, following links, with the machine's files under
+`/oldroot`, so a link `../../oldroot/<folder>` left in `/tmp`, in the way of the next command's mount of
+`dataDir`, had it make them in that folder. So the folder is bound there only where nothing else is
+mounted in `/tmp`, and a hidden path there gets no mask; otherwise `/tmp` is empty for each command.
+
 The workspace's clone is the service's own, outside the sandbox and on the machine's network, though the
 tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (above).
 
-The service warns at the start of what the tasks' commands can still read and connect to, when the local
+The service warns at the start of what the tasks' commands can still read and connect to (with
+`local.isolation`, the Unix sockets by name), when the local
 runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
 home, whose git config jig's own git reads outside the sandbox), and when `local.allowUnsandboxed` is set.
 Then it says that a task whose jig can't make its sandbox runs its commands directly on the machine, or,
