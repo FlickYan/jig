@@ -310,10 +310,27 @@ must be set) is told of each approval as it is stored: a POST of `{"task": <id>,
 signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
 2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
 it. A redirect is not followed but counted as a failed try, as it could send the signed POST anywhere the
-service can reach. Each approval is counted once in `jig_service_webhook_deliveries_total{tenant,result}`,
-`delivered` or `failed` (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's
-fail. One whose tries are cut off by the service stopping is counted neither way. Each tenant with a webhook
-starts at 0 for both, so the first failures show.
+service can reach. Each approval is counted once in
+`jig_service_webhook_deliveries_total{tenant,kind,result}` (`kind="approval"`), `delivered` or `failed`
+(after the last try), and `JigWebhookFailures` alerts when over half of a tenant's fail. One whose tries are
+cut off by the service stopping is counted neither way. Each tenant with a webhook starts at 0 for both, so
+the first failures show.
+
+A tenant with `taskWebhook` (a URL, with the same `webhookSecretEnv`) is told as each of its tasks ends: a
+POST of `{"task": <id>, "status": <the status it ended with>}` and no more, from the replica that ended it,
+with the same signature, tries and rule on redirects, counted with `kind="task"`. It is sent at most once and
+on a best effort: `GET /v1/tasks/<id>` is the record, and a client that must know of every end polls for
+the ones it wasn't told of. An end is not posted:
+
+1. for the tasks ended as the service stops (stopped as errors, or ending in its last moments): the webhooks
+   close before the runs are stopped. With a single replica, that is every restart;
+2. for the queued tasks cancelled at a start because their tenant left the config;
+3. when the store's reply to the end was lost (the task has ended, but the replica can't tell it was the one
+   to end it), or a task whose lease ran out couldn't be read back;
+4. when the replica that ends the task has a config with no `taskWebhook` for the tenant, as in the middle of
+   a rollout that adds it;
+5. while 100 of the tenant's POSTs wait on its endpoint (an end past that is counted `failed` at once, and
+   the service warns once until some finish), or after its 4 tries failed.
 
 ### Quotas and usage
 
@@ -398,7 +415,7 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
-| `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
+| `jig_service_webhook_deliveries_total{tenant,kind,result}` | approvals (`kind="approval"`) and task ends (`task`) posted to a tenant's webhooks: `delivered`, or `failed` once its last try failed (a task end past the 100 waiting, at once) |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above), at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
@@ -428,7 +445,7 @@ error as `err`.
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
 `alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
-upstream's breaker open, a provider's keys used up, quota refusals, approval webhooks failing, a region
+upstream's breaker open, a provider's keys used up, quota refusals, webhooks failing, a region
 down, and the store's, the leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all
 three, by region. Of the store's, `JigStoreErrors` (critical) is for reads and writes given up on, when
 tasks aren't started or a run's events or outcome aren't stored, and `JigStoreDegraded` (a warning) for

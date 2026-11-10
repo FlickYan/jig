@@ -56,6 +56,8 @@ export interface TenantConfig {
   approvalTimeout?: number;
   /** Where each approval its tasks ask for is POSTed, signed with the secret in the variable webhookSecretEnv names. */
   approvalWebhook?: string;
+  /** Where each of its tasks' ends is POSTed, {task, status}, signed with the same secret. */
+  taskWebhook?: string;
   webhookSecretEnv?: string;
   /** The most tasks it may create in a UTC day, and USD its tasks may spend in a UTC day or month. */
   quotas?: Quotas;
@@ -326,7 +328,8 @@ export async function startService(
     }
     const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
+    const onEnded = (task: Pick<Task, "id" | "tenant">, status: TaskStatus) => webhooks.ended(task, status);
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, onEnded, metrics, log });
     await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
@@ -489,14 +492,14 @@ async function listen(server: Server, port: number, host: string): Promise<strin
   return `http://${address.includes(":") ? `[${address}]` : address}:${bound}`;
 }
 
-/** The tenants' approval webhooks, each with its secret from the environment. */
+/** The tenants' webhooks, for approvals and for task ends, each with its secret from the environment. */
 function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
   const hooks = new Map<string, Webhook>();
-  for (const { id, approvalWebhook, webhookSecretEnv } of tenants) {
-    if (!approvalWebhook || !webhookSecretEnv) continue;
+  for (const { id, approvalWebhook, taskWebhook, webhookSecretEnv } of tenants) {
+    if ((!approvalWebhook && !taskWebhook) || !webhookSecretEnv) continue;
     const secret = process.env[webhookSecretEnv];
-    if (!secret) throw new Error(`Set ${webhookSecretEnv}, the secret tenant ${id}'s approval webhook is signed with.`);
-    hooks.set(id, { url: approvalWebhook, secret });
+    if (!secret) throw new Error(`Set ${webhookSecretEnv}, the secret tenant ${id}'s webhooks are signed with.`);
+    hooks.set(id, { ...(approvalWebhook && { approvals: approvalWebhook }), ...(taskWebhook && { tasks: taskWebhook }), secret });
   }
   return hooks;
 }
@@ -679,7 +682,8 @@ function configProblem(config: Config): string | undefined {
       whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1, MAX_SECONDS) ??
       whole(`${at}.maxStreams`, tenant.maxStreams, 1) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
-      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
+      http(`${at}.taskWebhook`, tenant.taskWebhook) ??
+      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined || tenant.taskWebhook !== undefined) ??
       (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
       (notQuota === undefined ? undefined : `${at}.quotas.${notQuota} isn't a quota: tasksPerDay, usdPerDay or usdPerMonth`) ??
       whole(`${at}.quotas.tasksPerDay`, tenant.quotas?.tasksPerDay, 1) ??

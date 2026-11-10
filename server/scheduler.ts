@@ -46,6 +46,11 @@ export interface SchedulerOptions {
   gitHosts?: string[];
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
   onApproval?: (task: Task, approval: Approval) => void;
+  /**
+   * Called as this replica ends a task (a run's outcome stored, a lease run out, a queued one cancelled), to
+   * tell its tenant: not waited for, and it must not throw. One replica wins each end, so each is told once.
+   */
+  onEnded?: (task: Pick<Task, "id" | "tenant">, status: TaskStatus) => void;
   /** Where its runs, leases and failures are counted (default: a registry of its own, which nothing serves). */
   metrics?: ServiceMetrics;
   log?: Log;
@@ -103,10 +108,11 @@ export class Scheduler {
   private keepTaskDirs: boolean;
   private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
+  private onEnded?: (task: Pick<Task, "id" | "tenant">, status: TaskStatus) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, keepTaskDirs = false, gitHosts, onApproval, onEnded, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -117,6 +123,7 @@ export class Scheduler {
     this.keepTaskDirs = keepTaskDirs;
     this.gitHosts = gitHosts;
     this.onApproval = onApproval;
+    this.onEnded = onEnded;
     this.metrics = metrics ?? serviceMetrics();
     this.log = log ?? createLog("service");
     store.changes.on("cancel", this.cancelled);
@@ -213,14 +220,17 @@ export class Scheduler {
       void abandoned.finally(() => this.abandoning.delete(abandoned));
     }
     // Rare (a replica is gone), so each is read again for its tenant and start, to be counted. They are
-    // ended already: one that can't be read goes uncounted, and the rest are counted all the same.
+    // ended already: one that can't be read goes uncounted (and its tenant untold), and the rest are counted
+    // all the same.
     for (const id of expired) {
       const task = await this.store.task(id).catch((err: unknown) => {
         this.metrics.storeErrors.inc({ retried: "false" });
         this.log.error("couldn't read an expired task to count it", { task: id, err });
         return undefined;
       });
-      if (task) this.ended(task, "error", task.started && task.ended ? Date.parse(task.ended) - Date.parse(task.started) : undefined);
+      if (!task) continue;
+      this.ended(task, "error", task.started && task.ended ? Date.parse(task.ended) - Date.parse(task.started) : undefined);
+      this.onEnded?.(task, "error");
     }
     return expired;
   }
@@ -304,6 +314,7 @@ export class Scheduler {
     if (task.status === "queued" && (await this.store.cancelQueued(task.id))) {
       this.updates.emit(task.id, { done: "cancelled" } satisfies Update);
       this.ended(task, "cancelled");
+      this.onEnded?.(task, "cancelled");
       return "cancelled";
     }
     // Running on another replica (or claimed meanwhile): its replica is told, and stops it.
@@ -533,12 +544,14 @@ export class Scheduler {
       // One this replica no longer held was ended by another, which counted it. Tried again on a failure
       // while the slot is held, so the limits hold; a task given up on ends when its lease runs out. A try
       // whose write was made but whose reply was lost leaves the next one false, as the task has ended: the
-      // outcome and the ledger are right, but the task isn't counted in the metrics, nor its cost.
+      // outcome and the ledger are right, but the task isn't counted in the metrics, nor its cost, and its
+      // tenant isn't told of the end.
       if (await this.retrying(() => this.store.finish(id, this.replicaId, outcome), run)) {
         this.ended(task, outcome.status, Date.now() - run.claimed);
         const spent = spentOf(outcome);
         if (spent.costUsd) this.metrics.cost.inc({ tenant }, spent.costUsd);
         for (const [kind, n] of [["input", spent.input], ["output", spent.output], ["cache_read", spent.cacheRead], ["cache_write", spent.cacheWrite]] as const) if (n) this.metrics.tokens.inc({ tenant, kind }, n);
+        this.onEnded?.(task, outcome.status);
       }
       this.updates.emit(id, { done: outcome.status } satisfies Update);
     } finally {

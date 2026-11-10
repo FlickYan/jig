@@ -75,8 +75,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Over half of {{ $labels.tenant }}'s approval webhooks fail"
-          description: "Its endpoint isn't 2xx after 4 tries (a redirect counts as a failure), so it isn't told of approvals, which time out as denies: the service's warn lines say why."
+          summary: "Over half of {{ $labels.tenant }}'s webhooks fail"
+          description: "Its endpoint isn't 2xx after 4 tries (a redirect counts as a failure), so it isn't told of approvals, which time out as denies, or of its tasks' ends: the service's warn lines say why."
       - alert: JigServiceDown
         expr: up{component="api"} == 0
         for: 2m
