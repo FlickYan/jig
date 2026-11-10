@@ -563,13 +563,16 @@ export async function startGateway(config: GatewayConfig, env: NodeJS.ProcessEnv
     keys: registry.gauge("jig_gateway_keys", "Each upstream's keys: ok, resting (rate-limited) or refused.", ["upstream", "state"]),
     refused: registry.counter("jig_gateway_refused_total", "Model calls the gateway turned away itself: auth, budget, rate, concurrency or quota.", ["tenant", "reason"]),
     stateErrors: registry.counter("jig_gateway_state_errors_total", "Reads and writes of the shared state (Redis) that failed."),
+    lateReleases: registry.counter("jig_gateway_state_late_releases_total", "Slots given back to Redis late, after it could not be reached: replayed, expired (the lease ran out first) or dropped (too many to remember).", ["outcome"]),
   };
   metrics.stateErrors.inc({}, 0);
+  for (const outcome of ["replayed", "expired", "dropped"]) metrics.lateReleases.inc({ outcome }, 0);
   const state: State = config.state
     ? new SharedState(new RedisState(config.state.redis, { prefix: config.state.prefix, leaseMs: config.state.leaseMs, now }), {
         onStateError: config.state.onStateError ?? "closed",
         now,
         onError: () => metrics.stateErrors.inc(),
+        onLate: (outcome, n) => metrics.lateReleases.inc({ outcome }, n),
         // Its lines, that Redis went away or came back, go out as the gateway's others do.
         log: (line, level) => log[level](line.replace(/^jig gateway: /, "")),
       })
