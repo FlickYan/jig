@@ -6,7 +6,7 @@
 
 import type { Usage } from "../src/agent.ts";
 import type { Limits } from "./limits.ts";
-import { Redis, type RedisReply, redisScript } from "./redis.ts";
+import { Redis, type RedisReply, redisScript, RedisUnsentError } from "./redis.ts";
 import type { TokenPayload } from "./token.ts";
 
 /** What a task, or a tenant in a day or a month, spent. */
@@ -361,7 +361,23 @@ export class RedisState implements State {
   }
 
   async release(tenant: string, id: string): Promise<void> {
-    await Promise.all([...this.leases(tenant).map((key) => this.redis.command(["ZREM", key, id])), this.redis.command(["PUBLISH", this.key("released"), tenant])]);
+    await this.releaseAll([{ tenant, id }]);
+  }
+
+  /** Gives back several slots at once: one ZREM for all of them, one for each tenant's, and one message. */
+  async releaseAll(slots: { tenant: string; id: string }[]): Promise<void> {
+    if (!slots.length) return;
+    const tenants = new Map<string, string[]>();
+    for (const { tenant, id } of slots) {
+      if (!tenants.has(tenant)) tenants.set(tenant, []);
+      tenants.get(tenant)!.push(id);
+    }
+    // All written before the first reply is waited for, as one release's commands are.
+    await Promise.all([
+      this.redis.command(["ZREM", this.key("inflight"), ...slots.map((slot) => slot.id)]),
+      ...[...tenants].map(([tenant, ids]) => this.redis.command(["ZREM", this.key("inflight", tenant), ...ids])),
+      this.redis.command(["PUBLISH", this.key("released"), slots[0].tenant]),
+    ]);
   }
 
   async renew(tenant: string, id: string): Promise<void> {
@@ -437,10 +453,32 @@ export class StateError extends Error {
   override name = "StateError";
 }
 
+/** How many slots are remembered to give back to Redis; one more expires with its lease. */
+const OWED_MAX = 10_000;
+/** How many slots one give-back sends. */
+const OWED_BATCH = 1000;
+/** How often what is owed is tried again. */
+const GIVE_BACK_MS = 1000;
+
+export interface SharedStateOptions {
+  onStateError: "closed" | "open";
+  onError(err: Error): void;
+  log?(line: string, level: "info" | "warn"): void;
+  now?: () => number;
+  /**
+   * Slots that Redis could not be told were free, and what became of them: given back late ("replayed"),
+   * their lease over before Redis answered ("expired"), or one too many to remember ("dropped").
+   */
+  onLate?(outcome: "replayed" | "expired" | "dropped", n: number): void;
+  /** How often what is owed is tried again (default: a second; tests set less). */
+  giveBackMs?: number;
+}
+
 /**
  * RedisState, with what to do when Redis can't be reached: "closed" refuses (a StateError, which the
  * gateway answers with 503), "open" uses this replica's own MemoryState until Redis is back. Either way the
- * error is counted, and said once each time Redis goes away.
+ * error is counted, and said once each time Redis goes away. A slot Redis could not be told was free, or
+ * may have taken for a request that never heard so, is remembered and given back once Redis answers again.
  */
 export class SharedState implements State {
   readonly leaseMs: number;
@@ -451,8 +489,22 @@ export class SharedState implements State {
   /** Slots the fallback gave, which go back to it. */
   private readonly local = new Set<string>();
   private down = false;
+  /**
+   * Slots to give back to Redis, by request id, oldest first. `until` is when the lease ends by itself at
+   * the latest for a release; for an admit Redis ran late it can be short, and the lease then ends by itself.
+   */
+  private readonly owed = new Map<string, { tenant: string; until: number }>();
+  private readonly onLate?: (outcome: "replayed" | "expired" | "dropped", n: number) => void;
+  private readonly giveBackMs: number;
+  private giving = false;
+  private timer?: NodeJS.Timeout;
+  private closed = false;
+  /** Said that more is owed than is remembered, until all of it is given back. */
+  private full = false;
 
-  constructor(redis: RedisState, options: { onStateError: "closed" | "open"; onError(err: Error): void; log?(line: string, level: "info" | "warn"): void; now?: () => number }) {
+  constructor(redis: RedisState, options: SharedStateOptions) {
+    this.onLate = options.onLate;
+    this.giveBackMs = options.giveBackMs ?? GIVE_BACK_MS;
     this.redis = redis;
     this.leaseMs = redis.leaseMs;
     if (options.onStateError === "open") this.fallback = new MemoryState({ now: options.now });
@@ -466,6 +518,7 @@ export class SharedState implements State {
       if (this.down) {
         this.down = false;
         this.log("jig gateway: Redis is back; limits and spending are shared again.", "info");
+        void this.giveBack();
       }
       return result;
     } catch (err) {
@@ -480,21 +533,106 @@ export class SharedState implements State {
     }
   }
 
+  /** Remembers that Redis holds, or may hold, a slot for `id` that nothing will renew. */
+  private owe(tenant: string, id: string): void {
+    if (this.closed || this.owed.has(id)) return;
+    if (this.owed.size >= OWED_MAX) {
+      // The newcomer is the one left out: what is remembered stays in the order its leases end.
+      if (!this.full) {
+        this.full = true;
+        this.log(`jig gateway: more than ${OWED_MAX} slots to give back to Redis; the rest expire with their leases.`, "warn");
+      }
+      this.onLate?.("dropped", 1);
+      return;
+    }
+    this.owed.set(id, { tenant, until: Date.now() + this.leaseMs });
+    this.arm();
+  }
+
+  private arm(): void {
+    if (this.closed || this.timer || !this.owed.size) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      void this.giveBack();
+    }, this.giveBackMs).unref();
+  }
+
+  /**
+   * Gives back what is owed, a batch at a time, oldest first. It is no request's doing, so a failure is
+   * neither counted nor said: Redis is still away, and the timer tries again. It never rejects.
+   */
+  private async giveBack(): Promise<void> {
+    if (this.giving || this.closed || !this.owed.size) return;
+    this.giving = true;
+    try {
+      while (this.owed.size && !this.closed) {
+        // A lease that ended by itself is nothing to give back.
+        const now = Date.now();
+        let expired = 0;
+        for (const [id, slot] of this.owed) {
+          if (slot.until > now) break;
+          this.owed.delete(id);
+          expired++;
+        }
+        if (expired) this.onLate?.("expired", expired);
+        const batch: { tenant: string; id: string }[] = [];
+        const slots = new Map<string, { tenant: string; until: number }>();
+        for (const [id, slot] of this.owed) {
+          if (batch.length === OWED_BATCH) break;
+          batch.push({ tenant: slot.tenant, id });
+          slots.set(id, slot);
+        }
+        if (!batch.length) break;
+        await this.redis.releaseAll(batch);
+        let replayed = 0;
+        for (const [id, slot] of slots) {
+          if (this.owed.get(id) === slot && this.owed.delete(id)) replayed++;
+        }
+        if (replayed) this.onLate?.("replayed", replayed);
+      }
+    } catch {
+      // Redis is still away (or the count's listener threw): what is left is tried again.
+    } finally {
+      this.giving = false;
+      if (!this.owed.size) this.full = false;
+      this.arm();
+    }
+  }
+
   async admit(tenant: string, id: string, limits: { tenant: Limits; global: Limits }): Promise<number> {
+    const local = async (fallback: MemoryState) => {
+      const wait = await fallback.admit(tenant, id, limits);
+      if (wait === 0) this.local.add(id);
+      return wait;
+    };
+    // An id whose slot is being given back is not sent to Redis again until that is done: a give-back
+    // still on its way would take the new lease with it. It is no failure of Redis's, so none is counted.
+    if (this.owed.has(id)) {
+      if (!this.fallback) throw new StateError("The gateway's shared state can't be reached: the request's slot is still being given back.");
+      return local(this.fallback);
+    }
     return this.either(
-      () => this.redis.admit(tenant, id, limits),
-      async (fallback) => {
-        const wait = await fallback.admit(tenant, id, limits);
-        if (wait === 0) this.local.add(id);
-        return wait;
-      },
+      () =>
+        this.redis.admit(tenant, id, limits).catch((err) => {
+          // Unless the command never left, Redis may have taken the slot, and nobody would renew or release it.
+          if (!(err instanceof RedisUnsentError)) this.owe(tenant, id);
+          throw err;
+        }),
+      local,
     );
   }
 
   async release(tenant: string, id: string): Promise<void> {
     if (this.local.delete(id)) return this.fallback!.release(tenant);
-    // A slot that can't be given back expires with its lease.
-    await this.either(() => this.redis.release(tenant, id), async () => {});
+    // A slot that can't be given back now is given back once Redis answers again, or expires with its lease.
+    await this.either(
+      () =>
+        this.redis.release(tenant, id).catch((err) => {
+          this.owe(tenant, id);
+          throw err;
+        }),
+      async () => {},
+    );
   }
 
   async renew(tenant: string, id: string): Promise<void> {
@@ -537,6 +675,12 @@ export class SharedState implements State {
   }
 
   close(): void {
+    // What is owed expires with its leases. Closed first: Redis rejects what is pending once it is closed,
+    // and those slots must not be remembered, nor the timer set again.
+    this.closed = true;
+    clearTimeout(this.timer);
+    this.timer = undefined;
+    this.owed.clear();
     this.redis.close();
     this.fallback?.close();
   }

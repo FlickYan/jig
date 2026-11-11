@@ -4,7 +4,7 @@ import { type AddressInfo, createServer, type Server, type Socket } from "node:n
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { createServer as createTlsServer, type TLSSocket } from "node:tls";
-import { parseRedisUrl, parseReply, Redis, RedisError, type RedisReply, redisScript } from "../server/redis.ts";
+import { parseRedisUrl, parseReply, Redis, RedisError, type RedisReply, redisScript, RedisUnsentError } from "../server/redis.ts";
 
 // server/redis.ts, the gateway's Redis client, against a stand-in server that speaks just enough RESP: it
 // reads commands with the client's own parser (a command is an array of bulk strings) and answers as each
@@ -125,10 +125,23 @@ describe("the Redis client", () => {
       return "+back\r\n";
     });
     const redis = client(fake.url);
-    await assert.rejects(redis.command(["GET", "k"]), /connection to Redis closed/);
-    // For the backoff time commands fail at once; then one connects again.
+    // The command had left, so it may have run: its error doesn't say it was never sent.
+    await assert.rejects(redis.command(["GET", "k"]), (err: Error) => /connection to Redis closed/.test(err.message) && !(err instanceof RedisUnsentError));
+    // For the backoff time commands fail at once, with the same message, and never left.
+    await assert.rejects(redis.command(["GET", "k"]), (err: Error) => /connection to Redis closed/.test(err.message) && err instanceof RedisUnsentError);
+    // Then one connects again.
     await until(async () => (await redis.command(["GET", "k"]).catch(() => "")) === "back", "the client to connect again");
     assert.equal(fake.connections, 2);
+  });
+
+  it("says of a command that waited for a connection Redis refused that it was never sent", async () => {
+    const dead = createServer();
+    await new Promise<void>((done) => dead.listen(0, "127.0.0.1", done));
+    const { port } = dead.address() as { port: number };
+    await new Promise((done) => dead.close(done));
+    const redis = client(`redis://127.0.0.1:${port}`);
+    const errors = await Promise.all([redis.command(["GET", "a"]), redis.command(["GET", "b"])].map((command) => command.catch((err: Error) => err)));
+    for (const err of errors) assert.ok(err instanceof RedisUnsentError && /ECONNREFUSED/.test(err.message), String(err));
   });
 
   it("gives up on a command Redis doesn't answer, and on a server that isn't there", async () => {

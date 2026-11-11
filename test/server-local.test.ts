@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
-import { hostname } from "node:os";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer } from "node:net";
+import { homedir, hostname } from "node:os";
 import { delimiter, join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { pathToFileURL } from "node:url";
@@ -41,7 +42,7 @@ async function fakeJig(dir: string): Promise<string> {
 
 function task(id: string): Task {
   const now = new Date().toISOString();
-  return { id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, usage: null, cost: null };
+  return { id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, usage: null, cost: null, result: null, resultTruncated: false, purged: null };
 }
 
 /** A local runner on `dataDir` whose jig writes its arguments to `out` and then sleeps `seconds`. */
@@ -109,6 +110,61 @@ describe("the local runner's sandbox", () => {
     checkConfig({ ...base, runner: "kubernetes", kubernetes: { image: "jig-worker" }, local: { allowUnsandboxed: true }, tenants: [{ id: "acme", keys: [] }, { id: "globex", keys: [] }] });
   });
 
+  it("refuses a local.isolation that isn't service or shared, or service where it can't be had", () => {
+    const base: Config = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [{ id: "acme", keys: [] }] };
+    assert.throws(() => checkConfig({ ...base, local: { isolation: "private" as never } }), /^Error: The config's local\.isolation must be "service" or "shared", not "private"$/);
+    assert.throws(() => checkConfig({ ...base, local: { isolation: true as never } }), /^Error: The config's local\.isolation must be "service" or "shared", not true$/);
+    assert.throws(() => checkConfig({ ...base, local: { isolation: "service", allowUnsandboxed: true } }), /^Error: The config's local\.isolation "service" needs jig's sandbox: unset local\.allowUnsandboxed$/);
+    checkConfig({ ...base, local: { isolation: "shared" } });
+    checkConfig({ ...base, local: { isolation: "shared", allowUnsandboxed: true } });
+    if (process.platform === "darwin") assert.throws(() => checkConfig({ ...base, local: { isolation: "service" } }), /^Error: The config's local\.isolation "service" is Linux's for now$/);
+    else checkConfig({ ...base, local: { isolation: "service" } });
+    // The other runners don't read it.
+    checkConfig({ ...base, runner: "kubernetes", kubernetes: { image: "jig-worker" }, local: { isolation: "service", allowUnsandboxed: true } });
+  });
+
+  it("asks jig for isolation by default on Linux, not with local.isolation shared or local.allowUnsandboxed, and says what tasks share either way", { skip: sandboxProblem() }, async () => {
+    // A socket of the service user's outside /tmp and /run, which isolation leaves within a command's reach.
+    const sockets = await mkdtemp(join(homedir(), ".jig-sock-"));
+    stops.push(() => rm(sockets, { recursive: true, force: true }));
+    const daemon = createServer();
+    await new Promise<void>((done, fail) => daemon.once("error", fail).listen(join(sockets, "s"), done));
+    stops.unshift(() => new Promise((done) => daemon.close(done)));
+    const tenant = (id: string) => ({ id, keys: [createHash("sha256").update(id === "acme" ? KEY : id).digest("hex")] });
+    /** The settings the service's local runner gave a task's jig, and what the service warned of at its start. */
+    const settingsWith = async (local: Config["local"], tenants = [tenant("acme"), tenant("globex")]) => {
+      const dir = await tempDir("jig-local-");
+      const config: Config = { port: 0, internal: { port: 0 }, database: join(dir, "jig.db"), dataDir: join(dir, "data"), keepTaskDirs: true, gatewayBaseUrl: "http://127.0.0.1:9/anthropic", jig: ["/bin/sh", await fakeJig(dir), join(dir, "argv"), "0"], local, tenants };
+      const lines: string[] = [];
+      const service = await startService(config, { secret: SECRET, log: createLog("service", { format: "text", write: (line) => lines.push(line) }) });
+      services.push(service);
+      const headers = { authorization: `Bearer ${KEY}`, "content-type": "application/json" };
+      const { id } = await (await fetch(`${service.url}/v1/tasks`, { method: "POST", headers, body: JSON.stringify({ prompt: "hi" }) })).json();
+      for (const deadline = Date.now() + 15_000; !(await (await fetch(`${service.url}/v1/tasks/${id}`, { headers })).json()).ended; ) {
+        assert.ok(Date.now() < deadline, "the task ends");
+        await new Promise((done) => setTimeout(done, 20));
+      }
+      return { settings: JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8")), warnings: lines.join("\n") };
+    };
+    const linux = process.platform === "linux";
+    const byDefault = await settingsWith(undefined);
+    assert.equal(byDefault.settings.isolation, linux ? "service" : undefined);
+    const shared = await settingsWith({ isolation: "shared" });
+    assert.deepEqual(Object.keys(shared.settings), ["hiddenPaths"]);
+    assert.match(shared.warnings, /a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, \/tmp and \/var\/tmp, /);
+    assert.doesNotMatch(shared.warnings, /can connect to these Unix sockets/);
+    assert.deepEqual(Object.keys((await settingsWith({ allowUnsandboxed: true }, [tenant("acme")])).settings), ["hiddenPaths"]);
+    if (!linux) return;
+    assert.match(byDefault.warnings, /a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel and the Unix sockets outside \/tmp, \/var\/tmp and \/run \(/);
+    assert.match(byDefault.warnings, /dataDir is in a temp folder, .*, and each command's \/tmp starts empty: keep it elsewhere/);
+    const named = new RegExp(`^jig service: a local task's commands can connect to these Unix sockets: .*${join(await realpath(sockets), "s")}.*; list their folders in local\\.hiddenPaths$`, "m");
+    assert.match(byDefault.warnings, named);
+    assert.match(shared.warnings, /: set local\.isolation to "service" to give each task its own \/tmp, \/var\/tmp and \/run$/m);
+    assert.doesNotMatch(shared.warnings, /each command's \/tmp starts empty/);
+    // Its folder hidden, the socket is out of a command's reach, and not named.
+    assert.doesNotMatch((await settingsWith({ hiddenPaths: [sockets] })).warnings, named);
+  });
+
   // On macOS the sandbox is /usr/bin/sandbox-exec, which no PATH hides.
   describe("with no bubblewrap on the PATH", { skip: process.platform !== "linux" && "Linux's sandbox only is found on the PATH" }, () => {
     /** A folder for the PATH with only node, git and bash in it. */
@@ -143,6 +199,14 @@ describe("the local runner's sandbox", () => {
       // What the local runner did before it passed --sandbox: jig says so, and goes on with --yes.
       const unsandboxed = await jig();
       assert.match(unsandboxed.output, /No sandbox: bubblewrap isn't installed[^]*couldn't be reached/);
+      // With isolation in its settings, as the local runner writes them, jig stops without --sandbox too:
+      // commands outside the sandbox would have the machine's /tmp.
+      await mkdir(env.JIG_HOME, { recursive: true });
+      await writeFile(join(env.JIG_HOME, "settings.json"), JSON.stringify({ isolation: "service" }));
+      const isolated = await jig();
+      assert.notEqual(isolated.code, 0);
+      assert.match(isolated.output, /No sandbox: bubblewrap isn't installed.*, and the settings' isolation needs one\./);
+      assert.doesNotMatch(isolated.output, /couldn't be reached/);
     });
 
     it("the service refuses to start on the local runner, before it touches the database, unless local.allowUnsandboxed", async () => {

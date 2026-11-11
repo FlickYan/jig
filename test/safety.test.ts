@@ -1,15 +1,16 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { appendFile, chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, sep } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { gunzipSync } from "node:zlib";
 import { inputLimits, Inputs } from "../src/inputs.ts";
 import { projectKey } from "../src/paths.ts";
-import { createSandbox, execInSandbox, gitControl, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile } from "../src/sandbox.ts";
+import { createSandbox, execInSandbox, gitControl, isolationProblem, lockedGitPaths, type Sandbox, sandboxProblem, seatbeltProfile, sharedPlaces } from "../src/sandbox.ts";
 import { isTrusted, mergeSettings, needsTrust, readSettings, trust } from "../src/settings.ts";
 import { Snapshots } from "../src/snapshots.ts";
 import { OutputFiles, runCommand } from "../src/tools/bash.ts";
@@ -1158,6 +1159,283 @@ describe("the sandbox's fallback without a session PID namespace", { skip: sandb
   });
 });
 
+describe("isolation: service", { skip: sandboxProblem() || (process.platform !== "linux" && "Linux only, for now") }, () => {
+  // The settings' isolation, as the service's local runner asks for each task: commands get nothing of the
+  // places a machine's users share. Each test has folders of its own, removed after it.
+  const made: string[] = [];
+  const saved = new Map<string, string | undefined>();
+  const setEnv = (vars: Record<string, string>) => {
+    for (const [name, value] of Object.entries(vars)) {
+      if (!saved.has(name)) saved.set(name, process.env[name]);
+      process.env[name] = value;
+    }
+  };
+  const folder = async (prefix: string) => {
+    const path = await mkdtemp(prefix);
+    made.push(path);
+    return path;
+  };
+  afterEach(async () => {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    saved.clear();
+    await Promise.all(made.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  });
+  const tag = `jig-iso-${process.pid}`;
+  const run = (command: string, cwd: string, sandbox: Sandbox) => runCommand(command, cwd, 20, undefined, sandbox);
+
+  /** A project, a TMPDIR and jig's directory outside /tmp, so no mount of the sandbox's goes into it. */
+  async function outsideTmp(): Promise<{ project: string; own: string }> {
+    const base = await folder(join(homedir(), ".jig-iso-"));
+    const [project, own] = [join(base, "project"), join(base, "tmp")];
+    await mkdir(project);
+    await mkdir(own);
+    setEnv({ TMPDIR: own, JIG_HOME: join(base, ".jig") });
+    return { project, own };
+  }
+
+  /** The local runner's layout in /tmp: a hidden data folder holding the task's work/ and home/, its TMPDIR in home/tmp, and another task's folder. */
+  async function insideTmp(): Promise<{ base: string; data: string; project: string; home: string; own: string; other: string }> {
+    const base = await folder("/tmp/jig-iso-");
+    const data = join(base, "data");
+    const [project, home, other] = [join(data, "task", "work"), join(data, "task", "home"), join(data, "other")];
+    const own = join(home, "tmp");
+    for (const path of [project, own, join(home, ".jig"), other]) await mkdir(path, { recursive: true });
+    setEnv({ TMPDIR: own, HOME: home, JIG_HOME: join(home, ".jig") });
+    return { base, data, project, home, own, other };
+  }
+
+  it("gives commands the session's own /tmp and /var/tmp, kept between commands, where no mount goes into them", async () => {
+    const { project, own } = await outsideTmp();
+    const marker = join("/tmp", `${tag}-marker`);
+    made.push(marker);
+    await writeFile(marker, "the machine's");
+    const sandbox = createSandbox(project, { network: false, isolated: true })!;
+    try {
+      assert.match(sandbox.limits, / \/tmp and \/var\/tmp here are this session's own, the same folder as \$TMPDIR, kept between commands\.$/);
+      assert.match(await run(`cat ${marker}`, project, sandbox), /No such file or directory/);
+      assert.match(await run(`echo one > /tmp/${tag}-a && echo two > /var/tmp/${tag}-b && echo written`, project, sandbox), /^written/);
+      assert.match(await run(`cat /tmp/${tag}-a /var/tmp/${tag}-b /var/tmp/${tag}-a "$TMPDIR/${tag}-b"`, project, sandbox), /^one\ntwo\none\ntwo\n/);
+      // On the machine they are in the session's TMPDIR, and nowhere else.
+      assert.deepEqual((await readdir(own)).sort(), [`${tag}-a`, `${tag}-b`]);
+      assert.equal(existsSync(`/tmp/${tag}-a`), false);
+      assert.equal(existsSync(`/var/tmp/${tag}-b`), false);
+    } finally {
+      sandbox.close?.();
+    }
+    // Without it, the machine's /tmp is theirs to read and write, as before.
+    const shared = createSandbox(project, { network: false })!;
+    try {
+      assert.match(await run(`cat ${marker}`, project, shared), /^the machine's/);
+    } finally {
+      shared.close?.();
+    }
+  });
+
+  it("gives each command an empty /tmp where the project lies in it, the session's own places on top", async () => {
+    const { data, project, home, own, other } = await insideTmp();
+    await writeFile(join(home, "note"), "the task's own note\n");
+    await writeFile(join(other, "secret"), "another task's");
+    const sandbox = createSandbox(project, { network: false, hidden: [data], isolated: true })!;
+    try {
+      assert.match(sandbox.limits, / \/tmp here is empty for each command: keep files in \$TMPDIR\.$/);
+      const first = await run(`echo ok > made.txt && cat made.txt ${join(home, "note")} && echo x > /tmp/${tag}-a && echo y > "$TMPDIR/keep" && ls /tmp && ls ${other}; cat ${join(other, "secret")}`, project, sandbox);
+      // ls sorts the two names in /tmp, the file's and the folder's with its random end, either way round.
+      assert.match(first, new RegExp(`^ok\\nthe task's own note\\n(${tag}-a\\njig-iso-[^\\n]+|jig-iso-[^\\n]+\\n${tag}-a)\\n`), first);
+      assert.doesNotMatch(first, /another task's|secret\n/);
+      assert.equal(existsSync(join(project, "made.txt")), true);
+      const second = await run(`cat "$TMPDIR/keep"; cat /tmp/${tag}-a; ls /tmp`, project, sandbox);
+      assert.match(second, /^y\ncat: [^\n]+: No such file or directory\njig-iso-[^\n]+\n\nExit code/, second);
+      // bubblewrap made the mounts' places in the empty /tmp, not in the session's TMPDIR.
+      assert.deepEqual(await readdir(own), ["keep"]);
+      assert.equal(existsSync(`/tmp/${tag}-a`), false);
+    } finally {
+      sandbox.close?.();
+    }
+  });
+
+  it("makes no directory on the machine through a link a command left in /tmp", async () => {
+    // bubblewrap makes a mount's place if it is missing, following links, and sees the machine's files under
+    // /oldroot as it does. With the session's folder bound at /tmp and mounts going into it, a command left
+    // a link there in a mount's way, and the next command's bubblewrap made directories outside every bind.
+    const victim = await folder(join(homedir(), ".jig-iso-victim-"));
+    const { base, data, project } = await insideTmp();
+    const inTmp = createSandbox(project, { network: false, hidden: [data], isolated: true })!;
+    try {
+      const name = base.slice("/tmp/".length);
+      assert.match(await run(`mv /tmp/${name} /tmp/aside; ln -s ../../oldroot${victim} /tmp/${name}; ls -l /tmp`, project, inTmp), new RegExp(`${name} -> `));
+      assert.match(await run("echo next", project, inTmp), /^next\n/);
+      assert.deepEqual(await readdir(victim), []);
+    } finally {
+      inTmp.close?.();
+    }
+  });
+
+  it("mounts nothing in the session's folder at /tmp, so a link a command left there leads bubblewrap nowhere", async () => {
+    // Where /tmp is the session's folder, a hidden path of the machine's /tmp gets no mask in it.
+    const victim = await folder(join(homedir(), ".jig-iso-victim-"));
+    const hidden = await folder("/tmp/jig-iso-");
+    await mkdir(join(hidden, "answers"));
+    const { project: outside, own } = await outsideTmp();
+    const bound = createSandbox(outside, { network: false, hidden: [join(hidden, "answers")], isolated: true })!;
+    try {
+      const name = hidden.slice("/tmp/".length);
+      assert.match(await run(`mv /tmp/${name} /tmp/aside 2>/dev/null; ln -s ../../oldroot${victim} /tmp/${name} && echo planted`, outside, bound), /^planted/);
+      assert.match(await run(`ls ${join(hidden, "answers")}; echo next`, outside, bound), /next\n/);
+      assert.deepEqual(await readdir(victim), []);
+      assert.deepEqual(await readdir(own), [name]);
+    } finally {
+      bound.close?.();
+    }
+  });
+
+  it("gives each command an empty /tmp where the project lies in $TMPDIR, so nothing there is seen a second time", async () => {
+    // Bound at /tmp, the session's folder showed the project again without the sandbox's mounts in it: the
+    // hidden file was read, and git's config written, at /tmp/project/.
+    const base = await folder(join(homedir(), ".jig-iso-"));
+    const own = join(base, "tmp");
+    const project = join(own, "project");
+    await mkdir(project, { recursive: true });
+    setEnv({ TMPDIR: own, JIG_HOME: join(base, ".jig") });
+    execFileSync("git", ["init", "-q", project]);
+    await writeFile(join(project, ".env"), "SECRET\n");
+    const config = await readFile(join(project, ".git", "config"), "utf8");
+    const attempt = `cat .env /tmp/project/.env /var/tmp/project/.env; for c in .git/config /tmp/project/.git/config /var/tmp/project/.git/config; do printf '[core]\\n\\tfsmonitor = id\\n' >> $c; done; echo ok > made.txt; echo done`;
+    for (const isolated of [true, false]) {
+      const sandbox = createSandbox(project, { network: false, hidden: [join(project, ".env")], isolated })!;
+      try {
+        if (isolated) assert.match(sandbox.limits, / \/tmp here is empty for each command: keep files in \$TMPDIR\.$/);
+        const out = await run(attempt, project, sandbox);
+        assert.match(out, /done\n/, out);
+        assert.doesNotMatch(out, /SECRET/, out);
+        assert.equal(await readFile(join(project, ".git", "config"), "utf8"), config);
+        assert.equal(existsSync(join(project, "made.txt")), true);
+        // $TMPDIR is still kept from one command to the next.
+        assert.match(await run(`echo kept > "$TMPDIR/${tag}-k" && echo x > /tmp/${tag}-gone`, project, sandbox), /^(?!.*denied)/s);
+        assert.match(await run(`cat "$TMPDIR/${tag}-k"`, project, sandbox), /^kept\n/);
+        if (isolated) assert.match(await run(`cat /tmp/${tag}-gone`, project, sandbox), /No such file or directory/);
+        await rm(`/tmp/${tag}-gone`, { force: true });
+      } finally {
+        sandbox.close?.();
+      }
+    }
+  });
+
+  it("keeps commands from the Unix sockets in /tmp and /run, through the session's first process too", async (t) => {
+    // The client is node: where node itself is in /tmp or /run, no isolated command can start it.
+    if (/^\/(tmp|var\/tmp|run)\//.test(process.execPath)) return t.skip("node is in a place isolation hides");
+    const { project } = await outsideTmp();
+    const listening: Server[] = [];
+    const listen = async (prefix: string) => {
+      const path = join(await folder(prefix), "s");
+      const server = createServer((socket) => socket.end("the machine's daemon"));
+      await new Promise<void>((done, fail) => server.once("error", fail).listen(path, done));
+      listening.push(server);
+      return path;
+    };
+    const sockets = [await listen("/tmp/jig-iso-")];
+    // Where the tests may write there: root's, not CI's.
+    await listen("/run/jig-iso-").then((path) => sockets.push(path), () => {});
+    const client = (path: string) =>
+      `${process.execPath} -e 'require("net").connect(process.argv[1]).on("data", (said) => console.log(String(said))).on("error", (err) => console.log("refused: " + err.code))' ${path}`;
+    const isolated = createSandbox(project, { network: false, isolated: true })!;
+    const shared = createSandbox(project, { network: false })!;
+    try {
+      for (const path of sockets) {
+        assert.match(await run(client(path), project, isolated), /^refused: ENOENT\n/, path);
+        assert.match(await run(client(`/proc/1/root${path}`), project, isolated), /^refused: ENOENT\n/, path);
+        // A socket is a file, so without isolation a command connects, with no network too.
+        assert.match(await run(client(path), project, shared), /^the machine's daemon\n/, path);
+      }
+    } finally {
+      isolated.close?.();
+      shared.close?.();
+      await Promise.all(listening.map((server) => new Promise((done) => server.close(done))));
+    }
+  });
+
+  it("shows nothing of the machine's /tmp, /dev/shm and /run in the session's first process's root, and gives each command its own IPC", async () => {
+    const { project } = await outsideTmp();
+    // The keeper is the namespace's pid 1, and its root was the machine's: /proc/1/root/tmp was its /tmp.
+    const markers = [`/tmp/${tag}-kept`, `/dev/shm/${tag}-kept`].filter((path) => {
+      try {
+        writeFileSync(path, "the machine's");
+        made.push(path);
+        return true;
+      } catch {
+        return false; // no /dev/shm the tests may write
+      }
+    });
+    const look = "ls /proc/1/root/tmp /proc/1/root/var/tmp /proc/1/root/dev/shm /tmp /dev/shm 2>&1; echo run: $(ls -A /run /proc/1/root/run | grep -vc '^/\\|^$'); readlink /proc/self/ns/ipc";
+    const ipc = execFileSync("readlink", ["/proc/self/ns/ipc"], { encoding: "utf8" }).trim();
+    const isolated = createSandbox(project, { network: false, isolated: true })!;
+    const shared = createSandbox(project, { network: false })!;
+    try {
+      const seen = await run(look, project, isolated);
+      assert.doesNotMatch(seen, new RegExp(`${tag}-kept`), seen);
+      assert.match(seen, /\nrun: 0\n/, seen);
+      assert.doesNotMatch(seen, new RegExp(ipc.replace(/[[\]]/g, "\\$&")), seen);
+      assert.match(await run("ls /proc | grep -cE '^[0-9]+$'", project, isolated), /^[1-9]\n/, "still only the session's own processes");
+      const before = await run(look, project, shared);
+      assert.match(before, new RegExp(`${tag}-kept`), before);
+      assert.match(before, new RegExp(ipc.replace(/[[\]]/g, "\\$&")), before);
+    } finally {
+      isolated.close?.();
+      shared.close?.();
+    }
+  });
+
+  it("holds in the fallback too, where each command has a PID namespace of its own", async () => {
+    const { project, own } = await outsideTmp();
+    const fakeBin = join(dir, "fakebin");
+    await mkdir(fakeBin);
+    const real = execFileSync("sh", ["-c", "command -v bwrap"], { encoding: "utf8" }).trim();
+    await writeFile(join(fakeBin, "bwrap"), `#!/bin/sh\nif [ "$1" = "--help" ]; then echo "    --unshare-pid    Create new pid namespace"; exit 0; fi\nexec ${real} "$@"\n`, { mode: 0o755 });
+    setEnv({ PATH: `${fakeBin}:${process.env.PATH}` });
+    const marker = join("/tmp", `${tag}-fallback`);
+    made.push(marker);
+    await writeFile(marker, "the machine's");
+    let fellBack = false;
+    const sandbox = createSandbox(project, { network: false, isolated: true, onFallback: () => (fellBack = true) })!;
+    try {
+      const { args } = sandbox.wrap("echo hi");
+      assert.equal(fellBack, true);
+      assert.ok(args.includes("--unshare-pid") && args.includes("--unshare-ipc") && !args.includes("--pidns"), args.join(" "));
+      assert.match(await run(`cat ${marker}; echo kept > /tmp/${tag}-c; ls -A /run | wc -l`, project, sandbox), /No such file or directory\n0\n/);
+      assert.match(await run(`cat /tmp/${tag}-c`, project, sandbox), /^kept\n/);
+      assert.deepEqual(await readdir(own), [`${tag}-c`]);
+    } finally {
+      sandbox.close?.();
+    }
+  });
+
+  it("refuses a TMPDIR that is a shared place, and a PATH that leads into /run", async () => {
+    const { project } = await outsideTmp();
+    setEnv({ TMPDIR: "/tmp" });
+    assert.throws(() => createSandbox(project, { network: false, isolated: true }), /^Error: isolation: "service" needs a TMPDIR of the task's own, not \/tmp$/);
+    createSandbox(project, { network: false })!.close?.();
+    // A folder of its own in /tmp will do.
+    setEnv({ TMPDIR: await folder("/tmp/jig-iso-") });
+    createSandbox(project, { network: false, isolated: true })!.close?.();
+    // /run is empty for commands, so programs there (NixOS's, in /run/current-system) would all be missing.
+    const link = join(dir, "bin");
+    await symlink("/run", link);
+    setEnv({ PATH: `${process.env.PATH}:${link}` });
+    assert.equal(isolationProblem(), `isolation: "service" empties /run for commands, and ${link} is in it`);
+    assert.throws(() => createSandbox(project, { network: false, isolated: true }), /^Error: isolation: "service" empties \/run for commands, and .*\/bin is in it$/);
+    createSandbox(project, { network: false })!.close?.();
+  });
+
+  it("names the shared places by real path, each once", () => {
+    const places = sharedPlaces();
+    assert.ok(places.includes("/tmp"), places.join(" "));
+    assert.equal(new Set(places).size, places.length);
+    for (const place of places) assert.equal(realpathSync(place), place);
+  });
+});
+
 describe("the macOS sandbox's profile", () => {
   it("keeps a repository's git config and hooks read-only, and its git directory in place", () => {
     const git = { locked: ["/p/.git/config", "/p/.git/hooks"], fixed: ["/p/.git"], gitDirectories: ["/p/.git"] };
@@ -2194,6 +2472,37 @@ describe("settings", () => {
     assert.deepEqual(mergeSettings(user, project!.settings, false).hiddenPaths, [join(homedir(), ".ssh"), "/srv/answers"]);
     await writeSettings({}, { hiddenPaths: ["answers"] });
     assert.throws(() => readSettings(dir), /"hiddenPaths" must be a list of absolute paths/);
+  });
+
+  it("takes isolation from the user's settings alone, whatever a project's say", async () => {
+    await writeSettings({ isolation: "service" }, { isolation: "service", deny: ["rm"], network: true });
+    const { user, project, warnings } = readSettings(dir);
+    assert.equal(user.isolation, "service");
+    assert.equal(project!.settings.isolation, undefined);
+    assert.deepEqual(warnings, [`${join(dir, ".jig", "settings.json")}: "isolation" is only read from the user's settings.`]);
+    assert.deepEqual(needsTrust(project!.settings), ["give sandboxed commands network access"]);
+    for (const trusted of [false, true]) assert.equal(mergeSettings(user, project!.settings, trusted).isolation, "service");
+    assert.equal(mergeSettings(user, undefined, false).isolation, "service");
+    // A project's never turns it on.
+    await writeSettings({}, { isolation: "service" });
+    const without = readSettings(dir);
+    assert.equal(mergeSettings(without.user, without.project!.settings, true).isolation, undefined);
+    await writeSettings({ isolation: true }, {});
+    assert.throws(() => readSettings(dir), /\.jig-home\/settings\.json: "isolation" must be "service"$/);
+  });
+
+  it("stops where the settings ask for isolation and the sandbox is turned off", async () => {
+    // Only the sandbox gives commands a /tmp of their own: without it they would run in the machine's.
+    await writeSettings({ isolation: "service", sandbox: false }, {});
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const { code, output } = await runJig(["--model", "claude-haiku-4-5", "Tidy up."], { api, cwd: dir, env: { JIG_HOME: join(dir, ".jig-home") }, timeout: 20_000 });
+      assert.equal(code, 1, output);
+      assert.match(output, /No sandbox: it is turned off, and the settings' isolation needs one\./);
+      assert.equal(api.requests.length, 0);
+    } finally {
+      api.close();
+    }
   });
 
   it("remembers trust in one version of the project's settings, not in later edits", async () => {

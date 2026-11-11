@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { TLSSocket } from "node:tls";
 import { Connection, parseUrl, Pool, redactUrl, Scram } from "../server/pg.ts";
-import { openStore } from "../server/store.ts";
+import { openStore, type Store, type Task } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, POSTGRES_URL, postgresDatabase } from "./postgres.ts";
 
 // The Postgres client (server/pg.ts): SCRAM against RFC 7677's example, the other logins and TLS against a
@@ -436,6 +436,29 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.equal((await seqs(0)).length, 250);
   });
 
+  it("lists tasks in several statuses and counts a tenant's standing as the SQLite store does", async () => {
+    const stores = [await openStore(await postgresDatabase()), await openStore(":memory:")];
+    // A task's cost is counted on the day it ended, by the clock: so the tasks are made by it too.
+    const now = new Date();
+    const seen: unknown[] = [];
+    for (const store of stores) {
+      closers.push(() => store.close());
+      await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+      // Numbered in their prompts, as the ids differ from store to store.
+      const tasks: Task[] = [];
+      for (let i = 0; i < 12; i++) tasks.push((await store.createTask("a", { prompt: String(i), maxSteps: 5, timeLimit: 60, model: "deepseek-flash" }, { now })) as Task);
+      for (const task of tasks.filter((_, i) => i % 3 === 0)) await store.cancelQueued(task.id);
+      const claimed = (await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 1, tenantConcurrency: 1 })) as Task;
+      await store.finish(claimed.id, "r1", { status: "succeeded", exitCode: 0, stop: "done", error: null, stats: null, usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, cost: 0.25 });
+      const prompts = async (options: Parameters<Store["tasks"]>[1]) => (await store.tasks("a", { ...options, prompts: true })).map((task) => Number(task.spec.prompt));
+      const page = await prompts({ status: ["queued", "cancelled"], limit: 4 });
+      const second = await store.tasks("a", { status: ["queued", "cancelled"], limit: 4, before: tasks[page.at(-1)!].id, prompts: true });
+      seen.push([page, second.map((task) => Number(task.spec.prompt)), await prompts({ status: ["succeeded", "cancelled", "error"] }), await store.standing("a", now), await store.standing("a", new Date("2100-01-01T00:00:00Z"))]);
+    }
+    assert.deepEqual(seen[0], seen[1]);
+    assert.deepEqual(seen[1], [[11, 10, 9, 8], [7, 6, 5, 4], [9, 6, 3, 1, 0], { queued: 7, running: 0, tasksToday: 12, usdToday: 0.25, usdThisMonth: 0.25 }, { queued: 7, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 }]);
+  });
+
   it("stops a page of a task's events once their JSON comes to the bytes asked for, in UTF-8", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());
@@ -451,5 +474,207 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual(await seqs(2, 100, 1), [3]);
     assert.deepEqual(await seqs(0, 2, 100 * size), [1, 2]);
     assert.deepEqual(await seqs(7, 100, 100 * size), [8, 9, 10]);
+  });
+
+  // A spec is stored as it came, and a JSON operator over one that holds "\u0000" anywhere is an error
+  // (22P05): the ledger, written in the statement that ends a task, once read the model that way.
+  const LIMITS = { concurrency: 5, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+  const PLAIN = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+  const WITH_NUL = { ...PLAIN, workspace: { files: { "a.bin": "x\u0000y" } } };
+  const TERMS = { owner: "r1", leaseMs: 60_000, concurrency: 10, tenantConcurrency: 10 };
+  const OUTCOME = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: { input: 3, cacheRead: 0, cacheWrite: 0, output: 2 }, cost: 0.25 };
+  const byModel = { from: "2000-01-01", to: "2999-12-31", group: ["model" as const] };
+
+  it("finishes and cancels a task whose files hold a NUL, with its model in the ledger", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const run = await store.createTask("a", WITH_NUL);
+    const queued = await store.createTask("a", WITH_NUL);
+    assert.equal(((await store.claim("a", TERMS)) as { id: string }).id, run.id);
+    assert.equal(await store.finish(run.id, "r1", OUTCOME), true);
+    assert.equal(await store.cancelQueued(queued.id), true);
+    assert.deepEqual((await store.task(run.id))!.spec.workspace, WITH_NUL.workspace);
+    assert.deepEqual((await store.tasks("a")).map((task) => task.status), ["cancelled", "succeeded"]);
+    const [row, ...rest] = await store.usage(byModel);
+    assert.deepEqual(rest, []);
+    assert.deepEqual({ model: row.model, tasks: row.tasks, input: row.input, output: row.output }, { model: "deepseek-flash", tasks: 2, input: 3, output: 2 });
+  });
+
+  it("keeps a finished task's result, and lists it only with the prompts", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const run = await store.createTask("a", PLAIN);
+    assert.deepEqual([run.result, run.resultTruncated], [null, false]);
+    await store.claim("a", TERMS);
+    assert.equal(await store.finish(run.id, "r1", { ...OUTCOME, result: "done: fixed app.py", resultTruncated: true }), true);
+    const ended = (await store.task(run.id))!;
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "done: fixed app.py", true]);
+    const [full] = await store.tasks("a", { prompts: true });
+    assert.deepEqual([full.spec.prompt, full.result, full.resultTruncated], ["x", "done: fixed app.py", true]);
+    const [listed] = await store.tasks("a");
+    assert.deepEqual([listed.spec.prompt, listed.result, listed.resultTruncated], ["", null, false]);
+  });
+
+  it("answers a create whose key the tenant used with the task it made, and whether its body was the same", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "b", limits: LIMITS }, []);
+    const now = new Date();
+    const made = await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h1" });
+    assert.ok("id" in made);
+    assert.deepEqual(await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h1" }), { replay: made, same: true });
+    assert.deepEqual(await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h2" }), { replay: made, same: false });
+    // Before the caps: the replay is answered though the queue is full, and a refusal records nothing.
+    assert.deepEqual(await store.createTask("a", PLAIN, { now, maxQueued: 1 }, { key: "k", hash: "h1" }), { replay: made, same: true });
+    assert.deepEqual(await store.createTask("a", PLAIN, { now, maxQueued: 1 }, { key: "k2", hash: "h1" }), { quota: "maxQueued", limit: 1, used: 1 });
+    const second = await store.createTask("a", PLAIN, { now }, { key: "k2", hash: "h1" });
+    assert.ok("id" in second && second.id !== made.id);
+    // Another tenant's key, and the same one once its 24 hours are over, make tasks of their own.
+    const theirs = await store.createTask("b", PLAIN, { now }, { key: "k", hash: "h1" });
+    assert.ok("id" in theirs && theirs.tenant === "b");
+    const later = await store.createTask("a", PLAIN, { now: new Date(now.getTime() + 24 * 3600_000) }, { key: "k", hash: "h1" });
+    assert.ok("id" in later && later.id !== made.id);
+    assert.equal((await store.tasks("a")).length, 3);
+  });
+
+  it("ends every tenant's lapsed tasks though one tenant's holds a NUL", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "b", limits: LIMITS }, []);
+    const bad = await store.createTask("a", WITH_NUL);
+    const other = await store.createTask("b", PLAIN);
+    // Leases that ran out a second before they were given.
+    for (const tenant of ["a", "b"]) await store.claim(tenant, { ...TERMS, leaseMs: -1000 });
+    assert.deepEqual((await store.expire("its replica is gone")).sort(), [bad.id, other.id].sort());
+    assert.equal((await store.task(other.id))!.status, "error");
+    assert.equal((await store.task(bad.id))!.status, "error");
+    assert.deepEqual(await store.inStatus("running"), []);
+  });
+
+  it("cancels the queued tasks of a tenant removed from the config though one holds a NUL", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "gone", limits: LIMITS }, []);
+    const kept = await store.createTask("a", PLAIN);
+    const bad = await store.createTask("gone", WITH_NUL);
+    const plain = await store.createTask("gone", PLAIN);
+    assert.equal(await store.retireTenants(["a"]), 2);
+    assert.deepEqual([(await store.task(bad.id))!.status, (await store.task(plain.id))!.status, (await store.task(kept.id))!.status], ["cancelled", "cancelled", "queued"]);
+  });
+
+  it("reads the model from the spec of a task that a replica of the version before made, and forgets old keys", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const old = await store.createTask("a", PLAIN);
+    const nul = await store.createTask("a", WITH_NUL);
+    const db = pool(url);
+    {
+      // As the version before inserts: no model column.
+      await db.query("UPDATE tasks SET model = NULL");
+      assert.equal(await store.cancelQueued(old.id), true);
+      assert.equal(await store.cancelQueued(nul.id), true);
+      assert.deepEqual((await store.usage(byModel)).map((row) => [row.model, row.tasks]).sort(), [["", 1], ["deepseek-flash", 1]]);
+      // A key is deleted once its day is over, whoever's it is, and holds until then.
+      const now = new Date();
+      const made = await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h" });
+      assert.ok("id" in made);
+      assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000 - 1)), 0);
+      assert.equal(Number((await db.query("SELECT count(*) AS n FROM idempotency")).rows[0].n), 1);
+      assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000)), 1);
+      assert.equal(Number((await db.query("SELECT count(*) AS n FROM idempotency")).rows[0].n), 0);
+    }
+  });
+
+  it("moves a database on whose tasks already hold a NUL or half a surrogate pair, and ends them", async () => {
+    const url = await postgresDatabase();
+    await (await openStore(url)).close();
+    const db = pool(url);
+    // As schema 5 left it: no model column, the model in the spec alone (nor the result's and the table of
+    // Idempotency-Keys, which came after).
+    await db.query("ALTER TABLE tasks DROP COLUMN model, DROP COLUMN result, DROP COLUMN result_truncated");
+    await db.query("DROP TABLE idempotency");
+    await db.query("UPDATE jig_schema SET version = 5");
+    await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
+    const insert = (id: string, spec: object, status: string) => db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created, started) VALUES ($1, 'a', 'x', $2, $3, now(), now())", [id, JSON.stringify(spec), status]);
+    const { prompt: _, ...plain } = PLAIN;
+    const nul = { ...plain, workspace: WITH_NUL.workspace };
+    await insert("task_1", plain, "queued");
+    await insert("task_2", nul, "queued");
+    await insert("task_3", nul, "running");
+    await insert("task_4", plain, "running");
+    // Half a surrogate pair, which the API let through in a file's contents: ->> refuses that escape too.
+    const lone = { ...plain, workspace: { files: { "a.txt": "x\ud800y" } } };
+    await insert("task_5", lone, "queued");
+    await insert("task_6", lone, "running");
+    // Escapes the operator reads; the backfill passes these by all the same, as it looks for "\u" alone.
+    await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
+    // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
+    assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
+      { id: "task_1", model: "deepseek-flash" },
+      { id: "task_2", model: null },
+      { id: "task_3", model: null },
+      { id: "task_4", model: "deepseek-flash" },
+      { id: "task_5", model: null },
+      { id: "task_6", model: null },
+      { id: "task_7", model: null },
+    ]);
+    for (const id of ["task_1", "task_2", "task_5", "task_7"]) assert.equal(await store.cancelQueued(id), true);
+    assert.deepEqual((await store.expire("its replica is gone")).sort(), ["task_3", "task_4", "task_6"]);
+    assert.deepEqual((await store.task("task_3"))!.spec.workspace, WITH_NUL.workspace);
+    assert.deepEqual((await store.task("task_6"))!.spec.workspace, lone.workspace);
+    const rows = await store.usage(byModel);
+    assert.deepEqual(rows.map((row) => [row.model, row.tasks]).sort(), [["", 5], ["deepseek-flash", 2]]);
+  });
+
+  it("opens a database whose purged column and index were made by hand, ahead of the upgrade", async () => {
+    const url = await postgresDatabase();
+    await (await openStore(url)).close();
+    const db = pool(url);
+    // As schema 8 left it, then the two statements docs/server.md gives for a large table.
+    await db.query("DROP INDEX tasks_unpurged");
+    await db.query("ALTER TABLE tasks DROP COLUMN purged");
+    await db.query("UPDATE jig_schema SET version = 8");
+    await db.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz");
+    await db.query("CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL");
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
+    assert.deepEqual((await db.query("SELECT indisvalid FROM pg_index WHERE indexrelid = 'tasks_unpurged'::regclass")).rows, [{ indisvalid: true }]);
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const task = await store.createTask("a", PLAIN);
+    assert.equal(await store.cancelQueued(task.id), true);
+    assert.equal((await store.purge(task.id))!.first, true);
+  });
+
+  it("purges tasks whose stored spec holds a NUL or half a surrogate pair, one by its id and the rest by their age", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    const db = pool(url);
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    // Inserted as an older version let them in: the API refuses a NUL in a file now.
+    const { prompt: _, ...plain } = PLAIN;
+    const specs = { task_1: { ...plain, workspace: WITH_NUL.workspace }, task_2: { ...plain, workspace: WITH_NUL.workspace }, task_3: { ...plain, workspace: { files: { "a.txt": "x\ud800y" } } } };
+    for (const [id, spec] of Object.entries(specs)) {
+      await db.query("INSERT INTO tasks (id, tenant, prompt, spec, model, status, created, started, ended) VALUES ($1, 'a', 'the prompt', $2, 'deepseek-flash', 'succeeded', now(), now(), now() - interval '1 hour')", [id, JSON.stringify(spec)]);
+      await store.addEvent(id, 1, { v: 1, seq: 1, ts: "", type: "text", text: "said\u0000" });
+    }
+    const slim = { prompt: "", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const purged = (await store.purge("task_1"))!;
+    assert.deepEqual([purged.first, purged.task.spec], [true, slim]);
+    // Retried while another test file's purge holds the database's lock.
+    assert.equal(await until(() => store.purgeEnded(60_000, 10), "the rest to be purged"), 2);
+    for (const id of Object.keys(specs)) assert.deepEqual([(await store.task(id))!.spec, await store.events(id)], [slim, []]);
+    assert.deepEqual((await db.query("SELECT spec::text AS spec FROM tasks WHERE id = 'task_3'")).rows, [{ spec: JSON.stringify(plain) }]);
   });
 });

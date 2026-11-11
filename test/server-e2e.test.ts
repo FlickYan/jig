@@ -265,6 +265,35 @@ describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gatewa
     assert.deepEqual(await readFile(join(base, ".git", "index")), index);
   });
 
+  it("gives each task's commands a /tmp of their own, kept between its commands and out of the next task's reach", { skip: sandboxProblem() || (process.platform !== "linux" && "local.isolation is Linux's") }, async () => {
+    // dataDir outside /tmp, so a task's /tmp is its TMPDIR (in /tmp it would be empty for each command).
+    const base = await mkdtemp(join(homedir(), ".jig-e2e-iso-"));
+    closers.push(() => rm(base, { recursive: true, force: true }));
+    const file = `/tmp/jig-iso-e2e-${randomUUID()}`;
+    const replies: Block[][] = [
+      [{ tool: "bash", input: { command: `echo "the first task's" > ${file} && echo written` } }],
+      [{ tool: "bash", input: { command: `cat ${file}` } }],
+      [{ text: "done" }],
+      [{ tool: "bash", input: { command: `cat ${file}; ls /tmp /var/tmp; echo probe-done` } }],
+      [{ text: "done" }],
+    ];
+    const { service, dataDir } = await stack(replies, {}, base);
+    const outputs = async (id: string) => (await events(service, id)).filter((frame) => frame.data.type === "tool_result").map((frame) => frame.data.output as string);
+    const first = await ended(service, (await call(service, "POST", "/v1/tasks", { prompt: "leave a file", maxSteps: 5 })).body.id);
+    assert.equal(first.status, "succeeded", JSON.stringify(first));
+    const [wrote, read] = await outputs(first.id);
+    assert.match(wrote, /^written/);
+    assert.match(read, /^the first task's/, "the task's next command reads it");
+    // On the machine it is in the task's own temp folder, not in /tmp.
+    assert.equal(existsSync(file), false);
+    assert.equal(await readFile(join(dataDir, "tasks", first.id, "home", "tmp", file.slice("/tmp/".length)), "utf8"), "the first task's\n");
+
+    const second = await ended(service, (await call(service, "POST", "/v1/tasks", { prompt: "look around", maxSteps: 5 })).body.id);
+    assert.equal(second.status, "succeeded", JSON.stringify(second));
+    const [probe] = await outputs(second.id);
+    assert.match(probe, /^cat: [^\n]+: No such file or directory\n\/tmp:\n\n\/var\/tmp:\nprobe-done\n/);
+  });
+
   it("keeps a task's long outputs, which jig saves in its TMPDIR, out of the other tasks' reach", { skip: sandboxProblem() }, async () => {
     // The first task prints its secret past what the model sees, so jig keeps the whole output in a file,
     // and waits there; the second looks for it where a shared TMPDIR would have put it, and in the first's.

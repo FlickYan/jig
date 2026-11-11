@@ -362,6 +362,9 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       }
       let region = regions.get(tenant.home)!;
       if (!region.up) {
+        // A key is known only to the store of the region that took it: another region would make the task
+        // again. So a create with one is never failed over.
+        if (req.headers["idempotency-key"] !== undefined) return down(x, tenant.home, "a create with an Idempotency-Key waits for its home region, where its key is known: try again once it is back");
         const other = tenant.failover ? order.map((name) => regions.get(name)!).find((other) => other.up && allowed(other.name)) : undefined;
         if (!other) return down(x, tenant.home, "try again once it is back");
         failovers.inc({ from: region.name, to: other.name });
@@ -384,8 +387,8 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       return forward(x, region, url.pathname + url.search);
     }
 
-    // The tenant's list, and its usage, are each region's own: ?region= picks one (the home by default).
-    const listed = url.pathname === "/v1/tasks" ? "list" : url.pathname === "/v1/usage" ? "usage" : undefined;
+    // The tenant's list, its usage and its limits are each region's own: ?region= picks one (the home by default).
+    const listed = url.pathname === "/v1/tasks" ? "list" : url.pathname === "/v1/usage" ? "usage" : url.pathname === "/v1/limits" ? "limits" : undefined;
     x.route = listed ?? "other";
     // Read once, as the service reads its own: region=us&region=eu would otherwise answer for us alone.
     if (listed && url.searchParams.getAll("region").length > 1) return reply(x, 400, { error: "region may be given once" });

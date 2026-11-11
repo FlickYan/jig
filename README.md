@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 986 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 1089 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -462,7 +462,13 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   those, and your home directory if it lies beside the project there, which stay as they were: the task
   service's local runner hides its data folder from a task this way, but for the task's own project and
   home. A hidden folder holding your home directory hides all of it, `~/.ssh` too, but for the project or
-  an `--add-dir` folder in it.
+  an `--add-dir` folder in it. Your own settings, not a project's, can also hold `"isolation": "service"`,
+  which the task service's local runner sets for each task (Linux only; docs/server.md): commands then get
+  a `/tmp`, `/var/tmp`, `/run` and IPC of the session's own instead of the machine's, `/tmp` being `$TMPDIR`
+  (which so can't be `/tmp` itself), or empty for each command where the project or jig's directory lies
+  in `/tmp`, or the project or a hidden path in `$TMPDIR`. It needs the sandbox: without one jig stops. The file tools only work in the project and the
+  `--add-dir` folders, so for them it only stops a link there that leads into the machine's `/tmp`, `/run`
+  or `/dev/shm`.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
   loosen the sandbox the moment you run jig in a repository you just cloned. So those parts only apply
   after you say yes to a prompt listing exactly what they would do; the answer is remembered for that

@@ -5,7 +5,7 @@ import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createLog, type Log } from "../log.ts";
-import { type JigEvent, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, workspaceProblem } from "../runner.ts";
+import { checkDisk, DiskLimit, type JigEvent, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
@@ -15,11 +15,14 @@ import type { Task, Tenant, Workspace } from "../store.ts";
 // them, all but the task's own project and home (see tools/util.ts's keptIn), and what `hidden` lists (the
 // database, the config's folder): another task's folder, the events and stats files and the database are
 // out of their reach, in a temp folder too. jig keeps long outputs, and --keep-inputs' copies, in $TMPDIR, so
-// that is the task's own: in a shared one, other tasks' commands could read them, and write them. What they
-// still share is the machine: its kernel, /tmp and /var/tmp by their paths, its Unix sockets, the rest of
-// what the service's user can read, and on macOS its processes and localhost. jig runs with --sandbox, so
-// one that can't make its sandbox fails, rather than run the task's commands directly on the machine, unless
-// the config turns that off (sandbox: false, local.allowUnsandboxed).
+// that is the task's own: in a shared one, other tasks' commands could read them, and write them. With
+// `isolation` (the config's local.isolation "service", the default on Linux) the settings ask jig for
+// isolation too: its commands then get a /tmp, /var/tmp, /run and IPC of the task's own (see src/sandbox.ts's
+// createSandbox), where without it they share the machine's /tmp and /var/tmp by their paths and every Unix
+// socket on it. What they share either way is the machine: its kernel, the Unix sockets outside those
+// folders, the rest of what the service's user can read, and on macOS its processes and localhost. jig runs
+// with --sandbox, so one that can't make its sandbox fails, rather than run the task's commands directly on
+// the machine, unless the config turns that off (sandbox: false, local.allowUnsandboxed).
 
 export interface LocalRunnerConfig {
   dataDir: string;
@@ -41,8 +44,14 @@ export interface LocalRunnerConfig {
   pollMs?: number;
   /** What else tasks' commands can't read, beside dataDir: the database's files and the config's folder, say. */
   hidden?: string[];
+  /** The most bytes a task's folder may take on the disk before its run is stopped (runner.ts's watchDisk); 0 or none: no cap. */
+  maxDiskBytes?: number;
+  /** How often the folder is measured, in milliseconds (default 5000). */
+  diskPollMs?: number;
   /** Run jig with --sandbox, so a task whose jig can't make one fails (default: yes). */
   sandbox?: boolean;
+  /** Give each task's commands their own /tmp, /var/tmp, /run and IPC: jig's isolation "service" (default: no). */
+  isolation?: boolean;
   /** Where the runner's lines go (default: the service's log). */
   log?: Log;
 }
@@ -87,7 +96,7 @@ export class LocalRunner implements Runner {
   }
 
   async start(task: Task, tenant: Tenant): Promise<RunHandle> {
-    const { graceSeconds, pollMs = 100 } = this.config;
+    const { graceSeconds, pollMs = 100, maxDiskBytes = 0 } = this.config;
     const dir = this.dir(task.id);
     const work = join(dir, "work");
     const home = join(dir, "home");
@@ -96,65 +105,93 @@ export class LocalRunner implements Runner {
     await mkdir(join(home, ".jig"), { recursive: true });
     await mkdir(join(home, "tmp"));
     const hiddenPaths = [resolve(this.config.dataDir), ...(this.config.hidden ?? []).map((path) => resolve(path))];
-    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify({ hiddenPaths }, null, 2)}\n`);
-    await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
+    const settings = { hiddenPaths, ...(this.config.isolation && { isolation: "service" }) };
+    await writeFile(join(home, ".jig", "settings.json"), `${JSON.stringify(settings, null, 2)}\n`);
 
-    const timeLimit = task.spec.timeLimit;
-    const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
-    // git, jig's and its commands', looks for a repository no further up than the task's folder: a workspace
-    // with none would otherwise take one dataDir lies in (the service run from a checkout) for its own, and
-    // jig's sandbox lets commands write the repository it finds.
-    const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), TMPDIR: join(home, "tmp"), GIT_CEILING_DIRECTORIES: resolve(dir), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
-    for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
-
-    const events = join(dir, "events.jsonl");
-    const stats = join(dir, "stats.json");
-    const log = join(dir, "output.log");
-    const out = openSync(log, "w");
-    const [program, ...first] = this.config.jig;
-    // A process group of its own, so a cancel or the time limit reaches what jig started too.
-    const sandbox = (this.config.sandbox ?? true) ? ["--sandbox"] : [];
-    const child = spawn(program, [...first, ...sandbox, ...jigArgs(task, tenant, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })], { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
-    closeSync(out);
-    // At once, before jig can have exited and its pid gone to another process.
-    if (child.pid) this.record(join(dir, "run.json"), child.pid);
-    child.stdin!.on("error", () => {}); // a jig that exits before reading its task
-    child.stdin!.end(task.spec.prompt);
-
-    const killGroup = (signal: NodeJS.Signals) => {
-      try {
-        process.kill(-child.pid!, signal);
-      } catch {} // the group is gone
+    // The disk cap: the folder is measured from here on, through a clone too, and the run stopped past it.
+    // Until jig runs, what is stopped is the clone.
+    let overDisk: string | undefined;
+    const preparing = new AbortController();
+    let stopRun = () => preparing.abort();
+    const over = (why: string) => {
+      overDisk ??= why;
+      this.log.warn("stopping a task whose folder went past the disk cap", { tenant: tenant.id, task: task.id, why });
+      stopRun();
     };
-    let exited = false;
-    let timedOut = false;
-    let killer: NodeJS.Timeout | undefined;
-    const stop = () => {
-      if (exited) return;
-      killGroup("SIGTERM");
-      killer ??= setTimeout(() => killGroup("SIGKILL"), TERM_MS);
-    };
-    const deadline = setTimeout(() => ((timedOut = true), stop()), (timeLimit + graceSeconds) * 1000);
-    const exit = new Promise<RunExit>((done) => {
-      child.on("error", (err) => {
-        exited = true;
-        clearTimeout(deadline);
-        done({ exitCode: null, timedOut, message: `jig didn't start: ${err.message}` });
-      });
-      child.on("exit", (code) => {
-        exited = true;
-        clearTimeout(deadline);
-        clearTimeout(killer);
-        // Whatever jig left in its group (a job in the background, say) ends with it.
-        killGroup("SIGKILL");
-        done({ exitCode: code, timedOut });
-      });
-    }).then(async (result) => ({
-      ...result,
-      stats: await readStats(stats),
-      message: result.message ?? (result.exitCode === 0 ? undefined : await lastLine(log)),
-    }));
-    return { events: tail(events, () => exited, pollMs), wait: () => exit, cancel: stop };
+    const unwatch = maxDiskBytes ? watchDisk(dir, maxDiskBytes, over, this.config.diskPollMs, { log: this.log }) : () => {};
+    // Whatever throws from here on, the watch ends with the start.
+    try {
+      await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects, preparing.signal);
+      // A workspace past the cap by itself never starts its jig.
+      await checkDisk(dir, maxDiskBytes);
+
+      const timeLimit = task.spec.timeLimit;
+      const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
+      // git, jig's and its commands', looks for a repository no further up than the task's folder: a workspace
+      // with none would otherwise take one dataDir lies in (the service run from a checkout) for its own, and
+      // jig's sandbox lets commands write the repository it finds.
+      const env: NodeJS.ProcessEnv = { HOME: home, JIG_HOME: join(home, ".jig"), TMPDIR: join(home, "tmp"), GIT_CEILING_DIRECTORIES: resolve(dir), NO_COLOR: "1", [keyVariable(task.spec.model)]: token };
+      for (const name of PASSED) if (process.env[name] !== undefined) env[name] = process.env[name];
+
+      const events = join(dir, "events.jsonl");
+      const stats = join(dir, "stats.json");
+      const log = join(dir, "output.log");
+      const [program, ...first] = this.config.jig;
+      const sandbox = (this.config.sandbox ?? true) ? ["--sandbox"] : [];
+      const args = [...first, ...sandbox, ...jigArgs(task, tenant, { cwd: work, events, stats, baseUrl: this.config.gatewayBaseUrl, internalBaseUrl: this.config.internalBaseUrl })];
+      const out = openSync(log, "w");
+      // A process group of its own, so a cancel or the time limit reaches what jig started too.
+      const child = spawn(program, args, { cwd: work, env, detached: true, stdio: ["pipe", out, out] });
+      closeSync(out);
+      // At once, before jig can have exited and its pid gone to another process.
+      if (child.pid) this.record(join(dir, "run.json"), child.pid);
+      child.stdin!.on("error", () => {}); // a jig that exits before reading its task
+      child.stdin!.end(task.spec.prompt);
+
+      const killGroup = (signal: NodeJS.Signals) => {
+        try {
+          process.kill(-child.pid!, signal);
+        } catch {} // the group is gone
+      };
+      let exited = false;
+      let timedOut = false;
+      let killer: NodeJS.Timeout | undefined;
+      const stop = () => {
+        if (exited) return;
+        killGroup("SIGTERM");
+        killer ??= setTimeout(() => killGroup("SIGKILL"), TERM_MS);
+      };
+      // From now the cap stops jig, at once if the folder went past it since the check.
+      stopRun = stop;
+      if (overDisk) stop();
+      const deadline = setTimeout(() => ((timedOut = true), stop()), (timeLimit + graceSeconds) * 1000);
+      const exit = new Promise<RunExit>((done) => {
+        child.on("error", (err) => {
+          exited = true;
+          clearTimeout(deadline);
+          unwatch();
+          done({ exitCode: null, timedOut, overDisk, message: `jig didn't start: ${err.message}` });
+        });
+        child.on("exit", (code) => {
+          exited = true;
+          clearTimeout(deadline);
+          clearTimeout(killer);
+          unwatch();
+          // Whatever jig left in its group (a job in the background, say) ends with it.
+          killGroup("SIGKILL");
+          done({ exitCode: code, timedOut, overDisk });
+        });
+      }).then(async (result) => ({
+        ...result,
+        stats: await readStats(stats),
+        message: result.message ?? (result.exitCode === 0 ? undefined : await lastLine(log)),
+      }));
+      return { events: tail(events, () => exited, pollMs), wait: () => exit, cancel: stop };
+    } catch (err) {
+      unwatch();
+      // A clone the cap stopped fails as a clone: the task is told of the cap.
+      throw overDisk ? new DiskLimit(overDisk) : err;
+    }
   }
 
   /**
@@ -228,9 +265,9 @@ function startTime(pid: number): number | undefined {
  * Writes a task's files into its (empty) workspace, or clones its repository there. What git says of a
  * clone that fails goes to `log`; the task is told only that it failed, or that a redirect it was sent isn't
  * followed. With `redirects`, a redirect on the clone's first request is followed, as git does by default;
- * without, none is.
+ * without, none is. `signal` stops a clone under way, which then fails.
  */
-export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log, redirects = false): Promise<void> {
+export async function prepareWorkspace(work: string, workspace: Workspace | undefined, protocols: string[], log?: Log, redirects = false, signal?: AbortSignal): Promise<void> {
   for (const [path, contents] of Object.entries(workspace?.files ?? {})) {
     const problem = workspaceProblem(path);
     if (problem) throw new Error(`The workspace file ${JSON.stringify(path)} ${problem}.`);
@@ -243,7 +280,7 @@ export async function prepareWorkspace(work: string, workspace: Workspace | unde
   // against them, is the only host asked. Without, any host may be named, so a redirect gets round nothing.
   const args = ["-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", ...(redirects ? [] : ["-c", "http.followRedirects=false"]), "clone", "--quiet", "--depth", "1", "--no-tags", ...(workspace.ref ? ["--branch", workspace.ref] : []), "--", workspace.git, work];
   const env = { PATH: process.env.PATH, HOME: dirname(work), GIT_ALLOW_PROTOCOL: protocols.join(":"), GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
-  await promisify(execFile)("git", args, { env, timeout: 120_000 }).catch((err: { code?: unknown; signal?: string | null; stderr?: string; message: string }) => {
+  await promisify(execFile)("git", args, { env, timeout: 120_000, signal }).catch((err: { code?: unknown; signal?: string | null; stderr?: string; message: string }) => {
     // git names the hosts and ports it tried and how they answered: told to the tenant, a clone on the
     // service's network would scan it for them.
     log?.warn("git clone failed", { stderr: (err.stderr || err.message).trim() });

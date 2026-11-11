@@ -13,11 +13,11 @@ import { promisify } from "node:util";
 import { bracketHost, checkConfig, type Config, resolvePaths, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { PgError } from "../server/pg.ts";
-import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
+import { type JigEvent, type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
-import { outcomeOf, Scheduler } from "../server/scheduler.ts";
-import { serviceMetrics } from "../server/service-metrics.ts";
-import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
+import { outcomeOf, resultOf, Scheduler } from "../server/scheduler.ts";
+import { routeOf, serviceMetrics } from "../server/service-metrics.ts";
+import { openStore, type Store, type Task, type Tenant, UNPURGED } from "../server/store.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -81,9 +81,9 @@ function newScheduler(...args: ConstructorParameters<typeof Scheduler>): Schedul
 
 /**
  * A service on a port of its own, with the fake jig, two tenants and a database in a new folder (a new
- * schema, on Postgres). It keeps each task's folder, which the tests look in.
+ * schema, on Postgres). It keeps each task's folder, which the tests look in. `now` is its clock, if given.
  */
-async function service(config: Partial<Config> = {}, base?: string): Promise<Service & { dataDir: string }> {
+async function service(config: Partial<Config> = {}, base?: string, now?: () => Date): Promise<Service & { dataDir: string }> {
   base ??= await tempDir("jig-service-");
   const dataDir = join(base, "data");
   const started = await startService(
@@ -102,7 +102,7 @@ async function service(config: Partial<Config> = {}, base?: string): Promise<Ser
       ],
       ...config,
     },
-    { secret: SECRET },
+    { secret: SECRET, ...(now && { now }) },
   );
   services.push(started);
   return { ...started, dataDir };
@@ -436,6 +436,9 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(await refused("{"), /isn't JSON/);
     // Postgres text can't hold a NUL: it is refused on both stores, not stored on one and a 500 on the other.
     assert.match(await refused({ prompt: "hi\u0000there" }), /NUL/);
+    // Nor in a file: a spec that holds one broke Postgres's JSON operators, and git has no path with one.
+    assert.equal(await refused({ prompt: "hi", workspace: { files: { "a.bin": "x\u0000y" } } }), 'workspace.files: "a.bin" must not hold a NUL character (\\u0000) in its contents');
+    assert.match(await refused({ prompt: "hi", workspace: { files: { "a\u0000b": "x" } } }), /^workspace\.files: "a\\u0000b" .*NUL/);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(20_000) })).status, 413);
     assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body, { tasks: [] });
 
@@ -531,10 +534,22 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
   it("refuses a task past the tenant's queue limit", async () => {
     const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, maxQueued: 2 }] });
     for (let i = 0; i < 2; i++) assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
-    const { status, body } = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
-    assert.equal(status, 429);
+    const refused = await fetch(`${api.url}/v1/tasks`, { method: "POST", headers: { authorization: `Bearer ${KEYS.acme}` }, body: JSON.stringify({ prompt: "exit 0" }) });
+    const body = await refused.json();
+    assert.equal(refused.status, 429);
     assert.match(body.error, /2 tasks queued/);
+    // As a quota's refusal says it, with no time it resets at: the queue has none, and Retry-After is a guess.
+    assert.deepEqual({ ...body, error: undefined }, { error: undefined, quota: "maxQueued", limit: 2, used: 2 });
+    assert.equal(refused.headers.get("retry-after"), "5");
     assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued")).body.tasks.length, 2);
+  });
+
+  it("makes a task for each of two identical creates without an Idempotency-Key", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    const [one, two] = [await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" }), await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })];
+    assert.deepEqual([one.status, two.status], [201, 201]);
+    assert.notEqual(one.body.id, two.body.id);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks.length, 2);
   });
 
   it("makes the database's folder, and names the database when it can't open it", { skip: name !== "SQLite" && "SQLite's own" }, async () => {
@@ -560,10 +575,112 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     const last = (await call(api, KEYS.acme, "GET", `/v1/tasks?limit=2&before=${second.next}&full=1`)).body;
     assert.deepEqual(last, { tasks: [{ ...last.tasks[0], id: ids[4], prompt: "task 0" }] });
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.length, 4);
-    // Another tenant's task leads nowhere, and a page is 1 to 100 tasks.
-    assert.deepEqual((await call(api, KEYS.globex, "GET", `/v1/tasks?before=${ids[0]}`)).body, { tasks: [] });
+    // A page is 1 to 100 tasks.
     for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).status, 400, query);
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${ids[0]}`)).body.prompt, "task 4");
+  });
+
+  it("refuses a list's parameters it doesn't know, one given twice, and a full that is neither 1 nor 0", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    // A misspelt filter isn't taken for no filter, and a region is the router's to read.
+    for (const name of ["stauts", "state", "region"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks?${name}=running`), { status: 400, body: { error: `Unknown parameter: ${name}` } });
+    }
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued&status=running"), { status: 400, body: { error: "status may be given once" } });
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/tasks?full=yes"), { status: 400, body: { error: "full must be 1 or 0" } });
+    for (const [full, prompt] of [["1", true], ["true", true], ["0", false], ["false", false]] as const) {
+      const { status, body } = await call(api, KEYS.acme, "GET", `/v1/tasks?full=${full}&limit=5&status=queued`);
+      assert.deepEqual([status, "prompt" in body.tasks[0]], [200, prompt], full);
+    }
+  });
+
+  it("lists the tasks in any of several statuses, newest first, a page at a time", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.unshift((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: `task ${i}` })).body.id);
+    // Every other one is cancelled, so the two statuses interleave.
+    for (const id of [ids[1], ids[3], ids[5]]) assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`)).status, 200);
+    const listed = async (query: string) => (await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).body;
+    assert.deepEqual((await listed("status=queued,cancelled")).tasks.map((task: Task) => [task.id, task.status]), ids.map((id, i) => [id, i % 2 ? "cancelled" : "queued"]));
+    assert.deepEqual((await listed("status=cancelled,queued,cancelled")).tasks.map((task: Task) => task.id), ids);
+    assert.deepEqual((await listed("status=cancelled,running")).tasks.map((task: Task) => task.id), [ids[1], ids[3], ids[5]]);
+    assert.deepEqual((await listed("status=running,error")).tasks, []);
+    const walked: string[] = [];
+    for (let page = await listed("status=queued,cancelled&limit=1"); page.tasks.length; page = page.next ? await listed(`status=queued,cancelled&limit=1&before=${page.next}`) : { tasks: [] }) {
+      assert.equal(page.tasks.length, 1);
+      walked.push(page.tasks[0].id);
+    }
+    assert.deepEqual(walked, ids);
+    for (const status of ["queued,nope", "", "queued,,running", "queued,", "queued, running"]) {
+      const { status: code, body } = await call(api, KEYS.acme, "GET", `/v1/tasks?status=${status}`);
+      assert.deepEqual([code, body.error], [400, "status must be one or more of: queued, running, succeeded, failed, stopped, cancelled, error, separated by commas"], status);
+    }
+  });
+
+  it("refuses a before that is no task of the tenant's, rather than answer with an empty page", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] });
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) ids.unshift((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id);
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    // One answer for another tenant's task and one that never was: it tells nothing of the first.
+    for (const before of [theirs, "task_nope"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks?before=${before}`), { status: 400, body: { error: "before must be the id of one of your tasks here" } }, before);
+    }
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.map((task: Task) => task.id), [ids[1]]);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[1]}`)).body, { tasks: [] });
+  });
+
+  it("answers 404 No such route for a path that is none, and No such task only on a task's routes", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    const theirs = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    for (const path of ["/v1/nope", "/v1/tasks/", `/v1/tasks/${id}/result`, `/v1/tasks/${id}/events/1`, "/v2/tasks", "/"]) {
+      for (const method of ["GET", "POST", "DELETE"]) assert.deepEqual(await call(api, KEYS.acme, method, path), { status: 404, body: { error: "No such route" } }, `${method} ${path}`);
+    }
+    for (const path of ["/v1/tasks/task_missing", `/v1/tasks/${theirs}`, `/v1/tasks/${theirs}/cancel`, "/v1/tasks/task_missing/approvals/ap_1"]) {
+      assert.deepEqual(await call(api, KEYS.acme, "GET", path), { status: 404, body: { error: "No such task" } }, path);
+    }
+    // A wrong method on a route is a 405, and a key is asked for before anything is said of the path.
+    assert.equal((await call(api, KEYS.acme, "PUT", `/v1/tasks/${id}`)).status, 405);
+    assert.equal((await call(api, undefined, "GET", "/v1/nope")).status, 401);
+    // The routes the API has are the ones its requests are counted under.
+    for (const path of ["/v1/nope", "/v1/tasks/", "/v1/task", `/v1/tasks/${id}`, `/v1/tasks/${id}/cancel`, `/v1/tasks/${id}/cancel/`, `/v1/tasks/${id}/approvals`, `/v1/tasks/${id}/approvals/ap_1`, `/v1/tasks/${id}/approvals/ap_1/x`, "/v1/usage", "/v1/limits", "/v1/limits/"]) {
+      const { status, body } = await call(api, KEYS.acme, "GET", path);
+      assert.equal(status === 404 && body.error === "No such route", routeOf(path) === "other", path);
+    }
+  });
+
+  it("tells a tenant its limits and what it has used of them (/v1/limits)", async () => {
+    const clock = new Date("2026-12-31T22:00:00Z");
+    const tenants = [
+      { id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, maxQueued: 5, quotas: { tasksPerDay: 10 } },
+      { id: "globex", keys: [sha256(KEYS.globex)] },
+    ];
+    const api = await service({ tenants }, undefined, () => clock);
+    for (let i = 0; i < 2; i++) assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    const resets = { day: "2027-01-01T00:00:00.000Z", month: "2027-01-01T00:00:00.000Z" };
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/limits"), {
+      status: 200,
+      body: {
+        tenant: "acme",
+        region: null,
+        limits: { concurrency: 0, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 5, approvalTimeout: 600, maxStreams: 20, quotas: { tasksPerDay: 10 } },
+        used: { queued: 2, running: 0, tasksToday: 2, usdToday: 0, usdThisMonth: 0 },
+        resets,
+      },
+    });
+    // Another tenant's are its own: the defaults, and nothing used.
+    const theirs = (await call(api, KEYS.globex, "GET", "/v1/limits")).body;
+    assert.deepEqual([theirs.tenant, theirs.limits.concurrency, theirs.limits.maxQueued, theirs.limits.quotas], ["globex", 2, 1000, {}]);
+    assert.deepEqual(theirs.used, { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await call(api, KEYS.acme, "GET", "/v1/limits?x=1"), { status: 400, body: { error: "Unknown parameter: x" } });
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/limits", {})).status, 405);
+    assert.equal((await call(api, undefined, "GET", "/v1/limits")).status, 401);
+    // A cancelled task is queued no more, and still one created today.
+    const [id] = (await call(api, KEYS.acme, "GET", "/v1/tasks?limit=1")).body.tasks.map((task: Task) => task.id);
+    await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/limits")).body.used, { queued: 1, running: 0, tasksToday: 2, usdToday: 0, usdThisMonth: 0 });
   });
 
   it("stores a run's events up to maxEvents, then one notice and its end, and the run goes on", async () => {
@@ -576,6 +693,31 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(JSON.parse(frames[3].data).text, /past 3 aren't kept/);
     const task = await statusOf(api, id, "succeeded");
     assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
+  });
+
+  it("shows the last text a run wrote as the task's result, though its events past maxEvents aren't kept", async () => {
+    const api = await service({ maxEvents: 3 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    // It has none while it runs.
+    const running = await statusOf(api, id, "running");
+    assert.deepEqual([running.result, running.resultTruncated], [null, false]);
+    await until(() => existsSync(work(api, id)), "the task's project");
+    await writeFile(join(work(api, id), "go"), "");
+    const task = await statusOf(api, id, "succeeded");
+    assert.deepEqual([task.result, task.resultTruncated], ["Done.", false]);
+    // The text itself was past the cap: no event holds it.
+    assert.ok((await api.store.events(id)).every(({ event }) => (event as { type: string }).type !== "text"));
+  });
+
+  it("lists tasks without their results unless asked", async () => {
+    const api = await service();
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await statusOf(api, id, "succeeded");
+    const [listed] = (await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks;
+    assert.equal(listed.id, id);
+    assert.ok(!("result" in listed) && !("resultTruncated" in listed));
+    const [full] = (await call(api, KEYS.acme, "GET", "/v1/tasks?full=1")).body.tasks;
+    assert.deepEqual([full.result, full.resultTruncated], ["Done.", false]);
   });
 
   it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
@@ -957,6 +1099,67 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     await until(() => api.metrics.eventStreams.get({ tenant: "acme" }) === 0, "the streams to be counted no more");
     for (const stream of streams) stream.destroy();
   });
+
+  it("deletes an ended task's content with DELETE, and keeps its row, its usage and its cost", async () => {
+    const api = await service();
+    const older = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "secret.txt": "a secret\n" } }, model: "claude-haiku-4-5" })).body.id;
+    const before = await statusOf(api, id, "succeeded");
+    await statusOf(api, older, "succeeded");
+    await api.scheduler.settled();
+    await api.store.addApproval(id, { id: "ap_1", step: 1, tool: "bash", description: "rm -rf build" });
+    assert.deepEqual([before.purged, before.prompt, before.result, before.stats], [null, "exit 0", "Done.", { stop: "end_turn", steps: 2 }]);
+
+    // Not without a key, not another tenant's, and only GET and DELETE on a task's own path.
+    assert.equal((await call(api, undefined, "DELETE", `/v1/tasks/${id}`)).status, 401);
+    assert.deepEqual(await call(api, KEYS.globex, "DELETE", `/v1/tasks/${id}`), { status: 404, body: { error: "No such task" } });
+    assert.deepEqual(await call(api, KEYS.acme, "DELETE", "/v1/tasks/task_none"), { status: 404, body: { error: "No such task" } });
+    assert.deepEqual(await call(api, KEYS.acme, "PUT", `/v1/tasks/${id}`), { status: 405, body: { error: "Use GET or DELETE" } });
+    assert.deepEqual([(await api.store.events(id)).length, (await api.store.approvals(id)).length, (await api.store.task(id))!.spec.prompt], [7, 1, "exit 0"]);
+
+    const deleted = await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`);
+    assert.equal(deleted.status, 200);
+    const { purged } = deleted.body;
+    assert.equal(new Date(purged).toISOString(), purged);
+    // What it was, but for what the tenant and the run wrote.
+    assert.deepEqual(deleted.body, { ...before, purged, prompt: "", stats: null, result: null, resultTruncated: false });
+    assert.deepEqual([deleted.body.status, deleted.body.model, deleted.body.usage, deleted.body.cost], ["succeeded", "claude-haiku-4-5", { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 }, 0.002]);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks/${id}`)).body, deleted.body);
+    assert.deepEqual([await api.store.events(id), await api.store.approvals(id)], [[], []]);
+    assert.deepEqual((await api.store.task(id))!.spec, { prompt: "", maxSteps: before.maxSteps, timeLimit: before.timeLimit, model: "claude-haiku-4-5" });
+    // Again: the same answer, with the time it was first deleted at.
+    assert.deepEqual(await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`), deleted);
+
+    // Its events and approvals are gone, which each way of asking for them says; a cancel says it has ended.
+    const gone = { status: 410, body: { error: "The task's events and approvals were deleted", id, purged } };
+    assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks/${id}/events`), gone);
+    assert.deepEqual(await call(api, KEYS.acme, "GET", `/v1/tasks/${id}/approvals`), gone);
+    assert.deepEqual(await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" }), gone);
+    assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`)).status, 409);
+
+    // It is still listed, and a page still starts after it; the task beside it is whole.
+    const listed = (await call(api, KEYS.acme, "GET", "/v1/tasks?full=1")).body.tasks;
+    assert.deepEqual(listed.map((task: { id: string; purged: string | null; prompt: string }) => [task.id, task.purged, task.prompt]), [[id, purged, ""], [older, null, "exit 0"]]);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${id}`)).body.tasks.map((task: Task) => task.id), [older]);
+    assert.equal((await api.store.events(older)).length, 7);
+  });
+
+  it("refuses to delete a task that hasn't ended, and deletes nothing of it", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 1 }] });
+    const running = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    const queued = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait too" })).body.id;
+    await statusOf(api, running, "running");
+    const events = await until(async () => (await api.store.events(running)).length, "the run's first events");
+    for (const [id, status] of [[running, "running"], [queued, "queued"]]) {
+      assert.deepEqual(await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`), { status: 409, body: { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status } });
+    }
+    assert.ok((await api.store.events(running)).length >= events);
+    const tasks = [(await api.store.task(running))!, (await api.store.task(queued))!];
+    assert.deepEqual(tasks.map((task) => [task.spec.prompt, task.purged]), [["wait", null], ["wait too", null]]);
+    // Cancelled, as the answer says, it can be.
+    assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${queued}/cancel`)).status, 200);
+    assert.equal((await call(api, KEYS.acme, "DELETE", `/v1/tasks/${queued}`)).status, 200);
+  });
 };
 
 /** A task's event stream, as the response to its request, and a way for its client to go away. */
@@ -1112,6 +1315,47 @@ const schedulerTests = () => {
     end();
     await scheduler.close();
     await store.close();
+  });
+
+  it("lists a tenant's tasks in several statuses a page at a time, with no gap or repeat, and counts its standing", async () => {
+    const store = await newStore();
+    const limits = { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+    for (const id of ["a", "b"]) await store.putTenant({ id, limits }, []);
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const now = new Date();
+    // a's tasks, newest first, with what became of each: queued, cancelled and running, interleaved with b's.
+    const made: [string, string][] = [];
+    for (let i = 0; i < 30; i++) {
+      const task = (await store.createTask(i % 5 === 4 ? "b" : "a", spec, { now })) as Task;
+      if (task.tenant === "a") made.unshift([task.id, i % 3 ? "queued" : "cancelled"]);
+      if (i % 3 === 0) assert.ok(await store.cancelQueued(task.id));
+    }
+    // The oldest queued of a's runs.
+    const running = (await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 5, tenantConcurrency: 5 })) as Task;
+    made.find(([id]) => id === running.id)![1] = "running";
+    const of = (...statuses: string[]) => made.filter(([, status]) => statuses.includes(status)).map(([id]) => id);
+    const ids = async (options: Parameters<Store["tasks"]>[1]) => (await store.tasks("a", options)).map((task) => task.id);
+    assert.deepEqual(await ids({ status: ["queued", "cancelled"] }), of("queued", "cancelled"));
+    assert.deepEqual(await ids({ status: ["cancelled", "running", "queued"] }), of("queued", "cancelled", "running"));
+    assert.deepEqual(await ids({ status: ["running", "error"] }), [running.id]);
+    assert.deepEqual(await ids({ status: ["queued"] }), of("queued"));
+    assert.deepEqual(await ids({ status: [] }), of("queued", "cancelled", "running"));
+    for (const limit of [1, 4, 7]) {
+      const walked: string[] = [];
+      for (let page = await ids({ status: ["queued", "cancelled"], limit }); page.length; page = await ids({ status: ["queued", "cancelled"], limit, before: page.at(-1) })) {
+        assert.ok(page.length <= limit);
+        walked.push(...page);
+      }
+      assert.deepEqual(walked, of("queued", "cancelled"), `limit ${limit}`);
+    }
+    assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 2, prompts: true }))[0].spec.prompt, "x");
+    assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 2 }))[0].spec.prompt, "");
+    // 24 of a's were made today: 8 cancelled, one running, and the rest queued.
+    assert.deepEqual(await store.standing("a", now), { queued: 15, running: 1, tasksToday: 24, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await store.standing("b", now), { queued: 4, running: 0, tasksToday: 6, usdToday: 0, usdThisMonth: 0 });
+    // The next day's count starts again; the queue is as long as it was.
+    assert.deepEqual(await store.standing("a", new Date(now.getTime() + 86_400_000)), { queued: 15, running: 1, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+    assert.deepEqual(await store.standing("nobody", now), { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
   });
 
   it("reads only the tasks it starts, however many are queued", async () => {
@@ -1399,6 +1643,111 @@ const schedulerTests = () => {
     });
   }
 
+  /** The task of a run that wrote these events (each given its seq and time) and exited 0, once it has ended. */
+  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner | number) => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    assert.deepEqual([task.result, task.resultTruncated], [null, false]);
+    // A number is the exit code of a run that writes the events; a runner is used as it is.
+    const exitCode = typeof runner === "number" ? runner : 0;
+    if (typeof runner !== "object") runner = {
+      async start() {
+        return {
+          events: (async function* () {
+            for (const [i, event] of events.entries()) yield { v: 1, seq: i + 1, ts: new Date().toISOString(), ...event } as JigEvent;
+          })(),
+          wait: async () => ({ exitCode, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, ...options });
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    const stored = (await store.events(task.id)).map(({ event }) => (event as { type: string }).type);
+    await scheduler.close();
+    await store.close();
+    return { ended, stored };
+  };
+  const END = { type: "end", stop: "end_turn" };
+
+  it("keeps the last text a run wrote as its task's result", async () => {
+    const { ended } = await ranWith([{ type: "text", step: 1, text: "working" }, { type: "text", step: 2, text: "done: fixed app.py" }, END]);
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "done: fixed app.py", false]);
+  });
+
+  it("keeps the result of a run whose last text was past maxEvents", async () => {
+    const notices = Array.from({ length: 5 }, (_, i) => ({ type: "notice", text: `notice ${i}` }));
+    const { ended, stored } = await ranWith([...notices, { type: "text", step: 1, text: "final" }, END], { maxEvents: 3 });
+    assert.deepEqual(stored, ["notice", "notice", "notice", "notice", "end"]);
+    assert.deepEqual([ended.result, ended.resultTruncated], ["final", false]);
+  });
+
+  it("cuts a result to maxResultBytes of UTF-8, at a character's end, and says so", async () => {
+    // "é" is two bytes: five fit in 10, four in 9.
+    const text = [{ type: "text", step: 1, text: "ééééééé" }, END];
+    const ten = (await ranWith(text, { maxResultBytes: 10 })).ended;
+    assert.deepEqual([ten.result, ten.resultTruncated], ["ééééé", true]);
+    const nine = (await ranWith(text, { maxResultBytes: 9 })).ended;
+    assert.deepEqual([nine.result, nine.resultTruncated], ["éééé", true]);
+  });
+
+  it("leaves the result null for a run that wrote no text, and passes by a text that isn't a string", async () => {
+    const none = (await ranWith([], {}, endsWith(0))).ended;
+    assert.deepEqual([none.status, none.result, none.resultTruncated], ["succeeded", null, false]);
+    const { ended } = await ranWith([{ type: "text", step: 1, text: "ok" }, { type: "text", step: 2, text: 42 }, END]);
+    assert.deepEqual([ended.result, ended.resultTruncated], ["ok", false]);
+  });
+
+  it("gives an earlier step's text as the result when the run's last step wrote none", async () => {
+    // As jig ends when the model's last reply has neither text nor a tool call: stop "empty", exit 8, so
+    // the task is stopped, not succeeded, and its result is the last thing the run said before that.
+    const events = [
+      { type: "text", step: 1, text: "I'll run the tests." },
+      { type: "tool_call", step: 1, id: "call_1", name: "bash", description: "npm test" },
+      { type: "tool_result", step: 1, id: "call_1", isError: false, output: "ok" },
+      { type: "step", step: 1 },
+      { type: "step", step: 2 },
+      { type: "end", stop: "empty" },
+    ];
+    const { ended } = await ranWith(events, {}, 8);
+    assert.deepEqual([ended.status, ended.stop, ended.exitCode, ended.result], ["stopped", "empty", 8, "I'll run the tests."]);
+  });
+
+  it("gives only the last part of a reply continued past the output limit", async () => {
+    // jig writes one text event per step, so a reply cut off and continued is two: the result is the second.
+    const events = [
+      { type: "text", step: 1, text: "The answer has two parts. Part one is long and " },
+      { type: "step", step: 1 },
+      { type: "text", step: 2, text: "part two ends it." },
+      { type: "step", step: 2 },
+      END,
+    ];
+    const { ended, stored } = await ranWith(events);
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "part two ends it.", false]);
+    assert.deepEqual(stored.filter((type) => type === "text").length, 2);
+  });
+
+  it("stores an outcome with a result, or without the result's fields, and lists results only with prompts", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const spec = { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const [first, second] = [await store.createTask("a", spec), await store.createTask("a", spec)];
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    for (const task of [first, second]) assert.equal(((await store.claim("a", terms)) as Task).id, task.id);
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    // As a caller written before the result was: neither field.
+    assert.equal(await store.finish(first.id, "r1", outcome), true);
+    assert.equal(await store.finish(second.id, "r1", { ...outcome, result: "the start", resultTruncated: true }), true);
+    const [plain, cut] = [(await store.task(first.id))!, (await store.task(second.id))!];
+    assert.deepEqual([plain.result, plain.resultTruncated], [null, false]);
+    assert.deepEqual([cut.result, cut.resultTruncated], ["the start", true]);
+    assert.deepEqual((await store.tasks("a", { prompts: true })).map((task) => [task.result, task.resultTruncated]), [["the start", true], [null, false]]);
+    assert.deepEqual((await store.tasks("a")).map((task) => [task.result, task.resultTruncated]), [[null, false], [null, false]]);
+    await store.close();
+  });
+
   it("frees a run's slot even when its outcome can't be stored", async () => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
@@ -1536,6 +1885,168 @@ const schedulerTests = () => {
     await scheduler.close();
     await store.close();
   });
+
+  it("purges an ended task once, leaves one that hasn't ended, and stores nothing for a purged task after", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const spec = { prompt: "the prompt", workspace: { files: { "a.txt": "a file" } }, maxSteps: 5, timeLimit: 60, model: "deepseek-flash", approvals: true, mode: "ask" as const };
+    const made = await store.createTask("a", spec, { now: new Date() }, { key: "k", hash: "h" });
+    assert.ok("id" in made);
+    const waiting = await store.createTask("a", { ...spec, prompt: "queued" });
+    assert.equal(await store.purge("task_none"), undefined);
+    // Queued, then running: nothing of it goes.
+    assert.deepEqual(await store.purge(made.id), { task: made, first: false });
+    const claimed = (await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 })) as Task;
+    await store.addEvent(made.id, 1, { v: 1, seq: 1, ts: "", type: "text", text: "said" });
+    await store.addApproval(made.id, { id: "ap_1", step: 1, tool: "bash", description: "rm" });
+    assert.deepEqual(await store.purge(made.id), { task: claimed, first: false });
+    assert.deepEqual([(await store.events(made.id)).length, (await store.approvals(made.id)).length], [1, 1]);
+    const outcome = { status: "error" as const, exitCode: 1, stop: "error", error: "what went wrong", stats: { steps: 1 }, usage: { input: 3, cacheRead: 0, cacheWrite: 0, output: 2 }, cost: 0.25, result: "said", resultTruncated: true };
+    assert.equal(await store.finish(made.id, "r1", outcome), true);
+    const ended = (await store.task(made.id))!;
+    const ledger = await store.usage({ from: "2000-01-01", to: "2100-01-01", group: ["model"] });
+
+    const purged = (await store.purge(made.id))!;
+    assert.equal(purged.first, true);
+    assert.ok(purged.task.purged);
+    assert.deepEqual(purged.task, { ...ended, purged: purged.task.purged, spec: { prompt: "", maxSteps: 5, timeLimit: 60, model: "deepseek-flash", approvals: true, mode: "ask" }, error: null, stats: null, result: null, resultTruncated: false });
+    assert.deepEqual(await store.task(made.id), purged.task);
+    assert.deepEqual([await store.events(made.id), await store.approvals(made.id)], [[], []]);
+    // Again, and not the first: the time stays.
+    assert.deepEqual(await store.purge(made.id), { task: purged.task, first: false });
+    // A late event or approval of its run's is dropped, as one with a seq already kept is.
+    await store.addEvent(made.id, 2, { v: 1, seq: 2, ts: "", type: "text", text: "late" });
+    assert.equal(await store.addApproval(made.id, { id: "ap_2", step: 2, tool: "bash", description: "late" }), undefined);
+    assert.deepEqual([await store.events(made.id), await store.approvals(made.id)], [[], []]);
+    // The ledger and its key are as they were, and the task beside it.
+    assert.deepEqual(await store.usage({ from: "2000-01-01", to: "2100-01-01", group: ["model"] }), ledger);
+    assert.deepEqual(await store.createTask("a", spec, { now: new Date() }, { key: "k", hash: "h" }), { replay: purged.task, same: true });
+    assert.deepEqual(await store.task(waiting.id), waiting);
+    await store.addEvent(waiting.id, 1, { v: 1, seq: 1, ts: "", type: "text", text: "kept" });
+    assert.equal((await store.events(waiting.id)).length, 1);
+    await store.close();
+  });
+
+  /** A tenant "a" in the store, and what makes a task of its that ended just now, with an event. */
+  const endedTasks = async (store: Store) => {
+    await store.putTenant({ id: "a", limits: { concurrency: 50, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    return async (prompt: string) => {
+      const { id } = await store.createTask("a", { prompt, maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+      assert.equal(((await store.claim("a", { owner: "r0", leaseMs: 60_000, concurrency: 50, tenantConcurrency: 50 })) as Task).id, id);
+      await store.addEvent(id, 1, { v: 1, seq: 1, ts: "", type: "text", text: prompt });
+      assert.equal(await store.finish(id, "r0", { status: "succeeded", exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null, result: prompt }), true);
+      // No two end in the same millisecond: they are purged in the order they ended.
+      await new Promise((done) => setTimeout(done, 5));
+      return id;
+    };
+  };
+  /**
+   * A batch of retention's that purged something: how many. Postgres's purges nothing while another
+   * replica's does, and the lock they take is the database's, which the test files running at once share.
+   */
+  const batch = (store: Store, limit: number) => until(() => store.purgeEnded(1, limit), "a batch to be purged");
+  /** The tasks' prompts, or "purged" where they are purged. */
+  const kept = async (store: Store, ids: string[]) => Promise.all(ids.map(async (id) => ((await store.task(id))!.purged ? "purged" : (await store.task(id))!.spec.prompt)));
+
+  it("purges the tasks that ended long enough ago, oldest first, a batch at a time, and none that hasn't ended", async () => {
+    const store = await newStore();
+    const end = await endedTasks(store);
+    const ids = [await end("t0"), await end("t1"), await end("t2")];
+    const queued = await store.createTask("a", { prompt: "queued", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    const running = (await store.claim("a", { owner: "r0", leaseMs: 60_000, concurrency: 50, tenantConcurrency: 50 })) as Task;
+    const waiting = await store.createTask("a", { prompt: "waiting", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    assert.equal(running.id, queued.id);
+    assert.equal(await store.purgeEnded(3_600_000, 10), 0);
+    assert.deepEqual(await kept(store, ids), ["t0", "t1", "t2"]);
+    await new Promise((done) => setTimeout(done, 20));
+    assert.equal(await batch(store, 2), 2);
+    assert.deepEqual(await kept(store, ids), ["purged", "purged", "t2"]);
+    assert.deepEqual([(await store.events(ids[0])).length, (await store.events(ids[2])).length, (await store.task(ids[0]))!.result], [0, 1, null]);
+    assert.equal(await batch(store, 2), 1);
+    assert.equal(await store.purgeEnded(1, 2), 0);
+    assert.deepEqual(await kept(store, [...ids, running.id, waiting.id]), ["purged", "purged", "purged", "queued", "waiting"]);
+    await store.close();
+  });
+
+  it("purges the tasks that ended over retentionMs ago at its start and every tenth round, with keepTaskDirs too, and none without retentionMs", async () => {
+    const store = await newStore();
+    const end = await endedTasks(store);
+    const first = await end("t0");
+    // Claimed before any scheduler starts, so none takes it: it ends later, below.
+    const second = (await store.createTask("a", { prompt: "t1", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" })).id;
+    assert.equal(((await store.claim("a", { owner: "r0", leaseMs: 60_000, concurrency: 50, tenantConcurrency: 50 })) as Task).id, second);
+    await store.addEvent(second, 1, { v: 1, seq: 1, ts: "", type: "text", text: "t1" });
+    const quiet = createLog("service", { write: () => {} });
+    const [none, some] = [serviceMetrics(), serviceMetrics()];
+    const without = newScheduler(store, new FakeRunner(), { concurrency: 1, leaseMs: 90, metrics: none, log: quiet });
+    await without.start();
+    // Over ten of its rounds.
+    await new Promise((done) => setTimeout(done, 500));
+    await without.close();
+    assert.deepEqual([await kept(store, [first, second]), none.purged.get({ reason: "retention" })], [["t0", "t1"], 0]);
+    const lines: string[] = [];
+    const scheduler = newScheduler(store, new FakeRunner(), { concurrency: 1, leaseMs: 90, retentionMs: 1, keepTaskDirs: true, metrics: some, log: createLog("service", { write: (line) => lines.push(line) }) });
+    await scheduler.start();
+    await until(async () => (await store.task(first))!.purged, "the task to be purged as the scheduler starts");
+    // One that ends later is purged by a later round.
+    assert.equal(await store.finish(second, "r0", { status: "succeeded", exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null }), true);
+    await until(async () => (await store.task(second))!.purged, "the task to be purged in a later round");
+    await scheduler.close();
+    assert.deepEqual([await store.events(first), await store.events(second)], [[], []]);
+    assert.equal(some.purged.get({ reason: "retention" }), 2);
+    assert.equal(lines.filter((line) => /purged 1 task\(s\)/.test(line)).length, 2, lines.join(""));
+    await store.close();
+  });
+
+  it("stops purging as it closes, after the batch in flight, which it waits for", async () => {
+    const store = await newStore();
+    const end = await endedTasks(store);
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) ids.push(await end(`t${i}`));
+    let release!: () => void;
+    const released = new Promise<void>((done) => (release = done));
+    let batches = 0;
+    const slow = new Proxy(store, {
+      get(target, name, receiver) {
+        const value = Reflect.get(target, name, receiver);
+        if (name !== "purgeEnded") return typeof value === "function" ? value.bind(target) : value;
+        return async (olderThanMs: number, limit: number) => {
+          batches++;
+          await released;
+          return batch(target, limit);
+        };
+      },
+    });
+    const scheduler = newScheduler(slow, new FakeRunner(), { concurrency: 1, retentionMs: 1, log: createLog("service", { write: () => {} }) });
+    await scheduler.start();
+    assert.equal(batches, 1);
+    let closed = false;
+    const closing = scheduler.close().then(() => (closed = true));
+    await new Promise((done) => setTimeout(done, 100));
+    assert.equal(closed, false);
+    release();
+    await closing;
+    // The batch was full, so another would have followed it.
+    assert.equal(batches, 1);
+    assert.deepEqual(await kept(store, ids), ["purged", "purged", "purged", "purged", "purged", "t5"]);
+    await store.close();
+  });
+
+  it("counts a failed purge of old tasks, and tries again in a later round", async () => {
+    const store = await newStore();
+    const end = await endedTasks(store);
+    const id = await end("t0");
+    let failures = 1;
+    const metrics = serviceMetrics();
+    const lines: string[] = [];
+    const scheduler = newScheduler(failingStore(store, "purgeEnded", () => failures-- > 0), new FakeRunner(), { concurrency: 1, leaseMs: 90, retentionMs: 1, metrics, log: createLog("service", { write: (line) => lines.push(line) }) });
+    await scheduler.start();
+    await until(() => lines.some((line) => /couldn't purge the tasks/.test(line)), "the failure to be logged");
+    assert.deepEqual([await kept(store, [id]), metrics.storeErrors.get({ retried: "false" })], [["t0"], 1]);
+    await until(async () => (await store.task(id))!.purged, "the task to be purged in a later round");
+    await scheduler.close();
+    await store.close();
+  });
 };
 
 for (const { name, skip } of BACKENDS) {
@@ -1558,11 +2069,56 @@ describe("a run's outcome", () => {
     assert.equal(outcomeOf(killed, undefined, undefined, undefined).stop, "error");
     assert.equal(outcomeOf(undefined, undefined, "the workspace couldn't be made", undefined).stop, null);
   });
+
+  it("holds the run's last text as its result, however the run ended", () => {
+    const killed = { exitCode: 143, timedOut: false };
+    const none = outcomeOf({ exitCode: 0, timedOut: false }, undefined, undefined, undefined);
+    assert.deepEqual([none.result, none.resultTruncated], [null, false]);
+    const cancelled = outcomeOf(killed, undefined, undefined, "cancelled", { text: "half done", truncated: false });
+    assert.deepEqual([cancelled.status, cancelled.stop, cancelled.result, cancelled.resultTruncated], ["cancelled", "interrupted", "half done", false]);
+    const failed = outcomeOf(undefined, undefined, "the events couldn't be stored", undefined, { text: "the start", truncated: true });
+    assert.deepEqual([failed.status, failed.result, failed.resultTruncated], ["error", "the start", true]);
+  });
+});
+
+describe("a task's result", () => {
+  it("is the text whole up to maxBytes of UTF-8, and its start past them, cut at a character's end", () => {
+    assert.deepEqual(resultOf("done", 4), { text: "done", truncated: false });
+    assert.deepEqual(resultOf("done.", 4), { text: "done", truncated: true });
+    assert.deepEqual(resultOf("ééééé", 10), { text: "ééééé", truncated: false });
+    // A four-byte emoji that straddles the cut is left out whole.
+    for (const maxBytes of [2, 3, 4, 5]) assert.deepEqual(resultOf("ab😀cd", maxBytes), { text: "ab", truncated: true }, `${maxBytes}`);
+    assert.deepEqual(resultOf("ab😀cd", 6), { text: "ab😀", truncated: true });
+    assert.deepEqual(resultOf("ab😀cd", 8), { text: "ab😀cd", truncated: false });
+  });
+
+  it("has U+FFFD for each NUL, and stays within maxBytes after that", () => {
+    assert.deepEqual(resultOf("a\0b", 100), { text: "a\uFFFDb", truncated: false });
+    // Ten NULs are ten bytes, but thirty once replaced: three of them fit.
+    const cut = resultOf("\0".repeat(10), 10);
+    assert.deepEqual(cut, { text: "\uFFFD".repeat(3), truncated: true });
+    assert.ok(Buffer.byteLength(cut.text) <= 10);
+  });
 });
 
 describe("the SQLite store's reads", () => {
   const limits = { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null };
   const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+
+  it("deletes the Idempotency-Keys whose day is over, and lets two processes open one file at once", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const [store, other] = await Promise.all([openStore(path), openStore(path)]);
+    opened.push(() => store.close(), () => other.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    const made = await store.createTask("a", spec, { now }, { key: "k", hash: "h" });
+    assert.ok("id" in made);
+    assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000 - 1)), 0);
+    assert.deepEqual(await other.createTask("a", spec, { now }, { key: "k", hash: "h" }), { replay: made, same: true });
+    assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000)), 1);
+    const again = await store.createTask("a", spec, { now }, { key: "k", hash: "h" });
+    assert.ok("id" in again && again.id !== made.id);
+  });
 
   it("reads a task's events a page at a time, and all of them without a limit", async () => {
     const store = await openStore(":memory:");
@@ -1617,6 +2173,168 @@ describe("the SQLite store's reads", () => {
     assert.equal(plans.length, 2);
     for (const plan of plans) assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
   });
+
+  it("lists a tenant's tasks in several statuses through the index a single status is read through", async () => {
+    const store = await openStore(":memory:");
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const ids: string[] = [];
+    for (let i = 0; i < 20; i++) ids.push((await store.createTask("a", spec)).id);
+    for (const id of ids.filter((_, i) => i % 2)) await store.cancelQueued(id);
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const prepare = DatabaseSync.prototype.prepare;
+    const plans: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (/ FROM tasks WHERE tenant = \?/.test(sql)) plans.push((prepare.call(this, `EXPLAIN QUERY PLAN ${sql}`).all() as { detail: string }[]).map((row) => row.detail).join("; "));
+      return prepare.call(this, sql);
+    };
+    try {
+      assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 5 })).length, 5);
+      assert.equal((await store.tasks("a", { status: ["queued", "cancelled"], limit: 5, before: ids.at(-1) })).length, 5);
+    } finally {
+      DatabaseSync.prototype.prepare = prepare;
+    }
+    assert.equal(plans.length, 2);
+    // Each status is a search of (tenant, status), in rowid order: never a walk of the tenant's whole history.
+    for (const plan of plans) {
+      assert.equal(plan.match(/SEARCH tasks USING (COVERING )?INDEX tasks_by_tenant \(tenant=\? AND status=\?/g)?.length, 2, plan);
+      assert.doesNotMatch(plan, /tasks_by_tenant_n|SCAN tasks/, plan);
+    }
+  });
+
+  it("picks the tasks retention purges next through the index of those not yet purged", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    // The statement the store prepares, as it prepares it.
+    const prepare = DatabaseSync.prototype.prepare;
+    const picks: string[] = [];
+    DatabaseSync.prototype.prepare = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (/^SELECT .* FROM tasks WHERE purged IS NULL/.test(sql)) picks.push(sql);
+      return prepare.call(this, sql);
+    };
+    try {
+      assert.equal(await store.purgeEnded(1, 5), 0);
+    } finally {
+      DatabaseSync.prototype.prepare = prepare;
+    }
+    assert.deepEqual(picks, [UNPURGED]);
+    const db = new DatabaseSync(path);
+    const plan = (db.prepare(`EXPLAIN QUERY PLAN ${UNPURGED}`).all("", 5) as { detail: string }[]).map((row) => row.detail).join("; ");
+    db.close();
+    assert.match(plan, /USING INDEX tasks_unpurged/);
+    assert.doesNotMatch(plan, /TEMP B-TREE/, plan);
+  });
+
+  it("leaves nothing of a purged task's prompt, files or events in the database's file", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    await store.putTenant({ id: "a", limits }, []);
+    // Long enough to fill pages of their own, which the delete frees.
+    const marks = { prompt: "PROMPT-MARK-", file: "FILE-MARK-", event: "EVENT-MARK-", result: "RESULT-MARK-" };
+    const task = await store.createTask("a", { ...spec, prompt: marks.prompt.repeat(2000), workspace: { files: { "a.txt": marks.file.repeat(2000) } } });
+    await store.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 1, tenantConcurrency: 1 });
+    for (let seq = 1; seq <= 50; seq++) await store.addEvent(task.id, seq, { v: 1, seq, ts: "", type: "text", text: marks.event.repeat(500) });
+    assert.equal(await store.finish(task.id, "r1", { status: "succeeded", exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null, result: marks.result.repeat(2000) }), true);
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    // The file once the write-ahead log has been written into it and emptied: which of the marks it holds.
+    const held = async () => {
+      const db = new DatabaseSync(path);
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      db.close();
+      const [file, wal] = [await readFile(path, "latin1"), await readFile(`${path}-wal`, "latin1").catch(() => "")];
+      return Object.entries(marks).filter(([, mark]) => file.includes(mark) || wal.includes(mark)).map(([name]) => name);
+    };
+    assert.deepEqual(await held(), ["prompt", "file", "event", "result"]);
+    assert.equal((await store.purge(task.id))!.first, true);
+    assert.deepEqual(await held(), []);
+  });
+});
+
+describe("the SQLite store's schema", () => {
+  it("moves a database from before tasks had a result on, and stores results in it", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const limits = { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits }, []);
+    const old = await before.createTask("a", spec);
+    await before.claim("a", terms);
+    assert.equal(await before.finish(old.id, "r1", { ...outcome, result: "said before", resultTruncated: true }), true);
+    assert.equal((await before.task(old.id))!.result, "said before");
+    await before.close();
+    // The database as the version before left it: without the two columns (and what came after), at schema 7.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; DROP TABLE idempotency; PRAGMA user_version = 7");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const moved = (await store.task(old.id))!;
+    assert.deepEqual([moved.status, moved.result, moved.resultTruncated], ["succeeded", null, false]);
+    const next = await store.createTask("a", spec);
+    await store.claim("a", terms);
+    assert.equal(await store.finish(next.id, "r1", { ...outcome, result: "said after" }), true);
+    const ended = (await store.task(next.id))!;
+    assert.deepEqual([ended.result, ended.resultTruncated], ["said after", false]);
+  });
+});
+
+describe("the SQLite store's schema, before Idempotency-Keys", () => {
+  it("moves a database from before them on, and holds a key in it", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const old = await before.createTask("a", spec);
+    await before.close();
+    // The database as the version before left it: without the table (and what came after), at schema 8.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; DROP TABLE idempotency; PRAGMA user_version = 8");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const after = new DatabaseSync(path);
+    const version = Number((after.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    after.close();
+    assert.ok(version >= 9, String(version));
+    assert.equal((await store.task(old.id))!.spec.prompt, "x");
+    const idem = { key: "k", hash: "h" };
+    const made = await store.createTask("a", spec, { now: new Date() }, idem);
+    assert.ok("id" in made);
+    assert.deepEqual(await store.createTask("a", spec, { now: new Date() }, idem), { replay: made, same: true });
+    assert.equal((await store.tasks("a")).length, 2);
+  });
+});
+
+describe("the SQLite store's schema, before tasks could be purged", () => {
+  it("moves a database from before on, and purges a task in it", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const old = await before.createTask("a", spec);
+    await before.claim("a", { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 });
+    await before.addEvent(old.id, 1, { v: 1, seq: 1, ts: "", type: "text", text: "said" });
+    assert.equal(await before.finish(old.id, "r1", { status: "succeeded", exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null }), true);
+    await before.close();
+    // The database as the version before left it: without the column and its index, at schema 9.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; PRAGMA user_version = 9");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const moved = (await store.task(old.id))!;
+    assert.deepEqual([moved.status, moved.purged, moved.spec.prompt, (await store.events(old.id)).length], ["succeeded", null, "x", 1]);
+    const purged = (await store.purge(old.id))!;
+    assert.deepEqual([purged.first, typeof purged.task.purged, purged.task.spec.prompt, (await store.events(old.id)).length], [true, "string", "", 0]);
+  });
 });
 
 describe("the service's config", () => {
@@ -1640,6 +2358,8 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxResultBytes: 0 }), "The config's maxResultBytes must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxResultBytes: 1 }), undefined);
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
     // Postgres's pool, which SQLite hasn't.
     const postgres = "postgres://jig@db.example.com/jig";
@@ -1672,6 +2392,11 @@ describe("the service's config", () => {
     assert.equal(problem({ tenants: [{ id: "acme", keys: [], maxStreams: 0 }] }), "The config's tenants[0].maxStreams must be a whole number from 1 up, not 0");
     assert.equal(problem({ maxStreams: 500, tenants: [{ id: "acme", keys: [], maxStreams: 50 }] }), undefined);
     await assert.rejects(startService({ ...base, concurrency: 0 }, { secret: SECRET }), /concurrency must be a whole number from 1 up/);
+  });
+
+  it("takes retentionDays as a number of days over 0, up to a hundred years", () => {
+    for (const days of [0, -1, "30", 40_000, null]) assert.equal(problem({ retentionDays: days }), `The config's retentionDays must be a number over 0, up to 36500, not ${JSON.stringify(days)}`);
+    for (const days of [0.5, 30, 36_500, undefined]) assert.equal(problem({ retentionDays: days }), undefined);
   });
 
   it("refuses what could never run: times past a timer's reach, a runner without its settings, a pool past concurrency", () => {
@@ -1814,7 +2539,8 @@ describe("the service's start", () => {
     await statusOf(started, id, "succeeded");
     const settings = JSON.parse(await readFile(join(dir, "data", "tasks", id, "home", ".jig", "settings.json"), "utf8"));
     const db = join(dir, "jig.db");
-    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir] });
+    // And, on Linux, that ask jig for a /tmp, /var/tmp and /run of the task's own (see test/server-local.test.ts).
+    assert.deepEqual(settings, { hiddenPaths: [join(dir, "data"), db, `${db}-wal`, `${db}-shm`, `${db}-journal`, dir], ...(process.platform === "linux" && { isolation: "service" }) });
   });
 
   it("clones only from gitHosts, follows no redirect with them, and tells the tenant only that the clone failed", { skip: sandboxProblem() }, async () => {

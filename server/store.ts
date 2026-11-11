@@ -58,6 +58,37 @@ export interface Refusal {
   used: number;
 }
 
+/** A create's Idempotency-Key, and the SHA-256 (hex) of the body it came with. */
+export interface Idempotency {
+  key: string;
+  hash: string;
+}
+
+/** The task an earlier create with the same key made, and whether that create's body was this one's. */
+export interface Replay {
+  replay: Task;
+  same: boolean;
+}
+
+/** How long a key answers with its task, from the create that made it. */
+export const IDEMPOTENCY_MS = 24 * 3600_000;
+
+/** Whether a key recorded at `created` no longer holds at `now`, in either store. */
+export function expired(created: string | Date, now: Date): boolean {
+  return now.getTime() - new Date(created).getTime() >= IDEMPOTENCY_MS;
+}
+
+/** What a tenant has used of its caps at a moment (Store.standing), and how many of its tasks are running. */
+export interface Standing {
+  queued: number;
+  running: number;
+  /** Tasks created in the UTC day, whatever became of them. */
+  tasksToday: number;
+  /** USD spent by the tasks that ended in the UTC day, and in the UTC month. */
+  usdToday: number;
+  usdThisMonth: number;
+}
+
 /** What the metrics read from the store at a scrape: the same on every replica sharing it. */
 export interface Counts {
   /** Queued and running tasks by tenant, with when the oldest of them was created (an ISO time). */
@@ -141,6 +172,12 @@ export interface Task {
   stats: unknown;
   usage: Usage | null;
   cost: number | null;
+  /** The last text the run wrote, cut to the service's maxResultBytes; null if it wrote none. */
+  result: string | null;
+  /** Whether the result is only the start of that text. */
+  resultTruncated: boolean;
+  /** When its content was deleted (Store.purge), by a DELETE or by retention; null while it is kept. */
+  purged: string | null;
 }
 
 /** What a finished run leaves on its task. */
@@ -152,6 +189,9 @@ export interface Outcome {
   stats: unknown;
   usage: Usage | null;
   cost: number | null;
+  /** The run's last text, already cut to size, with no NUL (Postgres text can't hold one); none when left out. */
+  result?: string | null;
+  resultTruncated?: boolean;
 }
 
 export type Decision = "allow" | "deny";
@@ -207,6 +247,13 @@ export interface ClaimTerms {
  */
 export type Changes = EventEmitter;
 
+export interface TasksQuery {
+  status?: TaskStatus[];
+  limit?: number;
+  before?: string;
+  prompts?: boolean;
+}
+
 export interface Store {
   /** Adds the tenant, or updates its limits; its API keys (SHA-256 hashes, in hex) become these. */
   putTenant(tenant: Tenant, keyHashes: string[]): Promise<void>;
@@ -222,14 +269,24 @@ export interface Store {
    * Adds the task unless the tenant is at one of the caps: the refusal for the first it is at, in the order
    * maxQueued, tasksPerDay, usdPerDay, usdPerMonth. The count and the insert are one replica's at a time, so
    * replicas sharing the store can't both admit the tenant's last task of the day.
+   *
+   * With `idem`, a key the tenant used in the last IDEMPOTENCY_MS answers with the task it made then, before
+   * the caps are looked at, and makes none; a new key is recorded with the task, in its transaction. A
+   * refusal records nothing.
    */
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
   task(id: string): Promise<Task | undefined>;
   /**
-   * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
-   * without their prompts (an empty string in their place) unless `prompts`.
+   * What the tenant has used of its caps at `now`, counted as createTask counts them but outside its lock:
+   * a task being admitted meanwhile may be missing from it.
    */
-  tasks(tenant: string, options?: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean }): Promise<Task[]>;
+  standing(tenant: string, now: Date): Promise<Standing>;
+  /**
+   * A tenant's tasks, newest first, at most `limit`, those in one of `status` if it is given, those older
+   * than the task `before` if it is given; without their prompts (an empty string in their place) and results (null) unless
+   * `prompts`.
+   */
+  tasks(tenant: string, options?: TasksQuery): Promise<Task[]>;
   /** Every tenant's tasks in a status, oldest first. */
   inStatus(status: TaskStatus): Promise<Task[]>;
   /** The tenants with tasks queued, by id. */
@@ -277,6 +334,22 @@ export interface Store {
   given(task: string, id: string): Promise<Given | undefined>;
   /** How many of each task's approvals have no answer yet; a task with none is left out. */
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
+  /**
+   * Deletes an ended task's content, in one transaction: its events and approvals, its prompt (left empty),
+   * its error, stats and result, and its spec but for slimSpec's fields. Its row stays, with its status,
+   * times, usage and cost, and so do its row of the usage ledger and its Idempotency-Key. Undefined if there
+   * is no such task; one that hasn't ended is left as it is, and comes back with `purged` null. `first` says
+   * this call is the one that purged it: a task purged already is purged again, and keeps its time.
+   */
+  purge(id: string): Promise<{ task: Task; first: boolean } | undefined>;
+  /**
+   * Purges the tasks that ended over `olderThanMs` ago, by the store's clock, and aren't purged yet: the
+   * oldest `limit` of them, in one transaction. How many it purged; on Postgres, 0 while another replica is
+   * at it.
+   */
+  purgeEnded(olderThanMs: number, limit: number): Promise<number>;
+  /** Deletes the Idempotency-Keys that no longer hold at `now` (IDEMPOTENCY_MS after their create). How many. */
+  forgetKeys(now: Date): Promise<number>;
   /** The usage ledger summed by the query's groups, sorted by them; a group with no ended task is left out. */
   usage(query: UsageQuery): Promise<UsageRow[]>;
   /** Says the replica is up for `ms` more, and forgets those whose heartbeat ran out. */
@@ -346,12 +419,62 @@ const MIGRATIONS = [
   // each task's rowid after its tenant, as Postgres's tasks_by_tenant holds n. Without it, each page sorted
   // all of the tenant's tasks.
   `CREATE INDEX tasks_by_tenant_n ON tasks (tenant);`,
+  // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
+  `ALTER TABLE tasks ADD COLUMN result TEXT;
+   ALTER TABLE tasks ADD COLUMN result_truncated INTEGER NOT NULL DEFAULT 0;`,
+  // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
+  // adding it locks and scans nothing of tasks. No foreign key to tasks: a key's row may outlive its task
+  // or go before it, and a key whose task is gone is as one never used.
+  `CREATE TABLE idempotency (tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, task TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tenant, key));
+   CREATE INDEX idempotency_by_created ON idempotency (created);`,
+  // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
+  // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged.
+  `ALTER TABLE tasks ADD COLUMN purged TEXT;
+   CREATE INDEX tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL;`,
 ];
 
 type Row = Record<string, unknown>;
 
-/** A task's columns but its prompt, which a list leaves out. */
-export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost";
+/**
+ * Whether a store's error is SQLite's SQLITE_FULL (13, whatever its extended code): the database's disk had
+ * no room for a write. Only that: a quota, a -shm file that can't grow and a journal that can't be made are
+ * other codes, and are retried like any failure. Postgres's 53100 isn't one either: its disk is its server's.
+ */
+export function diskFull(err: unknown): boolean {
+  const { code, errcode } = (err ?? {}) as { code?: unknown; errcode?: unknown };
+  return code === "ERR_SQLITE_ERROR" && typeof errcode === "number" && (errcode & 0xff) === 13;
+}
+
+/** A task's columns but its prompt and its result, which a list leaves out. */
+export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost, result_truncated, purged";
+/** The two it leaves out, or what stands in their place, for a list's SELECT. */
+export const longColumns = (prompts: boolean): string => (prompts ? "prompt, result" : "'' AS prompt, NULL AS result");
+
+/**
+ * What is left of a purged task's spec: its limits, its model and how it asked, which the API's views show.
+ * The workspace (its files, or its repository's URL, which may hold a token) goes, as the prompt does.
+ * Computed here, from the spec as it was read, and written back whole: SQL's JSON operators refuse a stored
+ * "\u0000" on Postgres.
+ */
+export function slimSpec(spec: Partial<TaskSpec>): Pick<TaskSpec, "maxSteps" | "timeLimit" | "model" | "approvals" | "mode"> {
+  const { maxSteps, timeLimit, model, approvals, mode } = spec;
+  return { maxSteps: maxSteps!, timeLimit: timeLimit!, model: model!, ...(approvals !== undefined && { approvals }), ...(mode !== undefined && { mode }) };
+}
+
+/**
+ * SQLite's pick of the tasks retention purges next: `?` is the time they ended before, then how many. It
+ * says the tasks_unpurged index's own condition, word for word, or SQLite wouldn't use the index.
+ */
+export const UNPURGED = "SELECT id, spec FROM tasks WHERE purged IS NULL AND ended IS NOT NULL AND ended < ? ORDER BY ended LIMIT ?";
+
+/** What a tenant has used of each cap, as admit counts it and standing reports it: the tenant, then the period's bounds. */
+const USED: Record<Cap, string> = {
+  maxQueued: "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'queued'",
+  tasksPerDay: "SELECT count(*) FROM tasks WHERE tenant = ? AND created >= ? AND created < ?",
+  usdPerDay: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?",
+  usdPerMonth: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?",
+};
+const RUNNING = "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'running'";
 
 // One replica's store, or several processes' on one machine: SQLite has no notifications, so changes
 // made by another process are found by looking again, and claims take its write lock.
@@ -375,17 +498,26 @@ class SqliteStore implements Store {
       throw new Error(`Couldn't open the database ${path}: ${err instanceof Error ? err.message : String(err)}`);
     }
     // WAL lets readers go on while a run's events are written; the timeout rides out another process's write.
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
-    const version = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    // secure_delete overwrites what a delete or a shorter value frees with zeros, so a purged task's prompt
+    // and events aren't left readable in the file's free pages. It costs where much is deleted: measured,
+    // a task's 64 MiB of events go in about 0.3 s rather than 0.02, and the WAL grows by as much meanwhile.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;");
+    const read = () => Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    const version = read();
     if (version > MIGRATIONS.length) throw new Error(`${path} was made by a newer version of the task service (schema ${version})`);
     for (let next = version; next < MIGRATIONS.length; next++) {
-      this.db.exec("BEGIN");
+      // The write lock first, then the version again: another process opening the file may have run this one.
+      this.db.exec("BEGIN IMMEDIATE");
       try {
+        if (read() > next) {
+          this.db.exec("COMMIT");
+          continue;
+        }
         this.db.exec(MIGRATIONS[next]);
         this.db.exec(`PRAGMA user_version = ${next + 1}`);
         this.db.exec("COMMIT");
       } catch (err) {
-        this.db.exec("ROLLBACK");
+        this.rollback();
         throw err;
       }
     }
@@ -399,7 +531,7 @@ class SqliteStore implements Store {
       for (const hash of keyHashes) this.db.prepare("INSERT OR REPLACE INTO api_keys (hash, tenant) VALUES (?, ?)").run(hash, tenant.id);
       this.db.exec("COMMIT");
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }
@@ -427,36 +559,54 @@ class SqliteStore implements Store {
   }
 
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
-  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
-    return caps ? this.admit(tenant, spec, caps) : this.insert(tenant, spec, new Date());
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
+    return caps ? this.admit(tenant, spec, caps, idem) : this.insert(tenant, spec, new Date());
   }
 
-  /** Adds the task, created at `created`. */
-  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
+  /** Adds the task, created at `created`: its id. */
+  private add(tenant: string, spec: TaskSpec, created: Date): string {
     const id = newTaskId(this.region);
     const { prompt, ...rest } = spec;
     this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), created.toISOString());
-    return (await this.task(id))!;
+    return id;
+  }
+
+  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
+    return (await this.task(this.add(tenant, spec, created)))!;
   }
 
   /**
-   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here waits
-   * (insert inserts before its first await), so no other statement of this process's runs inside it. The
-   * task is created at the caps' `now`, the clock the quotas' days are read from, so it is counted on the
-   * day they say.
+   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here
+   * waits, so no other statement of this process's runs inside it. The task is created at the caps' `now`,
+   * the clock the quotas' days are read from, so it is counted on the day they say.
+   *
+   * atomically commits when its body returns, so every statement here is synchronous and comes before
+   * the first await: the key's lookup, the removal of one that ran out, the caps, the task's insert and the
+   * key's. The task is read back (this.task, which reads before it first waits) as the body's last step.
    */
-  private admit(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal> {
+  private admit(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
     return this.atomically(() => {
+      if (idem) {
+        const row = this.db.prepare(IDEMPOTENT).get(tenant, idem.key) as Row | undefined;
+        // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
+        if (row && row.id !== null && !expired(String(row.idem_created), caps.now)) return Promise.resolve({ replay: toTask(row), same: row.idem_hash === idem.hash });
+        // Run out, or its task is gone: the key is free again.
+        if (row) this.db.prepare("DELETE FROM idempotency WHERE tenant = ? AND key = ?").run(tenant, idem.key);
+      }
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
       const refused = refusal(caps, (cap) =>
-        cap === "maxQueued" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'queued'")
-        : cap === "tasksPerDay" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND created >= ? AND created < ?", dayStart.toISOString(), nextDay.toISOString())
-        : cap === "usdPerDay" ? one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?", day)
-        : one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?", isoDay(monthStart), isoDay(nextMonth)),
+        cap === "maxQueued" ? one(USED.maxQueued)
+        : cap === "tasksPerDay" ? one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString())
+        : cap === "usdPerDay" ? one(USED.usdPerDay, day)
+        : one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
       );
-      return refused ? Promise.resolve(refused) : this.insert(tenant, spec, caps.now);
+      if (refused) return Promise.resolve(refused);
+      const id = this.add(tenant, spec, caps.now);
+      // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
+      if (idem) this.db.prepare("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES (?, ?, ?, ?, ?)").run(tenant, idem.key, idem.hash, id, caps.now.toISOString());
+      return this.task(id) as Promise<Task>;
     }, "BEGIN IMMEDIATE");
   }
 
@@ -465,11 +615,36 @@ class SqliteStore implements Store {
     return row && toTask(row);
   }
 
-  async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
-    const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
-    const params = [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit];
-    const rows = this.db.prepare(`SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`).all(...params);
-    return (rows as Row[]).map(toTask);
+  /** No statement here waits for another, so the five counts are of one moment. */
+  async standing(tenant: string, now: Date): Promise<Standing> {
+    const { day, dayStart, nextDay, monthStart, nextMonth } = periods(now);
+    const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
+    return {
+      queued: one(USED.maxQueued),
+      running: one(RUNNING),
+      tasksToday: one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString()),
+      usdToday: one(USED.usdPerDay, day),
+      usdThisMonth: one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
+    };
+  }
+
+  async tasks(tenant: string, { status = [], limit = 100, before, prompts = false }: TasksQuery = {}): Promise<Task[]> {
+    const one = (status: TaskStatus | undefined, columns: string) => {
+      const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
+      return {
+        sql: `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)}${columns} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`,
+        params: [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit],
+      };
+    };
+    if (status.length < 2) {
+      const { sql, params } = one(status[0], "");
+      return (this.db.prepare(sql).all(...params) as Row[]).map(toTask);
+    }
+    // Several statuses: each one's newest `limit`, read in its index's order as a single status is, then the
+    // newest `limit` of those. status IN (...) would walk the tenant's whole history to sort it.
+    const arms = status.map((status) => one(status, ", rowid AS r"));
+    const sql = `${arms.map((arm) => `SELECT * FROM (${arm.sql})`).join(" UNION ALL ")} ORDER BY r DESC LIMIT ?`;
+    return (this.db.prepare(sql).all(...arms.flatMap((arm) => arm.params), limit) as Row[]).map(toTask);
   }
 
   async inStatus(status: TaskStatus): Promise<Task[]> {
@@ -501,7 +676,7 @@ class SqliteStore implements Store {
       this.db.exec("COMMIT");
       return result;
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }
@@ -540,8 +715,9 @@ class SqliteStore implements Store {
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     return this.atomically(() => {
       const rows = this.db
-        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
-        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner) as Row[];
+        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, result = ?, result_truncated = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
+        // node:sqlite binds neither undefined nor a boolean.
+        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, outcome.result ?? null, outcome.resultTruncated ? 1 : 0, new Date().toISOString(), id, owner) as Row[];
       this.ledger(rows, spentOf(outcome));
       return rows.length === 1;
     });
@@ -584,6 +760,15 @@ class SqliteStore implements Store {
     return countsOf(tasks, Number(pending.n), Number(replicas.n));
   }
 
+  /**
+   * Rolls back the transaction a failed write left open, if it left one. On a full disk SQLite has already
+   * rolled back when COMMIT fails, and a second ROLLBACK throws "no transaction is active" in place of the
+   * real error.
+   */
+  private rollback(): void {
+    if (this.db.isTransaction) this.db.exec("ROLLBACK");
+  }
+
   /** Runs `body` in a transaction: committed if it returns, rolled back if it throws. It must not wait. */
   private atomically<T>(body: () => T, begin = "BEGIN"): T {
     this.db.exec(begin);
@@ -592,13 +777,50 @@ class SqliteStore implements Store {
       this.db.exec("COMMIT");
       return result;
     } catch (err) {
-      this.db.exec("ROLLBACK");
+      this.rollback();
       throw err;
     }
   }
 
+  async purge(id: string): Promise<{ task: Task; first: boolean } | undefined> {
+    return this.atomically(() => {
+      const row = this.db.prepare("SELECT id, spec, ended, purged FROM tasks WHERE id = ?").get(id) as Row | undefined;
+      if (!row) return undefined;
+      if (row.ended !== null) this.blank([row]);
+      return { task: toTask(this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row), first: row.ended !== null && row.purged === null };
+    }, "BEGIN IMMEDIATE");
+  }
+
+  async purgeEnded(olderThanMs: number, limit: number): Promise<number> {
+    return this.atomically(() => {
+      const rows = this.db.prepare(UNPURGED).all(new Date(Date.now() - olderThanMs).toISOString(), limit) as Row[];
+      this.blank(rows);
+      return rows.length;
+    }, "BEGIN IMMEDIATE");
+  }
+
+  async forgetKeys(now: Date): Promise<number> {
+    return Number(this.db.prepare("DELETE FROM idempotency WHERE created <= ?").run(new Date(now.getTime() - IDEMPOTENCY_MS).toISOString()).changes);
+  }
+
+  /** Deletes the content of ended tasks (their id and spec columns), inside a transaction: see Store.purge. */
+  private blank(rows: Row[]): void {
+    const now = new Date().toISOString();
+    const update = this.db.prepare("UPDATE tasks SET prompt = '', spec = ?, error = NULL, stats = NULL, result = NULL, result_truncated = 0, purged = coalesce(purged, ?) WHERE id = ?");
+    const events = this.db.prepare("DELETE FROM events WHERE task = ?");
+    const approvals = this.db.prepare("DELETE FROM approvals WHERE task = ?");
+    for (const row of rows) {
+      const id = String(row.id);
+      update.run(JSON.stringify(slimSpec(JSON.parse(String(row.spec)) as Partial<TaskSpec>)), now, id);
+      events.run(id);
+      approvals.run(id);
+    }
+  }
+
+  // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a
+  // replica that hadn't heard. Silently, as for a seq already kept.
   async addEvent(task: string, seq: number, event: object): Promise<void> {
-    this.db.prepare("INSERT OR IGNORE INTO events (task, seq, json) VALUES (?, ?, ?)").run(task, seq, JSON.stringify(event));
+    this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`).run(task, seq, JSON.stringify(event));
   }
 
   async events(task: string, after = 0, limit?: number, bytes = Infinity): Promise<{ seq: number; event: object }[]> {
@@ -616,7 +838,7 @@ class SqliteStore implements Store {
 
   async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
     const row = this.db
-      .prepare("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING *")
+      .prepare(`INSERT INTO approvals (task, id, step, tool, description, requested_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE ${LIVE} ON CONFLICT DO NOTHING RETURNING *`)
       .get(task, id, step, tool, description, new Date().toISOString()) as Row | undefined;
     return row && toApproval(row);
   }
@@ -668,6 +890,17 @@ class SqliteStore implements Store {
     this.db.close();
   }
 }
+
+/**
+ * A tenant's key (its two parameters, in either store's placeholders) with the task it made: the key's hash
+ * and time beside the task's columns, which are null if the task is gone.
+ */
+export const idempotent = (tenant: string, key: string) =>
+  `SELECT i.hash AS idem_hash, i.created AS idem_created, t.* FROM idempotency i LEFT JOIN tasks t ON t.id = i.task WHERE i.tenant = ${tenant} AND i.key = ${key}`;
+const IDEMPOTENT = idempotent("?", "?");
+
+/** Whether the task an event or an approval is for (?1) still keeps them, in SQLite's inserts. */
+const LIVE = "EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND purged IS NULL)";
 
 // What the metrics count, in SQL either store runs: through the status index, and the approvals of running
 // tasks only, as those of a task that ended are never answered.
@@ -829,5 +1062,9 @@ export function toTask(row: Row): Task {
     stats: parsed(row.stats),
     usage: parsed(row.usage) as Usage | null,
     cost: row.cost === null ? null : Number(row.cost),
+    result: (row.result as string | null | undefined) ?? null,
+    // A list that leaves the result out says nothing of its cut either.
+    resultTruncated: row.result != null && Boolean(row.result_truncated),
+    purged: time(row.purged),
   };
 }

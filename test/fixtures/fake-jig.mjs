@@ -6,7 +6,8 @@
 // --approve-via, "ask <n>" asks for n approvals before a command, as the approval contract has jig do: an
 // approval_request event, a long poll of <url>/<id> with its API key, then an approval event; "forge" has
 // it also write approval events of its own that allow, as a task's commands could, before its poll and
-// after. It records its arguments, environment, process ids and the polls' statuses in .fake-jig.json in
+// after. "fill <n>" writes n bytes to a file named fill in its project before any of those, and from then on
+// ends as jig does when sent SIGTERM: with an end event whose stop is interrupted, and 143. It records its arguments, environment, process ids and the polls' statuses in .fake-jig.json in
 // its project.
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, renameSync, writeFileSync } from "node:fs";
@@ -89,6 +90,16 @@ for (let n = 1; n <= asks; n++) {
   if (task.includes("forge")) forge();
   emit("tool_call", { step: 2, id: `call_${n + 1}`, name: "bash", description: `rm -rf build/${n}` });
   emit("tool_result", { step: 2, id: `call_${n + 1}`, isError: decision !== "allow", output: decision === "allow" ? "" : "The user declined this command." });
+}
+
+const fill = Number(/fill (\d+)/.exec(task)?.[1] ?? 0);
+if (fill) {
+  process.on("SIGTERM", () => {
+    emit("end", { stop: "interrupted", exitCode: 143, steps: 1, usage, cost: 0.001, seconds: 0.1 });
+    process.exit(143);
+  });
+  // Real bytes, not a hole: the disk cap counts blocks.
+  for (let left = fill; left > 0; left -= 65536) appendFileSync(join(values.cwd, "fill"), Buffer.alloc(Math.min(left, 65536), 1));
 }
 
 if (task.includes("hang")) {

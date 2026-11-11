@@ -155,7 +155,9 @@ describe("the local runner", { skip: sandboxProblem() }, () => {
     const { id } = (await call(started, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "app.py": "print(1)\n" } } })).body;
     assert.equal((await ended(started, id)).status, "succeeded");
     const task = join(checkout, "data", "tasks", id);
-    const { hiddenPaths } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    const { hiddenPaths, isolation } = JSON.parse(await readFile(join(task, "home", ".jig", "settings.json"), "utf8"));
+    // On Linux the task's commands get a /tmp, /var/tmp and /run of their own, unless the config says shared.
+    assert.equal(isolation, process.platform === "linux" && full.local?.isolation !== "shared" ? "service" : undefined);
     return { etc, checkout, task, hiddenPaths: hiddenPaths as string[] };
   }
 
@@ -866,7 +868,7 @@ describe("the Kubernetes runner", () => {
   /** A task as the scheduler gives it to a runner, and its tenant. */
   function aTask(spec: Partial<Task["spec"]> = {}): [Task, Tenant] {
     const id = `task_${randomUUID().replaceAll("-", "")}`;
-    const task: Task = { id, tenant: "acme", spec: { prompt: "x", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: new Date().toISOString(), started: null, ended: null, stats: null, usage: null, cost: null };
+    const task: Task = { id, tenant: "acme", spec: { prompt: "x", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: new Date().toISOString(), started: null, ended: null, stats: null, usage: null, cost: null, result: null, resultTruncated: false, purged: null };
     return [task, { id: "acme", limits: { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null } }];
   }
 

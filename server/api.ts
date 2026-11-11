@@ -1,13 +1,15 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { stat, statfs } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { sandboxProblem } from "../src/sandbox.ts";
+import { isolationProblem, sandboxProblem, sharedPlaces } from "../src/sandbox.ts";
+import { isInside } from "../src/tools/util.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
 import { checkedGit, type Runner, workspaceProblem } from "./runner.ts";
@@ -20,6 +22,7 @@ import {
   type Approval,
   type Counts,
   type Decision,
+  diskFull,
   FINISHED,
   isoDay,
   openStore,
@@ -56,6 +59,8 @@ export interface TenantConfig {
   approvalTimeout?: number;
   /** Where each approval its tasks ask for is POSTed, signed with the secret in the variable webhookSecretEnv names. */
   approvalWebhook?: string;
+  /** Where each of its tasks' ends is POSTed, {task, status}, signed with the same secret. */
+  taskWebhook?: string;
   webhookSecretEnv?: string;
   /** The most tasks it may create in a UTC day, and USD its tasks may spend in a UTC day or month. */
   quotas?: Quotas;
@@ -89,10 +94,12 @@ export interface Config {
   /** The hosts a workspace may be cloned from (default: any). */
   gitHosts?: string[];
   /**
-   * The local runner's: what else its tasks' commands can't read, as absolute paths; and whether it may run
-   * them with no sandbox, directly on this machine (one tenant only).
+   * The local runner's: what else its tasks' commands can't read, as absolute paths; whether it may run
+   * them with no sandbox, directly on this machine (one tenant only); and whether each task's commands get a
+   * /tmp, /var/tmp, /run and IPC of their own ("service", the default on Linux with the sandbox) or the
+   * machine's ("shared", as on macOS, where there is no other).
    */
-  local?: { hiddenPaths?: string[]; allowUnsandboxed?: boolean };
+  local?: { hiddenPaths?: string[]; allowUnsandboxed?: boolean; isolation?: "service" | "shared" };
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
   /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
@@ -107,8 +114,17 @@ export interface Config {
   maxEvents?: number;
   /** The most bytes of a task's events (as JSON) that are stored. */
   maxEventBytes?: number;
+  /** The most bytes of a run's last text that are kept as the task's result. */
+  maxResultBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
+  /** Days after a task ends that its content is deleted (as DELETE /v1/tasks/:id does); kept for good without it. */
+  retentionDays?: number;
+  /**
+   * The most bytes a task's folder may take on dataDir's disk before the local or docker runner stops its
+   * run (default 4 GiB; 0: no cap). Not for kubernetes, whose pods have an ephemeral-storage limit.
+   */
+  maxTaskDiskBytes?: number;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
@@ -119,7 +135,10 @@ export interface Config {
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log" | "maxDiskBytes" | "diskPollMs";
+
+/** A task's folder may take this much of the disk unless the config says: what a Kubernetes task's pod may, by default. */
+const MAX_TASK_DISK_BYTES = 4 * 1024 ** 3;
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {}, maxStreams: 20 };
 /** The most event streams open at once on a replica, across tenants, unless the config says. */
@@ -196,6 +215,11 @@ export async function startService(
     const problem = sandboxProblem();
     if (problem) throw new Error(`The local runner runs its tasks' commands in jig's sandbox, and there is none here: ${problem}. Fix that, use the docker or kubernetes runner, or, with a single tenant, set local.allowUnsandboxed to run them directly on this machine.`);
   }
+  // Nor where every task's jig would refuse the isolation its settings ask for.
+  if (!runner && (config.runner ?? "local") === "local" && isolates(config)) {
+    const problem = isolationProblem();
+    if (problem) throw new Error(`The local runner gives each task's commands a /tmp and /run of their own, which can't be done here: ${problem}. Fix that, use the docker or kubernetes runner, or set local.isolation to "shared".`);
+  }
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
   // A Bearer is read up to the first whitespace, so a key with some could never be given.
@@ -203,13 +227,16 @@ export async function startService(
   const metrics = serviceMetrics();
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  for (const { id } of config.tenants) metrics.replayed.inc({ tenant: id }, 0);
   for (const { id } of config.tenants) metrics.eventStreams.set({ tenant: id }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
   const answers = new Answers(store);
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
-   * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
+   * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged; one whose
+   * write found the database's disk full is a 503 to try again later, as room may be made (a task that
+   * ends, an operator), where a 500 would read as a fault in the request.
    */
   const handler =
     (serve: (req: IncomingMessage, res: ServerResponse, request: ServedRequest) => Promise<void>, api = false) =>
@@ -230,8 +257,9 @@ export async function startService(
         request.log.debug("request", { method: req.method, path, status: res.statusCode, ms: Math.round(seconds * 1000), tenant: request.tenant });
       });
       void serve(req, res, request).catch((err) => {
-        if (!res.headersSent) reply(res, 500, { error: "Internal error" });
-        else res.end();
+        if (res.headersSent) res.end();
+        else if (diskFull(err)) reply(res, 503, { error: "The service's database is out of disk space" }, { "retry-after": "30" });
+        else reply(res, 500, { error: "Internal error" });
         request.log.error("request failed", { err, tenant: request.tenant });
       });
     };
@@ -317,16 +345,21 @@ export async function startService(
     if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
     // What the local runner hides beside dataDir that holds more than the service's own files.
     const folders = !runner && (config.runner ?? "local") === "local" ? hiddenFolders(config.dataDir, configFile) : [];
+    // A runner given (by a test) has its own disk cap, or none: the config's says nothing of it.
+    const disk = runner ? [] : await diskRisks(config, log);
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, folders);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     if (runner instanceof LocalRunner) for (const warning of localRisks(config, folders)) log.warn(warning);
+    for (const warning of disk) log.warn(warning);
     // The Kubernetes runner's clone is in the task's pod, on its network.
     if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
       log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
     }
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionDays, gitHosts } = config;
+    const retentionMs = retentionDays === undefined ? undefined : retentionDays * 86_400_000;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
+    const onEnded = (task: Pick<Task, "id" | "tenant">, status: TaskStatus) => webhooks.ended(task, status);
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionMs, gitHosts, onApproval, onEnded, metrics, log });
     await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
@@ -355,6 +388,14 @@ export async function startService(
 }
 
 /**
+ * Whether the local runner asks jig for isolation (see src/sandbox.ts's createSandbox): as local.isolation
+ * says, and left unset, on Linux, unless tasks may run with no sandbox, which it needs.
+ */
+function isolates(config: Config): boolean {
+  return (config.local?.isolation ?? (process.platform === "linux" && !config.local?.allowUnsandboxed ? "service" : "shared")) === "service";
+}
+
+/**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
  * from their commands, but for the task's own project and home, and the database and the config's folder
  * (see runners/local.ts); without one (local.allowUnsandboxed), they run directly on the machine, as do
@@ -363,9 +404,12 @@ export async function startService(
  * the service's user can, and connect to the Unix sockets there, which a read-only file system doesn't stop.
  * And with dataDir in one of those, which they can write, a task's commands can change its home there, whose
  * git config jig's own git reads, outside the sandbox. A hidden folder (`folders`) that is the machine's
- * root, /etc, /usr or the service user's home hides what their commands need.
+ * root, /etc, /usr or the service user's home hides what their commands need. With isolation (see isolates)
+ * each task has its own /tmp, /var/tmp and /run, so what is left to share is the kernel and the Unix sockets
+ * elsewhere: those that take connections now are named, for the operator to hide their folders.
  */
 function localRisks(config: Config, folders: HiddenFolder[]): string[] {
+  const isolated = isolates(config);
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
   // task's own TMPDIR: not the service's.
   const temps = (process.platform === "darwin" ? ["/tmp", "/private/tmp"] : ["/tmp", "/var/tmp"]).flatMap((dir) => [dir, realOrSame(dir)]);
@@ -381,7 +425,8 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
     ...(config.local?.allowUnsandboxed
       ? ["local.allowUnsandboxed is set, so a local task whose jig can't make its sandbox (a check of it that fails or takes over 5 seconds) runs its commands directly on this machine, where they can read and write the database and the config: unset it to have such a task fail instead"]
       : []),
-    "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
+    `a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine ${isolated ? "outside /tmp, /var/tmp and /run (an ssh-agent's or a database's kept elsewhere)" : "(Docker's, a local Postgres's or Redis's, an ssh-agent's)"}: run the service as a user of its own, with no more than it needs`,
+    ...(isolated ? openSockets(config, folders) : []),
     ...folders.flatMap(({ what, path }) => {
       const real = realOrSame(path);
       const home = realOrSame(homedir());
@@ -389,10 +434,85 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
       const fix = what === "the config's folder" ? "keep the config in a folder of its own" : "keep dataDir out of that checkout";
       return [`the local runner hides ${what}, ${path}, from its tasks' commands, and that is ${real === home ? "the service user's home directory, where the toolchains they use may be" : "a folder every task's commands need"}: ${fix}`];
     }),
-    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
-    ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
+    ...(config.tenants.length <= 1
+      ? []
+      : isolated
+        ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel and the Unix sockets outside /tmp, /var/tmp and /run (the docker and kubernetes runners keep them apart)"]
+        : [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)${process.platform === "linux" ? ': set local.isolation to "service" to give each task its own /tmp, /var/tmp and /run' : ""}`]),
+    ...(inTemp(config.dataDir) ? [`dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox${isolated ? ", and each command's /tmp starts empty" : ""}: keep it elsewhere`] : []),
   ];
 }
+
+/**
+ * What the tasks' folders could do to dataDir's disk, on the local and docker runners: nothing holds them
+ * to maxTaskDiskBytes but a check every few seconds (runner.ts's watchDisk), so the tasks running at once
+ * need that much room each, and a SQLite database on the same file system fails with it when it is full.
+ * Never a reason not to start: a file system that can't be asked (none yet, or one that doesn't say) gives
+ * no line.
+ */
+export async function diskRisks(config: Config, log?: Log): Promise<string[]> {
+  if ((config.runner ?? "local") === "kubernetes") return [];
+  const cap = config.maxTaskDiskBytes ?? MAX_TASK_DISK_BYTES;
+  const concurrency = config.concurrency ?? 4;
+  try {
+    // dataDir is made by the first task, and the database's folder by the store: each is on the file
+    // system of the nearest folder that is there.
+    const dataDir = await nearest(resolve(config.dataDir));
+    const sameFs = sqliteFile(config.database) && config.database !== "" && (await stat(await nearest(dirname(resolve(config.database))))).dev === (await stat(dataDir)).dev;
+    const tail = sameFs ? ", and the SQLite database is on that file system too: once it is full the database's writes fail and every running task ends as an error. Keep the database, or dataDir, on a file system of its own" : "";
+    if (cap === 0) return [`maxTaskDiskBytes is 0, so a task's folder has no size limit and one task can fill dataDir's file system${tail}`];
+    const { bavail, bsize } = await statfs(dataDir);
+    const free = bavail * bsize;
+    if (free >= concurrency * cap) return [];
+    return [`dataDir's file system has ${free} bytes free, less than concurrency × maxTaskDiskBytes (${concurrency} × ${cap}): the tasks running at once could fill it${tail}; lower either, or give dataDir more room`];
+  } catch (err) {
+    log?.debug("couldn't look at dataDir's file system for its free space", { err });
+    return [];
+  }
+}
+
+/** The path, or the nearest folder above it that is there. */
+async function nearest(path: string): Promise<string> {
+  for (;;) {
+    if (await stat(path).then(() => true, () => false)) return path;
+    if (dirname(path) === path) return path;
+    path = dirname(path);
+  }
+}
+
+/**
+ * The warning that names the Unix sockets a local task's commands can still connect to under isolation, if
+ * there are any: those bound to a path that take connections now (a stream socket that listens, or a
+ * datagram one), as /proc/net/unix lists them, outside the shared places commands don't see, dataDir and
+ * the hidden paths. Up to ten of them: it is read once, at the start, to show the operator what is there.
+ */
+function openSockets(config: Config, folders: HiddenFolder[]): string[] {
+  const out = [...sharedPlaces(), ...[config.dataDir, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])].map((path) => realOrSame(resolve(path)))];
+  let lines: string[];
+  try {
+    lines = readFileSync("/proc/net/unix", "utf8").split("\n").slice(1);
+  } catch {
+    return []; // no /proc, or not to be read
+  }
+  const found = new Set<string>();
+  for (const line of lines) {
+    // "<address>: <references> <protocol> <flags> <type> <state> <inode> <path>": the path may hold spaces,
+    // is missing for a socket bound to none, and starts with @ for one that is no file.
+    const [, flags, type, path] = /^\S+ \S+ \S+ (\S+) (\S+) \S+ +\S+ (\/.*)$/.exec(line) ?? [];
+    if (path === undefined || !((Number.parseInt(flags, 16) & SO_ACCEPTCON) !== 0 || Number.parseInt(type, 16) === SOCK_DGRAM)) continue;
+    const real = realOrSame(path);
+    try {
+      // Bound in another mount namespace (a container's), the path can be none here, or lead through a file.
+      if (lstatSync(real).isSocket() && !out.some((dir) => isInside(dir, real))) found.add(real);
+    } catch {}
+  }
+  if (!found.size) return [];
+  const named = [...found].slice(0, 10);
+  return [`a local task's commands can connect to these Unix sockets: ${named.join(", ")}${found.size > named.length ? ` and ${found.size - named.length} more` : ""}; list their folders in local.hiddenPaths`];
+}
+
+const SO_ACCEPTCON = 0x10000; // in a socket's flags in /proc/net/unix: it listens
+const SOCK_DGRAM = 2;
 
 /** Whether the config's database is a SQLite file. */
 function sqliteFile(database: string): boolean {
@@ -489,14 +609,14 @@ async function listen(server: Server, port: number, host: string): Promise<strin
   return `http://${address.includes(":") ? `[${address}]` : address}:${bound}`;
 }
 
-/** The tenants' approval webhooks, each with its secret from the environment. */
+/** The tenants' webhooks, for approvals and for task ends, each with its secret from the environment. */
 function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
   const hooks = new Map<string, Webhook>();
-  for (const { id, approvalWebhook, webhookSecretEnv } of tenants) {
-    if (!approvalWebhook || !webhookSecretEnv) continue;
+  for (const { id, approvalWebhook, taskWebhook, webhookSecretEnv } of tenants) {
+    if ((!approvalWebhook && !taskWebhook) || !webhookSecretEnv) continue;
     const secret = process.env[webhookSecretEnv];
-    if (!secret) throw new Error(`Set ${webhookSecretEnv}, the secret tenant ${id}'s approval webhook is signed with.`);
-    hooks.set(id, { url: approvalWebhook, secret });
+    if (!secret) throw new Error(`Set ${webhookSecretEnv}, the secret tenant ${id}'s webhooks are signed with.`);
+    hooks.set(id, { ...(approvalWebhook && { approvals: approvalWebhook }), ...(taskWebhook && { tasks: taskWebhook }), secret });
   }
   return hooks;
 }
@@ -509,12 +629,14 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
 function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, folders: HiddenFolder[]): Runner {
   const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, gitRedirects: !config.gitHosts, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
+  // The local and docker runners': a Kubernetes pod's ephemeral-storage limit is its cap.
+  const maxDiskBytes = config.maxTaskDiskBytes ?? MAX_TASK_DISK_BYTES;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
     const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
-    return new LocalRunner({ ...shared, hidden, sandbox: !config.local?.allowUnsandboxed, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+    return new LocalRunner({ ...shared, maxDiskBytes, hidden, sandbox: !config.local?.allowUnsandboxed, isolation: isolates(config), jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
-  if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
+  if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared, maxDiskBytes });
   if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
   if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
   if (runner === "kubernetes") throw new Error('The kubernetes runner needs "kubernetes": {"image"}: the worker image');
@@ -634,6 +756,10 @@ function configProblem(config: Config): string | undefined {
       ? undefined
       : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
     (config.local?.allowUnsandboxed === undefined || typeof config.local.allowUnsandboxed === "boolean" ? undefined : "local.allowUnsandboxed must be true or false") ??
+    (config.local?.isolation === undefined || ["service", "shared"].includes(config.local.isolation) ? undefined : `local.isolation must be "service" or "shared", not ${JSON.stringify(config.local.isolation)}`) ??
+    // Asked for by name where it can't be had: a /tmp of its own is the sandbox's to give, on Linux.
+    (runner === "local" && config.local?.isolation === "service" && config.local.allowUnsandboxed ? 'local.isolation "service" needs jig\'s sandbox: unset local.allowUnsandboxed' : undefined) ??
+    (runner === "local" && config.local?.isolation === "service" && process.platform === "darwin" ? 'local.isolation "service" is Linux\'s for now' : undefined) ??
     // Without a sandbox a task's commands can read and write every other task's folder. The docker and
     // kubernetes runners don't read it.
     (runner === "local" && config.local?.allowUnsandboxed && Array.isArray(config.tenants) && config.tenants.length > 1 ? "local.allowUnsandboxed needs a single tenant: without a sandbox, a task's commands can read and change the other tenants' tasks" : undefined) ??
@@ -643,6 +769,8 @@ function configProblem(config: Config): string | undefined {
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
+    whole("maxResultBytes", config.maxResultBytes, 1) ??
+    positive("retentionDays", config.retentionDays, false, 36_500) ??
     whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
@@ -653,6 +781,9 @@ function configProblem(config: Config): string | undefined {
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
+    // A pod's disk is held by the kubelet, not by this service: a value here would be taken for a cap that isn't one.
+    (runner === "kubernetes" && fields.maxTaskDiskBytes !== undefined ? "maxTaskDiskBytes is for the local and docker runners: on kubernetes, set the ephemeral-storage limit in kubernetes.resources" : undefined) ??
+    whole("maxTaskDiskBytes", config.maxTaskDiskBytes, 0) ??
     text("adminKeyEnv", config.adminKeyEnv, false) ??
     (config.metrics === undefined || isObject(config.metrics) ? undefined : "metrics must be an object, {host, port}") ??
     text("metrics.host", config.metrics?.host, false) ??
@@ -679,7 +810,8 @@ function configProblem(config: Config): string | undefined {
       whole(`${at}.approvalTimeout`, tenant.approvalTimeout, 1, MAX_SECONDS) ??
       whole(`${at}.maxStreams`, tenant.maxStreams, 1) ??
       http(`${at}.approvalWebhook`, tenant.approvalWebhook) ??
-      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined) ??
+      http(`${at}.taskWebhook`, tenant.taskWebhook) ??
+      text(`${at}.webhookSecretEnv`, tenant.webhookSecretEnv, tenant.approvalWebhook !== undefined || tenant.taskWebhook !== undefined) ??
       (tenant.quotas === undefined || isObject(tenant.quotas) ? undefined : `${at}.quotas must be an object, {tasksPerDay, usdPerDay, usdPerMonth}`) ??
       (notQuota === undefined ? undefined : `${at}.quotas.${notQuota} isn't a quota: tasksPerDay, usdPerDay or usdPerMonth`) ??
       whole(`${at}.quotas.tasksPerDay`, tenant.quotas?.tasksPerDay, 1) ??
@@ -728,29 +860,49 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   request.tenant = tenant.id;
 
   if (url.pathname === "/v1/usage") return req.method === "GET" ? usage(res, url, context, { tenant: tenant.id }) : reply(res, 405, { error: "Use GET" });
+  if (url.pathname === "/v1/limits") return req.method === "GET" ? limits(res, url, tenant, context) : reply(res, 405, { error: "Use GET" });
 
   if (url.pathname === "/v1/tasks") {
     if (req.method === "POST") return createTask(req, res, tenant, context);
     if (req.method !== "GET") return reply(res, 405, { error: "Use GET or POST" });
-    const status = url.searchParams.get("status") ?? undefined;
-    if (status !== undefined && !STATUSES.includes(status as TaskStatus)) return reply(res, 400, { error: `status must be one of: ${STATUSES.join(", ")}` });
+    // A misspelt filter (?stauts=running) would otherwise list every task as if it had been applied.
+    const bad = badParams(url.searchParams, ["status", "before", "limit", "full"]);
+    if (bad) return reply(res, 400, { error: bad });
+    // One status or several, separated by commas.
+    const statuses = url.searchParams.get("status")?.split(",") as TaskStatus[] | undefined;
+    if (statuses?.some((status) => !STATUSES.includes(status))) return reply(res, 400, { error: `status must be one or more of: ${STATUSES.join(", ")}, separated by commas` });
     const before = url.searchParams.get("before") ?? undefined;
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
     const limit = Number(url.searchParams.get("limit") ?? 100);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
-    // The prompts can be long: a list leaves them out unless asked.
-    const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
-    const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
+    // The prompts and the results can be long: a list leaves them out unless asked.
+    const asked = url.searchParams.get("full") ?? "0";
+    if (!["1", "true", "0", "false"].includes(asked)) return reply(res, 400, { error: "full must be 1 or 0" });
+    const full = asked === "1" || asked === "true";
+    // An id that leads nowhere would give an empty page, which reads as the list's end. One answer for an
+    // id that never was, another tenant's and another region's. This reads the task's whole row, prompt
+    // and all, once a page.
+    const cursor = before === undefined ? undefined : await context.store.task(before);
+    if (before !== undefined && cursor?.tenant !== tenant.id) return reply(res, 400, { error: "before must be the id of one of your tasks here" });
+    const tasks = await context.store.tasks(tenant.id, { status: statuses && [...new Set(statuses)], before, limit, prompts: full });
     const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
     // A full page may have more after it: the next is read with before=<next>.
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full, result: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
+  // A path that is no route says so, whatever the method, before any task is read.
+  if (!match) return reply(res, 404, { error: "No such route" });
   // Another tenant's task is as missing as one that never was.
-  const task = match && (await context.store.task(match[1]));
-  if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
+  const task = await context.store.task(match[1]);
+  if (!task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
+  if (!action) {
+    if (req.method === "DELETE") return purge(res, task, context);
+    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
+  }
+  // A purged task has neither events nor approvals left: said once, here, for every way of asking for them,
+  // rather than an empty stream or list that would read as a run that wrote nothing. A cancel says it has ended.
+  if (task.purged !== null && action !== "/cancel") return reply(res, 410, { error: "The task's events and approvals were deleted", id: task.id, purged: task.purged });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
   if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
@@ -765,6 +917,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   return streamEvents(req, res, task, Number(after), tenant, context, request);
 }
 
+/** An Idempotency-Key: short, and of characters that need no escaping in a header, a log or an error. */
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
   const refused = (reason: "queue" | "quota" | "invalid") => context.metrics.refused.inc({ tenant: tenant.id, reason });
   const body = await readBody(req, context.maxBody);
@@ -772,6 +927,13 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     refused("invalid");
     res.setHeader("connection", "close");
     return reply(res, 413, { error: `The body is over ${context.maxBody} bytes` });
+  }
+  // Not by truthiness: an empty header is a key the client meant to send, and a header sent twice (Node
+  // joins the two with ", ") is no key either.
+  const key = req.headers["idempotency-key"];
+  if (key !== undefined && (typeof key !== "string" || !IDEMPOTENCY_KEY.test(key))) {
+    refused("invalid");
+    return reply(res, 400, { error: "Idempotency-Key must be 1 to 128 of letters, digits, _ . : -" });
   }
   let input: unknown;
   try {
@@ -795,11 +957,24 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   // A queue without an end would fill the disk, and a tenant's waits only grow. The caps are counted with
   // the insert, so replicas sharing the store keep to them together.
   const now = context.now();
-  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now });
+  // The body is compared as the bytes it came in: a retry resends them, and anything else is another request.
+  const idem = key === undefined ? undefined : { key, hash: createHash("sha256").update(body).digest("hex") };
+  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now }, idem);
+  if ("replay" in task) {
+    const { replay, same } = task;
+    if (!same) {
+      refused("invalid");
+      return reply(res, 422, { error: `Idempotency-Key ${key} was used with a different body, for task ${replay.id}: use a new key for a new task`, id: replay.id });
+    }
+    // The task the first create made, as it is now: nothing new to count or to start.
+    context.metrics.replayed.inc({ tenant: tenant.id });
+    return reply(res, 200, { id: replay.id, status: replay.status }, { "idempotent-replay": "true" });
+  }
   if ("quota" in task) {
     const { quota, limit, used } = task;
     refused(quota === "maxQueued" ? "queue" : "quota");
-    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start` });
+    // The queue has no time it empties at: five seconds is a guess at when a task may have started.
+    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start`, quota, limit, used }, { "retry-after": "5" });
     const { nextDay, nextMonth } = periods(now);
     const resets = quota === "usdPerMonth" ? nextMonth : nextDay;
     const what = quota === "tasksPerDay" ? `created ${used} tasks today (UTC), the most it may` : `spent $${used} ${quota === "usdPerDay" ? "today (UTC)" : "this month (UTC)"}, against a quota of $${limit}`;
@@ -809,6 +984,20 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   context.metrics.created.inc({ tenant: tenant.id });
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });
+}
+
+/**
+ * DELETE /v1/tasks/:id: deletes an ended task's content (Store.purge) and answers with what is left of it,
+ * 200, however often it is asked; 409 for a task that hasn't ended, which is cancelled first.
+ */
+async function purge(res: ServerResponse, task: Task, { store, metrics, region }: Context): Promise<void> {
+  const purged = await store.purge(task.id);
+  if (!purged) return reply(res, 404, { error: "No such task" });
+  const { id, status } = purged.task;
+  if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
+  // Once a task, however many deletes it gets, at once or one after another.
+  if (purged.first) metrics.purged.inc({ reason: "api" });
+  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
 }
 
 /** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */
@@ -822,6 +1011,35 @@ async function admin(req: IncomingMessage, res: ServerResponse, url: URL, key: s
   return usage(res, url, context, { byTenant: true, ...(tenant !== null && { tenant }) }, ["tenant"]);
 }
 
+/** What is wrong with a query's parameters, if one isn't among `allowed` or is there twice. */
+function badParams(params: URLSearchParams, allowed: string[]): string | undefined {
+  const unknown = [...params.keys()].find((name) => !allowed.includes(name));
+  if (unknown !== undefined) return `Unknown parameter: ${unknown}`;
+  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
+  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
+  return twice && `${twice} may be given once`;
+}
+
+/**
+ * The tenant's limits (the service's defaults where it has none of its own; only the quotas it has) and
+ * what it has used of them in this region now, with when the day's and the month's counts start again.
+ * Counted as a new task's admission counts them, but outside its lock: it may be a task behind.
+ */
+async function limits(res: ServerResponse, url: URL, tenant: Tenant, { store, now, region }: Context): Promise<void> {
+  const bad = badParams(url.searchParams, []);
+  if (bad) return reply(res, 400, { error: bad });
+  const at = now();
+  const used = await store.standing(tenant.id, at);
+  const { nextDay, nextMonth } = periods(at);
+  reply(res, 200, {
+    tenant: tenant.id,
+    region,
+    limits: { ...DEFAULT_LIMITS, ...tenant.limits },
+    used: { ...used, usdToday: roundUsd(used.usdToday), usdThisMonth: roundUsd(used.usdThisMonth) },
+    resets: { day: nextDay.toISOString(), month: nextMonth.toISOString() },
+  });
+}
+
 const DAY = /^(\d{4})-(\d\d)-(\d\d)$/;
 const MAX_DAYS = 366;
 
@@ -832,11 +1050,8 @@ const MAX_DAYS = 366;
  */
 async function usage(res: ServerResponse, url: URL, { store, now }: Context, scope: Pick<UsageQuery, "tenant" | "byTenant">, allowed: string[] = []): Promise<void> {
   const params = url.searchParams;
-  const unknown = [...params.keys()].find((name) => !["from", "to", "group", "format", ...allowed].includes(name));
-  if (unknown) return reply(res, 400, { error: `Unknown parameter: ${unknown}` });
-  // Each is read once: tenant=a&tenant=b would otherwise report a alone.
-  const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
-  if (twice) return reply(res, 400, { error: `${twice} may be given once` });
+  const bad = badParams(params, ["from", "to", "group", "format", ...allowed]);
+  if (bad) return reply(res, 400, { error: bad });
   const today = now();
   const from = params.get("from") ?? isoDay(periods(today).monthStart);
   const to = params.get("to") ?? isoDay(today);
@@ -962,6 +1177,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
       const problem = workspaceProblem(path);
       if (problem) return `workspace.files: ${JSON.stringify(path)} ${problem}`;
       if (typeof contents !== "string") return `workspace.files: ${JSON.stringify(path)} must have a string as its contents`;
+      // As for the prompt. A path with one is refused above; a spec holding one once broke Postgres's ledger.
+      if (contents.includes("\0")) return `workspace.files: ${JSON.stringify(path)} must not hold a NUL character (\\u0000) in its contents`;
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
@@ -979,12 +1196,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
- * (none, once it has ended); the list leaves out the stats, and the prompt unless asked.
+ * (none, once it has ended); the list leaves out the stats, and the prompt and the result unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>, region: string | null) {
-  const { spec, tenant, stats, ...rest } = task;
+function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean }, pending: Map<string, number>, region: string | null) {
+  const { spec, tenant, stats, result, resultTruncated, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

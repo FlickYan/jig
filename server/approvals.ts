@@ -5,7 +5,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { createLog, type Log } from "./log.ts";
 import type { JigEvent } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
-import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task } from "./store.ts";
+import type { Answer, Approval, ApprovalMode, ApprovalRequest, Given, Store, Task, TaskStatus } from "./store.ts";
 import { verifyToken } from "./token.ts";
 
 // Approvals over the API (docs/server.md, the approval contract). A task with approvals runs its jig with
@@ -146,7 +146,9 @@ function reply(res: ServerResponse, status: number, body: object, headers: Recor
 }
 
 export interface Webhook {
-  url: string;
+  /** Where the tenant's approvals are posted, and where its tasks' ends are: one of the two at least. */
+  approvals?: string;
+  tasks?: string;
   /** The tenant's webhook secret, which signs each POST. */
   secret: string;
 }
@@ -156,21 +158,32 @@ const RETRIES = 3;
 const ATTEMPT_MS = 10_000;
 /** The statuses that redirect, with a location to go to: any other 3xx (a 304, say) is just a failure. */
 const REDIRECTS = [301, 302, 303, 307, 308];
+/** The most POSTs of a tenant's task ends that may be waiting (being tried) at once. */
+const MAX_WAITING = 100;
 
 /**
- * Tells tenants that ask (`approvalWebhook`) of each approval their tasks ask for: a POST of {task, approval},
- * signed with the tenant's secret (x-jig-signature: sha256=<hex HMAC-SHA256 of the body>). Sent in the
- * background, so the run never waits on it, and tried again three times, 1, 2 and 4 seconds apart. A redirect
- * is a failed try, never followed: it could send the signed POST anywhere the service reaches. Each approval
- * is counted once in jig_service_webhook_deliveries_total, delivered or failed (one cut off by close, neither).
+ * Tells tenants that ask of each approval their tasks ask for (`approvalWebhook`: a POST of {task, approval})
+ * and of each task this replica ends (`taskWebhook`: a POST of {task, status}), signed with the tenant's
+ * secret (x-jig-signature: sha256=<hex HMAC-SHA256 of the body>). Sent in the background, so the run never
+ * waits on it, and tried again three times, 1, 2 and 4 seconds apart. A redirect is a failed try, never
+ * followed: it could send the signed POST anywhere the service reaches. Each POST is counted once in
+ * jig_service_webhook_deliveries_total, delivered or failed (one cut off by close, neither).
+ *
+ * Approvals wait on an answer, so a tenant's are bounded by the tasks it runs. Ends are bounded only by how
+ * fast its tasks end, and an endpoint that hangs holds each for a minute: with MAX_WAITING of a tenant's
+ * being tried, its next ends are not posted but counted as failed, with one warning until some finish.
+ * An end is posted at most once, and may not be (docs/server.md lists when): the task itself is the record.
  */
 export class Webhooks {
   private hooks: Map<string, Webhook>;
   private retryMs: number;
   private pending = new Set<AbortController>();
+  /** The POSTs of task ends being tried, by tenant, and the tenants warned that theirs are at the cap. */
+  private waiting = new Map<string, number>();
+  private full = new Set<string>();
   private log: Log;
   private metrics: ServiceMetrics;
-  /** Set by close: a run still draining as the service stops may ask after it, and is posted nothing. */
+  /** Set by close: a run still draining as the service stops may ask, or end, after it, and is posted nothing. */
   private closed = false;
 
   /** `log` is where a webhook that keeps failing is said (the service's); `metrics` count the deliveries. */
@@ -180,33 +193,62 @@ export class Webhooks {
     this.log = log;
     this.metrics = metrics;
     // Each tenant's series start at 0, so increase() sees its first deliveries and failures.
-    for (const tenant of hooks.keys()) for (const result of ["delivered", "failed"]) metrics.webhookDeliveries.inc({ tenant, result }, 0);
+    for (const [tenant, hook] of hooks) {
+      const kinds = [...(hook.approvals ? ["approval"] : []), ...(hook.tasks ? ["task"] : [])];
+      for (const kind of kinds) for (const result of ["delivered", "failed"]) metrics.webhookDeliveries.inc({ tenant, kind, result }, 0);
+    }
   }
 
   send(task: Task, approval: Approval): void {
-    const hook = this.hooks.get(task.tenant);
+    const url = this.hooks.get(task.tenant)?.approvals;
+    if (url) void this.post(task.tenant, task.id, url, JSON.stringify({ task: task.id, approval }), "approval", approval.id);
+  }
+
+  /** A task ended, with `status`. Never throws: the scheduler calls it as it ends each task. */
+  ended(task: Pick<Task, "id" | "tenant">, status: TaskStatus): void {
+    const { id, tenant } = task;
+    const url = this.hooks.get(tenant)?.tasks;
+    if (!url || this.closed) return;
+    const waiting = this.waiting.get(tenant) ?? 0;
+    if (waiting >= MAX_WAITING) {
+      this.metrics.webhookDeliveries.inc({ tenant, kind: "task", result: "failed" });
+      if (!this.full.has(tenant)) this.log.warn(`tenant ${tenant}'s task webhook has ${MAX_WAITING} POSTs waiting: ends are not posted until some finish`, { tenant });
+      this.full.add(tenant);
+      return;
+    }
+    this.waiting.set(tenant, waiting + 1);
+    void this.post(tenant, id, url, JSON.stringify({ task: id, status }), "task", id).finally(() => {
+      this.waiting.set(tenant, (this.waiting.get(tenant) ?? 1) - 1);
+      this.full.delete(tenant);
+    });
+  }
+
+  /** Posts `body` to the tenant's `url`, signed, until a try is taken or the last fails; `what` names it in the warning. */
+  private async post(tenant: string, task: string, url: string, body: string, kind: "approval" | "task", what: string): Promise<void> {
+    const hook = this.hooks.get(tenant);
     if (!hook || this.closed) return;
-    const body = JSON.stringify({ task: task.id, approval });
     const headers = { "content-type": "application/json", "x-jig-signature": `sha256=${createHmac("sha256", hook.secret).update(body).digest("hex")}` };
     const stop = new AbortController();
     this.pending.add(stop);
-    void (async () => {
+    try {
       let last = "";
       for (let attempt = 0; attempt <= RETRIES; attempt++) {
         try {
           if (attempt) await sleep(this.retryMs * 2 ** (attempt - 1), undefined, { signal: stop.signal });
-          const res = await fetch(hook.url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.any([stop.signal, AbortSignal.timeout(ATTEMPT_MS)]) });
+          const res = await fetch(url, { method: "POST", headers, body, redirect: "manual", signal: AbortSignal.any([stop.signal, AbortSignal.timeout(ATTEMPT_MS)]) });
           await res.body?.cancel();
-          if (res.ok) return this.metrics.webhookDeliveries.inc({ tenant: task.tenant, result: "delivered" });
+          if (res.ok) return this.metrics.webhookDeliveries.inc({ tenant, kind, result: "delivered" });
           last = REDIRECTS.includes(res.status) ? `${res.status} (redirects are not followed)` : `${res.status}`;
         } catch (err) {
           if (stop.signal.aborted) return;
           last = err instanceof Error ? err.message : String(err);
         }
       }
-      this.metrics.webhookDeliveries.inc({ tenant: task.tenant, result: "failed" });
-      this.log.warn(`the approval webhook failed for ${approval.id}, ${RETRIES + 1} times: ${last}`, { tenant: task.tenant, task: task.id });
-    })().finally(() => this.pending.delete(stop));
+      this.metrics.webhookDeliveries.inc({ tenant, kind, result: "failed" });
+      this.log.warn(`the ${kind} webhook failed for ${what}, ${RETRIES + 1} times: ${last}`, { tenant, task });
+    } finally {
+      this.pending.delete(stop);
+    }
   }
 
   /** Stops the POSTs still being tried, and sends no more. */

@@ -6,7 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { createLog, type Log } from "../log.ts";
 import { type Exited, type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
-import { jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken } from "../runner.ts";
+import { checkDisk, DiskLimit, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
 import type { PoolAnswer } from "../worker.ts";
 import { lastLine, prepareWorkspace, readStats, TERM_MS, tail } from "./local.ts";
@@ -15,7 +15,9 @@ import { lastLine, prepareWorkspace, readStats, TERM_MS, tail } from "./local.ts
 // CPU, memory and processes, a read-only root, no capabilities, and a network that reaches only the
 // gateway. The task's folder is made here as the local runner makes it and bound into the container at
 // /task; the events file jig writes there is read from this side. With a pool, containers are started
-// ahead of tasks, each with a folder of its own, and a task is given to one that waits (pool.ts).
+// ahead of tasks, each with a folder of its own, and a task is given to one that waits (pool.ts). The
+// folder is on this machine's disk, with no quota: while a task runs it is measured, and the run stopped
+// once it is past maxDiskBytes (runner.ts's watchDisk). An idle warm worker's isn't measured.
 
 export interface DockerRunnerConfig {
   /** Where the task folders go. The daemon binds them by this path, so it must be the same on its machine. */
@@ -50,6 +52,10 @@ export interface DockerRunnerConfig {
   /** How a warm worker starts in the image (default: node /opt/jig/server/worker.ts). */
   worker?: string[];
   pollMs?: number;
+  /** The most bytes a task's folder may take on the disk before its run is stopped; 0 or none: no cap. */
+  maxDiskBytes?: number;
+  /** How often the folder is measured, in milliseconds (default 5000). */
+  diskPollMs?: number;
   /** Where the runner's and its pool's lines go (default: the service's log). */
   log?: Log;
 }
@@ -127,19 +133,59 @@ export class DockerRunner implements Runner {
     const { jig = ["jig"], graceSeconds } = this.config;
     const dir = this.dir(task.id);
     await this.makeFolder(dir);
-    await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
-    await this.chown(dir);
+    const cap = this.cap(dir, task, tenant);
+    try {
+      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects, cap.signal);
+      await cap.check();
+      await this.chown(dir);
 
-    // The token goes by name only (-e NAME), its value in the CLI's environment, out of the process list.
-    const key = keyVariable(task.spec.model);
-    const name = `jig-${task.id}`;
-    const args = [
-      ...this.runArgs(name, dir, ["--interactive", "--label", `jig.task=${task.id}`, "--label", `jig.tenant=${tenant.id}`], key),
-      // The container is the boundary: bubblewrap would need Docker's seccomp filter and /proc masks loosened.
-      ...jig, "--no-sandbox", ...this.jigArgs(task, tenant),
-    ];
-    const container = this.launch(name, args, { [key]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) }, join(dir, "output.log"), task.spec.prompt);
-    return this.handle(container, dir, task);
+      // The token goes by name only (-e NAME), its value in the CLI's environment, out of the process list.
+      const key = keyVariable(task.spec.model);
+      const name = `jig-${task.id}`;
+      const args = [
+        ...this.runArgs(name, dir, ["--interactive", "--label", `jig.task=${task.id}`, "--label", `jig.tenant=${tenant.id}`], key),
+        // The container is the boundary: bubblewrap would need Docker's seccomp filter and /proc masks loosened.
+        ...jig, "--no-sandbox", ...this.jigArgs(task, tenant),
+      ];
+      const container = this.launch(name, args, { [key]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) }, join(dir, "output.log"), task.spec.prompt);
+      return this.handle(container, dir, task, cap);
+    } catch (err) {
+      throw cap.failed(err);
+    }
+  }
+
+  /**
+   * The disk cap on a task's folder (the slot's, on a warm worker), measured from now until `stop`: past it,
+   * what `bind` gave is called (the container's stop), and until then `signal` is aborted, which stops a
+   * clone. `over` is what the task is told, once it is past the cap.
+   */
+  private cap(dir: string, task: Task, tenant: Tenant): Cap {
+    const { maxDiskBytes = 0, diskPollMs } = this.config;
+    const preparing = new AbortController();
+    let why: string | undefined;
+    let stopRun = () => preparing.abort();
+    const over = (text: string) => {
+      why ??= text;
+      this.log.warn("stopping a task whose folder went past the disk cap", { tenant: tenant.id, task: task.id, why });
+      stopRun();
+    };
+    const stop = maxDiskBytes ? watchDisk(dir, maxDiskBytes, over, diskPollMs, { log: this.log }) : () => {};
+    return {
+      signal: preparing.signal,
+      // A workspace past the cap by itself never starts its jig.
+      check: () => checkDisk(dir, maxDiskBytes),
+      bind: (run) => {
+        stopRun = run;
+        if (why) run();
+      },
+      stop,
+      over: () => why,
+      // A clone the cap stopped fails as a clone: the task is told of the cap.
+      failed: (err) => {
+        stop();
+        return why ? new DiskLimit(why) : err;
+      },
+    };
   }
 
   /**
@@ -150,35 +196,46 @@ export class DockerRunner implements Runner {
   private async startWarm(warm: Warm<Slot>, task: Task, tenant: Tenant): Promise<RunHandle | undefined> {
     const { jig = ["jig"], graceSeconds } = this.config;
     const { name, dir, container } = warm.slot;
+    // The slot's folder is measured only from here, once it is a task's.
+    const cap = this.cap(dir, task, tenant);
     try {
-      await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects);
-      await this.chown(dir);
+      try {
+        await prepareWorkspace(join(dir, "work"), task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects, cap.signal);
+        await cap.check();
+        await this.chown(dir);
+      } catch (err) {
+        warm.stop();
+        throw err;
+      }
+      const answer: PoolAnswer = {
+        prompt: task.spec.prompt,
+        gitProtocols: this.config.gitProtocols ?? ["https"],
+        work: "/task/work",
+        stats: "/task/stats.json",
+        command: [...jig, "--no-sandbox", ...this.jigArgs(task, tenant)],
+        env: { [keyVariable(task.spec.model)]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) },
+      };
+      if (!warm.answer(answer)) {
+        // The cold start measures the task's own folder.
+        cap.stop();
+        return undefined;
+      }
+      warm.slot.assigned = true;
+      this.folders.set(task.id, dir);
+      // Named as a cold one would be, so a replica that ends the task after this one crashed finds it (abandon).
+      // Only once it has the task: a cold start of it would want the name. One not renamed runs all the same.
+      const renamed = `jig-${task.id}`;
+      await container.rename(renamed).then(
+        () => (warm.slot.name = renamed),
+        // A run that has already ended is gone, and needs no name.
+        (err: unknown) => container.exited() || this.log.warn("couldn't rename a warm worker's container for its task; if this replica crashes, the replica that ends the task may not find it, and the run goes on until its time limit", { task: task.id, container: name, err }),
+      );
+      // The folder keeps the worker's name, not the task's: this says which it is.
+      this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, container: warm.slot.name, folder: dir });
+      return { ...this.handle(container, dir, task, cap), warm: true };
     } catch (err) {
-      warm.stop();
-      throw err;
+      throw cap.failed(err);
     }
-    const answer: PoolAnswer = {
-      prompt: task.spec.prompt,
-      gitProtocols: this.config.gitProtocols ?? ["https"],
-      work: "/task/work",
-      stats: "/task/stats.json",
-      command: [...jig, "--no-sandbox", ...this.jigArgs(task, tenant)],
-      env: { [keyVariable(task.spec.model)]: taskToken(this.config.gatewaySecret, task, tenant, graceSeconds) },
-    };
-    if (!warm.answer(answer)) return undefined;
-    warm.slot.assigned = true;
-    this.folders.set(task.id, dir);
-    // Named as a cold one would be, so a replica that ends the task after this one crashed finds it (abandon).
-    // Only once it has the task: a cold start of it would want the name. One not renamed runs all the same.
-    const renamed = `jig-${task.id}`;
-    await container.rename(renamed).then(
-      () => (warm.slot.name = renamed),
-      // A run that has already ended is gone, and needs no name.
-      (err: unknown) => container.exited() || this.log.warn("couldn't rename a warm worker's container for its task; if this replica crashes, the replica that ends the task may not find it, and the run goes on until its time limit", { task: task.id, container: name, err }),
-    );
-    // The folder keeps the worker's name, not the task's: this says which it is.
-    this.log.info("the task runs on a warm worker", { task: task.id, tenant: tenant.id, container: warm.slot.name, folder: dir });
-    return { ...this.handle(container, dir, task), warm: true };
   }
 
   /** A warm worker: a container with its own slot's folder at /task, as a task's, that claims a task with its ticket. */
@@ -316,17 +373,36 @@ export class DockerRunner implements Runner {
     return { exit, exited: () => exited, stop, rename };
   }
 
-  /** A task's run in the container, from now: its events read from the folder, and stopped at its time limit and the grace. */
-  private handle(container: Container, dir: string, task: Task): RunHandle {
+  /** A task's run in the container, from now: its events read from the folder, and stopped at its time limit and the grace, or at its disk cap. */
+  private handle(container: Container, dir: string, task: Task, cap: Cap): RunHandle {
     const { graceSeconds, pollMs = 100 } = this.config;
     let timedOut = false;
     const deadline = setTimeout(() => ((timedOut = true), container.stop()), (task.spec.timeLimit + graceSeconds) * 1000);
+    // From now the cap stops the container, at once if the folder went past it since the check.
+    cap.bind(container.stop);
     const exit = container.exit.then(async ({ code, message }): Promise<RunExit> => {
       clearTimeout(deadline);
-      return { exitCode: code, timedOut, stats: await readStats(join(dir, "stats.json")), message: message ?? (code === 0 ? undefined : await lastLine(join(dir, "output.log"))) };
+      cap.stop();
+      return { exitCode: code, timedOut, overDisk: cap.over(), stats: await readStats(join(dir, "stats.json")), message: message ?? (code === 0 ? undefined : await lastLine(join(dir, "output.log"))) };
     });
     return { events: tail(join(dir, "events.jsonl"), container.exited, pollMs), wait: () => exit, cancel: container.stop };
   }
+}
+
+/** The disk cap on one task's folder (DockerRunner's cap). */
+interface Cap {
+  /** Aborted when the folder goes past the cap before its container is bound. */
+  signal: AbortSignal;
+  /** Throws what the task is told if the folder is past the cap now, or can't be measured. */
+  check(): Promise<void>;
+  /** Gives the cap what stops the run, which it calls at once if the folder is past it already. */
+  bind(run: () => void): void;
+  /** Ends the measuring. */
+  stop(): void;
+  /** What the task is told, once its folder went past the cap. */
+  over(): string | undefined;
+  /** Ends the measuring after a start that threw `err`, and gives what to throw: the cap's text, if it was the cap. */
+  failed(err: unknown): unknown;
 }
 
 /** A docker run of the runner's. */

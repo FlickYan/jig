@@ -20,8 +20,9 @@ queued tasks, and `server/runner.ts` is what a runner keeps to: `start(task, ten
 the run's events, `wait()` and `cancel()`. The local runner, `server/runners/local.ts`, runs jig as a
 process on the same machine; the Docker and Kubernetes runners (below) run each task in a container of its
 own, which is what keeps tenants apart best: jig's sandbox keeps a local task's commands out of the
-database's files, the config's folder and the other tasks' folders (below), but they share the machine's
-kernel, its Unix sockets and whatever else the service's user can read.
+database's files, the config's folder and the other tasks' folders, and on Linux gives each a `/tmp` and
+`/run` of its own (below), but they share the machine's kernel, its other Unix sockets and whatever else
+the service's user can read.
 
 Run it with a config file and the secret it shares with the gateway:
 
@@ -63,9 +64,19 @@ the most of a task's events that are stored, and `maxEventBytes` (64 MiB) the mo
 past either they are dropped, but for the run's last event if it is an `end` (jig writes its own last),
 with one `notice` event in place of the first dropped, and the run goes on. An `end` counts toward both
 like any event. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
-its events, `end`s too, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what
-tasks store over time.
-`keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
+its events, `end`s too, in lines of up to 1 MiB) can't fill the database with one task. What tasks store
+over time is bounded only with `retentionDays` (unset: everything is kept): the days after a task ends that
+its content is deleted, as `DELETE /v1/tasks/:id` deletes it (Deleting a task, and retention, below). A
+number over 0, up to 36,500, fractions allowed; one setting for every tenant; queued and running tasks are
+never touched, and a row per task and the usage ledger stay. Take a backup before first setting it, as
+the first sweep deletes the content of every task older than that. A misspelt field in the config is
+silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB) is the most of a run's last text that is kept as the
+task's `result` (below); setting it over 1 MiB does nothing more, as a longer line of events is never read.
+`keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed.
+`maxTaskDiskBytes` (4294967296, 4 GiB; 0 for none) is the most a task's folder may take on `dataDir`'s
+disk before its run is stopped (the disk cap, below). It is the local and docker runners': with `runner`
+`kubernetes` it is refused, as a pod's `ephemeral-storage` limit does that there. It is on by default, so
+a deployment whose tasks need more than 4 GiB each must raise it. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
 `leaseSeconds` over 86,400, `heartbeatSeconds` and `kubernetes.terminationGraceSeconds` over 3,600, a
@@ -98,13 +109,22 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
   -d '{"prompt": "the test in test_app.py fails, fix it", "workspace": {"files": {"app.py": "...", "test_app.py": "..."}}}'
 curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"prompt": "...", "workspace": {"git": "https://github.com/owner/repo", "ref": "main"}, "maxSteps": 30}'
+# With a key of the client's own, a retry of the same request makes no second task (below).
+curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -H 'Idempotency-Key: order-4711' -d '{"prompt": "..."}'
 
-curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost and stats
-# The tenant's latest 100 (or ?limit=), newest first, without their prompts unless ?full=1; with "next"
+curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats and result
+# The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1; with "next"
 # when the page is full, the id that ?before= takes for the page after it.
+# ?status= takes one status or several, separated by commas.
 curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
+curl -s 'localhost:8080/v1/tasks?status=queued,running' -H "Authorization: Bearer $KEY"
 curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Bearer $KEY"
+# The tenant's limits, and what it has used of them (Quotas and usage, below).
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8080/v1/tasks/$ID/cancel -H "Authorization: Bearer $KEY"
+# Deletes an ended task's prompt, files, result, events and approvals; its row and its usage stay (below).
+curl -s -X DELETE localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"
 
 # Its events (jig's --events lines) as server-sent events, each one's id its seq: those so far, the rest
 # as they come, then "event: done" with the status, and the stream ends. Last-Event-ID (or ?after=)
@@ -115,10 +135,19 @@ curl -sN localhost:8080/v1/tasks/$ID/events -H "Authorization: Bearer $KEY" -H '
 
 A request is refused with 400 and the reason when a field is unknown or out of bounds, the model isn't a
 Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file's path is absolute, goes
-through `..` or names a folder, the workspace has both files and a repository, or the prompt holds a NUL
-character (`\u0000`, which Postgres text can't hold, so no store takes it); with 413 when the body is
+through `..` or names a folder, the workspace has both files and a repository, or the prompt or a
+workspace file's path or contents holds a NUL character (`\u0000`, which Postgres text can't hold and its
+JSON operators can't read, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
-quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
+quotas (below). The list takes four parameters, `status`, `before`, `limit` and `full` (1, true, 0 or
+false): any other, such as a misspelt `?stauts=running`, or one given twice, is a 400 rather than a list
+of everything. A `before` that isn't the id of one of the tenant's tasks in this service is a 400 too,
+`{"error": "before must be the id of one of your tasks here"}`, the same for an id that never was and
+another tenant's; it used to be an empty page, which reads as the end of the list. A path that is no
+route is a 404 `{"error": "No such route"}`, whatever the method; on a task's routes, a task that doesn't
+exist or is another tenant's is a 404 `{"error": "No such task"}`, and a wrong method a 405. (Through the router, a path under `/v1/tasks/` whose id names no region is
+answered by the router itself, with `No such task`.) A cancel
+answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
@@ -135,6 +164,34 @@ with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open,
 goes away, even one asked for behind another request on the same connection. Each replica counts its own,
 in memory: behind a load balancer, a tenant may have its `maxStreams` open on each replica.
 
+**Idempotency-Key.** A create whose answer was lost (a timeout, a dropped connection, the router's 502)
+may or may not have made its task, and posting it again would run, and bill, the task twice. A create with
+an `Idempotency-Key` header can be sent again safely. The key is the client's own, 1 to 128 of letters,
+digits, `_`, `.`, `:` and `-` (anything else, an empty header or one sent twice is a 400), it is the
+tenant's, and it holds for 24 hours from the create that made its task:
+
+- the first create with it answers 201 `{"id", "status"}`, as one without;
+- the same body again answers 200 with that task's `id` and its `status` now (`queued`, `running` or what
+  it ended as), and the header `idempotent-replay: true`. Nothing is made or started, and it isn't counted
+  against `maxQueued` or the quotas, so it is answered even while a new task would be refused;
+- another body answers 422, `{"error", "id"}` with the id of the task the key made. Bodies are compared as
+  the bytes they came in, not as JSON: a retry must resend the same bytes, and a new task takes a new key.
+
+A create that was refused (400, 413, 429) records nothing: its key is free for the next try. The 429 for a
+full queue is `{"error", "quota": "maxQueued", "limit", "used"}` with `retry-after: 5`. The queue has no
+time it empties at, so the 5 is a fixed guess; it means nothing for a tenant whose `concurrency` or
+`maxQueued` is 0.
+
+What a key doesn't do. It is known to one store: another region's service, or one on another database,
+makes the task again (Several regions, below). The request is checked before the key is looked up, so a
+replay whose body no longer passes, after a change of the config (a model removed, a lower limit), is a
+400. During a rolling upgrade a replica of the version before ignores the header and makes a task each
+time, and a task it makes meanwhile is ended with its model read from its spec (none in the ledger if the
+spec holds a `\u` escape). The key isn't shown on the task. Keys past their 24 hours are deleted beside the
+folder sweep, so their table holds about a day of creates. It stops holding after its 24 hours, when the same key makes a new
+task, or sooner if its task's row is removed from the database. There is no key for a cancel or an
+approval's answer.
+
 A task is `queued`, then `running`, then one of:
 
 | status | when |
@@ -143,12 +200,82 @@ A task is `queued`, then `running`, then one of:
 | `stopped` | the run stopped short at a limit: steps (exit 2), the output limit or context window (3), repeating itself (6), the time limit (7, or the runner's stop past it), empty replies (8), an interruption (130) |
 | `failed` | the model declined (4), or tool calls needed approval (5) |
 | `cancelled` | cancelled through the API |
-| `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, or the service stopping while it ran |
+| `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, a folder past the disk cap, or the service stopping while it ran |
 
 `stop` is how jig's run ended, from its `end` event (or its exit code, without one; a run stopped by a
 cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
-that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
+that event too. A run stopped at the disk cap (below) is an `error` with stop `disk_limit`, though jig's
+own `end` says `interrupted`; a task whose workspace alone is past the cap is an `error` before jig starts,
+with no `stop`. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
 U+FFFD.
+
+`result` is the last text the run wrote (its last `text` event), on `GET /v1/tasks/:id` and, with
+`?full=1`, in the list: the model's final reply when the run ended with one, the wrap-up when it stopped
+at `max_steps`, and otherwise the last thing it said before it ended, whatever the task's status. So read
+it with `status` and `stop`: a `stopped` task with stop `empty` (the model's last reply had no text) has
+an earlier step's text, and a cancelled one what it had said so far. A reply cut off at the output limit
+and continued is one `text` event per step, so the result is only its last part, with `resultTruncated`
+false: the whole answer is in the task's `text` events, where they were kept. It is `null` while the task
+is queued or running, and for a task whose run wrote no text, that never ran (cancelled while queued), or
+whose replica was lost (ended when its lease ran out). It is kept even when the text was past `maxEvents`
+or `maxEventBytes`, so its event wasn't. A text of more than `maxResultBytes` of UTF-8 is cut to its start, at the end of a
+character, and `resultTruncated` is true; a NUL in it is shown as U+FFFD. On Docker and Kubernetes a
+task's commands can write its events, so the result is the task's word, not the service's. It isn't in
+the stream's `done`, the webhooks or the usage ledger.
+
+The task's files aren't retrievable: there is no diff of the workspace and no `GET /v1/tasks/:id/diff`.
+Making one would run git on the host over a repository the task's commands wrote, a files workspace has
+no commit to compare with, and on Kubernetes the only way out of the pod is its log. A task whose changes
+you need must push them, or print them.
+
+### Deleting a task, and retention
+
+`DELETE /v1/tasks/:id` deletes what an ended task holds of the tenant's and the run's words: its events and
+approvals, its prompt (an empty string from then on), its workspace (the files, or the repository's URL),
+its `error`, `stats` and `result`. It keeps a slim row: `id`, `status`, `exitCode`, `stop`, `created`,
+`started`, `ended`, `usage`, `cost`, the model, `maxSteps`, `timeLimit`, `approvals` and `mode`, and the
+time it was deleted, `purged`, which every view of a task has (`null` until then). `stop` and `usage` stay
+as the run reported them. The task's row of the usage ledger and its `Idempotency-Key` stay too: a deleted
+task still counts toward `tasksPerDay` and the spending quotas, stays in the usage reports, and a replay of
+its key still answers with its id. It answers 200 with the task as it is now, and again with the same
+`purged` however often it is asked; 404 for a task that isn't the tenant's; 409, `{"error", "id",
+"status"}`, for one that is queued or running, which is cancelled first. Any other method on a task's own
+path but GET is a 405.
+
+Once a task is purged, its `/events` and `/approvals` paths (an approval's answer too) are 410, `{"error",
+"id", "purged"}`, rather than an empty stream or list that would read as a run that wrote nothing; a cancel
+is the 409 of a task that has ended. A stream already open when the delete comes just ends with `done`. An
+event or an approval that a replica still writes for the task is dropped, as one already stored is.
+
+`retentionDays` in the config does the same to every task that ended longer ago than that, with no request.
+The sweep runs beside the folder sweep (Scheduling, below): at each start and every tenth round of renewals,
+none while a replica waits out a round after a failure, and with `keepTaskDirs` too. It purges 5 tasks in a
+transaction, the oldest first, then lets the event loop go before the next 5, until none is left or the
+service starts to stop. On SQLite a transaction holds the event loop while it runs: at the worst about 0.4 s
+for a task with 64 MiB of events, so about 2 s a batch. A sweep that purged anything logs one line with how
+many; one that failed logs an error, counts in `jig_service_store_errors_total{retried="false"}`, and the
+next tries again. On Postgres one replica sweeps at a time (an advisory lock; the others skip that sweep),
+and the database's clock says what is old enough. During a rolling upgrade, a replica of the version before
+neither refuses a purged task's late events nor answers 410.
+
+What a delete doesn't reach, so don't call it complete erasure: a task's folder kept with `keepTaskDirs`,
+the service's and the gateway's logs, approval webhooks already posted or still being tried again (for up to a minute after the request), what the model's provider keeps,
+and backups. On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
+stay in its `-wal` file until that is next reset (a checkpoint with no reader, or the service's stop). On
+Postgres the rows stay dead in the table until vacuum, and in WAL archives and on standbys as long as those
+keep them. There is no delete of a task's row or its ledger row, no retention per tenant or of the events
+alone, and no delete of many tasks at once or by the admin key.
+
+What the API doesn't have, and why. An error is a sentence in `error`, with no `code` beside it: codes
+would be a contract across every route's refusals, which nothing here needs yet. There is no OpenAPI
+description, and a 405 names the method in its `error` but sends no `Allow` header. Only the list,
+`/v1/usage` and `/v1/limits` refuse parameters they don't know: the other routes read one at most. The
+list filters by status only, not by when a task was created or ended, which would need an index of its
+own to page through. A list in several statuses is read a status at a time, each through the index one
+status uses, and merged: one query for all of them would walk the tenant's whole history. The list has no
+`?region=all`, as a page across regions would need a cursor for each. `/v1/limits` leaves out the regions
+a tenant may use, which only the router knows, and its open streams, which each replica counts for
+itself. And the check of `before` reads the task's whole row, prompt included, once a page.
 
 ### Scheduling
 
@@ -208,6 +335,18 @@ cancel or a shutdown, a write of a run's events or approvals isn't tried again, 
 past the first failure, its events aren't stored. Its outcome is still tried again. On Postgres, an error in the data itself (SQLSTATE class 22 or 23) isn't
 tried again, as it would fail each time.
 
+A SQLite database whose disk is full (SQLite's `SQLITE_FULL`) is tried again like any other failure:
+stopping a run can't make room, and the task that filled the disk is stopped by its disk cap and its folder
+removed, which the other runs' tries ride out. A run whose events still can't be written after half a lease
+ends as an `error` that says the service's database couldn't be written because its disk is full. Before
+a run's outcome is tried again after that failure, its folder is removed (unless `keepTaskDirs`), as it may
+be what filled the disk. The API's own writes (a new task, an approval's answer) are answered 503 with
+`retry-after: 30` and `{"error": "The service's database is out of disk space"}`, not 500. `/readyz` stays
+200, as reads still work. Other signs of a full disk (a quota, a `-shm` file that can't grow, a journal that
+can't be made, Postgres's own disk) come as other errors, and are plain store failures. With `keepTaskDirs`,
+or a disk that something else filled, nothing makes room: the outcome is given up on after half a lease, and
+the task ends when its lease runs out, with the lease's text.
+
 ### Several replicas, on Postgres
 
 With `"database": "postgres://user:password@host:5432/jig?sslmode=require"` (or the URL in
@@ -216,7 +355,9 @@ Postgres, through `server/pg.ts`, a client of jig's own with no dependencies (SC
 cleartext logins; `sslmode=require` checks the server's certificate against the system's CAs, or the file
 in `sslrootcert`), and several replicas of the service share it: each runs the same config, with a
 `replicaId` of its own (the host's name, the process's id and a random part, by default). The schema is
-moved on by the `jig_schema` table, under a lock, so replicas starting together do it once.
+moved on by the `jig_schema` table, under a lock, so replicas starting together do it once. A replica of
+the version before goes on running against the schema once a newer one has moved it, but refuses to start
+again; a task it finishes meanwhile has a `null` result (the columns came with schema 7, SQLite's 8).
 
 A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
 counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`
@@ -288,10 +429,27 @@ must be set) is told of each approval as it is stored: a POST of `{"task": <id>,
 signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
 2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
 it. A redirect is not followed but counted as a failed try, as it could send the signed POST anywhere the
-service can reach. Each approval is counted once in `jig_service_webhook_deliveries_total{tenant,result}`,
-`delivered` or `failed` (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's
-fail. One whose tries are cut off by the service stopping is counted neither way. Each tenant with a webhook
-starts at 0 for both, so the first failures show.
+service can reach. Each approval is counted once in
+`jig_service_webhook_deliveries_total{tenant,kind,result}` (`kind="approval"`), `delivered` or `failed`
+(after the last try), and `JigWebhookFailures` alerts when over half of a tenant's fail. One whose tries are
+cut off by the service stopping is counted neither way. Each tenant with a webhook starts at 0 for both, so
+the first failures show.
+
+A tenant with `taskWebhook` (a URL, with the same `webhookSecretEnv`) is told as each of its tasks ends: a
+POST of `{"task": <id>, "status": <the status it ended with>}` and no more, from the replica that ended it,
+with the same signature, tries and rule on redirects, counted with `kind="task"`. It is sent at most once and
+on a best effort: `GET /v1/tasks/<id>` is the record, and a client that must know of every end polls for
+the ones it wasn't told of. An end is not posted:
+
+1. for the tasks ended as the service stops (stopped as errors, or ending in its last moments): the webhooks
+   close before the runs are stopped. With a single replica, that is every restart;
+2. for the queued tasks cancelled at a start because their tenant left the config;
+3. when the store's reply to the end was lost (the task has ended, but the replica can't tell it was the one
+   to end it), or a task whose lease ran out couldn't be read back;
+4. when the replica that ends the task has a config with no `taskWebhook` for the tenant, as in the middle of
+   a rollout that adds it;
+5. while 100 of the tenant's POSTs wait on its endpoint (an end past that is counted `failed` at once, and
+   the service warns once until some finish), or after its 4 tries failed.
 
 ### Quotas and usage
 
@@ -305,7 +463,8 @@ Each is no limit when left out. `tasksPerDay` counts the tasks the tenant create
 of them; `usdPerDay` and `usdPerMonth` add up the cost of its tasks that ended that day or month, from the
 usage ledger (below). A task posted at one of them is refused with 429, `{"error", "quota", "limit",
 "used", "resetsAt"}`, `resetsAt` being the start of the next UTC day (of the next month, for
-`usdPerMonth`), and `retry-after` the seconds until then. They are counted with the task's insert, under a
+`usdPerMonth`), and `retry-after` the seconds until then. A create answered with an earlier task for its
+`Idempotency-Key` (The API, above) is not a new task: it counts for no quota. They are counted with the task's insert, under a
 lock of the tenant's (Postgres's, or SQLite's write lock), so replicas can't both let in a tenant's last
 task of the day; `maxQueued` is counted the same way. The USD quotas count only tasks that have ended, so
 the tasks running when one is reached can take the tenant past it by what they spend: the service only
@@ -337,6 +496,20 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&fo
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 ```
 
+```bash
+# What the tenant may do, and where it stands:
+# {"tenant", "region", "limits": {"concurrency", "maxSteps", "timeLimit", "budgetUsd", "maxQueued", "approvalTimeout", "maxStreams", "quotas"},
+#  "used": {"queued", "running", "tasksToday", "usdToday", "usdThisMonth"}, "resets": {"day", "month"}}
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
+```
+
+`GET /v1/limits` lets a tenant read its caps before it is refused at one. `limits` holds the tenant's own
+and the service's defaults where it has none, with only the quotas it has; `used` always holds all five
+counts; `resets` is when the next UTC day and month start. The counts are read with the queries a new
+task is admitted by, but outside its lock, so they can be a task behind. `usdToday` and `usdThisMonth`
+count ended tasks only, as the quotas do. `maxStreams` is per replica, and the streams open now aren't
+reported. Each region answers for itself. It takes no parameter (400).
+
 Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
 that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
 the config, the environment variable that holds the admin key (which must be set, and may hold no
@@ -357,14 +530,16 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | metric | what |
 |--------|------|
 | `jig_service_http_requests_total{route,status}`, `jig_service_http_request_seconds{route}` | the API's requests, and their seconds to the end of the response (an event stream's lasts as long as it is followed) |
-| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413), each at 0 from the start |
+| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400, 413 or 422), each at 0 from the start |
+| `jig_service_tasks_replayed_total{tenant}` | creates answered with an earlier task, for their `Idempotency-Key`, at 0 from the start |
 | `jig_service_tasks_ended_total{tenant,status}`, `jig_service_run_seconds{status}` | tasks ended, and their seconds from start to end |
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
-| `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
+| `jig_service_webhook_deliveries_total{tenant,kind,result}` | approvals (`kind="approval"`) and task ends (`task`) posted to a tenant's webhooks: `delivered`, or `failed` once its last try failed (a task end past the 100 waiting, at once) |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above), at 0 from the start |
+| `jig_service_tasks_purged_total{reason}` | ended tasks whose content this replica deleted: `api` (a `DELETE`, counted once however often it is repeated) or `retention` (`retentionDays`), each at 0 from the start |
 | `jig_service_cost_usd_total{tenant}`, `jig_service_tokens_total{tenant,kind}` | what the tasks spent, from their end events (`kind`: `input`, `output`, `cache_read`, `cache_write`) |
 | `jig_service_db_pool_connections{state}` | on Postgres, the replica's connections to it: `open` (in use or idle), `idle`, and `waiting`, the queries waiting for one |
 | `jig_service_event_streams{tenant}` | event streams open on this replica (`maxStreams`), the config's tenants at 0 from the start |
@@ -392,7 +567,7 @@ error as `err`.
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
 `alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
-upstream's breaker open, a provider's keys used up, quota refusals, approval webhooks failing, a region
+upstream's breaker open, a provider's keys used up, quota refusals, webhooks failing, a region
 down, and the store's, the leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all
 three, by region. Of the store's, `JigStoreErrors` (critical) is for reads and writes given up on, when
 tasks aren't started or a run's events or outcome aren't stored, and `JigStoreDegraded` (a warning) for
@@ -488,22 +663,69 @@ bubblewrap puts an empty folder over `dataDir` and binds the two back as they we
 `dataDir` but for them. jig's file tools refuse the same paths. jig keeps a long command output, and
 `--keep-inputs`' copies, in `$TMPDIR`, which is why each task has its own there, in its home: in a shared
 one the other tasks' commands could read and write them. What the tasks still share is the machine: its
-kernel, `/tmp` and `/var/tmp` (where a command can still leave a file for another, by its path), and on
+kernel, without `local.isolation` (below) `/tmp` and `/var/tmp` (where a command can leave a file for
+another, by its path), and on
 macOS its processes and `localhost`: Seatbelt lets a command see and signal the processes of the user
 it runs as, the service's own among them, whose environment holds `JIG_GATEWAY_SECRET` and the provider
 key. So on macOS the local runner is for one tenant you trust; the Docker and Kubernetes runners keep
 tenants apart. On every system, outside the hidden paths, a command reads whatever the service's user can
 (its `~/.ssh`, `~/.aws`, `.pgpass`), and connects to the Unix sockets there (Docker's, a local Postgres's
-or Redis's, an ssh-agent's), which cutting the network off doesn't close. So run the service as a user of
+or Redis's, an ssh-agent's; with `local.isolation`, only those outside `/tmp`, `/var/tmp` and `/run`),
+which cutting the network off doesn't close. So run the service as a user of
 its own, with nothing it doesn't need, and list what else is secret in `local.hiddenPaths` (that user's home
 directory, say, unless the toolchains the tasks use are installed there). The config's folder is hidden
 when the service starts with `--config`; a program that calls `startService` itself passes the config's
 path as `configFile`.
 
+**`local.isolation`.** On Linux those settings also hold `"isolation": "service"` (README: settings), so a
+task's commands see nothing of the places a machine's users share whatever the file permissions say. This
+is the default there, and a change: local tasks no longer see the machine's `/tmp`, `/var/tmp` or `/run`.
+`"local": {"isolation": "shared"}` gives them back, as before; so does `local.allowUnsandboxed`, since
+only the sandbox can do it, and the two together are refused. With it:
+
+- `/tmp` and `/var/tmp` are the task's own, in one of two ways. With `dataDir` outside them, they are the
+  task's `$TMPDIR` (`home/tmp`), the same folder under three names, kept from one command to the next. With
+  `dataDir` in `/tmp` (or `/var/tmp`), that one is a new, empty folder for each command, with the task's
+  project, home and `$TMPDIR` bound on top: private too, but a file a command leaves in `/tmp` is gone
+  with it, so `$TMPDIR` is where to keep one (jig tells the model which it is). The service warns of it. (Outside
+  the service, jig does the same where the project, a hidden path or jig's directory lies in `$TMPDIR`:
+  bound at `/tmp`, the folder would show them a second time, without the sandbox's protections.)
+- `/run` is empty (and `/var/run`), and `/dev/shm` each command's own. So there is no D-Bus, no
+  `docker.sock`, no socket in `/run/postgresql`: a database a task needs is one it starts itself. With the
+  network on, the file `/etc/resolv.conf` leads to is bound back if it is in `/run` (systemd-resolved's).
+- Each command has an IPC namespace of its own: System V shared memory, semaphores and queues, and POSIX
+  message queues, don't last from one command to the next, and never reach another task's.
+- The session's first process, whose root a command reaches through `/proc/1/root`, has the same empty
+  folders and a `/dev` of its own.
+- jig's file tools follow no link from the project into the machine's `/tmp`, `/run` or `/dev/shm`.
+
+A task's `/tmp` now lies in its folder, on `dataDir`'s volume, and counts toward `maxTaskDiskBytes`
+(the disk cap, below); its `/run` and `/dev/shm` are memory, which the cap doesn't see. Where bash or a folder on the service's `PATH` is in `/run` (NixOS keeps the
+system's programs in `/run/current-system`), every command would fail to start, so the service doesn't
+start, and says to set `local.isolation` to `"shared"`. What is left to share: the kernel; Unix sockets
+at paths elsewhere (one in the service user's home, say), which would take seccomp to refuse; whatever
+else the service's user can read; and the machine's loopback, for a task run with the network on. At its
+start the service reads `/proc/net/unix` once and names up to ten sockets that take connections outside
+those folders and the hidden paths: list their folders in `local.hiddenPaths`. macOS has none of this,
+and `"isolation": "service"` is refused there: Seatbelt's profile allows by default, so rules for `/tmp`,
+processes and `localhost` would be a claim nothing here could test, and one that fails to compile fails
+every command. There the local runner stays for one tenant you trust.
+
+Three things that went wrong on the way. The session's first process kept the machine's root, so with a
+private `/tmp` in each command, `cat /proc/1/root/tmp/<file>` still read the machine's, `/dev/shm` and the
+sockets in `/run` likewise: it now has its own. An empty `/tmp` for every command, the simple way, lost
+what a command left there for the next, which build tools do. And binding the task's `$TMPDIR` at `/tmp`
+whatever else was mounted there let a command make directories anywhere the service's user can:
+bubblewrap makes a mount's place if it is missing, following links, with the machine's files under
+`/oldroot`, so a link `../../oldroot/<folder>` left in `/tmp`, in the way of the next command's mount of
+`dataDir`, had it make them in that folder. So the folder is bound there only where nothing else is
+mounted in `/tmp`, and a hidden path there gets no mask; otherwise `/tmp` is empty for each command.
+
 The workspace's clone is the service's own, outside the sandbox and on the machine's network, though the
 tasks' commands have none: list the hosts tenants may clone from in `gitHosts` (above).
 
-The service warns at the start of what the tasks' commands can still read and connect to, when the local
+The service warns at the start of what the tasks' commands can still read and connect to (with
+`local.isolation`, the Unix sockets by name), when the local
 runner serves several tenants, when `dataDir` is in a temp folder (where a task's commands can write its
 home, whose git config jig's own git reads outside the sandbox), and when `local.allowUnsandboxed` is set.
 Then it says that a task whose jig can't make its sandbox runs its commands directly on the machine, or,
@@ -556,7 +778,52 @@ is on that network too, but takes only tenants' keys, which no task holds.
 The daemon binds the task folders by their path on its own machine, so a service in a container must have
 `dataDir` at the same path as on the host. A service running as root gives each task folder to
 `docker.user` (10001:10001, the image's `jig` user); one that doesn't must run as that user. The task
-folders are on the host's disk with no quota of their own: put `dataDir` on a file system of its own.
+folders are on the host's disk with no quota of their own; the disk cap (below) stops a run whose folder
+grows past `maxTaskDiskBytes`, but it is a check and not a quota. So still put `dataDir` on a file system
+of its own: what gets past the cap then fills that one, not the database's or the host's.
+
+### The disk cap
+
+The local and Docker runners keep each task's folder on the service's machine, where nothing limits its
+size. So while a task runs, the service measures its folder (`dataDir/tasks/<id>`, or the slot's
+`pool_<hex>` on a warm worker: the workspace, jig's home, the events and `output.log`), and stops the run
+once it takes more than `maxTaskDiskBytes`: SIGTERM, to jig's process group or to the container, and
+SIGKILL 5 seconds later. The task ends as an `error` with stop `disk_limit` and the error `the task's folder
+grew past maxTaskDiskBytes (<n> bytes), so the service stopped the run`; what it spent until then is
+stored as for any run. A workspace that is past the cap by itself, or a clone stopped at it, ends the
+task the same way before any run. The folder is then removed with the task, as any is.
+
+What is counted is the blocks each file and folder takes on the disk, so a sparse file counts for what it
+holds, not its length. No link is followed and no other file system entered, and a file with several
+names is counted once. The folder is measured every 5 seconds, from before the workspace is made (a clone
+that goes past the cap is stopped too) until the run ends; after a walk that took long, the next waits ten
+times as long as it took, and one folder is walked at a time across all the tasks, so a machine of big
+trees is read by one walk, not by one for each task.
+
+It is a check, not a quota, and these are its limits:
+
+- A task can go past the cap by what the disk takes in the time between two checks and the 5 seconds
+  between SIGTERM and SIGKILL. The room to leave for that is the operator's to judge.
+- Not counted: a file written while it has no name (opened, then removed), `/tmp` and `/var/tmp` on the
+  local runner without `local.isolation` (the machine's own, which tasks share; a task's `TMPDIR` is in
+  its folder and is counted, as its `/tmp` and `/var/tmp` are under isolation), what a command writes to
+  `/run` and `/dev/shm` under isolation (memory, each up to half the machine's, until the command's
+  processes end),
+  Docker's own log of the container, the folders `keepTaskDirs` keeps after their tasks, and a warm worker's
+  folder while it waits for a task.
+- A task that times the walk can move data round it, or make a tree it has to give up on. The cap is
+  against tasks that run away, not hostile ones: for those, a file system with quotas, or the Kubernetes
+  runner.
+- A folder that can't be measured (a folder in it the service's user can't read, a path too long to name,
+  over 1,000,000 files) on two checks in a row ends the task as an `error` that says so, as it can't be held
+  to the cap. One such check may only have met a folder as it was made.
+- On a file system that compresses, the blocks are what is stored, so the cap undercounts what was written.
+
+At its start the service warns when `dataDir`'s file system has less free than `concurrency` ×
+`maxTaskDiskBytes`, what the tasks running at once may take: 17.2 GB with the defaults (4 tasks of 4 GiB),
+34.4 GB with `deploy/service.docker.json`'s `concurrency` 8. It warns too when `maxTaskDiskBytes` is 0, and
+in both says so if the SQLite database is on that file system: once it is full, the database's writes fail
+(Scheduling, above). It starts all the same.
 
 ### The Kubernetes runner
 
@@ -597,7 +864,8 @@ what it requests. A warm worker's Job and Secret are made the same way.
   "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "cpu": "1", "memory": "2Gi", "ephemeral-storage": "4Gi" } } }
 ```
 
-A pod's files are on its node, out of the service's reach, so the events come in its log: the pod runs
+A pod's files are on its node, out of the service's reach (so `maxTaskDiskBytes` doesn't apply: the pod's
+`ephemeral-storage` limit holds them), and the events come in its log: the pod runs
 `node server/worker.ts`, which makes `HOME` and the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events
@@ -898,6 +1166,7 @@ without the block there is none, and the public port never serves metrics. Each 
 | `jig_gateway_keys` | `upstream`, `state` | gauge: how many keys are `ok`, `resting` or `refused` |
 | `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` or `quota` |
 | `jig_gateway_state_errors_total` | | reads and writes of Redis that failed, a scrape's own reads of the keys' standing included |
+| `jig_gateway_state_late_releases_total` | `outcome` | slots given back to Redis late, after it could not be reached: `replayed` (given back once it answered), `expired` (the lease ended first) or `dropped` (more than 10,000 to remember) |
 
 No label holds a key, a token, a prompt or a task. Every reply carries `x-request-id`: the client's, if it
 sent one of 1 to 128 letters, digits, `_`, `.` and `-`, or else a new one. It isn't sent to the provider.
@@ -955,7 +1224,23 @@ and quotas count only what went through that replica during the outage: each rep
 so a task that had already spent its budget can spend it again on each replica, and what is spent while
 Redis is down is never written to Redis, so it is missing from `/usage` and from the billing days once
 Redis is back. Choose `open` only where availability matters more than holding budgets and billing exactly. Either way the gateway says so once on stderr and counts each failure in
-`jig_gateway_state_errors_total`.
+`jig_gateway_state_errors_total`; once it says Redis is back, it gives back the slots it could not
+meanwhile, counted in `jig_gateway_state_late_releases_total`.
+
+A request that ends while Redis can't be reached can't give its slot back, and nothing renews it any more.
+The replica remembers such slots (up to 10,000, each for `leaseMs` at most) and gives them back, a thousand
+in a round, about a second after Redis answers again, rather than leave the tenant short of them on every
+replica until their leases end. A slot Redis may have taken for a request whose answer was lost is given
+back the same way, when Redis ran the request before the connection was lost. What this leaves:
+
+- What a gateway owes when it stops, and what is over 10,000, expires with its lease; the list is each
+  replica's own, in memory.
+- A request Redis let through only after the gateway had given up on it holds its slot for one lease, and
+  the rate token such a request took is not returned.
+- With `open`, a waiting request whose slot is being given back goes by this replica's own limits until
+  Redis has answered the give-back.
+- Spending lost in an outage stays lost, and a reply that outlasts an outage longer than `leaseMs` loses
+  its lease, as before.
 
 ## Several regions
 
@@ -1004,7 +1289,9 @@ it as `task`; a client that leaves before its new task's body is read gets no an
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
-- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default; given twice, a 400).
+- `GET /v1/tasks`, `GET /v1/usage` and `GET /v1/limits` go to `?region=` (the home by default; given
+  twice, a 400). The router takes `region` off before it passes the request on: sent straight to a
+  region's service, `?region=` is an unknown parameter of the list and of the limits, a 400.
   `GET /v1/usage?region=all` asks every region the tenant may use and adds up their answers, the rows with
   the same day and model and the total, with `regions`, those that answered (502 if none did); it is JSON
   only. A client that leaves, or the router closing, ends those requests, and the client is neither
@@ -1018,8 +1305,14 @@ waits 2 seconds at most for the database, so the router hears its 503 and logs w
 `/readyz` answers 404 or 401, a service from before it, is asked its `/healthz` instead, and the router
 logs that once. While a tenant's home is down, a new task that names no region goes, if the tenant has
 `failover`, to the first region in `regions` that is up and that it may use; otherwise, and for a task that
-names the region that is down, it is 503 with the region and `retry-after`. A task never fails over: it
-runs where it was made, and while its region is down it can't be read, streamed or cancelled (503), since
+names the region that is down, it is 503 with the region and `retry-after`. A new task with an
+`Idempotency-Key` is never failed over either: its key is known only in its home's store, so while the home
+is down it is 503 with `retry-after`, failover or not, and is to be sent again as it was. Naming another
+region on the retry makes it a new body in another store, which can make a second task beside the one the
+home already made. The router's 502 (a region it couldn't reach) may follow a create that was made: with
+a key, sending it again is safe. A task never fails over: it
+runs where it was made, and while its region is down it can't be read, streamed, cancelled or deleted (503;
+a `DELETE` goes to the region in the task's id, as its other requests do), since
 its data is there alone; it is all there once the region is back. A tenant is placed by its `home`, where
 its tasks and their data go unless it asks otherwise; one whose data must stay in a region gets that
 region alone in `allowed`, and no failover.
@@ -1059,6 +1352,28 @@ Before `docker compose up`, put your tenants' key hashes (`printf %s "$KEY" | sh
 placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for the router): the service
 refuses to start with it. Set its `gitHosts` to the hosts your tenants clone from: the service clones on
 the host's network, not on `jig-tasks` (see Clones and gitHosts).
+
+### Database size and upgrades
+
+Deleting tasks' content (`DELETE /v1/tasks/:id`, `retentionDays`) frees space inside the database, not on
+the disk. SQLite reuses the freed pages for new tasks and its file doesn't shrink: the service runs no
+`VACUUM` and sets no `auto_vacuum`. To shrink it, stop the service and run `sqlite3 jig.db VACUUM`, with
+free disk for a second copy. A purged task leaves about half a kilobyte (its row and its ledger row; typical,
+not a bound). Postgres relies on autovacuum, which makes the dead rows' space reusable without giving it
+back.
+
+The service changes its schema as it starts. Adding `purged` to `tasks` is quick, but its index is built
+under a lock that holds writes to `tasks` for the build. Before upgrading a large Postgres, make both by
+hand, which the upgrade then finds and leaves:
+
+```sql
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz;
+CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL;
+SELECT indisvalid FROM pg_index WHERE indexrelid = 'tasks_unpurged'::regclass;
+```
+
+A concurrent build that failed leaves an index that isn't valid (`indisvalid` false), which `IF NOT EXISTS`
+takes as there: drop it (`DROP INDEX CONCURRENTLY tasks_unpurged`) and build it again before the upgrade.
 
 ### Trying it on kind
 

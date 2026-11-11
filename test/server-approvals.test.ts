@@ -8,7 +8,10 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { checkConfig, type Config, type Service, startService } from "../server/api.ts";
 import { Webhooks } from "../server/approvals.ts";
 import { createLog } from "../server/log.ts";
-import type { Approval, Task } from "../server/store.ts";
+import type { Runner } from "../server/runner.ts";
+import { Scheduler } from "../server/scheduler.ts";
+import { serviceMetrics } from "../server/service-metrics.ts";
+import { type Approval, openStore, type Task } from "../server/store.ts";
 import { mintToken } from "../server/token.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
 import { dropPostgresDatabases, NO_POSTGRES, postgresDatabase } from "./postgres.ts";
@@ -340,6 +343,75 @@ const approvalTests = () => {
     assert.ok(posts[2].at - posts[1].at >= 90, "the second retry waits twice as long as the first");
   });
 
+  it("posts each task's end to the tenant's task webhook, signed and tried again, and none to a tenant without one", async () => {
+    // The first POST is answered 500; the rest are taken.
+    const posts: { headers: IncomingHttpHeaders; url: string; body: string }[] = [];
+    const receiver = createServer((req, res: ServerResponse) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        posts.push({ headers: req.headers, url: req.url ?? "", body });
+        res.writeHead(posts.length === 1 ? 500 : 204).end();
+      });
+    });
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const saved = process.env.ACME_WEBHOOK_SECRET;
+    process.env.ACME_WEBHOOK_SECRET = "acme's webhook secret";
+    closers.push(async () => (saved === undefined ? delete process.env.ACME_WEBHOOK_SECRET : (process.env.ACME_WEBHOOK_SECRET = saved)));
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks`;
+    // globex asks to be told of approvals only: its tasks' ends are posted nowhere.
+    const tenants = [
+      { ...ACME, taskWebhook: `${url}/tasks`, webhookSecretEnv: "ACME_WEBHOOK_SECRET" },
+      { ...GLOBEX, approvalWebhook: `${url}/approvals`, webhookSecretEnv: "ACME_WEBHOOK_SECRET" },
+    ];
+    const api = await service({ tenants }, { webhookRetryMs: 50 });
+
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await statusOf(api, id, "succeeded");
+    await until(() => posts.length === 2, "the webhook's retry");
+    for (const post of posts) {
+      assert.equal(post.url, "/hooks/tasks");
+      assert.equal(post.body, JSON.stringify({ task: id, status: "succeeded" }));
+      assert.equal(post.headers["content-type"], "application/json");
+      assert.equal(post.headers["x-jig-signature"], `sha256=${createHmac("sha256", "acme's webhook secret").update(post.body).digest("hex")}`);
+    }
+    const other = (await call(api, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await until(async () => (await call(api, KEYS.globex, "GET", `/v1/tasks/${other}`)).body.status === "succeeded", "globex's task to end");
+    const failed = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 1" })).body.id;
+    await statusOf(api, failed, "error");
+    await until(() => posts.length === 3, "the second task's POST");
+    await new Promise((done) => setTimeout(done, 300));
+    assert.deepEqual(posts.slice(2).map((post) => [post.url, JSON.parse(post.body)]), [["/hooks/tasks", { task: failed, status: "error" }]], "one POST for an end that is taken, and none for globex's");
+  });
+
+  it("posts the end of a task cancelled while it is queued, once", async () => {
+    const posts: string[] = [];
+    const receiver = createServer((req, res: ServerResponse) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        posts.push(body);
+        res.writeHead(204).end();
+      });
+    });
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const saved = process.env.ACME_WEBHOOK_SECRET;
+    process.env.ACME_WEBHOOK_SECRET = "acme's webhook secret";
+    closers.push(async () => (saved === undefined ? delete process.env.ACME_WEBHOOK_SECRET : (process.env.ACME_WEBHOOK_SECRET = saved)));
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/tasks`;
+    // acme may run none, so its task stays queued.
+    const api = await service({ tenants: [{ ...ACME, concurrency: 0, taskWebhook: url, webhookSecretEnv: "ACME_WEBHOOK_SECRET" }, GLOBEX] }, { webhookRetryMs: 50 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`)).body.status, "cancelled");
+    await until(() => posts.length === 1, "the webhook's POST");
+    // A second cancel finds it ended, and ends nothing.
+    assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${id}/cancel`)).body.status, "cancelled");
+    await new Promise((done) => setTimeout(done, 300));
+    assert.deepEqual(posts, [JSON.stringify({ task: id, status: "cancelled" })]);
+  });
+
   it("checks a task's approvals and mode, and runs one without approvals with --yes", async () => {
     const api = await service();
     for (const [body, error] of [
@@ -377,15 +449,87 @@ describe("the approvals' webhooks", () => {
     await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
     closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
     const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`;
-    const webhooks = new Webhooks(new Map([["acme", { url, secret: "acme's webhook secret" }]]), 50);
+    const webhooks = new Webhooks(new Map([["acme", { approvals: url, tasks: url, secret: "acme's webhook secret" }]]), 50);
     const task = { id: "task_1", tenant: "acme" } as Task;
     const approval: Approval = { id: "ap_1", step: 1, tool: "bash", description: "make deploy", requestedAt: new Date().toISOString() };
     webhooks.send(task, approval);
     await until(() => posts.length === 1, "the webhook's POST");
     webhooks.close();
     webhooks.send(task, approval);
+    // Nor a task's end: on a single replica, the tasks stopped as the service stops end after it.
+    webhooks.ended(task, "error");
     await new Promise((done) => setTimeout(done, 200));
     assert.equal(posts.length, 1);
+  });
+
+  it("posts no more of a tenant's task ends while 100 of them wait, and says so once", async () => {
+    // An endpoint that hangs holds each POST for its four tries: without a cap, a tenant whose tasks end
+    // fast would pile them up without bound.
+    const held: ServerResponse[] = [];
+    const receiver = createServer((req, res: ServerResponse) => void req.resume().on("end", () => held.push(res)));
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/tasks`;
+    const lines: string[] = [];
+    const log = createLog("service", { format: "text", level: "info", write: (line) => lines.push(line) });
+    const metrics = serviceMetrics();
+    const hooks = new Map([
+      ["acme", { tasks: url, secret: "s" }],
+      ["globex", { tasks: url, secret: "s" }],
+    ]);
+    const webhooks = new Webhooks(hooks, 10, log, metrics);
+    closers.push(async () => webhooks.close());
+    const count = (tenant: string, result: string) => metrics.webhookDeliveries.get({ tenant, kind: "task", result });
+    for (let i = 0; i < 100; i++) webhooks.ended({ id: `task_${i}`, tenant: "acme" }, "succeeded");
+    await until(() => held.length === 100, "the 100 POSTs");
+    assert.deepEqual([count("acme", "failed"), lines], [0, []]);
+    webhooks.ended({ id: "task_100", tenant: "acme" }, "succeeded");
+    webhooks.ended({ id: "task_101", tenant: "acme" }, "failed");
+    // Another tenant's are posted all the same.
+    webhooks.ended({ id: "task_g", tenant: "globex" }, "succeeded");
+    await until(() => held.length === 101, "globex's POST");
+    await new Promise((done) => setTimeout(done, 200));
+    assert.equal(held.length, 101, "the 101st and 102nd of acme's are not posted");
+    assert.deepEqual([count("acme", "failed"), count("globex", "failed")], [2, 0]);
+    assert.equal(lines.length, 1, lines.join("\n"));
+    assert.match(lines[0], /tenant acme's task webhook has 100 POSTs waiting: ends are not posted until some finish/);
+    // Once some are taken, the next end is posted again.
+    for (const res of held.splice(0)) res.writeHead(204).end();
+    await until(() => count("acme", "delivered") === 100, "the POSTs to be taken");
+    webhooks.ended({ id: "task_102", tenant: "acme" }, "succeeded");
+    await until(() => held.length === 1, "the next end's POST");
+    assert.equal(count("acme", "failed"), 2);
+  });
+
+  it("posts the end of a task whose lease ran out, as an error, from the replica that ended it", async () => {
+    const posts: string[] = [];
+    const receiver = createServer((req, res: ServerResponse) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => {
+        posts.push(body);
+        res.writeHead(204).end();
+      });
+    });
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const webhooks = new Webhooks(new Map([["acme", { tasks: `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/tasks`, secret: "s" }]]), 10);
+    const store = await openStore(join(await tempDir("jig-approvals-"), "jig.db"));
+    await store.putTenant({ id: "acme", limits: { concurrency: 2, maxSteps: 10, timeLimit: 600, budgetUsd: null } }, []);
+    const task = await store.createTask("acme", { prompt: "x", maxSteps: 10, timeLimit: 600, model: "claude-x" });
+    // Claimed by a replica that is gone: its lease runs out at once, and this one's first round ends it.
+    await store.claim("acme", { owner: "a crashed replica", leaseMs: 1, concurrency: 2, tenantConcurrency: 2 });
+    const runner: Runner = { start: async () => Promise.reject(new Error("no task is started here")) };
+    const scheduler = new Scheduler(store, runner, { concurrency: 0, replicaId: "B", leaseMs: 300, keepTaskDirs: true, onEnded: (ended, status) => webhooks.ended(ended, status), log: createLog("service", { write: () => {} }) });
+    closers.push(async () => {
+      webhooks.close();
+      await scheduler.close();
+      await store.close();
+    });
+    await scheduler.start();
+    await until(() => posts.length === 1, "the webhook's POST");
+    await new Promise((done) => setTimeout(done, 300));
+    assert.deepEqual(posts, [JSON.stringify({ task: task.id, status: "error" })]);
   });
 
   it("follows no redirect: a 3xx is a failed try, and the signed body goes nowhere else", async () => {
@@ -406,7 +550,7 @@ describe("the approvals' webhooks", () => {
     closers.push(() => new Promise((done) => (outer.closeAllConnections(), outer.close(done))));
     const lines: string[] = [];
     const log = createLog("service", { format: "text", level: "info", write: (line) => lines.push(line) });
-    const webhooks = new Webhooks(new Map([["acme", { url: `http://127.0.0.1:${(outer.address() as AddressInfo).port}/hooks/approvals`, secret: "s" }]]), 10, log);
+    const webhooks = new Webhooks(new Map([["acme", { approvals: `http://127.0.0.1:${(outer.address() as AddressInfo).port}/hooks/approvals`, secret: "s" }]]), 10, log);
     closers.push(async () => webhooks.close());
     const approval: Approval = { id: "ap_1", step: 1, tool: "bash", description: "make deploy", requestedAt: new Date().toISOString() };
     webhooks.send({ id: "task_1", tenant: "acme" } as Task, approval);
@@ -429,7 +573,7 @@ describe("the approvals' webhooks", () => {
       closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
       const lines: string[] = [];
       const log = createLog("service", { format: "text", level: "info", write: (line) => lines.push(line) });
-      const webhooks = new Webhooks(new Map([["acme", { url: `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`, secret: "s" }]]), 5, log);
+      const webhooks = new Webhooks(new Map([["acme", { approvals: `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`, secret: "s" }]]), 5, log);
       closers.push(async () => webhooks.close());
       webhooks.send({ id: "task_1", tenant: "acme" } as Task, { id: "ap_1", step: 1, tool: "bash", description: "make deploy", requestedAt: new Date().toISOString() });
       const warned = await until(() => lines.find((line) => line.includes("approval webhook failed")), `the warning for a ${status}`);
@@ -463,9 +607,10 @@ describe("the approvals' webhooks", () => {
     const series = (...values: number[]) =>
       ["acme delivered", "acme failed", "globex delivered", "globex failed"].map((labels, i) => {
         const [tenant, result] = labels.split(" ");
-        return `jig_service_webhook_deliveries_total{tenant="${tenant}",result="${result}"} ${values[i]}`;
+        return `jig_service_webhook_deliveries_total{tenant="${tenant}",kind="approval",result="${result}"} ${values[i]}`;
       });
-    // Each tenant with a webhook starts at 0 both ways, so increase() sees its first failures.
+    // Each tenant with a webhook starts at 0 both ways, so increase() sees its first failures; neither asked
+    // to be told of its tasks' ends, so no series of that kind starts.
     assert.deepEqual(await counted(), series(0, 0, 0, 0));
     for (const [tenant, key] of Object.entries(KEYS)) {
       const id = (await call(api, key, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id;
@@ -473,6 +618,32 @@ describe("the approvals' webhooks", () => {
       assert.equal((await call(api, key, "POST", `/v1/tasks/${id}/approvals/ap_1`, { decision: "allow" })).status, 200);
     }
     await until(async () => (await counted()).filter((line) => line.endsWith(" 1")).length === 2, "both tenants' deliveries counted");
+    assert.deepEqual(await counted(), series(0, 1, 1, 0));
+  });
+
+  it("counts the task ends posted apart from the approvals, by kind", { skip: sandboxProblem() }, async () => {
+    // acme's endpoint always answers 503; globex's takes each.
+    const urls: string[] = [];
+    for (const status of [503, 200]) {
+      const server = createServer((req, res) => void req.resume().on("end", () => res.writeHead(status).end()));
+      await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+      closers.push(() => new Promise((done) => (server.closeAllConnections(), server.close(done))));
+      urls.push(`http://127.0.0.1:${(server.address() as AddressInfo).port}/hooks/tasks`);
+    }
+    const saved = process.env.JIG_TEST_WEBHOOK_SECRET;
+    process.env.JIG_TEST_WEBHOOK_SECRET = "a webhook secret";
+    closers.push(async () => (saved === undefined ? delete process.env.JIG_TEST_WEBHOOK_SECRET : (process.env.JIG_TEST_WEBHOOK_SECRET = saved)));
+    const hook = (url: string) => ({ taskWebhook: url, webhookSecretEnv: "JIG_TEST_WEBHOOK_SECRET" });
+    const api = await service({ metrics: { port: 0 }, tenants: [{ ...ACME, ...hook(urls[0]) }, { ...GLOBEX, ...hook(urls[1]) }] }, { webhookRetryMs: 10 });
+    const counted = async () => (await (await fetch(`${api.metricsUrl}/metrics`)).text()).split("\n").filter((line) => line.startsWith("jig_service_webhook_deliveries_total")).sort();
+    const series = (...values: number[]) =>
+      ["acme delivered", "acme failed", "globex delivered", "globex failed"].map((labels, i) => {
+        const [tenant, result] = labels.split(" ");
+        return `jig_service_webhook_deliveries_total{tenant="${tenant}",kind="task",result="${result}"} ${values[i]}`;
+      });
+    assert.deepEqual(await counted(), series(0, 0, 0, 0));
+    for (const key of Object.values(KEYS)) assert.equal((await call(api, key, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    await until(async () => (await counted()).filter((line) => line.endsWith(" 1")).length === 2, "both tenants' ends counted");
     assert.deepEqual(await counted(), series(0, 1, 1, 0));
   });
 });
@@ -496,10 +667,17 @@ describe("the approvals' config", () => {
     assert.equal(problem({ tenants: [{ ...ACME, approvalTimeout: 0 }] }), "The config's tenants[0].approvalTimeout must be a whole number from 1 to 2000000, not 0");
     assert.equal(problem({ tenants: [{ ...ACME, approvalWebhook: "https://hooks.example.com/jig" }] }), "The config's tenants[0].webhookSecretEnv is missing");
     assert.equal(problem({ tenants: [{ ...ACME, approvalWebhook: "hooks", webhookSecretEnv: "X" }] }), 'The config\'s tenants[0].approvalWebhook must be an http or https URL, not "hooks"');
+    assert.equal(problem({ tenants: [{ ...ACME, taskWebhook: "https://hooks.example.com/jig" }] }), "The config's tenants[0].webhookSecretEnv is missing");
+    assert.equal(problem({ tenants: [{ ...ACME, taskWebhook: "hooks", webhookSecretEnv: "X" }] }), 'The config\'s tenants[0].taskWebhook must be an http or https URL, not "hooks"');
+    assert.equal(problem({ tenants: [{ ...ACME, taskWebhook: "https://hooks.example.com/jig", approvalWebhook: "http://hooks.example.com/approvals", webhookSecretEnv: "X" }] }), undefined);
     const unset = "JIG_TEST_A_VARIABLE_NOT_SET";
     await assert.rejects(
       startService({ ...base, internal: { port: 0 }, local: { allowUnsandboxed: true }, tenants: [{ ...ACME, approvalWebhook: "https://hooks.example.com/jig", webhookSecretEnv: unset }] }, { secret: SECRET }),
-      new RegExp(`Set ${unset}, the secret tenant acme's approval webhook is signed with`),
+      new RegExp(`Set ${unset}, the secret tenant acme's webhooks are signed with`),
+    );
+    await assert.rejects(
+      startService({ ...base, internal: { port: 0 }, local: { allowUnsandboxed: true }, tenants: [{ ...ACME, taskWebhook: "https://hooks.example.com/jig", webhookSecretEnv: unset }] }, { secret: SECRET }),
+      new RegExp(`Set ${unset}, the secret tenant acme's webhooks are signed with`),
     );
   });
 });
