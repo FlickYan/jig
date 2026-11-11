@@ -117,6 +117,46 @@ async function scrape(service: Service): Promise<{ text: string; value: (series:
 }
 
 const observeTests = () => {
+  it("counts a create answered with its key's earlier task as replayed, not created, and one with another body as invalid", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    // At 0 from the start, so increase() sees the first.
+    assert.equal((await scrape(api)).value('jig_service_tasks_replayed_total{tenant="acme"}'), 0);
+    const keyed = (prompt: string) => call(api, KEYS.acme, "POST", "/v1/tasks", { prompt }, { "idempotency-key": "order-1" });
+    assert.deepEqual([(await keyed("exit 0")).status, (await keyed("exit 0")).status, (await keyed("exit 1")).status], [201, 200, 422]);
+    const { value } = await scrape(api);
+    assert.equal(value('jig_service_tasks_replayed_total{tenant="acme"}'), 1);
+    assert.equal(value('jig_service_tasks_created_total{tenant="acme"}'), 1);
+    assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 1);
+    assert.equal(value('jig_service_tasks{tenant="acme",status="queued"}'), 1);
+  });
+
+  it("counts a task purged once, by a DELETE or by retention, however often it is deleted", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 2 }] });
+    const purged = async (service: Service) => {
+      const { value } = await scrape(service);
+      return [value('jig_service_tasks_purged_total{reason="api"}'), value('jig_service_tasks_purged_total{reason="retention"}')];
+    };
+    // At 0 from the start, so increase() sees the first.
+    assert.deepEqual(await purged(api), [0, 0]);
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) ids.push((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id);
+    for (const id of ids) await ended(api, KEYS.acme, id);
+    const remove = (id: string) => call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`);
+    assert.deepEqual([(await remove(ids[0])).status, (await remove(ids[0])).status], [200, 200]);
+    assert.deepEqual(await purged(api), [1, 0]);
+    // Two at once: one of them is the first.
+    assert.deepEqual((await Promise.all([remove(ids[1]), remove(ids[1])])).map((answer) => answer.status), [200, 200]);
+    assert.deepEqual(await purged(api), [2, 0]);
+    // With retentionDays, a task is purged with no delete once it ended that long ago, with a line in the log.
+    const swept = await service({ retentionDays: 1e-9, leaseSeconds: 0.3 });
+    assert.deepEqual(await purged(swept), [0, 0]);
+    const old = (await call(swept, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await until(async () => (await call(swept, KEYS.acme, "GET", `/v1/tasks/${old}`)).body.purged, "the task to be purged");
+    await until(async () => (await purged(swept))[1] === 1, "the purge to be counted");
+    assert.deepEqual(await purged(swept), [0, 1]);
+    assert.ok(swept.lines.some((line) => line.level === "info" && /^purged 1 task\(s\)/.test(line.msg)), JSON.stringify(swept.lines.at(-1)));
+  });
+
   it("counts tasks from created to ended, by tenant and status, with the queue read from the store at each scrape", async () => {
     const api = await service({
       tenants: [
@@ -316,7 +356,7 @@ describe("the task service's metrics listener, request ids and logs", { skip: sa
   it("starts at 0 the counters without labels that a panel or an alert takes increase() of", async () => {
     // A series that first shows up at N adds nothing to increase(): the sweep at start removes folders before the first scrape.
     const lines = (await serviceMetrics().registry.render()).split("\n");
-    for (const series of ["jig_service_lease_errors_total", "jig_service_task_folders_removed_total", 'jig_service_store_errors_total{retried="true"}', 'jig_service_store_errors_total{retried="false"}']) {
+    for (const series of ["jig_service_lease_errors_total", "jig_service_task_folders_removed_total", 'jig_service_tasks_purged_total{reason="api"}', 'jig_service_tasks_purged_total{reason="retention"}', 'jig_service_store_errors_total{retried="true"}', 'jig_service_store_errors_total{retried="false"}']) {
       assert.ok(lines.includes(`${series} 0`), series);
     }
   });

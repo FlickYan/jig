@@ -25,6 +25,9 @@ import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, 
 // A run's folder is removed as it ends; one a crashed replica left is removed by the sweep at the next start,
 // or every tenth round, once its task has ended over a lease ago, or the store doesn't have it and the folder
 // hasn't changed for a lease (ten minutes at least).
+//
+// With retentionMs, the tasks that ended longer ago than that are purged (Store.purge), at the start and
+// every tenth round too: a few at a time, by one replica at a time.
 
 /** What followers of a task hear: each event once it is stored, then the status it ended with. */
 export type Update = { event: JigEvent } | { done: TaskStatus };
@@ -40,8 +43,12 @@ export interface SchedulerOptions {
   maxEvents?: number;
   /** The most bytes of a run's events (as JSON) that are stored; past it, as past maxEvents (default 64 MiB). */
   maxEventBytes?: number;
+  /** The most bytes of a run's last text that are kept as the task's result; past it, its start is (default 64 KiB). */
+  maxResultBytes?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
+  /** Purge the tasks that ended over this many milliseconds ago (the config's retentionDays); none without it. */
+  retentionMs?: number;
   /** The hosts a workspace may be cloned from (default: any), checked again as each task starts. */
   gitHosts?: string[];
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
@@ -69,6 +76,11 @@ const EXPIRED = `${SHUTDOWN} (the replica running it stopped renewing its lease:
 const LOST = "the replica running it lost its lease on it, and stopped it";
 /** How long a folder whose task the store doesn't have must be left unchanged before it is swept, at the least. */
 const UNKNOWN_MS = 10 * 60_000;
+/**
+ * The tasks retention purges in one transaction. Few, as SQLite's holds the event loop while it deletes
+ * their events: about 0.4 s for a task with 64 MiB of them, so about 2 s at the worst.
+ */
+const RETAIN_BATCH = 5;
 
 export class Scheduler {
   /** Emits a task's updates under its id. */
@@ -93,6 +105,7 @@ export class Scheduler {
   /** The rounds of renewals that got through and ended what was gone: every tenth sweeps the folders. */
   private rounds = 0;
   private sweeping?: Promise<void>;
+  private retaining?: Promise<void>;
 
   private store: Store;
   private runner: Runner;
@@ -100,13 +113,15 @@ export class Scheduler {
   private leaseMs: number;
   private maxEvents: number;
   private maxEventBytes: number;
+  private maxResultBytes: number;
   private keepTaskDirs: boolean;
+  private retentionMs?: number;
   private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, maxResultBytes = 64 * 1024, keepTaskDirs = false, retentionMs, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -114,7 +129,9 @@ export class Scheduler {
     this.leaseMs = leaseMs;
     this.maxEvents = maxEvents;
     this.maxEventBytes = maxEventBytes;
+    this.maxResultBytes = maxResultBytes;
     this.keepTaskDirs = keepTaskDirs;
+    this.retentionMs = retentionMs;
     this.gitHosts = gitHosts;
     this.onApproval = onApproval;
     this.metrics = metrics ?? serviceMetrics();
@@ -141,6 +158,7 @@ export class Scheduler {
     // starts as it comes back), and the live ones are owed a round to renew theirs.
     // Not waited for: a disk full of left folders, each run stopped in turn, mustn't hold up the API.
     void this.sweep();
+    void this.retain();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
   }
@@ -170,7 +188,10 @@ export class Scheduler {
         else {
           await this.expire(Math.max(0, took - this.leaseMs / 3));
           // Not waited for: a slow disk mustn't hold up the renewals.
-          if (++this.rounds % 10 === 0) void this.sweep();
+          if (++this.rounds % 10 === 0) {
+            void this.sweep();
+            void this.retain();
+          }
         }
         // A slot another replica freed, or a task it queued, is looked for here.
         void this.poke();
@@ -259,6 +280,34 @@ export class Scheduler {
     return this.sweeping;
   }
 
+  /**
+   * Purges the tasks that ended over retentionMs ago, RETAIN_BATCH at a time until a batch comes back short:
+   * nothing is left, or another replica is at it. The event loop gets a turn between batches, and the service
+   * starting to stop ends it after the batch in flight. Beside the folder sweep rather than in it, as that
+   * one does nothing with keepTaskDirs. A failure is logged and counted, and the next sweep tries again.
+   */
+  private retain(): Promise<void> {
+    const { retentionMs } = this;
+    if (retentionMs === undefined) return Promise.resolve();
+    this.retaining ??= (async () => {
+      let purged = 0;
+      try {
+        while (!this.paused) {
+          const batch = await this.store.purgeEnded(retentionMs, RETAIN_BATCH);
+          purged += batch;
+          this.metrics.purged.inc({ reason: "retention" }, batch);
+          if (batch < RETAIN_BATCH) break;
+          await new Promise((done) => setImmediate(done));
+        }
+      } catch (err) {
+        this.metrics.storeErrors.inc({ retried: "false" });
+        this.log.error("couldn't purge the tasks that ended longer ago than retentionDays", { err });
+      }
+      if (purged) this.log.info(`purged ${purged} task(s) that ended longer ago than retentionDays`);
+    })().finally(() => (this.retaining = undefined));
+    return this.retaining;
+  }
+
   /** Counts a task that this replica ended, and how long it ran (in milliseconds) if it started. */
   private ended(task: Task, status: TaskStatus, ms?: number): void {
     this.metrics.ended.inc({ tenant: task.tenant, status });
@@ -337,6 +386,7 @@ export class Scheduler {
     await this.settled();
     await this.keeping;
     await this.sweeping;
+    await this.retaining;
     await Promise.all(this.abandoning);
     // Counted no more among the replicas up; one that can't say so is forgotten when its heartbeat runs out.
     await this.store.leave(this.replicaId).catch(() => {});
@@ -388,6 +438,8 @@ export class Scheduler {
     let exit: RunExit | undefined;
     let failure: string | undefined;
     let end: JigEvent | undefined;
+    /** The run's last text so far, cut to size: the task's result. */
+    let said: Said | undefined;
     let stored = 0;
     /** The bytes of the events stored, as JSON. */
     let bytes = 0;
@@ -407,6 +459,8 @@ export class Scheduler {
       for await (const event of run.handle.events) {
         if (!stored) this.metrics.startSeconds.observe({ start }, (Date.now() - run.claimed) / 1000);
         if (event.type === "end") end = event;
+        // Taken before the caps below, so a run whose events are dropped still leaves what it said last.
+        if (event.type === "text" && typeof event.text === "string") said = resultOf(event.text, this.maxResultBytes);
         let kept = event;
         // Past either cap, a run's events are dropped, but for its last event if that is an end (jig writes
         // its own last), and one notice in place of the first dropped says so: a task's commands can't fill
@@ -465,7 +519,7 @@ export class Scheduler {
     }
     run.ended = true;
     // Each failure to store it is counted as it is tried again.
-    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => {
+    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping, said)).catch((err: unknown) => {
       this.log.error("couldn't store how the task ended", { tenant: task.tenant, task: task.id, err });
     });
     this.recording.add(recorded);
@@ -551,8 +605,32 @@ export class Scheduler {
   }
 }
 
-/** A run's outcome: from its exit, its end event (the stop, usage and cost), and why it was stopped. */
-export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"]): Outcome {
+/** A run's last text as its task keeps it, and whether that is only its start. */
+export interface Said {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * A text as a task's result: with no NUL, and whole if it is `maxBytes` of UTF-8 or fewer, else its start,
+ * up to the last character that ends within them. The NULs go first, as U+FFFD is three bytes where a NUL
+ * was one: the bound is on what is stored.
+ */
+export function resultOf(text: string, maxBytes: number): Said {
+  const clean = withoutNul(text);
+  if (Buffer.byteLength(clean) <= maxBytes) return { text: clean, truncated: false };
+  const buf = Buffer.from(clean);
+  let end = maxBytes;
+  // A byte of the form 10xxxxxx continues a character: the cut steps back to where one starts.
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString(), truncated: true };
+}
+
+/**
+ * A run's outcome: from its exit, its end event (the stop, usage and cost), why it was stopped, and the
+ * last text it wrote (the result), however it ended.
+ */
+export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"], said?: Said): Outcome {
   const status = stopping === "shutdown" || stopping === "lost" ? "error" : stopping === "cancelled" ? "cancelled" : failure ? "error" : statusFor(exit!);
   const exitCode = exit?.exitCode ?? null;
   // A run that was stopped and wrote no end of its own (jig, sent SIGTERM, exits 143 without one) was interrupted.
@@ -569,6 +647,8 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
     stats: exit?.stats ?? null,
     usage: (end?.usage as Usage | undefined) ?? null,
     cost: typeof end?.cost === "number" ? end.cost : null,
+    result: said?.text ?? null,
+    resultTruncated: said?.truncated ?? false,
   };
 }
 

@@ -107,8 +107,12 @@ export interface Config {
   maxEvents?: number;
   /** The most bytes of a task's events (as JSON) that are stored. */
   maxEventBytes?: number;
+  /** The most bytes of a run's last text that are kept as the task's result. */
+  maxResultBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
+  /** Days after a task ends that its content is deleted (as DELETE /v1/tasks/:id does); kept for good without it. */
+  retentionDays?: number;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
@@ -203,6 +207,7 @@ export async function startService(
   const metrics = serviceMetrics();
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  for (const { id } of config.tenants) metrics.replayed.inc({ tenant: id }, 0);
   for (const { id } of config.tenants) metrics.eventStreams.set({ tenant: id }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
@@ -324,9 +329,10 @@ export async function startService(
     if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
       log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
     }
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionDays, gitHosts } = config;
+    const retentionMs = retentionDays === undefined ? undefined : retentionDays * 86_400_000;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionMs, gitHosts, onApproval, metrics, log });
     await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
@@ -643,6 +649,8 @@ function configProblem(config: Config): string | undefined {
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
+    whole("maxResultBytes", config.maxResultBytes, 1) ??
+    positive("retentionDays", config.retentionDays, false, 36_500) ??
     whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
@@ -738,19 +746,25 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
     const limit = Number(url.searchParams.get("limit") ?? 100);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
-    // The prompts can be long: a list leaves them out unless asked.
+    // The prompts and the results can be long: a list leaves them out unless asked.
     const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
     const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
     const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
     // A full page may have more after it: the next is read with before=<next>.
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full, result: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
   // Another tenant's task is as missing as one that never was.
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
+  if (!action) {
+    if (req.method === "DELETE") return purge(res, task, context);
+    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
+  }
+  // A purged task has neither events nor approvals left: said once, here, for every way of asking for them,
+  // rather than an empty stream or list that would read as a run that wrote nothing. A cancel says it has ended.
+  if (task.purged !== null && action !== "/cancel") return reply(res, 410, { error: "The task's events and approvals were deleted", id: task.id, purged: task.purged });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
   if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
@@ -765,6 +779,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   return streamEvents(req, res, task, Number(after), tenant, context, request);
 }
 
+/** An Idempotency-Key: short, and of characters that need no escaping in a header, a log or an error. */
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
   const refused = (reason: "queue" | "quota" | "invalid") => context.metrics.refused.inc({ tenant: tenant.id, reason });
   const body = await readBody(req, context.maxBody);
@@ -772,6 +789,13 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     refused("invalid");
     res.setHeader("connection", "close");
     return reply(res, 413, { error: `The body is over ${context.maxBody} bytes` });
+  }
+  // Not by truthiness: an empty header is a key the client meant to send, and a header sent twice (Node
+  // joins the two with ", ") is no key either.
+  const key = req.headers["idempotency-key"];
+  if (key !== undefined && (typeof key !== "string" || !IDEMPOTENCY_KEY.test(key))) {
+    refused("invalid");
+    return reply(res, 400, { error: "Idempotency-Key must be 1 to 128 of letters, digits, _ . : -" });
   }
   let input: unknown;
   try {
@@ -795,11 +819,24 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   // A queue without an end would fill the disk, and a tenant's waits only grow. The caps are counted with
   // the insert, so replicas sharing the store keep to them together.
   const now = context.now();
-  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now });
+  // The body is compared as the bytes it came in: a retry resends them, and anything else is another request.
+  const idem = key === undefined ? undefined : { key, hash: createHash("sha256").update(body).digest("hex") };
+  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now }, idem);
+  if ("replay" in task) {
+    const { replay, same } = task;
+    if (!same) {
+      refused("invalid");
+      return reply(res, 422, { error: `Idempotency-Key ${key} was used with a different body, for task ${replay.id}: use a new key for a new task`, id: replay.id });
+    }
+    // The task the first create made, as it is now: nothing new to count or to start.
+    context.metrics.replayed.inc({ tenant: tenant.id });
+    return reply(res, 200, { id: replay.id, status: replay.status }, { "idempotent-replay": "true" });
+  }
   if ("quota" in task) {
     const { quota, limit, used } = task;
     refused(quota === "maxQueued" ? "queue" : "quota");
-    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start` });
+    // The queue has no time it empties at: five seconds is a guess at when a task may have started.
+    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start`, quota, limit, used }, { "retry-after": "5" });
     const { nextDay, nextMonth } = periods(now);
     const resets = quota === "usdPerMonth" ? nextMonth : nextDay;
     const what = quota === "tasksPerDay" ? `created ${used} tasks today (UTC), the most it may` : `spent $${used} ${quota === "usdPerDay" ? "today (UTC)" : "this month (UTC)"}, against a quota of $${limit}`;
@@ -809,6 +846,20 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   context.metrics.created.inc({ tenant: tenant.id });
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });
+}
+
+/**
+ * DELETE /v1/tasks/:id: deletes an ended task's content (Store.purge) and answers with what is left of it,
+ * 200, however often it is asked; 409 for a task that hasn't ended, which is cancelled first.
+ */
+async function purge(res: ServerResponse, task: Task, { store, metrics, region }: Context): Promise<void> {
+  const purged = await store.purge(task.id);
+  if (!purged) return reply(res, 404, { error: "No such task" });
+  const { id, status } = purged.task;
+  if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
+  // Once a task, however many deletes it gets, at once or one after another.
+  if (purged.first) metrics.purged.inc({ reason: "api" });
+  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
 }
 
 /** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */
@@ -962,6 +1013,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
       const problem = workspaceProblem(path);
       if (problem) return `workspace.files: ${JSON.stringify(path)} ${problem}`;
       if (typeof contents !== "string") return `workspace.files: ${JSON.stringify(path)} must have a string as its contents`;
+      // As for the prompt. A path with one is refused above; a spec holding one once broke Postgres's ledger.
+      if (contents.includes("\0")) return `workspace.files: ${JSON.stringify(path)} must not hold a NUL character (\\u0000) in its contents`;
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
@@ -979,12 +1032,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
- * (none, once it has ended); the list leaves out the stats, and the prompt unless asked.
+ * (none, once it has ended); the list leaves out the stats, and the prompt and the result unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>, region: string | null) {
-  const { spec, tenant, stats, ...rest } = task;
+function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean }, pending: Map<string, number>, region: string | null) {
+  const { spec, tenant, stats, result, resultTruncated, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

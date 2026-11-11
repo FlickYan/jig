@@ -362,6 +362,9 @@ export async function startRouter(config: RouterConfig, { log = createLog("route
       }
       let region = regions.get(tenant.home)!;
       if (!region.up) {
+        // A key is known only to the store of the region that took it: another region would make the task
+        // again. So a create with one is never failed over.
+        if (req.headers["idempotency-key"] !== undefined) return down(x, tenant.home, "a create with an Idempotency-Key waits for its home region, where its key is known: try again once it is back");
         const other = tenant.failover ? order.map((name) => regions.get(name)!).find((other) => other.up && allowed(other.name)) : undefined;
         if (!other) return down(x, tenant.home, "try again once it is back");
         failovers.inc({ from: region.name, to: other.name });

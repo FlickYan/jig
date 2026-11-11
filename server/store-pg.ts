@@ -13,6 +13,9 @@ import {
   countsOf,
   type DatabasePool,
   ENDED,
+  expired,
+  type Idempotency,
+  idempotent,
   type Given,
   isoDay,
   json,
@@ -20,10 +23,13 @@ import {
   type Outcome,
   periods,
   type Refusal,
+  type Replay,
   refusal,
   spentOf,
+  slimSpec,
   type Store,
   TASK_COLUMNS,
+  longColumns,
   type Task,
   type TaskSpec,
   type TaskStatus,
@@ -50,12 +56,16 @@ const APPROVALS = "jig_approvals";
 // pg_advisory_xact_lock's keys: claims, and migrations (so two replicas starting at once don't both run them).
 const CLAIM_LOCK = 7_366_000_001;
 const MIGRATE_LOCK = 7_366_000_002;
+// Retention's: one replica purges at a time (pg_try_advisory_xact_lock; the others leave it to that one).
+const RETAIN_LOCK = 7_366_000_003;
 // With a tenant's hashtext, a lock of its own on its new tasks: two 32-bit keys, a key space apart from the above.
 const CREATE_LOCK = 7366;
 
 // Each entry moves the schema one version on (jig_schema counts them). Never edit one that has shipped:
 // add another. JSON is kept as `json`, which holds the text as it came, or as text: jsonb would turn away
-// a "\u0000" in a command's output.
+// a "\u0000" in a command's output. json's operators (->>, json_extract_path) turn one away too, and half a
+// surrogate pair ("\ud800"), anywhere in the document, so no statement applies one to a document a tenant
+// or a run wrote.
 const MIGRATIONS = [
   `CREATE TABLE tenants (id text PRIMARY KEY, limits json NOT NULL);
    CREATE TABLE api_keys (hash text PRIMARY KEY, tenant text NOT NULL REFERENCES tenants (id));
@@ -86,6 +96,27 @@ const MIGRATIONS = [
   `CREATE TABLE replicas (id text PRIMARY KEY, seen_until timestamptz NOT NULL);`,
   // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
   `CREATE INDEX usage_by_day ON usage (day);`,
+  // A task's model, for the ledger, which read it from the spec: an error (22P05) for a spec holding "\u0000",
+  // in the statement ending the task and so for every task that statement ended. The operator refuses half a
+  // surrogate pair too (22P02), and other escapes in a database that isn't UTF8, so the backfill reads only
+  // specs with no "\u" escape at all: one refusal would fail the migration, and the service couldn't start.
+  // JSON.stringify writes that escape for control characters and lone surrogates alone, so few specs have
+  // one; those keep no model here (their ledger rows say ''). chr(92) is the backslash, however the session
+  // reads strings.
+  `ALTER TABLE tasks ADD COLUMN model text;
+   UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u') = 0;`,
+  // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
+  `ALTER TABLE tasks ADD COLUMN result text;
+   ALTER TABLE tasks ADD COLUMN result_truncated boolean NOT NULL DEFAULT false;`,
+  // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
+  // adding it locks and scans nothing of tasks. No foreign key to tasks: it would take a lock on tasks to
+  // add, and a key's row may outlive its task or go before it (a key whose task is gone is as one never used).
+  `CREATE TABLE idempotency (tenant text NOT NULL, key text NOT NULL, hash text NOT NULL, task text NOT NULL, created timestamptz NOT NULL, PRIMARY KEY (tenant, key))`,
+  // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
+  // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged. Both
+  // may be there already: made by hand ahead of the upgrade, on a large table (docs/server.md).
+  `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz;
+   CREATE INDEX IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -93,12 +124,25 @@ const NOTIFY_DONE = `SELECT id, pg_notify('${EVENTS}', json_build_object('task',
 const IDS = "SELECT json_array_elements_text($1::json)";
 
 /**
- * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING ENDED), in the statement that ends
+ * A CTE with the task an event or an approval is for ($1), if it still keeps them: none for a purged task,
+ * so nothing is stored for it, silently, as for a seq already kept. FOR KEY SHARE is the lock the insert's
+ * foreign key takes on the task anyway: a purge (FOR UPDATE) waits for it and it for a purge, and it then
+ * sees the task purged; a renewal of the task's lease doesn't wait for it, as it would for FOR SHARE.
+ */
+const LIVE = "live AS (SELECT id FROM tasks WHERE id = $1 AND purged IS NULL FOR KEY SHARE)";
+/** What a purge leaves of a task's row, but for its spec: see Store.purge. */
+const BLANK = "prompt = '', error = NULL, stats = NULL, result = NULL, result_truncated = false";
+
+/** What a statement that ends tasks returns of each, for the ledger: the model from its column, not the spec. */
+const DONE = `${ENDED}, model`;
+
+/**
+ * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING DONE), in the statement that ends
  * them, so in its transaction; `spent` is the SQL of input, output, cache_read, cache_write and cost_usd.
  */
 const ledger = (spent = "0, 0, 0, 0, 0") =>
   `ledger AS (INSERT INTO usage (task, tenant, day, model, status, input, output, cache_read, cache_write, cost_usd, seconds)
-     SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(spec->>'model', ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
+     SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(model, ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
      FROM done ON CONFLICT DO NOTHING)`;
 
 export class PostgresStore implements Store {
@@ -175,7 +219,7 @@ export class PostgresStore implements Store {
     return this.pool.transaction(async (db) => {
       await db.query(`DELETE FROM api_keys WHERE tenant NOT IN (${IDS})`, [json(keep)]);
       const { rows } = await db.query(
-        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
+        `WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now(), error = 'its tenant was removed from the config' WHERE status = 'queued' AND tenant NOT IN (${IDS}) RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`,
         [json(keep)],
       );
       return rows.length;
@@ -183,13 +227,13 @@ export class PostgresStore implements Store {
   }
 
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
-  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
     const { prompt, ...rest } = spec;
     // With caps, created at their `now`, the clock the quotas' days are read from, so it is counted on the
     // day they say; without, at the database's.
     const insert = async (db: Client) => {
-      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES ($1, $2, $3, $4, 'queued', coalesce($5, now())) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest), caps?.now ?? null]);
+      const { rows } = await db.query("INSERT INTO tasks (id, tenant, prompt, spec, model, status, created) VALUES ($1, $2, $3, $4, $5, 'queued', coalesce($6, now())) RETURNING *", [newTaskId(this.region), tenant, prompt, json(rest), spec.model ?? null, caps?.now ?? null]);
       return toTask(rows[0]);
     };
     if (!caps) return insert(this.pool);
@@ -197,6 +241,14 @@ export class PostgresStore implements Store {
       // Held to the transaction's end, so the counts and the insert are one replica's at a time, for this
       // tenant; each count is a statement of its own, which sees what the last insert committed.
       await db.query(`SELECT pg_advisory_xact_lock(${CREATE_LOCK}, hashtext($1))`, [tenant]);
+      if (idem) {
+        // Under the tenant's lock, so two creates with one key can't both find it unused.
+        const [row] = (await db.query(idempotent("$1", "$2"), [tenant, idem.key])).rows;
+        // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
+        if (row && row.id !== null && !expired(row.idem_created as Date, caps.now)) return { replay: toTask(row), same: row.idem_hash === idem.hash };
+        // Run out, or its task is gone: the key is free again.
+        if (row) await db.query("DELETE FROM idempotency WHERE tenant = $1 AND key = $2", [tenant, idem.key]);
+      }
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = async (sql: string, ...params: unknown[]) => Number(Object.values((await db.query(sql, [tenant, ...params])).rows[0])[0]);
       const used = {
@@ -205,7 +257,12 @@ export class PostgresStore implements Store {
         usdPerDay: caps.usdPerDay === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day = $2", day),
         usdPerMonth: caps.usdPerMonth === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day >= $2 AND day < $3", isoDay(monthStart), isoDay(nextMonth)),
       };
-      return refusal(caps, (cap) => used[cap]) ?? insert(db);
+      const refused = refusal(caps, (cap) => used[cap]);
+      if (refused) return refused;
+      const task = await insert(db);
+      // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
+      if (idem) await db.query("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES ($1, $2, $3, $4, $5)", [tenant, idem.key, idem.hash, task.id, caps.now]);
+      return task;
     });
   }
 
@@ -219,7 +276,7 @@ export class PostgresStore implements Store {
     const where = ["tenant = $1"];
     if (status) where.push(`status = $${params.push(status)}`);
     if (before) where.push(`n < (SELECT n FROM tasks WHERE id = $${params.push(before)} AND tenant = $1)`);
-    const sql = `SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
+    const sql = `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
     return (await this.pool.query(sql, params)).rows.map(toTask);
   }
 
@@ -263,7 +320,7 @@ export class PostgresStore implements Store {
   async expire(error: string, graceMs = 0): Promise<string[]> {
     // The database's clock, not the replicas', says when a lease ran out.
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now() - $2 * interval '1 millisecond') RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`,
+      `WITH done AS (UPDATE tasks SET status = 'error', error = $1, ended = now() WHERE status = 'running' AND (lease_until IS NULL OR lease_until < now() - $2 * interval '1 millisecond') RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`,
       [error, graceMs],
     );
     return rows.map((row) => String(row.id));
@@ -278,23 +335,23 @@ export class PostgresStore implements Store {
   }
 
   async cancelQueued(id: string): Promise<boolean> {
-    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING ${ENDED}), ${ledger()} ${NOTIFY_DONE}`, [id]);
+    const { rows } = await this.pool.query(`WITH done AS (UPDATE tasks SET status = 'cancelled', ended = now() WHERE id = $1 AND status = 'queued' RETURNING ${DONE}), ${ledger()} ${NOTIFY_DONE}`, [id]);
     return rows.length === 1;
   }
 
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
-       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${ENDED}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
-      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd],
+      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, result = $15, result_truncated = $16::boolean, ended = now()
+       WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${DONE}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
+      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd, outcome.result ?? null, outcome.resultTruncated ?? false],
     );
     return rows.length === 1;
   }
 
   async addEvent(task: string, seq: number, event: object): Promise<void> {
     await this.pool.query(
-      `WITH added AS (INSERT INTO events (task, seq, json) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING task, seq)
+      `WITH ${LIVE}, added AS (INSERT INTO events (task, seq, json) SELECT id, $2::integer, $3::text FROM live ON CONFLICT DO NOTHING RETURNING task, seq)
        SELECT pg_notify('${EVENTS}', json_build_object('task', task, 'seq', seq)::text) FROM added`,
       [task, seq, JSON.stringify(event)],
     );
@@ -315,7 +372,10 @@ export class PostgresStore implements Store {
 
   async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
     const [row] = (
-      await this.pool.query("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT DO NOTHING RETURNING *", [task, id, step, tool, description])
+      await this.pool.query(
+        `WITH ${LIVE} INSERT INTO approvals (task, id, step, tool, description, requested_at) SELECT id, $2::text, $3::integer, $4::text, $5::text, now() FROM live ON CONFLICT DO NOTHING RETURNING *`,
+        [task, id, step, tool, description],
+      )
     ).rows;
     return row && toApproval(row);
   }
@@ -361,6 +421,45 @@ export class PostgresStore implements Store {
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
     const { rows } = await this.pool.query(`SELECT task, count(*) AS n FROM approvals WHERE task IN (${IDS}) AND decision IS NULL GROUP BY task`, [json(tasks)]);
     return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
+  // No statement here reads into a stored spec with SQL (see MIGRATIONS): what is kept of it is worked out
+  // here and written back whole.
+  async purge(id: string): Promise<{ task: Task; first: boolean } | undefined> {
+    return this.pool.transaction(async (db) => {
+      // FOR UPDATE, which the UPDATE below wouldn't take by itself (it changes no key): an event or an
+      // approval being stored holds FOR KEY SHARE on the task, and is waited for, then deleted with the rest.
+      const [row] = (await db.query("SELECT spec, purged FROM tasks WHERE id = $1 AND ended IS NOT NULL FOR UPDATE", [id])).rows;
+      if (!row) {
+        // Not ended, or not there.
+        const [task] = (await db.query("SELECT * FROM tasks WHERE id = $1", [id])).rows;
+        return task && { task: toTask(task), first: false };
+      }
+      const [task] = (await db.query(`UPDATE tasks SET purged = coalesce(purged, now()), ${BLANK}, spec = $2 WHERE id = $1 RETURNING *`, [id, json(slimSpec(row.spec as Partial<TaskSpec>))])).rows;
+      await db.query("DELETE FROM events WHERE task = $1", [id]);
+      await db.query("DELETE FROM approvals WHERE task = $1", [id]);
+      return { task: toTask(task), first: row.purged === null };
+    });
+  }
+
+  async purgeEnded(olderThanMs: number, limit: number): Promise<number> {
+    return this.pool.transaction(async (db) => {
+      const [lock] = (await db.query(`SELECT pg_try_advisory_xact_lock(${RETAIN_LOCK}) AS mine`)).rows;
+      if (lock.mine !== true) return 0;
+      // The database's clock, not the replicas', says what is old enough. SKIP LOCKED passes over a task a
+      // DELETE is purging meanwhile.
+      const { rows } = await db.query(
+        "SELECT id, spec FROM tasks WHERE purged IS NULL AND ended IS NOT NULL AND ended < now() - $1 * interval '1 millisecond' ORDER BY ended LIMIT $2 FOR UPDATE SKIP LOCKED",
+        [olderThanMs, limit],
+      );
+      if (!rows.length) return 0;
+      // Each task's id with what is kept of its spec, which the three statements read their tasks from.
+      const slim = json(Object.fromEntries(rows.map((row) => [String(row.id), slimSpec(row.spec as Partial<TaskSpec>)])));
+      await db.query(`UPDATE tasks SET purged = now(), ${BLANK}, spec = s.value FROM json_each($1::json) s WHERE tasks.id = s.key`, [slim]);
+      await db.query("DELETE FROM events WHERE task IN (SELECT json_object_keys($1::json))", [slim]);
+      await db.query("DELETE FROM approvals WHERE task IN (SELECT json_object_keys($1::json))", [slim]);
+      return rows.length;
+    });
   }
 
   async usage(query: UsageQuery): Promise<UsageRow[]> {
