@@ -107,6 +107,8 @@ export interface Config {
   maxEvents?: number;
   /** The most bytes of a task's events (as JSON) that are stored. */
   maxEventBytes?: number;
+  /** The most bytes of a run's last text that are kept as the task's result. */
+  maxResultBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
@@ -324,9 +326,9 @@ export async function startService(
     if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
       log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
     }
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, keepTaskDirs, gitHosts } = config;
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, gitHosts } = config;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
     await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
@@ -643,6 +645,7 @@ function configProblem(config: Config): string | undefined {
     positive("leaseSeconds", config.leaseSeconds, false, 86_400) ??
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
+    whole("maxResultBytes", config.maxResultBytes, 1) ??
     whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
@@ -738,19 +741,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
     const limit = Number(url.searchParams.get("limit") ?? 100);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
-    // The prompts can be long: a list leaves them out unless asked.
+    // The prompts and the results can be long: a list leaves them out unless asked.
     const full = ["1", "true"].includes(url.searchParams.get("full") ?? "");
     const tasks = await context.store.tasks(tenant.id, { status: status as TaskStatus | undefined, before, limit, prompts: full });
     const pending = await context.store.pendingApprovals(tasks.map((task) => task.id));
     // A full page may have more after it: the next is read with before=<next>.
-    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
+    return reply(res, 200, { tasks: tasks.map((task) => view(task, { prompt: full, result: full }, pending, context.region)), ...(tasks.length === limit && { next: tasks.at(-1)!.id }) });
   }
   const match = /^\/v1\/tasks\/([\w-]+)(\/cancel|\/events|\/approvals(?:\/([\w-]{1,100}))?)?$/.exec(url.pathname);
   // Another tenant's task is as missing as one that never was.
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
+  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
   if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
@@ -981,12 +984,12 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
- * (none, once it has ended); the list leaves out the stats, and the prompt unless asked.
+ * (none, once it has ended); the list leaves out the stats, and the prompt and the result unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean }, pending: Map<string, number>, region: string | null) {
-  const { spec, tenant, stats, ...rest } = task;
+function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean }, pending: Map<string, number>, region: string | null) {
+  const { spec, tenant, stats, result, resultTruncated, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

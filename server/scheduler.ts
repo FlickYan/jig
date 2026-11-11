@@ -40,6 +40,8 @@ export interface SchedulerOptions {
   maxEvents?: number;
   /** The most bytes of a run's events (as JSON) that are stored; past it, as past maxEvents (default 64 MiB). */
   maxEventBytes?: number;
+  /** The most bytes of a run's last text that are kept as the task's result; past it, its start is (default 64 KiB). */
+  maxResultBytes?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
   /** The hosts a workspace may be cloned from (default: any), checked again as each task starts. */
@@ -100,13 +102,14 @@ export class Scheduler {
   private leaseMs: number;
   private maxEvents: number;
   private maxEventBytes: number;
+  private maxResultBytes: number;
   private keepTaskDirs: boolean;
   private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, maxResultBytes = 64 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -114,6 +117,7 @@ export class Scheduler {
     this.leaseMs = leaseMs;
     this.maxEvents = maxEvents;
     this.maxEventBytes = maxEventBytes;
+    this.maxResultBytes = maxResultBytes;
     this.keepTaskDirs = keepTaskDirs;
     this.gitHosts = gitHosts;
     this.onApproval = onApproval;
@@ -388,6 +392,8 @@ export class Scheduler {
     let exit: RunExit | undefined;
     let failure: string | undefined;
     let end: JigEvent | undefined;
+    /** The run's last text so far, cut to size: the task's result. */
+    let said: Said | undefined;
     let stored = 0;
     /** The bytes of the events stored, as JSON. */
     let bytes = 0;
@@ -407,6 +413,8 @@ export class Scheduler {
       for await (const event of run.handle.events) {
         if (!stored) this.metrics.startSeconds.observe({ start }, (Date.now() - run.claimed) / 1000);
         if (event.type === "end") end = event;
+        // Taken before the caps below, so a run whose events are dropped still leaves what it said last.
+        if (event.type === "text" && typeof event.text === "string") said = resultOf(event.text, this.maxResultBytes);
         let kept = event;
         // Past either cap, a run's events are dropped, but for its last event if that is an end (jig writes
         // its own last), and one notice in place of the first dropped says so: a task's commands can't fill
@@ -465,7 +473,7 @@ export class Scheduler {
     }
     run.ended = true;
     // Each failure to store it is counted as it is tried again.
-    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping)).catch((err: unknown) => {
+    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping, said)).catch((err: unknown) => {
       this.log.error("couldn't store how the task ended", { tenant: task.tenant, task: task.id, err });
     });
     this.recording.add(recorded);
@@ -551,8 +559,32 @@ export class Scheduler {
   }
 }
 
-/** A run's outcome: from its exit, its end event (the stop, usage and cost), and why it was stopped. */
-export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"]): Outcome {
+/** A run's last text as its task keeps it, and whether that is only its start. */
+export interface Said {
+  text: string;
+  truncated: boolean;
+}
+
+/**
+ * A text as a task's result: with no NUL, and whole if it is `maxBytes` of UTF-8 or fewer, else its start,
+ * up to the last character that ends within them. The NULs go first, as U+FFFD is three bytes where a NUL
+ * was one: the bound is on what is stored.
+ */
+export function resultOf(text: string, maxBytes: number): Said {
+  const clean = withoutNul(text);
+  if (Buffer.byteLength(clean) <= maxBytes) return { text: clean, truncated: false };
+  const buf = Buffer.from(clean);
+  let end = maxBytes;
+  // A byte of the form 10xxxxxx continues a character: the cut steps back to where one starts.
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) end--;
+  return { text: buf.subarray(0, end).toString(), truncated: true };
+}
+
+/**
+ * A run's outcome: from its exit, its end event (the stop, usage and cost), why it was stopped, and the
+ * last text it wrote (the result), however it ended.
+ */
+export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"], said?: Said): Outcome {
   const status = stopping === "shutdown" || stopping === "lost" ? "error" : stopping === "cancelled" ? "cancelled" : failure ? "error" : statusFor(exit!);
   const exitCode = exit?.exitCode ?? null;
   // A run that was stopped and wrote no end of its own (jig, sent SIGTERM, exits 143 without one) was interrupted.
@@ -569,6 +601,8 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
     stats: exit?.stats ?? null,
     usage: (end?.usage as Usage | undefined) ?? null,
     cost: typeof end?.cost === "number" ? end.cost : null,
+    result: said?.text ?? null,
+    resultTruncated: said?.truncated ?? false,
   };
 }
 

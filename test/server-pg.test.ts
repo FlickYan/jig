@@ -478,6 +478,22 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual({ model: row.model, tasks: row.tasks, input: row.input, output: row.output }, { model: "deepseek-flash", tasks: 2, input: 3, output: 2 });
   });
 
+  it("keeps a finished task's result, and lists it only with the prompts", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const run = await store.createTask("a", PLAIN);
+    assert.deepEqual([run.result, run.resultTruncated], [null, false]);
+    await store.claim("a", TERMS);
+    assert.equal(await store.finish(run.id, "r1", { ...OUTCOME, result: "done: fixed app.py", resultTruncated: true }), true);
+    const ended = (await store.task(run.id))!;
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "done: fixed app.py", true]);
+    const [full] = await store.tasks("a", { prompts: true });
+    assert.deepEqual([full.spec.prompt, full.result, full.resultTruncated], ["x", "done: fixed app.py", true]);
+    const [listed] = await store.tasks("a");
+    assert.deepEqual([listed.spec.prompt, listed.result, listed.resultTruncated], ["", null, false]);
+  });
+
   it("ends every tenant's lapsed tasks though one tenant's holds a NUL", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());
@@ -509,8 +525,8 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     const url = await postgresDatabase();
     await (await openStore(url)).close();
     const db = pool(url);
-    // As schema 5 left it: no model column, the model in the spec alone.
-    await db.query("ALTER TABLE tasks DROP COLUMN model");
+    // As schema 5 left it: no model column, the model in the spec alone (nor the result's, which came after).
+    await db.query("ALTER TABLE tasks DROP COLUMN model, DROP COLUMN result, DROP COLUMN result_truncated");
     await db.query("UPDATE jig_schema SET version = 5");
     await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
     const insert = (id: string, spec: object, status: string) => db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created, started) VALUES ($1, 'a', 'x', $2, $3, now(), now())", [id, JSON.stringify(spec), status]);
@@ -528,7 +544,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
     const store = await openStore(url);
     closers.push(() => store.close());
-    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 6);
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 7);
     // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
     assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
       { id: "task_1", model: "deepseek-flash" },

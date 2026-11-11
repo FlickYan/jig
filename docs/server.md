@@ -64,7 +64,8 @@ past either they are dropped, but for the run's last event if it is an `end` (ji
 with one `notice` event in place of the first dropped, and the run goes on. An `end` counts toward both
 like any event. Both bound what one task stores, so its commands (which on Docker and Kubernetes can write
 its events, `end`s too, in lines of up to 1 MiB) can't fill the database with one task; nothing bounds what
-tasks store over time.
+tasks store over time. `maxResultBytes` (64 KiB) is the most of a run's last text that is kept as the
+task's `result` (below); setting it over 1 MiB does nothing more, as a longer line of events is never read.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
@@ -99,8 +100,8 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
 curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"prompt": "...", "workspace": {"git": "https://github.com/owner/repo", "ref": "main"}, "maxSteps": 30}'
 
-curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost and stats
-# The tenant's latest 100 (or ?limit=), newest first, without their prompts unless ?full=1; with "next"
+curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats and result
+# The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1; with "next"
 # when the page is full, the id that ?before= takes for the page after it.
 curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
 curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Bearer $KEY"
@@ -150,6 +151,23 @@ A task is `queued`, then `running`, then one of:
 cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
 that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
 U+FFFD.
+
+`result` is the last text the run wrote (its last `text` event), on `GET /v1/tasks/:id` and, with
+`?full=1`, in the list: the model's final reply only if its last step had text, the wrap-up when the run
+stopped at `max_steps`, and otherwise the last thing it said before that, whatever the task's status. So
+read it with `status` and `stop`: a `succeeded` task whose last reply was empty of text has an earlier
+step's, and a cancelled one what it had said so far. It is `null` while the task is queued or running,
+and for a task whose run wrote no text, that never ran (cancelled while queued), or whose replica was lost
+(ended when its lease ran out). It is kept even when the text was past `maxEvents` or `maxEventBytes`, so
+its event wasn't. A text of more than `maxResultBytes` of UTF-8 is cut to its start, at the end of a
+character, and `resultTruncated` is true; a NUL in it is shown as U+FFFD. On Docker and Kubernetes a
+task's commands can write its events, so the result is the task's word, not the service's. It isn't in
+the stream's `done`, the webhooks or the usage ledger.
+
+The task's files aren't retrievable: there is no diff of the workspace and no `GET /v1/tasks/:id/diff`.
+Making one would run git on the host over a repository the task's commands wrote, a files workspace has
+no commit to compare with, and on Kubernetes the only way out of the pod is its log. A task whose changes
+you need must push them, or print them.
 
 ### Scheduling
 
@@ -217,7 +235,9 @@ Postgres, through `server/pg.ts`, a client of jig's own with no dependencies (SC
 cleartext logins; `sslmode=require` checks the server's certificate against the system's CAs, or the file
 in `sslrootcert`), and several replicas of the service share it: each runs the same config, with a
 `replicaId` of its own (the host's name, the process's id and a random part, by default). The schema is
-moved on by the `jig_schema` table, under a lock, so replicas starting together do it once.
+moved on by the `jig_schema` table, under a lock, so replicas starting together do it once. A replica of
+the version before goes on running against the schema once a newer one has moved it, but refuses to start
+again; a task it finishes meanwhile has a `null` result (the columns came with schema 7, SQLite's 8).
 
 A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
 counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`

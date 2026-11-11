@@ -24,6 +24,7 @@ import {
   spentOf,
   type Store,
   TASK_COLUMNS,
+  longColumns,
   type Task,
   type TaskSpec,
   type TaskStatus,
@@ -97,6 +98,9 @@ const MIGRATIONS = [
   // reads strings.
   `ALTER TABLE tasks ADD COLUMN model text;
    UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u') = 0;`,
+  // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
+  `ALTER TABLE tasks ADD COLUMN result text;
+   ALTER TABLE tasks ADD COLUMN result_truncated boolean NOT NULL DEFAULT false;`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -233,7 +237,7 @@ export class PostgresStore implements Store {
     const where = ["tenant = $1"];
     if (status) where.push(`status = $${params.push(status)}`);
     if (before) where.push(`n < (SELECT n FROM tasks WHERE id = $${params.push(before)} AND tenant = $1)`);
-    const sql = `SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
+    const sql = `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
     return (await this.pool.query(sql, params)).rows.map(toTask);
   }
 
@@ -299,9 +303,9 @@ export class PostgresStore implements Store {
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, ended = now()
+      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, result = $15, result_truncated = $16::boolean, ended = now()
        WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${DONE}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
-      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd],
+      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd, outcome.result ?? null, outcome.resultTruncated ?? false],
     );
     return rows.length === 1;
   }

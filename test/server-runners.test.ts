@@ -866,7 +866,7 @@ describe("the Kubernetes runner", () => {
   /** A task as the scheduler gives it to a runner, and its tenant. */
   function aTask(spec: Partial<Task["spec"]> = {}): [Task, Tenant] {
     const id = `task_${randomUUID().replaceAll("-", "")}`;
-    const task: Task = { id, tenant: "acme", spec: { prompt: "x", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: new Date().toISOString(), started: null, ended: null, stats: null, usage: null, cost: null };
+    const task: Task = { id, tenant: "acme", spec: { prompt: "x", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: new Date().toISOString(), started: null, ended: null, stats: null, usage: null, cost: null, result: null, resultTruncated: false };
     return [task, { id: "acme", limits: { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null } }];
   }
 

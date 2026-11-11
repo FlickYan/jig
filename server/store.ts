@@ -141,6 +141,10 @@ export interface Task {
   stats: unknown;
   usage: Usage | null;
   cost: number | null;
+  /** The last text the run wrote, cut to the service's maxResultBytes; null if it wrote none. */
+  result: string | null;
+  /** Whether the result is only the start of that text. */
+  resultTruncated: boolean;
 }
 
 /** What a finished run leaves on its task. */
@@ -152,6 +156,9 @@ export interface Outcome {
   stats: unknown;
   usage: Usage | null;
   cost: number | null;
+  /** The run's last text, already cut to size, with no NUL (Postgres text can't hold one); none when left out. */
+  result?: string | null;
+  resultTruncated?: boolean;
 }
 
 export type Decision = "allow" | "deny";
@@ -227,7 +234,7 @@ export interface Store {
   task(id: string): Promise<Task | undefined>;
   /**
    * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
-   * without their prompts (an empty string in their place) unless `prompts`.
+   * without their prompts (an empty string in their place) and results (null) unless `prompts`.
    */
   tasks(tenant: string, options?: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean }): Promise<Task[]>;
   /** Every tenant's tasks in a status, oldest first. */
@@ -346,12 +353,17 @@ const MIGRATIONS = [
   // each task's rowid after its tenant, as Postgres's tasks_by_tenant holds n. Without it, each page sorted
   // all of the tenant's tasks.
   `CREATE INDEX tasks_by_tenant_n ON tasks (tenant);`,
+  // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
+  `ALTER TABLE tasks ADD COLUMN result TEXT;
+   ALTER TABLE tasks ADD COLUMN result_truncated INTEGER NOT NULL DEFAULT 0;`,
 ];
 
 type Row = Record<string, unknown>;
 
-/** A task's columns but its prompt, which a list leaves out. */
-export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost";
+/** A task's columns but its prompt and its result, which a list leaves out. */
+export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost, result_truncated";
+/** The two it leaves out, or what stands in their place, for a list's SELECT. */
+export const longColumns = (prompts: boolean): string => (prompts ? "prompt, result" : "'' AS prompt, NULL AS result");
 
 // One replica's store, or several processes' on one machine: SQLite has no notifications, so changes
 // made by another process are found by looking again, and claims take its write lock.
@@ -468,7 +480,7 @@ class SqliteStore implements Store {
   async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
     const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
     const params = [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit];
-    const rows = this.db.prepare(`SELECT ${TASK_COLUMNS}, ${prompts ? "prompt" : "'' AS prompt"} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`).all(...params);
+    const rows = this.db.prepare(`SELECT ${TASK_COLUMNS}, ${longColumns(prompts)} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`).all(...params);
     return (rows as Row[]).map(toTask);
   }
 
@@ -540,8 +552,9 @@ class SqliteStore implements Store {
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     return this.atomically(() => {
       const rows = this.db
-        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
-        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, new Date().toISOString(), id, owner) as Row[];
+        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, result = ?, result_truncated = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
+        // node:sqlite binds neither undefined nor a boolean.
+        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, outcome.result ?? null, outcome.resultTruncated ? 1 : 0, new Date().toISOString(), id, owner) as Row[];
       this.ledger(rows, spentOf(outcome));
       return rows.length === 1;
     });
@@ -829,5 +842,8 @@ export function toTask(row: Row): Task {
     stats: parsed(row.stats),
     usage: parsed(row.usage) as Usage | null,
     cost: row.cost === null ? null : Number(row.cost),
+    result: (row.result as string | null | undefined) ?? null,
+    // A list that leaves the result out says nothing of its cut either.
+    resultTruncated: row.result != null && Boolean(row.result_truncated),
   };
 }

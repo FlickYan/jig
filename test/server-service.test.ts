@@ -13,9 +13,9 @@ import { promisify } from "node:util";
 import { bracketHost, checkConfig, type Config, resolvePaths, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { PgError } from "../server/pg.ts";
-import { type RunHandle, type Runner, statusFor } from "../server/runner.ts";
+import { type JigEvent, type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
-import { outcomeOf, Scheduler } from "../server/scheduler.ts";
+import { outcomeOf, resultOf, Scheduler } from "../server/scheduler.ts";
 import { serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant } from "../server/store.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
@@ -579,6 +579,31 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(JSON.parse(frames[3].data).text, /past 3 aren't kept/);
     const task = await statusOf(api, id, "succeeded");
     assert.deepEqual(task.usage, { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 });
+  });
+
+  it("shows the last text a run wrote as the task's result, though its events past maxEvents aren't kept", async () => {
+    const api = await service({ maxEvents: 3 });
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    // It has none while it runs.
+    const running = await statusOf(api, id, "running");
+    assert.deepEqual([running.result, running.resultTruncated], [null, false]);
+    await until(() => existsSync(work(api, id)), "the task's project");
+    await writeFile(join(work(api, id), "go"), "");
+    const task = await statusOf(api, id, "succeeded");
+    assert.deepEqual([task.result, task.resultTruncated], ["Done.", false]);
+    // The text itself was past the cap: no event holds it.
+    assert.ok((await api.store.events(id)).every(({ event }) => (event as { type: string }).type !== "text"));
+  });
+
+  it("lists tasks without their results unless asked", async () => {
+    const api = await service();
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    await statusOf(api, id, "succeeded");
+    const [listed] = (await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks;
+    assert.equal(listed.id, id);
+    assert.ok(!("result" in listed) && !("resultTruncated" in listed));
+    const [full] = (await call(api, KEYS.acme, "GET", "/v1/tasks?full=1")).body.tasks;
+    assert.deepEqual([full.result, full.resultTruncated], ["Done.", false]);
   });
 
   it("stores a run's events up to maxEventBytes, then one notice and its end", async () => {
@@ -1402,6 +1427,94 @@ const schedulerTests = () => {
     });
   }
 
+  /** The task of a run that wrote these events (each given its seq and time) and exited 0, once it has ended. */
+  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner) => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
+    assert.deepEqual([task.result, task.resultTruncated], [null, false]);
+    runner ??= {
+      async start() {
+        return {
+          events: (async function* () {
+            for (const [i, event] of events.entries()) yield { v: 1, seq: i + 1, ts: new Date().toISOString(), ...event } as JigEvent;
+          })(),
+          wait: async () => ({ exitCode: 0, timedOut: false }),
+          cancel() {},
+        };
+      },
+    };
+    const scheduler = newScheduler(store, runner, { concurrency: 4, ...options });
+    await scheduler.poke();
+    const ended = await endOf(store, task.id);
+    const stored = (await store.events(task.id)).map(({ event }) => (event as { type: string }).type);
+    await scheduler.close();
+    await store.close();
+    return { ended, stored };
+  };
+  const END = { type: "end", stop: "end_turn" };
+
+  it("keeps the last text a run wrote as its task's result", async () => {
+    const { ended } = await ranWith([{ type: "text", step: 1, text: "working" }, { type: "text", step: 2, text: "done: fixed app.py" }, END]);
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "done: fixed app.py", false]);
+  });
+
+  it("keeps the result of a run whose last text was past maxEvents", async () => {
+    const notices = Array.from({ length: 5 }, (_, i) => ({ type: "notice", text: `notice ${i}` }));
+    const { ended, stored } = await ranWith([...notices, { type: "text", step: 1, text: "final" }, END], { maxEvents: 3 });
+    assert.deepEqual(stored, ["notice", "notice", "notice", "notice", "end"]);
+    assert.deepEqual([ended.result, ended.resultTruncated], ["final", false]);
+  });
+
+  it("cuts a result to maxResultBytes of UTF-8, at a character's end, and says so", async () => {
+    // "é" is two bytes: five fit in 10, four in 9.
+    const text = [{ type: "text", step: 1, text: "ééééééé" }, END];
+    const ten = (await ranWith(text, { maxResultBytes: 10 })).ended;
+    assert.deepEqual([ten.result, ten.resultTruncated], ["ééééé", true]);
+    const nine = (await ranWith(text, { maxResultBytes: 9 })).ended;
+    assert.deepEqual([nine.result, nine.resultTruncated], ["éééé", true]);
+  });
+
+  it("leaves the result null for a run that wrote no text, and passes by a text that isn't a string", async () => {
+    const none = (await ranWith([], {}, endsWith(0))).ended;
+    assert.deepEqual([none.status, none.result, none.resultTruncated], ["succeeded", null, false]);
+    const { ended } = await ranWith([{ type: "text", step: 1, text: "ok" }, { type: "text", step: 2, text: 42 }, END]);
+    assert.deepEqual([ended.result, ended.resultTruncated], ["ok", false]);
+  });
+
+  it("gives an earlier step's text as the result when the run's last step wrote none", async () => {
+    // As jig ends when the model's last reply is empty of text: the result is the last thing it said.
+    const events = [
+      { type: "text", step: 1, text: "I'll run the tests." },
+      { type: "tool_call", step: 1, id: "call_1", name: "bash", description: "npm test" },
+      { type: "tool_result", step: 1, id: "call_1", isError: false, output: "ok" },
+      { type: "step", step: 1 },
+      { type: "step", step: 2 },
+      END,
+    ];
+    const { ended } = await ranWith(events);
+    assert.deepEqual([ended.status, ended.stop, ended.result], ["succeeded", "end_turn", "I'll run the tests."]);
+  });
+
+  it("stores an outcome with a result, or without the result's fields, and lists results only with prompts", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const spec = { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const [first, second] = [await store.createTask("a", spec), await store.createTask("a", spec)];
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    for (const task of [first, second]) assert.equal(((await store.claim("a", terms)) as Task).id, task.id);
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    // As a caller written before the result was: neither field.
+    assert.equal(await store.finish(first.id, "r1", outcome), true);
+    assert.equal(await store.finish(second.id, "r1", { ...outcome, result: "the start", resultTruncated: true }), true);
+    const [plain, cut] = [(await store.task(first.id))!, (await store.task(second.id))!];
+    assert.deepEqual([plain.result, plain.resultTruncated], [null, false]);
+    assert.deepEqual([cut.result, cut.resultTruncated], ["the start", true]);
+    assert.deepEqual((await store.tasks("a", { prompts: true })).map((task) => [task.result, task.resultTruncated]), [["the start", true], [null, false]]);
+    assert.deepEqual((await store.tasks("a")).map((task) => [task.result, task.resultTruncated]), [[null, false], [null, false]]);
+    await store.close();
+  });
+
   it("frees a run's slot even when its outcome can't be stored", async () => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
@@ -1561,6 +1674,36 @@ describe("a run's outcome", () => {
     assert.equal(outcomeOf(killed, undefined, undefined, undefined).stop, "error");
     assert.equal(outcomeOf(undefined, undefined, "the workspace couldn't be made", undefined).stop, null);
   });
+
+  it("holds the run's last text as its result, however the run ended", () => {
+    const killed = { exitCode: 143, timedOut: false };
+    const none = outcomeOf({ exitCode: 0, timedOut: false }, undefined, undefined, undefined);
+    assert.deepEqual([none.result, none.resultTruncated], [null, false]);
+    const cancelled = outcomeOf(killed, undefined, undefined, "cancelled", { text: "half done", truncated: false });
+    assert.deepEqual([cancelled.status, cancelled.stop, cancelled.result, cancelled.resultTruncated], ["cancelled", "interrupted", "half done", false]);
+    const failed = outcomeOf(undefined, undefined, "the events couldn't be stored", undefined, { text: "the start", truncated: true });
+    assert.deepEqual([failed.status, failed.result, failed.resultTruncated], ["error", "the start", true]);
+  });
+});
+
+describe("a task's result", () => {
+  it("is the text whole up to maxBytes of UTF-8, and its start past them, cut at a character's end", () => {
+    assert.deepEqual(resultOf("done", 4), { text: "done", truncated: false });
+    assert.deepEqual(resultOf("done.", 4), { text: "done", truncated: true });
+    assert.deepEqual(resultOf("ééééé", 10), { text: "ééééé", truncated: false });
+    // A four-byte emoji that straddles the cut is left out whole.
+    for (const maxBytes of [2, 3, 4, 5]) assert.deepEqual(resultOf("ab😀cd", maxBytes), { text: "ab", truncated: true }, `${maxBytes}`);
+    assert.deepEqual(resultOf("ab😀cd", 6), { text: "ab😀", truncated: true });
+    assert.deepEqual(resultOf("ab😀cd", 8), { text: "ab😀cd", truncated: false });
+  });
+
+  it("has U+FFFD for each NUL, and stays within maxBytes after that", () => {
+    assert.deepEqual(resultOf("a\0b", 100), { text: "a\uFFFDb", truncated: false });
+    // Ten NULs are ten bytes, but thirty once replaced: three of them fit.
+    const cut = resultOf("\0".repeat(10), 10);
+    assert.deepEqual(cut, { text: "\uFFFD".repeat(3), truncated: true });
+    assert.ok(Buffer.byteLength(cut.text) <= 10);
+  });
 });
 
 describe("the SQLite store's reads", () => {
@@ -1622,6 +1765,37 @@ describe("the SQLite store's reads", () => {
   });
 });
 
+describe("the SQLite store's schema", () => {
+  it("moves a database from before tasks had a result on, and stores results in it", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const limits = { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits }, []);
+    const old = await before.createTask("a", spec);
+    await before.claim("a", terms);
+    assert.equal(await before.finish(old.id, "r1", { ...outcome, result: "said before", resultTruncated: true }), true);
+    assert.equal((await before.task(old.id))!.result, "said before");
+    await before.close();
+    // The database as the version before left it: without the two columns, at schema 7.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; PRAGMA user_version = 7");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const moved = (await store.task(old.id))!;
+    assert.deepEqual([moved.status, moved.result, moved.resultTruncated], ["succeeded", null, false]);
+    const next = await store.createTask("a", spec);
+    await store.claim("a", terms);
+    assert.equal(await store.finish(next.id, "r1", { ...outcome, result: "said after" }), true);
+    const ended = (await store.task(next.id))!;
+    assert.deepEqual([ended.result, ended.resultTruncated], ["said after", false]);
+  });
+});
+
 describe("the service's config", () => {
   const base = { database: ":memory:", dataDir: "data", gatewayBaseUrl: "http://127.0.0.1:9/anthropic", tenants: [] } satisfies Config;
   const problem = (config: object) => {
@@ -1643,6 +1817,8 @@ describe("the service's config", () => {
     assert.equal(problem({ leaseSeconds: 0 }), "The config's leaseSeconds must be a number over 0, up to 86400, not 0");
     assert.equal(problem({ keepTaskDirs: "yes" }), "The config's keepTaskDirs must be true or false");
     assert.equal(problem({ maxEventBytes: 0 }), "The config's maxEventBytes must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxResultBytes: 0 }), "The config's maxResultBytes must be a whole number from 1 up, not 0");
+    assert.equal(problem({ maxResultBytes: 1 }), undefined);
     assert.equal(problem({ tenants: {} }), "The config's tenants must be a list");
     // Postgres's pool, which SQLite hasn't.
     const postgres = "postgres://jig@db.example.com/jig";
