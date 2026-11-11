@@ -1322,7 +1322,9 @@ describe("isolation: service", { skip: sandboxProblem() || (process.platform !==
     }
   });
 
-  it("keeps commands from the Unix sockets in /tmp and /run, through the session's first process too", async () => {
+  it("keeps commands from the Unix sockets in /tmp and /run, through the session's first process too", async (t) => {
+    // The client is node: where node itself is in /tmp or /run, no isolated command can start it.
+    if (/^\/(tmp|var\/tmp|run)\//.test(process.execPath)) return t.skip("node is in a place isolation hides");
     const { project } = await outsideTmp();
     const listening: Server[] = [];
     const listen = async (prefix: string) => {
