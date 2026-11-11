@@ -7,6 +7,7 @@ import {
   type Caps,
   type ClaimTerms,
   type Changes,
+  type Cap,
   COUNT_PENDING,
   COUNT_TASKS,
   type Counts,
@@ -27,12 +28,14 @@ import {
   refusal,
   spentOf,
   slimSpec,
+  type Standing,
   type Store,
   TASK_COLUMNS,
   longColumns,
   type Task,
   type TaskSpec,
   type TaskStatus,
+  type TasksQuery,
   type Tenant,
   toApproval,
   toGiven,
@@ -145,6 +148,19 @@ const ledger = (spent = "0, 0, 0, 0, 0") =>
      SELECT id, tenant, to_char(ended AT TIME ZONE 'UTC', 'YYYY-MM-DD'), coalesce(model, ''), status, ${spent}, coalesce(extract(epoch FROM ended - started), 0)
      FROM done ON CONFLICT DO NOTHING)`;
 
+/** What a tenant has used of each cap, as createTask counts it and standing reports it: $1 the tenant, then the period's bounds. */
+const USED: Record<Cap, string> = {
+  maxQueued: "SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'queued'",
+  tasksPerDay: "SELECT count(*) FROM tasks WHERE tenant = $1 AND created >= $2 AND created < $3",
+  usdPerDay: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day = $2",
+  usdPerMonth: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day >= $2 AND day < $3",
+};
+/** `sql` with its parameters after $1 numbered `by` higher, to stand in one statement with the others. */
+const shifted = (sql: string, by: number) => sql.replace(/\$([2-9])/g, (_, n: string) => `$${Number(n) + by}`);
+/** The five counts of a standing in one statement, so in one snapshot: $1 the tenant, $2 to $6 the periods' bounds. */
+const STANDING = `SELECT (${USED.maxQueued}) AS queued, (SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'running') AS running,
+  (${USED.tasksPerDay}) AS tasks_today, (${shifted(USED.usdPerDay, 2)}) AS usd_today, (${shifted(USED.usdPerMonth, 3)}) AS usd_this_month`;
+
 export class PostgresStore implements Store {
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   private pool: Pool;
@@ -252,10 +268,10 @@ export class PostgresStore implements Store {
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = async (sql: string, ...params: unknown[]) => Number(Object.values((await db.query(sql, [tenant, ...params])).rows[0])[0]);
       const used = {
-        maxQueued: caps.maxQueued === undefined ? 0 : await one("SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'queued'"),
-        tasksPerDay: caps.tasksPerDay === undefined ? 0 : await one("SELECT count(*) FROM tasks WHERE tenant = $1 AND created >= $2 AND created < $3", dayStart, nextDay),
-        usdPerDay: caps.usdPerDay === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day = $2", day),
-        usdPerMonth: caps.usdPerMonth === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day >= $2 AND day < $3", isoDay(monthStart), isoDay(nextMonth)),
+        maxQueued: caps.maxQueued === undefined ? 0 : await one(USED.maxQueued),
+        tasksPerDay: caps.tasksPerDay === undefined ? 0 : await one(USED.tasksPerDay, dayStart, nextDay),
+        usdPerDay: caps.usdPerDay === undefined ? 0 : await one(USED.usdPerDay, day),
+        usdPerMonth: caps.usdPerMonth === undefined ? 0 : await one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
       };
       const refused = refusal(caps, (cap) => used[cap]);
       if (refused) return refused;
@@ -271,12 +287,21 @@ export class PostgresStore implements Store {
     return row && toTask(row);
   }
 
-  async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
+  async standing(tenant: string, now: Date): Promise<Standing> {
+    const { day, dayStart, nextDay, monthStart, nextMonth } = periods(now);
+    const [row] = (await this.pool.query(STANDING, [tenant, dayStart, nextDay, day, isoDay(monthStart), isoDay(nextMonth)])).rows;
+    return { queued: Number(row.queued), running: Number(row.running), tasksToday: Number(row.tasks_today), usdToday: Number(row.usd_today), usdThisMonth: Number(row.usd_this_month) };
+  }
+
+  async tasks(tenant: string, { status = [], limit = 100, before, prompts = false }: TasksQuery = {}): Promise<Task[]> {
     const params: unknown[] = [tenant];
-    const where = ["tenant = $1"];
-    if (status) where.push(`status = $${params.push(status)}`);
-    if (before) where.push(`n < (SELECT n FROM tasks WHERE id = $${params.push(before)} AND tenant = $1)`);
-    const sql = `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)} FROM tasks WHERE ${where.join(" AND ")} ORDER BY n DESC LIMIT $${params.push(limit)}`;
+    const older = before ? ` AND n < (SELECT n FROM tasks WHERE id = $${params.push(before)} AND tenant = $1)` : "";
+    const last = `ORDER BY n DESC LIMIT $${params.push(limit)}`;
+    const one = (status: TaskStatus | undefined, columns: string) =>
+      `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)}${columns} FROM tasks WHERE tenant = $1${status ? ` AND status = $${params.push(status)}` : ""}${older} ${last}`;
+    // Several statuses: each one's newest `limit`, read in its index's order as a single status is, then the
+    // newest `limit` of those. status IN (...) would sort every task of the tenant's in them.
+    const sql = status.length < 2 ? one(status[0], "") : `${status.map((status) => `(${one(status, ", n")})`).join(" UNION ALL ")} ${last}`;
     return (await this.pool.query(sql, params)).rows.map(toTask);
   }
 

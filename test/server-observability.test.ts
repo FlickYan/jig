@@ -370,6 +370,7 @@ describe("the task service's metrics listener, request ids and logs", { skip: sa
       ["/v1/tasks/task_1/approvals", "/v1/tasks/:id/approvals"],
       ["/v1/tasks/task_1/approvals/ap_1", "/v1/tasks/:id/approvals/:aid"],
       ["/v1/usage", "/v1/usage"],
+      ["/v1/limits", "/v1/limits"],
       ["/admin/usage", "/admin/usage"],
       ["/healthz", "/healthz"],
       ["/readyz", "/readyz"],

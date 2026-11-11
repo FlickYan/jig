@@ -157,6 +157,26 @@ const quotaTests = () => {
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
   });
 
+  it("reports in /v1/limits what a refusal would say was used, and starts the day's counts again the next day", async () => {
+    clock = new Date();
+    const api = await service({ usdPerDay: 0.004, usdPerMonth: 1 });
+    await ran(api, KEYS.acme);
+    await ran(api, KEYS.acme);
+    const refused = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.deepEqual([refused.status, refused.body.quota], [429, "usdPerDay"]);
+    const { body } = await call(api, KEYS.acme, "GET", "/v1/limits");
+    assert.deepEqual(body.limits.quotas, { usdPerDay: 0.004, usdPerMonth: 1 });
+    assert.deepEqual(body.used, { queued: 0, running: 0, tasksToday: 2, usdToday: refused.body.used, usdThisMonth: refused.body.used });
+    assert.deepEqual(body.resets, { day: refused.body.resetsAt, month: nextMonth(clock).toISOString() });
+    assert.deepEqual((await call(api, KEYS.globex, "GET", "/v1/limits")).body.used, { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: 0 });
+    // The next day, if it is in the same month, the month's spending stays.
+    const sameMonth = nextDay(clock) < nextMonth(clock);
+    clock = nextDay(clock);
+    const next = (await call(api, KEYS.acme, "GET", "/v1/limits")).body;
+    assert.deepEqual(next.used, { queued: 0, running: 0, tasksToday: 0, usdToday: 0, usdThisMonth: sameMonth ? 0.004 : 0 });
+    assert.deepEqual(next.resets, { day: nextDay(clock).toISOString(), month: nextMonth(clock).toISOString() });
+  });
+
   it("refuses new tasks once what the tenant's tasks spent this month reaches usdPerMonth, until the next month", async () => {
     clock = new Date();
     const api = await service({ usdPerMonth: 0.004, usdPerDay: 1 });

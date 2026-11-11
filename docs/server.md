@@ -111,8 +111,12 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
 curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats and result
 # The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1; with "next"
 # when the page is full, the id that ?before= takes for the page after it.
+# ?status= takes one status or several, separated by commas.
 curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
+curl -s 'localhost:8080/v1/tasks?status=queued,running' -H "Authorization: Bearer $KEY"
 curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Bearer $KEY"
+# The tenant's limits, and what it has used of them (Quotas and usage, below).
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8080/v1/tasks/$ID/cancel -H "Authorization: Bearer $KEY"
 # Deletes an ended task's prompt, files, result, events and approvals; its row and its usage stay (below).
 curl -s -X DELETE localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"
@@ -130,7 +134,14 @@ through `..` or names a folder, the workspace has both files and a repository, o
 workspace file's path or contents holds a NUL character (`\u0000`, which Postgres text can't hold and its
 JSON operators can't read, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
-quotas (below). A cancel answers 200 for a queued task (it is cancelled at once), 202 for a running one
+quotas (below). The list takes four parameters, `status`, `before`, `limit` and `full` (1, true, 0 or
+false): any other, such as a misspelt `?stauts=running`, or one given twice, is a 400 rather than a list
+of everything. A `before` that isn't the id of one of the tenant's tasks in this service is a 400 too,
+`{"error": "before must be the id of one of your tasks here"}`, the same for an id that never was and
+another tenant's; it used to be an empty page, which reads as the end of the list. A path that is no
+route is a 404 `{"error": "No such route"}`, whatever the method; on a task's routes, a task that doesn't
+exist or is another tenant's is a 404 `{"error": "No such task"}`, and a wrong method a 405. A cancel
+answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
 events 100 at a time, or fewer once they come to 4 MiB, and the next page only once the client has taken
@@ -244,6 +255,17 @@ stay in its `-wal` file until that is next reset (a checkpoint with no reader, o
 Postgres the rows stay dead in the table until vacuum, and in WAL archives and on standbys as long as those
 keep them. There is no delete of a task's row or its ledger row, no retention per tenant or of the events
 alone, and no delete of many tasks at once or by the admin key.
+
+What the API doesn't have, and why. An error is a sentence in `error`, with no `code` beside it: codes
+would be a contract across every route's refusals, which nothing here needs yet. There is no OpenAPI
+description, and a 405 names the method in its `error` but sends no `Allow` header. Only the list,
+`/v1/usage` and `/v1/limits` refuse parameters they don't know: the other routes read one at most. The
+list filters by status only, not by when a task was created or ended, which would need an index of its
+own to page through. A list in several statuses is read a status at a time, each through the index one
+status uses, and merged: one query for all of them would walk the tenant's whole history. The list has no
+`?region=all`, as a page across regions would need a cursor for each. `/v1/limits` leaves out the regions
+a tenant may use, which only the router knows, and its open streams, which each replica counts for
+itself. And the check of `before` reads the task's whole row, prompt included, once a page.
 
 ### Scheduling
 
@@ -385,10 +407,27 @@ must be set) is told of each approval as it is stored: a POST of `{"task": <id>,
 signed in `x-jig-signature: sha256=<hex HMAC-SHA256 of the body, keyed by the secret>`. One that fails (not
 2xx, or no answer in 10 seconds) is tried again 3 times, 1, 2 and 4 seconds apart; the run never waits on
 it. A redirect is not followed but counted as a failed try, as it could send the signed POST anywhere the
-service can reach. Each approval is counted once in `jig_service_webhook_deliveries_total{tenant,result}`,
-`delivered` or `failed` (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's
-fail. One whose tries are cut off by the service stopping is counted neither way. Each tenant with a webhook
-starts at 0 for both, so the first failures show.
+service can reach. Each approval is counted once in
+`jig_service_webhook_deliveries_total{tenant,kind,result}` (`kind="approval"`), `delivered` or `failed`
+(after the last try), and `JigWebhookFailures` alerts when over half of a tenant's fail. One whose tries are
+cut off by the service stopping is counted neither way. Each tenant with a webhook starts at 0 for both, so
+the first failures show.
+
+A tenant with `taskWebhook` (a URL, with the same `webhookSecretEnv`) is told as each of its tasks ends: a
+POST of `{"task": <id>, "status": <the status it ended with>}` and no more, from the replica that ended it,
+with the same signature, tries and rule on redirects, counted with `kind="task"`. It is sent at most once and
+on a best effort: `GET /v1/tasks/<id>` is the record, and a client that must know of every end polls for
+the ones it wasn't told of. An end is not posted:
+
+1. for the tasks ended as the service stops (stopped as errors, or ending in its last moments): the webhooks
+   close before the runs are stopped. With a single replica, that is every restart;
+2. for the queued tasks cancelled at a start because their tenant left the config;
+3. when the store's reply to the end was lost (the task has ended, but the replica can't tell it was the one
+   to end it), or a task whose lease ran out couldn't be read back;
+4. when the replica that ends the task has a config with no `taskWebhook` for the tenant, as in the middle of
+   a rollout that adds it;
+5. while 100 of the tenant's POSTs wait on its endpoint (an end past that is counted `failed` at once, and
+   the service warns once until some finish), or after its 4 tries failed.
 
 ### Quotas and usage
 
@@ -435,6 +474,20 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&fo
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 ```
 
+```bash
+# What the tenant may do, and where it stands:
+# {"tenant", "region", "limits": {"concurrency", "maxSteps", "timeLimit", "budgetUsd", "maxQueued", "approvalTimeout", "maxStreams", "quotas"},
+#  "used": {"queued", "running", "tasksToday", "usdToday", "usdThisMonth"}, "resets": {"day", "month"}}
+curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
+```
+
+`GET /v1/limits` lets a tenant read its caps before it is refused at one. `limits` holds the tenant's own
+and the service's defaults where it has none, with only the quotas it has; `used` always holds all five
+counts; `resets` is when the next UTC day and month start. The counts are read with the queries a new
+task is admitted by, but outside its lock, so they can be a task behind. `usdToday` and `usdThisMonth`
+count ended tasks only, as the quotas do. `maxStreams` is per replica, and the streams open now aren't
+reported. Each region answers for itself. It takes no parameter (400).
+
 Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
 that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
 the config, the environment variable that holds the admin key (which must be set, and may hold no
@@ -461,7 +514,7 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
 | `jig_service_approval_wait_seconds{decision}` | seconds from an approval's request to its answer: `allow`, `deny` or `timeout` (a timeout by jig's events' times) |
-| `jig_service_webhook_deliveries_total{tenant,result}` | approvals posted to a tenant's webhook: `delivered`, or `failed` once its last try failed |
+| `jig_service_webhook_deliveries_total{tenant,kind,result}` | approvals (`kind="approval"`) and task ends (`task`) posted to a tenant's webhooks: `delivered`, or `failed` once its last try failed (a task end past the 100 waiting, at once) |
 | `jig_service_lease_errors_total`, `jig_service_store_errors_total{retried}` | rounds of renewing the leases that failed, and tries of reads and writes of the store that failed outside a request: `true` when the try was made again (which may then have got through), `false` when it was given up on, each at 0 from the start |
 | `jig_service_task_folders_removed_total` | task folders that runs left (a crashed replica's), which this replica's sweep removed (Scheduling, above), at 0 from the start |
 | `jig_service_tasks_purged_total{reason}` | ended tasks whose content this replica deleted: `api` (a `DELETE`, counted once however often it is repeated) or `retention` (`retentionDays`), each at 0 from the start |
@@ -492,7 +545,7 @@ error as `err`.
 `deploy/observability/` has what watches a fleet: `prometheus.yml` scrapes the service's, the gateway's
 and the router's metrics listeners (the Kubernetes pods that ask to be, or addresses written down);
 `alerts.yml` holds Prometheus rules for a queue backing up, tasks or requests failing, failovers, an
-upstream's breaker open, a provider's keys used up, quota refusals, approval webhooks failing, a region
+upstream's breaker open, a provider's keys used up, quota refusals, webhooks failing, a region
 down, and the store's, the leases' or Redis's errors; and `grafana-dashboard.json` is a dashboard of all
 three, by region. Of the store's, `JigStoreErrors` (critical) is for reads and writes given up on, when
 tasks aren't started or a run's events or outcome aren't stored, and `JigStoreDegraded` (a warning) for
@@ -1104,7 +1157,9 @@ it as `task`; a client that leaves before its new task's body is read gets no an
 - `/v1/tasks/<id>` and what is under it (events, cancel, approvals) go to the region in the id: 404 for a
   region the router doesn't know or the tenant may not use; an id without one goes to the home. A stream
   of events is passed on as it comes, and a client that leaves it closes the request to the region.
-- `GET /v1/tasks` and `GET /v1/usage` go to `?region=` (the home by default; given twice, a 400).
+- `GET /v1/tasks`, `GET /v1/usage` and `GET /v1/limits` go to `?region=` (the home by default; given
+  twice, a 400). The router takes `region` off before it passes the request on: sent straight to a
+  region's service, `?region=` is an unknown parameter of the list and of the limits, a 400.
   `GET /v1/usage?region=all` asks every region the tenant may use and adds up their answers, the rows with
   the same day and model and the total, with `regions`, those that answered (502 if none did); it is JSON
   only. A client that leaves, or the router closing, ends those requests, and the client is neither

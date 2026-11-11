@@ -78,6 +78,17 @@ export function expired(created: string | Date, now: Date): boolean {
   return now.getTime() - new Date(created).getTime() >= IDEMPOTENCY_MS;
 }
 
+/** What a tenant has used of its caps at a moment (Store.standing), and how many of its tasks are running. */
+export interface Standing {
+  queued: number;
+  running: number;
+  /** Tasks created in the UTC day, whatever became of them. */
+  tasksToday: number;
+  /** USD spent by the tasks that ended in the UTC day, and in the UTC month. */
+  usdToday: number;
+  usdThisMonth: number;
+}
+
 /** What the metrics read from the store at a scrape: the same on every replica sharing it. */
 export interface Counts {
   /** Queued and running tasks by tenant, with when the oldest of them was created (an ISO time). */
@@ -236,6 +247,13 @@ export interface ClaimTerms {
  */
 export type Changes = EventEmitter;
 
+export interface TasksQuery {
+  status?: TaskStatus[];
+  limit?: number;
+  before?: string;
+  prompts?: boolean;
+}
+
 export interface Store {
   /** Adds the tenant, or updates its limits; its API keys (SHA-256 hashes, in hex) become these. */
   putTenant(tenant: Tenant, keyHashes: string[]): Promise<void>;
@@ -259,10 +277,16 @@ export interface Store {
   createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
   task(id: string): Promise<Task | undefined>;
   /**
-   * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
-   * without their prompts (an empty string in their place) and results (null) unless `prompts`.
+   * What the tenant has used of its caps at `now`, counted as createTask counts them but outside its lock:
+   * a task being admitted meanwhile may be missing from it.
    */
-  tasks(tenant: string, options?: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean }): Promise<Task[]>;
+  standing(tenant: string, now: Date): Promise<Standing>;
+  /**
+   * A tenant's tasks, newest first, at most `limit`, those in one of `status` if it is given, those older
+   * than the task `before` if it is given; without their prompts (an empty string in their place) and results (null) unless
+   * `prompts`.
+   */
+  tasks(tenant: string, options?: TasksQuery): Promise<Task[]>;
   /** Every tenant's tasks in a status, oldest first. */
   inStatus(status: TaskStatus): Promise<Task[]>;
   /** The tenants with tasks queued, by id. */
@@ -430,6 +454,15 @@ export function slimSpec(spec: Partial<TaskSpec>): Pick<TaskSpec, "maxSteps" | "
  */
 export const UNPURGED = "SELECT id, spec FROM tasks WHERE purged IS NULL AND ended IS NOT NULL AND ended < ? ORDER BY ended LIMIT ?";
 
+/** What a tenant has used of each cap, as admit counts it and standing reports it: the tenant, then the period's bounds. */
+const USED: Record<Cap, string> = {
+  maxQueued: "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'queued'",
+  tasksPerDay: "SELECT count(*) FROM tasks WHERE tenant = ? AND created >= ? AND created < ?",
+  usdPerDay: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?",
+  usdPerMonth: "SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?",
+};
+const RUNNING = "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'running'";
+
 // One replica's store, or several processes' on one machine: SQLite has no notifications, so changes
 // made by another process are found by looking again, and claims take its write lock.
 class SqliteStore implements Store {
@@ -545,10 +578,10 @@ class SqliteStore implements Store {
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
       const refused = refusal(caps, (cap) =>
-        cap === "maxQueued" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'queued'")
-        : cap === "tasksPerDay" ? one("SELECT count(*) FROM tasks WHERE tenant = ? AND created >= ? AND created < ?", dayStart.toISOString(), nextDay.toISOString())
-        : cap === "usdPerDay" ? one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?", day)
-        : one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?", isoDay(monthStart), isoDay(nextMonth)),
+        cap === "maxQueued" ? one(USED.maxQueued)
+        : cap === "tasksPerDay" ? one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString())
+        : cap === "usdPerDay" ? one(USED.usdPerDay, day)
+        : one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
       );
       if (refused) return Promise.resolve(refused);
       const id = this.add(tenant, spec, caps.now);
@@ -563,11 +596,36 @@ class SqliteStore implements Store {
     return row && toTask(row);
   }
 
-  async tasks(tenant: string, { status, limit = 100, before, prompts = false }: { status?: TaskStatus; limit?: number; before?: string; prompts?: boolean } = {}): Promise<Task[]> {
-    const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
-    const params = [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit];
-    const rows = this.db.prepare(`SELECT ${TASK_COLUMNS}, ${longColumns(prompts)} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`).all(...params);
-    return (rows as Row[]).map(toTask);
+  /** No statement here waits for another, so the five counts are of one moment. */
+  async standing(tenant: string, now: Date): Promise<Standing> {
+    const { day, dayStart, nextDay, monthStart, nextMonth } = periods(now);
+    const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
+    return {
+      queued: one(USED.maxQueued),
+      running: one(RUNNING),
+      tasksToday: one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString()),
+      usdToday: one(USED.usdPerDay, day),
+      usdThisMonth: one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
+    };
+  }
+
+  async tasks(tenant: string, { status = [], limit = 100, before, prompts = false }: TasksQuery = {}): Promise<Task[]> {
+    const one = (status: TaskStatus | undefined, columns: string) => {
+      const where = ["tenant = ?", ...(status ? ["status = ?"] : []), ...(before ? ["rowid < (SELECT rowid FROM tasks WHERE id = ? AND tenant = ?)"] : [])];
+      return {
+        sql: `SELECT ${TASK_COLUMNS}, ${longColumns(prompts)}${columns} FROM tasks WHERE ${where.join(" AND ")} ORDER BY rowid DESC LIMIT ?`,
+        params: [tenant, ...(status ? [status] : []), ...(before ? [before, tenant] : []), limit],
+      };
+    };
+    if (status.length < 2) {
+      const { sql, params } = one(status[0], "");
+      return (this.db.prepare(sql).all(...params) as Row[]).map(toTask);
+    }
+    // Several statuses: each one's newest `limit`, read in its index's order as a single status is, then the
+    // newest `limit` of those. status IN (...) would walk the tenant's whole history to sort it.
+    const arms = status.map((status) => one(status, ", rowid AS r"));
+    const sql = `${arms.map((arm) => `SELECT * FROM (${arm.sql})`).join(" UNION ALL ")} ORDER BY r DESC LIMIT ?`;
+    return (this.db.prepare(sql).all(...arms.flatMap((arm) => arm.params), limit) as Row[]).map(toTask);
   }
 
   async inStatus(status: TaskStatus): Promise<Task[]> {

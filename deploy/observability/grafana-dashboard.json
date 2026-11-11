@@ -494,7 +494,7 @@
       "id": 11,
       "type": "timeseries",
       "title": "Approvals",
-      "description": "Approvals waiting for an answer, how long they waited, and the approvals posted to webhooks, delivered or failed.",
+      "description": "Approvals waiting for an answer, how long they waited, and the approvals and task ends posted to webhooks, delivered or failed.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

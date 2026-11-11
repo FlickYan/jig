@@ -293,6 +293,18 @@ describe("the router", () => {
     assert.deepEqual(ids(await call(front.url, KEYS.acme, "GET", "/v1/tasks")), [hanging]);
     assert.deepEqual(ids(await call(front.url, KEYS.acme, "GET", "/v1/tasks?region=us")), [waiting]);
     assert.equal((await call(front.url, KEYS.globex, "GET", "/v1/tasks?region=us")).status, 403);
+    // So with its limits and what it has used of them: each region answers for itself.
+    const limits = async (key: string, query = "") => {
+      const { status, body } = await call(front.url, key, "GET", `/v1/limits${query}`);
+      return [status, body.region, body.used?.tasksToday];
+    };
+    assert.deepEqual(await limits(KEYS.acme), [200, "eu", 1]);
+    assert.deepEqual(await limits(KEYS.acme, "?region=us"), [200, "us", 1]);
+    assert.deepEqual(await limits(KEYS.initech, "?region=eu"), [200, "eu", 0]);
+    assert.deepEqual(await limits(KEYS.acme, "?region=all"), [400, "all", undefined]);
+    assert.deepEqual(await limits(KEYS.globex, "?region=us"), [403, "us", undefined]);
+    assert.equal((await call(front.url, KEYS.acme, "GET", "/v1/limits?region=us&region=eu")).status, 400);
+    assert.match(await (await fetch(`${front.metricsUrl}/metrics`)).text(), /^jig_router_requests_total\{region="us",route="limits",status="200"\} 1$/m);
 
     // An id in a region the tenant may not use, or one there isn't, is a task that doesn't exist.
     assert.deepEqual((await call(front.url, KEYS.globex, "GET", `/v1/tasks/${waiting}`)).body, { error: "No such task" });
