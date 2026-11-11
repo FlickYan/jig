@@ -187,7 +187,7 @@ makes the task again (Several regions, below). The request is checked before the
 replay whose body no longer passes, after a change of the config (a model removed, a lower limit), is a
 400. During a rolling upgrade a replica of the version before ignores the header and makes a task each
 time, and a task it makes meanwhile is ended with its model read from its spec (none in the ledger if the
-spec holds a `\\u` escape). The key isn't shown on the task. Keys past their 24 hours are deleted beside the
+spec holds a `\u` escape). The key isn't shown on the task. Keys past their 24 hours are deleted beside the
 folder sweep, so their table holds about a day of creates. It stops holding after its 24 hours, when the same key makes a new
 task, or sooner if its task's row is removed from the database. There is no key for a cancel or an
 approval's answer.
