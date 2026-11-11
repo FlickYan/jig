@@ -696,8 +696,8 @@ only the sandbox can do it, and the two together are refused. With it:
   folders and a `/dev` of its own.
 - jig's file tools follow no link from the project into the machine's `/tmp`, `/run` or `/dev/shm`.
 
-A task's `/tmp` now lies in its folder, on `dataDir`'s volume, with no quota of its own: put `dataDir` on
-a file system of its own. Where bash or a folder on the service's `PATH` is in `/run` (NixOS keeps the
+A task's `/tmp` now lies in its folder, on `dataDir`'s volume, and counts toward `maxTaskDiskBytes`
+(the disk cap, below); its `/run` and `/dev/shm` are memory, which the cap doesn't see. Where bash or a folder on the service's `PATH` is in `/run` (NixOS keeps the
 system's programs in `/run/current-system`), every command would fail to start, so the service doesn't
 start, and says to set `local.isolation` to `"shared"`. What is left to share: the kernel; Unix sockets
 at paths elsewhere (one in the service user's home, say), which would take seccomp to refuse; whatever
@@ -801,7 +801,10 @@ It is a check, not a quota, and these are its limits:
 - A task can go past the cap by what the disk takes in the time between two checks and the 5 seconds
   between SIGTERM and SIGKILL. The room to leave for that is the operator's to judge.
 - Not counted: a file written while it has no name (opened, then removed), `/tmp` and `/var/tmp` on the
-  local runner (the machine's own, which tasks share; a task's `TMPDIR` is in its folder and is counted),
+  local runner without `local.isolation` (the machine's own, which tasks share; a task's `TMPDIR` is in
+  its folder and is counted, as its `/tmp` and `/var/tmp` are under isolation), what a command writes to
+  `/run` and `/dev/shm` under isolation (memory, each up to half the machine's, until the command's
+  processes end),
   Docker's own log of the container, the folders `keepTaskDirs` keeps after their tasks, and a warm worker's
   folder while it waits for a task.
 - A task that times the walk can move data round it, or make a tree it has to give up on. The cap is
