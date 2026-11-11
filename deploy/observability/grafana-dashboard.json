@@ -717,6 +717,15 @@
           "expr": "max by (instance) (jig_service_db_pool_connections{region=~\"$region\",state=\"waiting\"})",
           "legendFormat": "waiting for a database connection, {{instance}}",
           "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (reason) (increase(jig_service_tasks_purged_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "tasks purged: {{reason}}",
+          "refId": "F"
         }
       ]
     },

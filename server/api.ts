@@ -111,6 +111,8 @@ export interface Config {
   maxResultBytes?: number;
   /** Keep each task's folder after it ends. */
   keepTaskDirs?: boolean;
+  /** Days after a task ends that its content is deleted (as DELETE /v1/tasks/:id does); kept for good without it. */
+  retentionDays?: number;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
@@ -327,9 +329,10 @@ export async function startService(
     if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
       log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
     }
-    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, gitHosts } = config;
+    const { concurrency = 4, replicaId, leaseSeconds = 30, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionDays, gitHosts } = config;
+    const retentionMs = retentionDays === undefined ? undefined : retentionDays * 86_400_000;
     const onApproval = (task: Task, approval: Approval) => webhooks.send(task, approval);
-    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, gitHosts, onApproval, metrics, log });
+    scheduler = new Scheduler(store, runner, { concurrency, replicaId, leaseMs: leaseSeconds * 1000, maxEvents, maxEventBytes, maxResultBytes, keepTaskDirs, retentionMs, gitHosts, onApproval, metrics, log });
     await scheduler.start();
   } catch (err) {
     // Its port is taken, say: what has started stops.
@@ -647,6 +650,7 @@ function configProblem(config: Config): string | undefined {
     whole("maxEvents", config.maxEvents, 1) ??
     whole("maxEventBytes", config.maxEventBytes, 1) ??
     whole("maxResultBytes", config.maxResultBytes, 1) ??
+    positive("retentionDays", config.retentionDays, false, 36_500) ??
     whole("maxStreams", config.maxStreams, 1) ??
     // Checked here, so a runner that can't start is refused before the store is changed.
     (["local", "docker", "kubernetes"].includes(runner) ? undefined : `runner must be local, docker or kubernetes, not ${JSON.stringify(runner)}`) ??
@@ -754,7 +758,13 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   const task = match && (await context.store.task(match[1]));
   if (!match || !task || task.tenant !== tenant.id) return reply(res, 404, { error: "No such task" });
   const [, , action, approval] = match;
-  if (!action) return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET" });
+  if (!action) {
+    if (req.method === "DELETE") return purge(res, task, context);
+    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
+  }
+  // A purged task has neither events nor approvals left: said once, here, for every way of asking for them,
+  // rather than an empty stream or list that would read as a run that wrote nothing. A cancel says it has ended.
+  if (task.purged !== null && action !== "/cancel") return reply(res, 410, { error: "The task's events and approvals were deleted", id: task.id, purged: task.purged });
   if (action === "/approvals") return req.method === "GET" ? reply(res, 200, { approvals: await context.store.approvals(task.id) }) : reply(res, 405, { error: "Use GET" });
   if (approval !== undefined) return answer(req, res, task, approval, context);
   if (action === "/cancel") {
@@ -836,6 +846,20 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   context.metrics.created.inc({ tenant: tenant.id });
   void context.scheduler.poke();
   reply(res, 201, { id: task.id, status: task.status });
+}
+
+/**
+ * DELETE /v1/tasks/:id: deletes an ended task's content (Store.purge) and answers with what is left of it,
+ * 200, however often it is asked; 409 for a task that hasn't ended, which is cancelled first.
+ */
+async function purge(res: ServerResponse, task: Task, { store, metrics, region }: Context): Promise<void> {
+  const purged = await store.purge(task.id);
+  if (!purged) return reply(res, 404, { error: "No such task" });
+  const { id, status } = purged.task;
+  if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
+  // Once a task, however many deletes it gets, at once or one after another.
+  if (purged.first) metrics.purged.inc({ reason: "api" });
+  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
 }
 
 /** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */

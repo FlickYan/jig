@@ -41,7 +41,7 @@ async function fakeJig(dir: string): Promise<string> {
 
 function task(id: string): Task {
   const now = new Date().toISOString();
-  return { id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, usage: null, cost: null, result: null, resultTruncated: false };
+  return { id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, usage: null, cost: null, result: null, resultTruncated: false, purged: null };
 }
 
 /** A local runner on `dataDir` whose jig writes its arguments to `out` and then sleeps `seconds`. */

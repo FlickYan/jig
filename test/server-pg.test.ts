@@ -569,7 +569,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
     const store = await openStore(url);
     closers.push(() => store.close());
-    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 8);
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
     // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
     assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
       { id: "task_1", model: "deepseek-flash" },
@@ -586,5 +586,47 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual((await store.task("task_6"))!.spec.workspace, lone.workspace);
     const rows = await store.usage(byModel);
     assert.deepEqual(rows.map((row) => [row.model, row.tasks]).sort(), [["", 5], ["deepseek-flash", 2]]);
+  });
+
+  it("opens a database whose purged column and index were made by hand, ahead of the upgrade", async () => {
+    const url = await postgresDatabase();
+    await (await openStore(url)).close();
+    const db = pool(url);
+    // As schema 8 left it, then the two statements docs/server.md gives for a large table.
+    await db.query("DROP INDEX tasks_unpurged");
+    await db.query("ALTER TABLE tasks DROP COLUMN purged");
+    await db.query("UPDATE jig_schema SET version = 8");
+    await db.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz");
+    await db.query("CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL");
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
+    assert.deepEqual((await db.query("SELECT indisvalid FROM pg_index WHERE indexrelid = 'tasks_unpurged'::regclass")).rows, [{ indisvalid: true }]);
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const task = await store.createTask("a", PLAIN);
+    assert.equal(await store.cancelQueued(task.id), true);
+    assert.equal((await store.purge(task.id))!.first, true);
+  });
+
+  it("purges tasks whose stored spec holds a NUL or half a surrogate pair, one by its id and the rest by their age", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    const db = pool(url);
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    // Inserted as an older version let them in: the API refuses a NUL in a file now.
+    const { prompt: _, ...plain } = PLAIN;
+    const specs = { task_1: { ...plain, workspace: WITH_NUL.workspace }, task_2: { ...plain, workspace: WITH_NUL.workspace }, task_3: { ...plain, workspace: { files: { "a.txt": "x\ud800y" } } } };
+    for (const [id, spec] of Object.entries(specs)) {
+      await db.query("INSERT INTO tasks (id, tenant, prompt, spec, model, status, created, started, ended) VALUES ($1, 'a', 'the prompt', $2, 'deepseek-flash', 'succeeded', now(), now(), now() - interval '1 hour')", [id, JSON.stringify(spec)]);
+      await store.addEvent(id, 1, { v: 1, seq: 1, ts: "", type: "text", text: "said\u0000" });
+    }
+    const slim = { prompt: "", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const purged = (await store.purge("task_1"))!;
+    assert.deepEqual([purged.first, purged.task.spec], [true, slim]);
+    // Retried while another test file's purge holds the database's lock.
+    assert.equal(await until(() => store.purgeEnded(60_000, 10), "the rest to be purged"), 2);
+    for (const id of Object.keys(specs)) assert.deepEqual([(await store.task(id))!.spec, await store.events(id)], [slim, []]);
+    assert.deepEqual((await db.query("SELECT spec::text AS spec FROM tasks WHERE id = 'task_3'")).rows, [{ spec: JSON.stringify(plain) }]);
   });
 });

@@ -25,6 +25,9 @@ import { type Approval, FINISHED, type Outcome, spentOf, type Store, type Task, 
 // A run's folder is removed as it ends; one a crashed replica left is removed by the sweep at the next start,
 // or every tenth round, once its task has ended over a lease ago, or the store doesn't have it and the folder
 // hasn't changed for a lease (ten minutes at least).
+//
+// With retentionMs, the tasks that ended longer ago than that are purged (Store.purge), at the start and
+// every tenth round too: a few at a time, by one replica at a time.
 
 /** What followers of a task hear: each event once it is stored, then the status it ended with. */
 export type Update = { event: JigEvent } | { done: TaskStatus };
@@ -44,6 +47,8 @@ export interface SchedulerOptions {
   maxResultBytes?: number;
   /** Keep each task's folder after it ends, instead of removing it. */
   keepTaskDirs?: boolean;
+  /** Purge the tasks that ended over this many milliseconds ago (the config's retentionDays); none without it. */
+  retentionMs?: number;
   /** The hosts a workspace may be cloned from (default: any), checked again as each task starts. */
   gitHosts?: string[];
   /** Called once an approval a run asked for is stored (to tell its tenant), not waited for. */
@@ -71,6 +76,11 @@ const EXPIRED = `${SHUTDOWN} (the replica running it stopped renewing its lease:
 const LOST = "the replica running it lost its lease on it, and stopped it";
 /** How long a folder whose task the store doesn't have must be left unchanged before it is swept, at the least. */
 const UNKNOWN_MS = 10 * 60_000;
+/**
+ * The tasks retention purges in one transaction. Few, as SQLite's holds the event loop while it deletes
+ * their events: about 0.4 s for a task with 64 MiB of them, so about 2 s at the worst.
+ */
+const RETAIN_BATCH = 5;
 
 export class Scheduler {
   /** Emits a task's updates under its id. */
@@ -95,6 +105,7 @@ export class Scheduler {
   /** The rounds of renewals that got through and ended what was gone: every tenth sweeps the folders. */
   private rounds = 0;
   private sweeping?: Promise<void>;
+  private retaining?: Promise<void>;
 
   private store: Store;
   private runner: Runner;
@@ -104,12 +115,13 @@ export class Scheduler {
   private maxEventBytes: number;
   private maxResultBytes: number;
   private keepTaskDirs: boolean;
+  private retentionMs?: number;
   private gitHosts?: string[];
   private onApproval?: (task: Task, approval: Approval) => void;
   private metrics: ServiceMetrics;
   private log: Log;
 
-  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, maxResultBytes = 64 * 1024, keepTaskDirs = false, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
+  constructor(store: Store, runner: Runner, { concurrency, replicaId, leaseMs = 30_000, maxEvents = 10_000, maxEventBytes = 64 * 1024 * 1024, maxResultBytes = 64 * 1024, keepTaskDirs = false, retentionMs, gitHosts, onApproval, metrics, log }: SchedulerOptions) {
     this.store = store;
     this.runner = runner;
     this.concurrency = concurrency;
@@ -119,6 +131,7 @@ export class Scheduler {
     this.maxEventBytes = maxEventBytes;
     this.maxResultBytes = maxResultBytes;
     this.keepTaskDirs = keepTaskDirs;
+    this.retentionMs = retentionMs;
     this.gitHosts = gitHosts;
     this.onApproval = onApproval;
     this.metrics = metrics ?? serviceMetrics();
@@ -145,6 +158,7 @@ export class Scheduler {
     // starts as it comes back), and the live ones are owed a round to renew theirs.
     // Not waited for: a disk full of left folders, each run stopped in turn, mustn't hold up the API.
     void this.sweep();
+    void this.retain();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
   }
@@ -174,7 +188,10 @@ export class Scheduler {
         else {
           await this.expire(Math.max(0, took - this.leaseMs / 3));
           // Not waited for: a slow disk mustn't hold up the renewals.
-          if (++this.rounds % 10 === 0) void this.sweep();
+          if (++this.rounds % 10 === 0) {
+            void this.sweep();
+            void this.retain();
+          }
         }
         // A slot another replica freed, or a task it queued, is looked for here.
         void this.poke();
@@ -263,6 +280,34 @@ export class Scheduler {
     return this.sweeping;
   }
 
+  /**
+   * Purges the tasks that ended over retentionMs ago, RETAIN_BATCH at a time until a batch comes back short:
+   * nothing is left, or another replica is at it. The event loop gets a turn between batches, and the service
+   * starting to stop ends it after the batch in flight. Beside the folder sweep rather than in it, as that
+   * one does nothing with keepTaskDirs. A failure is logged and counted, and the next sweep tries again.
+   */
+  private retain(): Promise<void> {
+    const { retentionMs } = this;
+    if (retentionMs === undefined) return Promise.resolve();
+    this.retaining ??= (async () => {
+      let purged = 0;
+      try {
+        while (!this.paused) {
+          const batch = await this.store.purgeEnded(retentionMs, RETAIN_BATCH);
+          purged += batch;
+          this.metrics.purged.inc({ reason: "retention" }, batch);
+          if (batch < RETAIN_BATCH) break;
+          await new Promise((done) => setImmediate(done));
+        }
+      } catch (err) {
+        this.metrics.storeErrors.inc({ retried: "false" });
+        this.log.error("couldn't purge the tasks that ended longer ago than retentionDays", { err });
+      }
+      if (purged) this.log.info(`purged ${purged} task(s) that ended longer ago than retentionDays`);
+    })().finally(() => (this.retaining = undefined));
+    return this.retaining;
+  }
+
   /** Counts a task that this replica ended, and how long it ran (in milliseconds) if it started. */
   private ended(task: Task, status: TaskStatus, ms?: number): void {
     this.metrics.ended.inc({ tenant: task.tenant, status });
@@ -341,6 +386,7 @@ export class Scheduler {
     await this.settled();
     await this.keeping;
     await this.sweeping;
+    await this.retaining;
     await Promise.all(this.abandoning);
     // Counted no more among the replicas up; one that can't say so is forgotten when its heartbeat runs out.
     await this.store.leave(this.replicaId).catch(() => {});

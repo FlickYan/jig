@@ -437,6 +437,26 @@ const quotaTests = () => {
     assert.equal(second.status, 201);
     assert.deepEqual((await sql(api.database, "SELECT task FROM idempotency")).map((row) => row.task), [second.body.id]);
   });
+
+  it("counts a deleted task toward tasksPerDay still, and keeps it in the usage reports and the day's spending", async () => {
+    clock = new Date();
+    const api = await service({ tasksPerDay: 2 });
+    const ids = [await ran(api, KEYS.acme), await ran(api, KEYS.acme)];
+    const usage = async () => (await call(api, KEYS.acme, "GET", "/v1/usage?group=day,model")).body;
+    const before = await usage();
+    assert.deepEqual([before.total.tasks, before.total.costUsd], [2, 0.004]);
+    for (const id of ids) assert.equal((await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`)).status, 200);
+    assert.deepEqual(await usage(), before);
+    const refused = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.deepEqual([refused.status, refused.body.quota, refused.body.used], [429, "tasksPerDay", 2]);
+
+    // What a deleted task spent still stands against usdPerDay.
+    const spent = await service({ usdPerDay: 0.002 });
+    const id = await ran(spent, KEYS.acme);
+    assert.equal((await call(spent, KEYS.acme, "DELETE", `/v1/tasks/${id}`)).status, 200);
+    const over = await call(spent, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
+    assert.deepEqual([over.status, over.body.quota, over.body.used], [429, "usdPerDay", 0.002]);
+  });
 };
 
 for (const { name, skip } of BACKENDS) {

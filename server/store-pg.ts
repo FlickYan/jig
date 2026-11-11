@@ -26,6 +26,7 @@ import {
   type Replay,
   refusal,
   spentOf,
+  slimSpec,
   type Store,
   TASK_COLUMNS,
   longColumns,
@@ -55,6 +56,8 @@ const APPROVALS = "jig_approvals";
 // pg_advisory_xact_lock's keys: claims, and migrations (so two replicas starting at once don't both run them).
 const CLAIM_LOCK = 7_366_000_001;
 const MIGRATE_LOCK = 7_366_000_002;
+// Retention's: one replica purges at a time (pg_try_advisory_xact_lock; the others leave it to that one).
+const RETAIN_LOCK = 7_366_000_003;
 // With a tenant's hashtext, a lock of its own on its new tasks: two 32-bit keys, a key space apart from the above.
 const CREATE_LOCK = 7366;
 
@@ -109,11 +112,26 @@ const MIGRATIONS = [
   // adding it locks and scans nothing of tasks. No foreign key to tasks: it would take a lock on tasks to
   // add, and a key's row may outlive its task or go before it (a key whose task is gone is as one never used).
   `CREATE TABLE idempotency (tenant text NOT NULL, key text NOT NULL, hash text NOT NULL, task text NOT NULL, created timestamptz NOT NULL, PRIMARY KEY (tenant, key))`,
+  // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
+  // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged. Both
+  // may be there already: made by hand ahead of the upgrade, on a large table (docs/server.md).
+  `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz;
+   CREATE INDEX IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
 const NOTIFY_DONE = `SELECT id, pg_notify('${EVENTS}', json_build_object('task', id, 'done', status)::text) FROM done`;
 const IDS = "SELECT json_array_elements_text($1::json)";
+
+/**
+ * A CTE with the task an event or an approval is for ($1), if it still keeps them: none for a purged task,
+ * so nothing is stored for it, silently, as for a seq already kept. FOR KEY SHARE is the lock the insert's
+ * foreign key takes on the task anyway: a purge (FOR UPDATE) waits for it and it for a purge, and it then
+ * sees the task purged; a renewal of the task's lease doesn't wait for it, as it would for FOR SHARE.
+ */
+const LIVE = "live AS (SELECT id FROM tasks WHERE id = $1 AND purged IS NULL FOR KEY SHARE)";
+/** What a purge leaves of a task's row, but for its spec: see Store.purge. */
+const BLANK = "prompt = '', error = NULL, stats = NULL, result = NULL, result_truncated = false";
 
 /** What a statement that ends tasks returns of each, for the ledger: the model from its column, not the spec. */
 const DONE = `${ENDED}, model`;
@@ -333,7 +351,7 @@ export class PostgresStore implements Store {
 
   async addEvent(task: string, seq: number, event: object): Promise<void> {
     await this.pool.query(
-      `WITH added AS (INSERT INTO events (task, seq, json) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING RETURNING task, seq)
+      `WITH ${LIVE}, added AS (INSERT INTO events (task, seq, json) SELECT id, $2::integer, $3::text FROM live ON CONFLICT DO NOTHING RETURNING task, seq)
        SELECT pg_notify('${EVENTS}', json_build_object('task', task, 'seq', seq)::text) FROM added`,
       [task, seq, JSON.stringify(event)],
     );
@@ -354,7 +372,10 @@ export class PostgresStore implements Store {
 
   async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
     const [row] = (
-      await this.pool.query("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES ($1, $2, $3, $4, $5, now()) ON CONFLICT DO NOTHING RETURNING *", [task, id, step, tool, description])
+      await this.pool.query(
+        `WITH ${LIVE} INSERT INTO approvals (task, id, step, tool, description, requested_at) SELECT id, $2::text, $3::integer, $4::text, $5::text, now() FROM live ON CONFLICT DO NOTHING RETURNING *`,
+        [task, id, step, tool, description],
+      )
     ).rows;
     return row && toApproval(row);
   }
@@ -400,6 +421,45 @@ export class PostgresStore implements Store {
   async pendingApprovals(tasks: string[]): Promise<Map<string, number>> {
     const { rows } = await this.pool.query(`SELECT task, count(*) AS n FROM approvals WHERE task IN (${IDS}) AND decision IS NULL GROUP BY task`, [json(tasks)]);
     return new Map(rows.map((row) => [String(row.task), Number(row.n)]));
+  }
+
+  // No statement here reads into a stored spec with SQL (see MIGRATIONS): what is kept of it is worked out
+  // here and written back whole.
+  async purge(id: string): Promise<{ task: Task; first: boolean } | undefined> {
+    return this.pool.transaction(async (db) => {
+      // FOR UPDATE, which the UPDATE below wouldn't take by itself (it changes no key): an event or an
+      // approval being stored holds FOR KEY SHARE on the task, and is waited for, then deleted with the rest.
+      const [row] = (await db.query("SELECT spec, purged FROM tasks WHERE id = $1 AND ended IS NOT NULL FOR UPDATE", [id])).rows;
+      if (!row) {
+        // Not ended, or not there.
+        const [task] = (await db.query("SELECT * FROM tasks WHERE id = $1", [id])).rows;
+        return task && { task: toTask(task), first: false };
+      }
+      const [task] = (await db.query(`UPDATE tasks SET purged = coalesce(purged, now()), ${BLANK}, spec = $2 WHERE id = $1 RETURNING *`, [id, json(slimSpec(row.spec as Partial<TaskSpec>))])).rows;
+      await db.query("DELETE FROM events WHERE task = $1", [id]);
+      await db.query("DELETE FROM approvals WHERE task = $1", [id]);
+      return { task: toTask(task), first: row.purged === null };
+    });
+  }
+
+  async purgeEnded(olderThanMs: number, limit: number): Promise<number> {
+    return this.pool.transaction(async (db) => {
+      const [lock] = (await db.query(`SELECT pg_try_advisory_xact_lock(${RETAIN_LOCK}) AS mine`)).rows;
+      if (lock.mine !== true) return 0;
+      // The database's clock, not the replicas', says what is old enough. SKIP LOCKED passes over a task a
+      // DELETE is purging meanwhile.
+      const { rows } = await db.query(
+        "SELECT id, spec FROM tasks WHERE purged IS NULL AND ended IS NOT NULL AND ended < now() - $1 * interval '1 millisecond' ORDER BY ended LIMIT $2 FOR UPDATE SKIP LOCKED",
+        [olderThanMs, limit],
+      );
+      if (!rows.length) return 0;
+      // Each task's id with what is kept of its spec, which the three statements read their tasks from.
+      const slim = json(Object.fromEntries(rows.map((row) => [String(row.id), slimSpec(row.spec as Partial<TaskSpec>)])));
+      await db.query(`UPDATE tasks SET purged = now(), ${BLANK}, spec = s.value FROM json_each($1::json) s WHERE tasks.id = s.key`, [slim]);
+      await db.query("DELETE FROM events WHERE task IN (SELECT json_object_keys($1::json))", [slim]);
+      await db.query("DELETE FROM approvals WHERE task IN (SELECT json_object_keys($1::json))", [slim]);
+      return rows.length;
+    });
   }
 
   async usage(query: UsageQuery): Promise<UsageRow[]> {

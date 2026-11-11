@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { type Config, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
+import { Pool } from "../server/pg.ts";
 import { type Leftover, type RunHandle, type Runner, taskFolders } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { LocalRunner } from "../server/runners/local.ts";
@@ -254,6 +255,128 @@ for (const { name, skip } of BACKENDS) {
     });
   });
 }
+
+describe("replicas purging tasks on one Postgres", { skip: NO_POSTGRES }, () => {
+  const TERMS = { owner: "r1", leaseMs: 60_000, concurrency: 200, tenantConcurrency: 200 };
+  const OUTCOME = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+  const text = (seq: number) => ({ v: 1, seq, ts: "", type: "text", text: "said" });
+
+  /** Two stores on one new database, a pool of the test's own on it, and a tenant "a". */
+  async function two(): Promise<{ one: Store; other: Store; db: Pool }> {
+    const url = await postgresDatabase();
+    const [one, other] = [await openStore(url), await openStore(url)];
+    const db = new Pool(url);
+    opened.push(() => one.close(), () => other.close(), () => db.close());
+    await one.putTenant({ id: "a", limits: { ...LIMITS, concurrency: 200 } }, []);
+    return { one, other, db };
+  }
+
+  it("purge each old task once between them, a batch at a time", async () => {
+    const { one, other, db } = await two();
+    for (let i = 0; i < 100; i++) {
+      const { id } = await one.createTask("a", QUIET);
+      await one.claim("a", TERMS);
+      await one.addEvent(id, 1, text(1));
+      await one.finish(id, "r1", OUTCOME);
+    }
+    await sleep(20);
+    const left = async () => Number((await db.query("SELECT count(*) AS n FROM tasks WHERE purged IS NULL")).rows[0].n);
+    // Each until none is left: a batch is 0 while the other replica, or another test file, holds the lock.
+    const loop = async (store: Store) => {
+      const batches: number[] = [];
+      for (;;) {
+        const batch = await store.purgeEnded(1, 20);
+        if (batch) batches.push(batch);
+        else if (!(await left())) return batches;
+      }
+    };
+    const batches = (await Promise.all([loop(one), loop(other)])).flat();
+    assert.equal(batches.reduce((sum, batch) => sum + batch, 0), 100, batches.join(" "));
+    assert.ok(batches.every((batch) => batch <= 20), batches.join(" "));
+    assert.deepEqual((await db.query("SELECT (SELECT count(*) FROM events) AS events, (SELECT count(*) FROM tasks WHERE prompt = '') AS blank")).rows, [{ events: 0, blank: 100 }]);
+  });
+
+  it("leave no event of a purged task, whichever of the purge and the event's write comes first", async () => {
+    const { one, other, db } = await two();
+    const ended = async () => {
+      const { id } = await one.createTask("a", QUIET);
+      await one.claim("a", TERMS);
+      await one.finish(id, "r1", OUTCOME);
+      return id;
+    };
+    const events = async (id: string) => Number((await db.query("SELECT count(*) AS n FROM events WHERE task = $1", [id])).rows[0].n);
+    /** A transaction of the test's own, held open until `commit` is called. */
+    const held = async (begin: (client: Parameters<Parameters<Pool["transaction"]>[0]>[0]) => Promise<unknown>) => {
+      let commit!: () => void;
+      const go = new Promise<void>((done) => (commit = done));
+      let began!: () => void;
+      const ready = new Promise<void>((done) => (began = done));
+      const done = db.transaction(async (client) => {
+        await begin(client);
+        began();
+        await go;
+      });
+      await ready;
+      // Let go after a test that failed too, or the pool's close would wait for it.
+      opened.push(() => (commit(), done));
+      return { commit: () => (commit(), done) };
+    };
+    const pending = async (promise: Promise<unknown>) => (await Promise.race([promise.then(() => false), sleep(200).then(() => true)]));
+
+    // An event being written as the purge comes: the purge waits for it, then deletes it with the rest.
+    const first = await ended();
+    const writing = await held(async (client) => {
+      await client.query("SELECT id FROM tasks WHERE id = $1 AND purged IS NULL FOR KEY SHARE", [first]);
+      await client.query("INSERT INTO events (task, seq, json) VALUES ($1, 1, '{}')", [first]);
+    });
+    const purge = other.purge(first);
+    assert.equal(await pending(purge), true);
+    await writing.commit();
+    assert.equal((await purge)!.first, true);
+    assert.equal(await events(first), 0);
+
+    // A purge under way as the event comes: its write waits for the purge, then stores nothing.
+    const second = await ended();
+    const purging = await held(async (client) => {
+      await client.query("SELECT spec FROM tasks WHERE id = $1 FOR UPDATE", [second]);
+      await client.query("UPDATE tasks SET purged = now() WHERE id = $1", [second]);
+    });
+    const [event, approval] = [one.addEvent(second, 1, text(1)), one.addApproval(second, { id: "ap_1", step: 1, tool: "bash", description: "rm" })];
+    assert.deepEqual([await pending(event), await pending(approval)], [true, true]);
+    await purging.commit();
+    assert.deepEqual([await event, await approval], [undefined, undefined]);
+    assert.deepEqual([await events(second), await one.approvals(second)], [0, []]);
+  });
+
+  it("renew a task's lease while one of its events is being written", async () => {
+    const { one, other, db } = await two();
+    const { id } = await one.createTask("a", QUIET);
+    await one.claim("a", TERMS);
+    // The store's own write of seq 1 waits for this one, of the same seq, holding its lock on the task.
+    let rollback!: () => void;
+    const undo = new Promise<void>((done) => (rollback = done));
+    let began!: () => void;
+    const ready = new Promise<void>((done) => (began = done));
+    const open = db
+      .transaction(async (client) => {
+        await client.query("INSERT INTO events (task, seq, json) VALUES ($1, 1, '{}')", [id]);
+        began();
+        await undo;
+        throw new Error("rolled back");
+      })
+      .catch(() => {});
+    opened.push(() => (rollback(), open));
+    await ready;
+    const event = one.addEvent(id, 1, text(1));
+    await until(async () => Number((await db.query("SELECT count(*) AS n FROM pg_locks WHERE NOT granted AND locktype = 'transactionid'")).rows[0].n) > 0 || undefined, "the event's write to wait");
+    const renewed = await Promise.race([other.renew([id], "r1", 60_000), sleep(3000).then(() => "waited")]);
+    assert.deepEqual(renewed, [{ id, cancel: false }]);
+    rollback();
+    await open;
+    await event;
+    assert.equal((await one.events(id)).length, 1);
+  });
+});
 
 /** A store on the SQLite file, closed after the test. */
 async function sqliteStore(file: string): Promise<Store> {

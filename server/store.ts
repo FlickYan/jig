@@ -165,6 +165,8 @@ export interface Task {
   result: string | null;
   /** Whether the result is only the start of that text. */
   resultTruncated: boolean;
+  /** When its content was deleted (Store.purge), by a DELETE or by retention; null while it is kept. */
+  purged: string | null;
 }
 
 /** What a finished run leaves on its task. */
@@ -308,6 +310,20 @@ export interface Store {
   given(task: string, id: string): Promise<Given | undefined>;
   /** How many of each task's approvals have no answer yet; a task with none is left out. */
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
+  /**
+   * Deletes an ended task's content, in one transaction: its events and approvals, its prompt (left empty),
+   * its error, stats and result, and its spec but for slimSpec's fields. Its row stays, with its status,
+   * times, usage and cost, and so do its row of the usage ledger and its Idempotency-Key. Undefined if there
+   * is no such task; one that hasn't ended is left as it is, and comes back with `purged` null. `first` says
+   * this call is the one that purged it: a task purged already is purged again, and keeps its time.
+   */
+  purge(id: string): Promise<{ task: Task; first: boolean } | undefined>;
+  /**
+   * Purges the tasks that ended over `olderThanMs` ago, by the store's clock, and aren't purged yet: the
+   * oldest `limit` of them, in one transaction. How many it purged; on Postgres, 0 while another replica is
+   * at it.
+   */
+  purgeEnded(olderThanMs: number, limit: number): Promise<number>;
   /** The usage ledger summed by the query's groups, sorted by them; a group with no ended task is left out. */
   usage(query: UsageQuery): Promise<UsageRow[]>;
   /** Says the replica is up for `ms` more, and forgets those whose heartbeat ran out. */
@@ -384,14 +400,35 @@ const MIGRATIONS = [
   // adding it locks and scans nothing of tasks. No foreign key to tasks: a key's row may outlive its task
   // or go before it, and a key whose task is gone is as one never used.
   `CREATE TABLE idempotency (tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, task TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tenant, key));`,
+  // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
+  // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged.
+  `ALTER TABLE tasks ADD COLUMN purged TEXT;
+   CREATE INDEX tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL;`,
 ];
 
 type Row = Record<string, unknown>;
 
 /** A task's columns but its prompt and its result, which a list leaves out. */
-export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost, result_truncated";
+export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost, result_truncated, purged";
 /** The two it leaves out, or what stands in their place, for a list's SELECT. */
 export const longColumns = (prompts: boolean): string => (prompts ? "prompt, result" : "'' AS prompt, NULL AS result");
+
+/**
+ * What is left of a purged task's spec: its limits, its model and how it asked, which the API's views show.
+ * The workspace (its files, or its repository's URL, which may hold a token) goes, as the prompt does.
+ * Computed here, from the spec as it was read, and written back whole: SQL's JSON operators refuse a stored
+ * "\u0000" on Postgres.
+ */
+export function slimSpec(spec: Partial<TaskSpec>): Pick<TaskSpec, "maxSteps" | "timeLimit" | "model" | "approvals" | "mode"> {
+  const { maxSteps, timeLimit, model, approvals, mode } = spec;
+  return { maxSteps: maxSteps!, timeLimit: timeLimit!, model: model!, ...(approvals !== undefined && { approvals }), ...(mode !== undefined && { mode }) };
+}
+
+/**
+ * SQLite's pick of the tasks retention purges next: `?` is the time they ended before, then how many. It
+ * says the tasks_unpurged index's own condition, word for word, or SQLite wouldn't use the index.
+ */
+export const UNPURGED = "SELECT id, spec FROM tasks WHERE purged IS NULL AND ended IS NOT NULL AND ended < ? ORDER BY ended LIMIT ?";
 
 // One replica's store, or several processes' on one machine: SQLite has no notifications, so changes
 // made by another process are found by looking again, and claims take its write lock.
@@ -415,7 +452,10 @@ class SqliteStore implements Store {
       throw new Error(`Couldn't open the database ${path}: ${err instanceof Error ? err.message : String(err)}`);
     }
     // WAL lets readers go on while a run's events are written; the timeout rides out another process's write.
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    // secure_delete overwrites what a delete or a shorter value frees with zeros, so a purged task's prompt
+    // and events aren't left readable in the file's free pages. It costs where much is deleted: measured,
+    // a task's 64 MiB of events go in about 0.3 s rather than 0.02, and the WAL grows by as much meanwhile.
+    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;");
     const version = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
     if (version > MIGRATIONS.length) throw new Error(`${path} was made by a newer version of the task service (schema ${version})`);
     for (let next = version; next < MIGRATIONS.length; next++) {
@@ -656,8 +696,41 @@ class SqliteStore implements Store {
     }
   }
 
+  async purge(id: string): Promise<{ task: Task; first: boolean } | undefined> {
+    return this.atomically(() => {
+      const row = this.db.prepare("SELECT id, spec, ended, purged FROM tasks WHERE id = ?").get(id) as Row | undefined;
+      if (!row) return undefined;
+      if (row.ended !== null) this.blank([row]);
+      return { task: toTask(this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row), first: row.ended !== null && row.purged === null };
+    }, "BEGIN IMMEDIATE");
+  }
+
+  async purgeEnded(olderThanMs: number, limit: number): Promise<number> {
+    return this.atomically(() => {
+      const rows = this.db.prepare(UNPURGED).all(new Date(Date.now() - olderThanMs).toISOString(), limit) as Row[];
+      this.blank(rows);
+      return rows.length;
+    }, "BEGIN IMMEDIATE");
+  }
+
+  /** Deletes the content of ended tasks (their id and spec columns), inside a transaction: see Store.purge. */
+  private blank(rows: Row[]): void {
+    const now = new Date().toISOString();
+    const update = this.db.prepare("UPDATE tasks SET prompt = '', spec = ?, error = NULL, stats = NULL, result = NULL, result_truncated = 0, purged = coalesce(purged, ?) WHERE id = ?");
+    const events = this.db.prepare("DELETE FROM events WHERE task = ?");
+    const approvals = this.db.prepare("DELETE FROM approvals WHERE task = ?");
+    for (const row of rows) {
+      const id = String(row.id);
+      update.run(JSON.stringify(slimSpec(JSON.parse(String(row.spec)) as Partial<TaskSpec>)), now, id);
+      events.run(id);
+      approvals.run(id);
+    }
+  }
+
+  // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a
+  // replica that hadn't heard. Silently, as for a seq already kept.
   async addEvent(task: string, seq: number, event: object): Promise<void> {
-    this.db.prepare("INSERT OR IGNORE INTO events (task, seq, json) VALUES (?, ?, ?)").run(task, seq, JSON.stringify(event));
+    this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`).run(task, seq, JSON.stringify(event));
   }
 
   async events(task: string, after = 0, limit?: number, bytes = Infinity): Promise<{ seq: number; event: object }[]> {
@@ -675,7 +748,7 @@ class SqliteStore implements Store {
 
   async addApproval(task: string, { id, step, tool, description }: ApprovalRequest): Promise<Approval | undefined> {
     const row = this.db
-      .prepare("INSERT INTO approvals (task, id, step, tool, description, requested_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING RETURNING *")
+      .prepare(`INSERT INTO approvals (task, id, step, tool, description, requested_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6 WHERE ${LIVE} ON CONFLICT DO NOTHING RETURNING *`)
       .get(task, id, step, tool, description, new Date().toISOString()) as Row | undefined;
     return row && toApproval(row);
   }
@@ -735,6 +808,9 @@ class SqliteStore implements Store {
 export const idempotent = (tenant: string, key: string) =>
   `SELECT i.hash AS idem_hash, i.created AS idem_created, t.* FROM idempotency i LEFT JOIN tasks t ON t.id = i.task WHERE i.tenant = ${tenant} AND i.key = ${key}`;
 const IDEMPOTENT = idempotent("?", "?");
+
+/** Whether the task an event or an approval is for (?1) still keeps them, in SQLite's inserts. */
+const LIVE = "EXISTS (SELECT 1 FROM tasks WHERE id = ?1 AND purged IS NULL)";
 
 // What the metrics count, in SQL either store runs: through the status index, and the approvals of running
 // tasks only, as those of a task that ended are never answered.
@@ -899,5 +975,6 @@ export function toTask(row: Row): Task {
     result: (row.result as string | null | undefined) ?? null,
     // A list that leaves the result out says nothing of its cut either.
     resultTruncated: row.result != null && Boolean(row.result_truncated),
+    purged: time(row.purged),
   };
 }
