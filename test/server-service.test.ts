@@ -1428,18 +1428,20 @@ const schedulerTests = () => {
   }
 
   /** The task of a run that wrote these events (each given its seq and time) and exited 0, once it has ended. */
-  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner) => {
+  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner | number) => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
     const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
     assert.deepEqual([task.result, task.resultTruncated], [null, false]);
-    runner ??= {
+    // A number is the exit code of a run that writes the events; a runner is used as it is.
+    const exitCode = typeof runner === "number" ? runner : 0;
+    if (typeof runner !== "object") runner = {
       async start() {
         return {
           events: (async function* () {
             for (const [i, event] of events.entries()) yield { v: 1, seq: i + 1, ts: new Date().toISOString(), ...event } as JigEvent;
           })(),
-          wait: async () => ({ exitCode: 0, timedOut: false }),
+          wait: async () => ({ exitCode, timedOut: false }),
           cancel() {},
         };
       },
@@ -1483,17 +1485,32 @@ const schedulerTests = () => {
   });
 
   it("gives an earlier step's text as the result when the run's last step wrote none", async () => {
-    // As jig ends when the model's last reply is empty of text: the result is the last thing it said.
+    // As jig ends when the model's last reply has neither text nor a tool call: stop "empty", exit 8, so
+    // the task is stopped, not succeeded, and its result is the last thing the run said before that.
     const events = [
       { type: "text", step: 1, text: "I'll run the tests." },
       { type: "tool_call", step: 1, id: "call_1", name: "bash", description: "npm test" },
       { type: "tool_result", step: 1, id: "call_1", isError: false, output: "ok" },
       { type: "step", step: 1 },
       { type: "step", step: 2 },
+      { type: "end", stop: "empty" },
+    ];
+    const { ended } = await ranWith(events, {}, 8);
+    assert.deepEqual([ended.status, ended.stop, ended.exitCode, ended.result], ["stopped", "empty", 8, "I'll run the tests."]);
+  });
+
+  it("gives only the last part of a reply continued past the output limit", async () => {
+    // jig writes one text event per step, so a reply cut off and continued is two: the result is the second.
+    const events = [
+      { type: "text", step: 1, text: "The answer has two parts. Part one is long and " },
+      { type: "step", step: 1 },
+      { type: "text", step: 2, text: "part two ends it." },
+      { type: "step", step: 2 },
       END,
     ];
-    const { ended } = await ranWith(events);
-    assert.deepEqual([ended.status, ended.stop, ended.result], ["succeeded", "end_turn", "I'll run the tests."]);
+    const { ended, stored } = await ranWith(events);
+    assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "part two ends it.", false]);
+    assert.deepEqual(stored.filter((type) => type === "text").length, 2);
   });
 
   it("stores an outcome with a result, or without the result's fields, and lists results only with prompts", async () => {

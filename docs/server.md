@@ -153,13 +153,15 @@ that event too. A NUL character in `stop` or `error`, which come from what the r
 U+FFFD.
 
 `result` is the last text the run wrote (its last `text` event), on `GET /v1/tasks/:id` and, with
-`?full=1`, in the list: the model's final reply only if its last step had text, the wrap-up when the run
-stopped at `max_steps`, and otherwise the last thing it said before that, whatever the task's status. So
-read it with `status` and `stop`: a `succeeded` task whose last reply was empty of text has an earlier
-step's, and a cancelled one what it had said so far. It is `null` while the task is queued or running,
-and for a task whose run wrote no text, that never ran (cancelled while queued), or whose replica was lost
-(ended when its lease ran out). It is kept even when the text was past `maxEvents` or `maxEventBytes`, so
-its event wasn't. A text of more than `maxResultBytes` of UTF-8 is cut to its start, at the end of a
+`?full=1`, in the list: the model's final reply when the run ended with one, the wrap-up when it stopped
+at `max_steps`, and otherwise the last thing it said before it ended, whatever the task's status. So read
+it with `status` and `stop`: a `stopped` task with stop `empty` (the model's last reply had no text) has
+an earlier step's text, and a cancelled one what it had said so far. A reply cut off at the output limit
+and continued is one `text` event per step, so the result is only its last part, with `resultTruncated`
+false: the whole answer is in the task's `text` events, where they were kept. It is `null` while the task
+is queued or running, and for a task whose run wrote no text, that never ran (cancelled while queued), or
+whose replica was lost (ended when its lease ran out). It is kept even when the text was past `maxEvents`
+or `maxEventBytes`, so its event wasn't. A text of more than `maxResultBytes` of UTF-8 is cut to its start, at the end of a
 character, and `resultTruncated` is true; a NUL in it is shown as U+FFFD. On Docker and Kubernetes a
 task's commands can write its events, so the result is the task's word, not the service's. It isn't in
 the stream's `done`, the webhooks or the usage ledger.
