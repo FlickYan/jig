@@ -45,6 +45,7 @@ export function serviceMetrics(registry = new Registry()) {
     foldersRemoved: registry.counter("jig_service_task_folders_removed_total", "Folders that runs left on this machine for tasks that ended long ago, or that the store doesn't have, which this replica removed (a crashed replica's)."),
     dbPool: registry.gauge("jig_service_db_pool_connections", "This replica's connections to Postgres, by state: open (in use or idle), idle, and waiting (queries waiting for one).", ["state"]),
     eventStreams: registry.gauge("jig_service_event_streams", "Event streams open on this replica, by tenant.", ["tenant"]),
+    replayed: registry.counter("jig_service_tasks_replayed_total", "Creates answered with an earlier task, for their Idempotency-Key, by tenant.", ["tenant"]),
   };
   // At 0 from the start, so increase() counts the first of each: a failure, or the folders the sweep at start
   // removes before the first scrape.

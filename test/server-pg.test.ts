@@ -494,6 +494,29 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual([listed.spec.prompt, listed.result, listed.resultTruncated], ["", null, false]);
   });
 
+  it("answers a create whose key the tenant used with the task it made, and whether its body was the same", async () => {
+    const store = await openStore(await postgresDatabase());
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    await store.putTenant({ id: "b", limits: LIMITS }, []);
+    const now = new Date();
+    const made = await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h1" });
+    assert.ok("id" in made);
+    assert.deepEqual(await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h1" }), { replay: made, same: true });
+    assert.deepEqual(await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h2" }), { replay: made, same: false });
+    // Before the caps: the replay is answered though the queue is full, and a refusal records nothing.
+    assert.deepEqual(await store.createTask("a", PLAIN, { now, maxQueued: 1 }, { key: "k", hash: "h1" }), { replay: made, same: true });
+    assert.deepEqual(await store.createTask("a", PLAIN, { now, maxQueued: 1 }, { key: "k2", hash: "h1" }), { quota: "maxQueued", limit: 1, used: 1 });
+    const second = await store.createTask("a", PLAIN, { now }, { key: "k2", hash: "h1" });
+    assert.ok("id" in second && second.id !== made.id);
+    // Another tenant's key, and the same one once its 24 hours are over, make tasks of their own.
+    const theirs = await store.createTask("b", PLAIN, { now }, { key: "k", hash: "h1" });
+    assert.ok("id" in theirs && theirs.tenant === "b");
+    const later = await store.createTask("a", PLAIN, { now: new Date(now.getTime() + 24 * 3600_000) }, { key: "k", hash: "h1" });
+    assert.ok("id" in later && later.id !== made.id);
+    assert.equal((await store.tasks("a")).length, 3);
+  });
+
   it("ends every tenant's lapsed tasks though one tenant's holds a NUL", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());
@@ -525,8 +548,10 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     const url = await postgresDatabase();
     await (await openStore(url)).close();
     const db = pool(url);
-    // As schema 5 left it: no model column, the model in the spec alone (nor the result's, which came after).
+    // As schema 5 left it: no model column, the model in the spec alone (nor the result's and the table of
+    // Idempotency-Keys, which came after).
     await db.query("ALTER TABLE tasks DROP COLUMN model, DROP COLUMN result, DROP COLUMN result_truncated");
+    await db.query("DROP TABLE idempotency");
     await db.query("UPDATE jig_schema SET version = 5");
     await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
     const insert = (id: string, spec: object, status: string) => db.query("INSERT INTO tasks (id, tenant, prompt, spec, status, created, started) VALUES ($1, 'a', 'x', $2, $3, now(), now())", [id, JSON.stringify(spec), status]);
@@ -544,7 +569,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
     const store = await openStore(url);
     closers.push(() => store.close());
-    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 7);
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 8);
     // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
     assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
       { id: "task_1", model: "deepseek-flash" },

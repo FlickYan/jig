@@ -99,6 +99,9 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
   -d '{"prompt": "the test in test_app.py fails, fix it", "workspace": {"files": {"app.py": "...", "test_app.py": "..."}}}'
 curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -d '{"prompt": "...", "workspace": {"git": "https://github.com/owner/repo", "ref": "main"}, "maxSteps": 30}'
+# With a key of the client's own, a retry of the same request makes no second task (below).
+curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -H 'Idempotency-Key: order-4711' -d '{"prompt": "..."}'
 
 curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats and result
 # The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1; with "next"
@@ -136,6 +139,32 @@ with 429, `retry-after: 5` and `{"error": "The tenant has 20 event streams open,
 20, "open": 20}` (or the service's, "The service has 200 ..."). A stream counts until it ends or its client
 goes away, even one asked for behind another request on the same connection. Each replica counts its own,
 in memory: behind a load balancer, a tenant may have its `maxStreams` open on each replica.
+
+**Idempotency-Key.** A create whose answer was lost (a timeout, a dropped connection, the router's 502)
+may or may not have made its task, and posting it again would run, and bill, the task twice. A create with
+an `Idempotency-Key` header can be sent again safely. The key is the client's own, 1 to 128 of letters,
+digits, `_`, `.`, `:` and `-` (anything else, an empty header or one sent twice is a 400), it is the
+tenant's, and it holds for 24 hours from the create that made its task:
+
+- the first create with it answers 201 `{"id", "status"}`, as one without;
+- the same body again answers 200 with that task's `id` and its `status` now (`queued`, `running` or what
+  it ended as), and the header `idempotent-replay: true`. Nothing is made or started, and it isn't counted
+  against `maxQueued` or the quotas, so it is answered even while a new task would be refused;
+- another body answers 422, `{"error", "id"}` with the id of the task the key made. Bodies are compared as
+  the bytes they came in, not as JSON: a retry must resend the same bytes, and a new task takes a new key.
+
+A create that was refused (400, 413, 429) records nothing: its key is free for the next try. The 429 for a
+full queue is `{"error", "quota": "maxQueued", "limit", "used"}` with `retry-after: 5`. The queue has no
+time it empties at, so the 5 is a fixed guess; it means nothing for a tenant whose `concurrency` or
+`maxQueued` is 0.
+
+What a key doesn't do. It is known to one store: another region's service, or one on another database,
+makes the task again (Several regions, below). The request is checked before the key is looked up, so a
+replay whose body no longer passes, after a change of the config (a model removed, a lower limit), is a
+400. During a rolling upgrade a replica of the version before ignores the header and makes a task each
+time. The key isn't shown on the task. It stops holding after its 24 hours, when the same key makes a new
+task, or sooner if its task's row is removed from the database. There is no key for a cancel or an
+approval's answer.
 
 A task is `queued`, then `running`, then one of:
 
@@ -328,7 +357,8 @@ Each is no limit when left out. `tasksPerDay` counts the tasks the tenant create
 of them; `usdPerDay` and `usdPerMonth` add up the cost of its tasks that ended that day or month, from the
 usage ledger (below). A task posted at one of them is refused with 429, `{"error", "quota", "limit",
 "used", "resetsAt"}`, `resetsAt` being the start of the next UTC day (of the next month, for
-`usdPerMonth`), and `retry-after` the seconds until then. They are counted with the task's insert, under a
+`usdPerMonth`), and `retry-after` the seconds until then. A create answered with an earlier task for its
+`Idempotency-Key` (The API, above) is not a new task: it counts for no quota. They are counted with the task's insert, under a
 lock of the tenant's (Postgres's, or SQLite's write lock), so replicas can't both let in a tenant's last
 task of the day; `maxQueued` is counted the same way. The USD quotas count only tasks that have ended, so
 the tasks running when one is reached can take the tenant past it by what they spend: the service only
@@ -380,7 +410,8 @@ The probes, `/healthz` and `/readyz`, are routes of their own, and `JigApiErrors
 | metric | what |
 |--------|------|
 | `jig_service_http_requests_total{route,status}`, `jig_service_http_request_seconds{route}` | the API's requests, and their seconds to the end of the response (an event stream's lasts as long as it is followed) |
-| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400 or 413), each at 0 from the start |
+| `jig_service_tasks_created_total{tenant}`, `jig_service_tasks_refused_total{tenant,reason}` | tasks posted, and refused: `queue` (`maxQueued`), `quota`, or `invalid` (a 400, 413 or 422), each at 0 from the start |
+| `jig_service_tasks_replayed_total{tenant}` | creates answered with an earlier task, for their `Idempotency-Key`, at 0 from the start |
 | `jig_service_tasks_ended_total{tenant,status}`, `jig_service_run_seconds{status}` | tasks ended, and their seconds from start to end |
 | `jig_service_queue_seconds`, `jig_service_start_seconds{start}` | seconds from a task's creation to its start, and from its start to jig's first event, `warm` or `cold` |
 | `jig_service_pool_idle`, `jig_service_pool_takes_total{result}` | warm workers waiting, and the tasks started with a pool: `hit` (a warm worker took it) or `miss` (it started cold) |
@@ -1041,7 +1072,12 @@ waits 2 seconds at most for the database, so the router hears its 503 and logs w
 `/readyz` answers 404 or 401, a service from before it, is asked its `/healthz` instead, and the router
 logs that once. While a tenant's home is down, a new task that names no region goes, if the tenant has
 `failover`, to the first region in `regions` that is up and that it may use; otherwise, and for a task that
-names the region that is down, it is 503 with the region and `retry-after`. A task never fails over: it
+names the region that is down, it is 503 with the region and `retry-after`. A new task with an
+`Idempotency-Key` is never failed over either: its key is known only in its home's store, so while the home
+is down it is 503 with `retry-after`, failover or not, and is to be sent again as it was. Naming another
+region on the retry makes it a new body in another store, which can make a second task beside the one the
+home already made. The router's 502 (a region it couldn't reach) may follow a create that was made: with
+a key, sending it again is safe. A task never fails over: it
 runs where it was made, and while its region is down it can't be read, streamed or cancelled (503), since
 its data is there alone; it is all there once the region is back. A tenant is placed by its `home`, where
 its tasks and their data go unless it asks otherwise; one whose data must stay in a region gets that

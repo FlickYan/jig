@@ -13,6 +13,9 @@ import {
   countsOf,
   type DatabasePool,
   ENDED,
+  expired,
+  type Idempotency,
+  idempotent,
   type Given,
   isoDay,
   json,
@@ -20,6 +23,7 @@ import {
   type Outcome,
   periods,
   type Refusal,
+  type Replay,
   refusal,
   spentOf,
   type Store,
@@ -101,6 +105,10 @@ const MIGRATIONS = [
   // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
   `ALTER TABLE tasks ADD COLUMN result text;
    ALTER TABLE tasks ADD COLUMN result_truncated boolean NOT NULL DEFAULT false;`,
+  // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
+  // adding it locks and scans nothing of tasks. No foreign key to tasks: it would take a lock on tasks to
+  // add, and a key's row may outlive its task or go before it (a key whose task is gone is as one never used).
+  `CREATE TABLE idempotency (tenant text NOT NULL, key text NOT NULL, hash text NOT NULL, task text NOT NULL, created timestamptz NOT NULL, PRIMARY KEY (tenant, key))`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -201,8 +209,8 @@ export class PostgresStore implements Store {
   }
 
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
-  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
     const { prompt, ...rest } = spec;
     // With caps, created at their `now`, the clock the quotas' days are read from, so it is counted on the
     // day they say; without, at the database's.
@@ -215,6 +223,14 @@ export class PostgresStore implements Store {
       // Held to the transaction's end, so the counts and the insert are one replica's at a time, for this
       // tenant; each count is a statement of its own, which sees what the last insert committed.
       await db.query(`SELECT pg_advisory_xact_lock(${CREATE_LOCK}, hashtext($1))`, [tenant]);
+      if (idem) {
+        // Under the tenant's lock, so two creates with one key can't both find it unused.
+        const [row] = (await db.query(idempotent("$1", "$2"), [tenant, idem.key])).rows;
+        // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
+        if (row && row.id !== null && !expired(row.idem_created as Date, caps.now)) return { replay: toTask(row), same: row.idem_hash === idem.hash };
+        // Run out, or its task is gone: the key is free again.
+        if (row) await db.query("DELETE FROM idempotency WHERE tenant = $1 AND key = $2", [tenant, idem.key]);
+      }
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = async (sql: string, ...params: unknown[]) => Number(Object.values((await db.query(sql, [tenant, ...params])).rows[0])[0]);
       const used = {
@@ -223,7 +239,12 @@ export class PostgresStore implements Store {
         usdPerDay: caps.usdPerDay === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day = $2", day),
         usdPerMonth: caps.usdPerMonth === undefined ? 0 : await one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = $1 AND day >= $2 AND day < $3", isoDay(monthStart), isoDay(nextMonth)),
       };
-      return refusal(caps, (cap) => used[cap]) ?? insert(db);
+      const refused = refusal(caps, (cap) => used[cap]);
+      if (refused) return refused;
+      const task = await insert(db);
+      // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
+      if (idem) await db.query("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES ($1, $2, $3, $4, $5)", [tenant, idem.key, idem.hash, task.id, caps.now]);
+      return task;
     });
   }
 

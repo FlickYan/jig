@@ -58,6 +58,26 @@ export interface Refusal {
   used: number;
 }
 
+/** A create's Idempotency-Key, and the SHA-256 (hex) of the body it came with. */
+export interface Idempotency {
+  key: string;
+  hash: string;
+}
+
+/** The task an earlier create with the same key made, and whether that create's body was this one's. */
+export interface Replay {
+  replay: Task;
+  same: boolean;
+}
+
+/** How long a key answers with its task, from the create that made it. */
+export const IDEMPOTENCY_MS = 24 * 3600_000;
+
+/** Whether a key recorded at `created` no longer holds at `now`, in either store. */
+export function expired(created: string | Date, now: Date): boolean {
+  return now.getTime() - new Date(created).getTime() >= IDEMPOTENCY_MS;
+}
+
 /** What the metrics read from the store at a scrape: the same on every replica sharing it. */
 export interface Counts {
   /** Queued and running tasks by tenant, with when the oldest of them was created (an ISO time). */
@@ -229,8 +249,12 @@ export interface Store {
    * Adds the task unless the tenant is at one of the caps: the refusal for the first it is at, in the order
    * maxQueued, tasksPerDay, usdPerDay, usdPerMonth. The count and the insert are one replica's at a time, so
    * replicas sharing the store can't both admit the tenant's last task of the day.
+   *
+   * With `idem`, a key the tenant used in the last IDEMPOTENCY_MS answers with the task it made then, before
+   * the caps are looked at, and makes none; a new key is recorded with the task, in its transaction. A
+   * refusal records nothing.
    */
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
   task(id: string): Promise<Task | undefined>;
   /**
    * A tenant's tasks, newest first, at most `limit`, those older than the task `before` if it is given;
@@ -356,6 +380,10 @@ const MIGRATIONS = [
   // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
   `ALTER TABLE tasks ADD COLUMN result TEXT;
    ALTER TABLE tasks ADD COLUMN result_truncated INTEGER NOT NULL DEFAULT 0;`,
+  // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
+  // adding it locks and scans nothing of tasks. No foreign key to tasks: a key's row may outlive its task
+  // or go before it, and a key whose task is gone is as one never used.
+  `CREATE TABLE idempotency (tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, task TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tenant, key));`,
 ];
 
 type Row = Record<string, unknown>;
@@ -439,27 +467,41 @@ class SqliteStore implements Store {
   }
 
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
-  createTask(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal>;
-  async createTask(tenant: string, spec: TaskSpec, caps?: Caps): Promise<Task | Refusal> {
-    return caps ? this.admit(tenant, spec, caps) : this.insert(tenant, spec, new Date());
+  createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
+  async createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
+    return caps ? this.admit(tenant, spec, caps, idem) : this.insert(tenant, spec, new Date());
   }
 
-  /** Adds the task, created at `created`. */
-  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
+  /** Adds the task, created at `created`: its id. */
+  private add(tenant: string, spec: TaskSpec, created: Date): string {
     const id = newTaskId(this.region);
     const { prompt, ...rest } = spec;
     this.db.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created) VALUES (?, ?, ?, ?, 'queued', ?)").run(id, tenant, prompt, JSON.stringify(rest), created.toISOString());
-    return (await this.task(id))!;
+    return id;
+  }
+
+  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
+    return (await this.task(this.add(tenant, spec, created)))!;
   }
 
   /**
-   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here waits
-   * (insert inserts before its first await), so no other statement of this process's runs inside it. The
-   * task is created at the caps' `now`, the clock the quotas' days are read from, so it is counted on the
-   * day they say.
+   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here
+   * waits, so no other statement of this process's runs inside it. The task is created at the caps' `now`,
+   * the clock the quotas' days are read from, so it is counted on the day they say.
+   *
+   * atomically commits when its body returns, so every statement here is synchronous and comes before
+   * the first await: the key's lookup, the removal of one that ran out, the caps, the task's insert and the
+   * key's. The task is read back (this.task, which reads before it first waits) as the body's last step.
    */
-  private admit(tenant: string, spec: TaskSpec, caps: Caps): Promise<Task | Refusal> {
+  private admit(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
     return this.atomically(() => {
+      if (idem) {
+        const row = this.db.prepare(IDEMPOTENT).get(tenant, idem.key) as Row | undefined;
+        // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
+        if (row && row.id !== null && !expired(String(row.idem_created), caps.now)) return Promise.resolve({ replay: toTask(row), same: row.idem_hash === idem.hash });
+        // Run out, or its task is gone: the key is free again.
+        if (row) this.db.prepare("DELETE FROM idempotency WHERE tenant = ? AND key = ?").run(tenant, idem.key);
+      }
       const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
       const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
       const refused = refusal(caps, (cap) =>
@@ -468,7 +510,11 @@ class SqliteStore implements Store {
         : cap === "usdPerDay" ? one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day = ?", day)
         : one("SELECT coalesce(sum(cost_usd), 0) FROM usage WHERE tenant = ? AND day >= ? AND day < ?", isoDay(monthStart), isoDay(nextMonth)),
       );
-      return refused ? Promise.resolve(refused) : this.insert(tenant, spec, caps.now);
+      if (refused) return Promise.resolve(refused);
+      const id = this.add(tenant, spec, caps.now);
+      // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
+      if (idem) this.db.prepare("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES (?, ?, ?, ?, ?)").run(tenant, idem.key, idem.hash, id, caps.now.toISOString());
+      return this.task(id) as Promise<Task>;
     }, "BEGIN IMMEDIATE");
   }
 
@@ -681,6 +727,14 @@ class SqliteStore implements Store {
     this.db.close();
   }
 }
+
+/**
+ * A tenant's key (its two parameters, in either store's placeholders) with the task it made: the key's hash
+ * and time beside the task's columns, which are null if the task is gone.
+ */
+export const idempotent = (tenant: string, key: string) =>
+  `SELECT i.hash AS idem_hash, i.created AS idem_created, t.* FROM idempotency i LEFT JOIN tasks t ON t.id = i.task WHERE i.tenant = ${tenant} AND i.key = ${key}`;
+const IDEMPOTENT = idempotent("?", "?");
 
 // What the metrics count, in SQL either store runs: through the status index, and the approvals of running
 // tasks only, as those of a task that ended are never answered.

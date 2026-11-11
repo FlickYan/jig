@@ -205,6 +205,7 @@ export async function startService(
   const metrics = serviceMetrics();
   // Each tenant's refusals start at 0, so increase() sees the first.
   for (const { id } of config.tenants) for (const reason of ["queue", "quota", "invalid"]) metrics.refused.inc({ tenant: id, reason }, 0);
+  for (const { id } of config.tenants) metrics.replayed.inc({ tenant: id }, 0);
   for (const { id } of config.tenants) metrics.eventStreams.set({ tenant: id }, 0);
   const webhooks = new Webhooks(webhooksOf(config.tenants), webhookRetryMs, log, metrics);
   const store = await openStore(config.database, { region: config.region, pool: config.databasePool });
@@ -768,6 +769,9 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   return streamEvents(req, res, task, Number(after), tenant, context, request);
 }
 
+/** An Idempotency-Key: short, and of characters that need no escaping in a header, a log or an error. */
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Tenant, context: Context): Promise<void> {
   const refused = (reason: "queue" | "quota" | "invalid") => context.metrics.refused.inc({ tenant: tenant.id, reason });
   const body = await readBody(req, context.maxBody);
@@ -775,6 +779,13 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
     refused("invalid");
     res.setHeader("connection", "close");
     return reply(res, 413, { error: `The body is over ${context.maxBody} bytes` });
+  }
+  // Not by truthiness: an empty header is a key the client meant to send, and a header sent twice (Node
+  // joins the two with ", ") is no key either.
+  const key = req.headers["idempotency-key"];
+  if (key !== undefined && (typeof key !== "string" || !IDEMPOTENCY_KEY.test(key))) {
+    refused("invalid");
+    return reply(res, 400, { error: "Idempotency-Key must be 1 to 128 of letters, digits, _ . : -" });
   }
   let input: unknown;
   try {
@@ -798,11 +809,24 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   // A queue without an end would fill the disk, and a tenant's waits only grow. The caps are counted with
   // the insert, so replicas sharing the store keep to them together.
   const now = context.now();
-  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now });
+  // The body is compared as the bytes it came in: a retry resends them, and anything else is another request.
+  const idem = key === undefined ? undefined : { key, hash: createHash("sha256").update(body).digest("hex") };
+  const task = await context.store.createTask(tenant.id, spec, { maxQueued: tenant.limits.maxQueued ?? DEFAULT_LIMITS.maxQueued, ...tenant.limits.quotas, now }, idem);
+  if ("replay" in task) {
+    const { replay, same } = task;
+    if (!same) {
+      refused("invalid");
+      return reply(res, 422, { error: `Idempotency-Key ${key} was used with a different body, for task ${replay.id}: use a new key for a new task`, id: replay.id });
+    }
+    // The task the first create made, as it is now: nothing new to count or to start.
+    context.metrics.replayed.inc({ tenant: tenant.id });
+    return reply(res, 200, { id: replay.id, status: replay.status }, { "idempotent-replay": "true" });
+  }
   if ("quota" in task) {
     const { quota, limit, used } = task;
     refused(quota === "maxQueued" ? "queue" : "quota");
-    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start` });
+    // The queue has no time it empties at: five seconds is a guess at when a task may have started.
+    if (quota === "maxQueued") return reply(res, 429, { error: `The tenant has ${limit} tasks queued, the most it may: wait for some to start`, quota, limit, used }, { "retry-after": "5" });
     const { nextDay, nextMonth } = periods(now);
     const resets = quota === "usdPerMonth" ? nextMonth : nextDay;
     const what = quota === "tasksPerDay" ? `created ${used} tasks today (UTC), the most it may` : `spent $${used} ${quota === "usdPerDay" ? "today (UTC)" : "this month (UTC)"}, against a quota of $${limit}`;

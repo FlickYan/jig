@@ -67,10 +67,10 @@ async function service(quotas: object | undefined, config: Partial<Config> = {})
   return { ...started, database: db };
 }
 
-async function call(service: Service, key: string | undefined, method: string, path: string, body?: unknown): Promise<{ status: number; body: any; headers: Headers }> {
+async function call(service: Service, key: string | undefined, method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<{ status: number; body: any; headers: Headers }> {
   const res = await fetch(service.url + path, {
     method,
-    headers: { ...(key && { authorization: `Bearer ${key}` }), ...(body !== undefined && { "content-type": "application/json" }) },
+    headers: { ...(key && { authorization: `Bearer ${key}` }), ...(body !== undefined && { "content-type": "application/json" }), ...headers },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const text = await res.text();
@@ -341,6 +341,101 @@ const quotaTests = () => {
     assert.equal((await call(api, ADMIN, "GET", "/admin/other")).status, 404);
     // The admin key opens no tenant's tasks.
     assert.equal((await call(api, ADMIN, "GET", "/v1/tasks")).status, 401);
+  });
+
+  /** A create with an Idempotency-Key. */
+  const keyed = (api: Service, tenant: string, key: string, body: object = { prompt: "exit 0" }) => call(api, tenant, "POST", "/v1/tasks", body, { "idempotency-key": key });
+  const idle = { tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }, { id: "globex", keys: [sha256(KEYS.globex)], concurrency: 0 }] };
+
+  it("makes one task for a tenant's Idempotency-Key: the same body again is answered with it, another body with 422", async () => {
+    const api = await service(undefined, idle);
+    const first = await keyed(api, KEYS.acme, "order-1");
+    assert.deepEqual([first.status, first.body.status, first.headers.get("idempotent-replay")], [201, "queued", null]);
+    const again = await keyed(api, KEYS.acme, "order-1");
+    assert.deepEqual([again.status, again.body, again.headers.get("idempotent-replay")], [200, { id: first.body.id, status: "queued" }, "true"]);
+    assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks.map((task: any) => task.id), [first.body.id]);
+
+    // Compared as bytes: a body that says anything else is another request, and makes nothing.
+    const other = await keyed(api, KEYS.acme, "order-1", { prompt: "exit 1" });
+    assert.deepEqual([other.status, other.body], [422, { error: `Idempotency-Key order-1 was used with a different body, for task ${first.body.id}: use a new key for a new task`, id: first.body.id }]);
+    assert.equal((await api.store.tasks("acme")).length, 1);
+
+    // A key is its tenant's: another's use of the same one is a task of its own.
+    const theirs = await keyed(api, KEYS.globex, "order-1");
+    assert.equal(theirs.status, 201);
+    assert.notEqual(theirs.body.id, first.body.id);
+    // And a create without one is a new task each time, as before.
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
+    assert.equal((await api.store.tasks("acme")).length, 2);
+  });
+
+  it("refuses an Idempotency-Key that isn't 1 to 128 of its characters with 400, and makes no task", async () => {
+    const api = await service(undefined, idle);
+    // The last is a header sent twice, as the service reads it: its two values, joined.
+    for (const key of ["", "k".repeat(129), "two words", "order-1, order-1"]) {
+      const refused = await keyed(api, KEYS.acme, key);
+      assert.deepEqual([refused.status, refused.body], [400, { error: "Idempotency-Key must be 1 to 128 of letters, digits, _ . : -" }], JSON.stringify(key));
+    }
+    assert.equal((await api.store.tasks("acme")).length, 0);
+    assert.equal((await keyed(api, KEYS.acme, "k".repeat(128))).status, 201);
+    assert.equal((await keyed(api, KEYS.acme, "A_b.c:d-9")).status, 201);
+  });
+
+  it("answers a key's replay past tasksPerDay, and records nothing for a create it refused", async () => {
+    clock = new Date();
+    const api = await service(undefined, { tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, quotas: { tasksPerDay: 1 } }] });
+    const first = await keyed(api, KEYS.acme, "first");
+    assert.equal(first.status, 201);
+    // The tenant is at its quota, and the retry of the task it was given is still answered.
+    const again = await keyed(api, KEYS.acme, "first");
+    assert.deepEqual([again.status, again.body.id], [200, first.body.id]);
+    for (let i = 0; i < 2; i++) {
+      const refused = await keyed(api, KEYS.acme, "second");
+      assert.deepEqual([refused.status, refused.body.quota], [429, "tasksPerDay"]);
+    }
+    assert.deepEqual((await sql(api.database, "SELECT key FROM idempotency")).map((row) => row.key), ["first"]);
+    // The refused key is free the next day.
+    clock = nextDay(clock);
+    assert.equal((await keyed(api, KEYS.acme, "second")).status, 201);
+  });
+
+  it("holds a key for 24 hours from the create that made its task, then lets it make another", async () => {
+    clock = new Date("2026-03-01T10:00:00Z");
+    const api = await service(undefined, idle);
+    const first = await keyed(api, KEYS.acme, "K");
+    clock = new Date(clock.getTime() + 24 * 3600_000 - 1000);
+    assert.deepEqual([(await keyed(api, KEYS.acme, "K")).status, (await keyed(api, KEYS.acme, "K")).body.id], [200, first.body.id]);
+    clock = new Date(clock.getTime() + 2000);
+    const second = await keyed(api, KEYS.acme, "K");
+    assert.equal(second.status, 201);
+    assert.notEqual(second.body.id, first.body.id);
+    assert.deepEqual((await sql(api.database, "SELECT task FROM idempotency WHERE key = ?", ["K"])).map((row) => row.task), [second.body.id]);
+    // From then, the key is the second task's.
+    assert.deepEqual([(await keyed(api, KEYS.acme, "K")).status, (await keyed(api, KEYS.acme, "K")).body.id], [200, second.body.id]);
+  });
+
+  it("makes one task of concurrent creates with one key, across two replicas on one database", async () => {
+    const config = { database: await database(), ...idle };
+    const [one, two] = [await service(undefined, config), await service(undefined, config)];
+    const answers = await Promise.all(Array.from({ length: 10 }, (_, i) => keyed(i % 2 ? one : two, KEYS.acme, "once")));
+    assert.deepEqual(answers.map((answer) => answer.status).sort(), [...Array(9).fill(200), 201]);
+    assert.equal(new Set(answers.map((answer) => answer.body.id)).size, 1);
+    assert.equal((await one.store.tasks("acme")).length, 1);
+  });
+
+  it("answers a replay with the task's status now, and frees a key whose task's row is gone", async () => {
+    const api = await service(undefined);
+    const first = await keyed(api, KEYS.acme, "ran");
+    await until(async () => (await call(api, KEYS.acme, "GET", `/v1/tasks/${first.body.id}`)).body.ended, "the task to end");
+    const again = await keyed(api, KEYS.acme, "ran");
+    assert.deepEqual([again.status, again.body], [200, { id: first.body.id, status: "succeeded" }]);
+
+    // As an operator's cleanup would leave it: the key points at no task, so it makes a new one.
+    for (const table of ["usage", "events", "approvals"]) await sql(api.database, `DELETE FROM ${table} WHERE task = ?`, [first.body.id]);
+    await sql(api.database, "DELETE FROM tasks WHERE id = ?", [first.body.id]);
+    const second = await keyed(api, KEYS.acme, "ran");
+    assert.equal(second.status, 201);
+    assert.deepEqual((await sql(api.database, "SELECT task FROM idempotency")).map((row) => row.task), [second.body.id]);
   });
 };
 

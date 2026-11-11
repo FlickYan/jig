@@ -117,6 +117,19 @@ async function scrape(service: Service): Promise<{ text: string; value: (series:
 }
 
 const observeTests = () => {
+  it("counts a create answered with its key's earlier task as replayed, not created, and one with another body as invalid", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    // At 0 from the start, so increase() sees the first.
+    assert.equal((await scrape(api)).value('jig_service_tasks_replayed_total{tenant="acme"}'), 0);
+    const keyed = (prompt: string) => call(api, KEYS.acme, "POST", "/v1/tasks", { prompt }, { "idempotency-key": "order-1" });
+    assert.deepEqual([(await keyed("exit 0")).status, (await keyed("exit 0")).status, (await keyed("exit 1")).status], [201, 200, 422]);
+    const { value } = await scrape(api);
+    assert.equal(value('jig_service_tasks_replayed_total{tenant="acme"}'), 1);
+    assert.equal(value('jig_service_tasks_created_total{tenant="acme"}'), 1);
+    assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 1);
+    assert.equal(value('jig_service_tasks{tenant="acme",status="queued"}'), 1);
+  });
+
   it("counts tasks from created to ended, by tenant and status, with the queue read from the store at each scrape", async () => {
     const api = await service({
       tenants: [

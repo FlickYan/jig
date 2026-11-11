@@ -534,10 +534,22 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
   it("refuses a task past the tenant's queue limit", async () => {
     const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0, maxQueued: 2 }] });
     for (let i = 0; i < 2; i++) assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 201);
-    const { status, body } = await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" });
-    assert.equal(status, 429);
+    const refused = await fetch(`${api.url}/v1/tasks`, { method: "POST", headers: { authorization: `Bearer ${KEYS.acme}` }, body: JSON.stringify({ prompt: "exit 0" }) });
+    const body = await refused.json();
+    assert.equal(refused.status, 429);
     assert.match(body.error, /2 tasks queued/);
+    // As a quota's refusal says it, with no time it resets at: the queue has none, and Retry-After is a guess.
+    assert.deepEqual({ ...body, error: undefined }, { error: undefined, quota: "maxQueued", limit: 2, used: 2 });
+    assert.equal(refused.headers.get("retry-after"), "5");
     assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks?status=queued")).body.tasks.length, 2);
+  });
+
+  it("makes a task for each of two identical creates without an Idempotency-Key", async () => {
+    const api = await service({ tenants: [{ id: "acme", keys: [sha256(KEYS.acme)], concurrency: 0 }] });
+    const [one, two] = [await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" }), await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })];
+    assert.deepEqual([one.status, two.status], [201, 201]);
+    assert.notEqual(one.body.id, two.body.id);
+    assert.equal((await call(api, KEYS.acme, "GET", "/v1/tasks")).body.tasks.length, 2);
   });
 
   it("makes the database's folder, and names the database when it can't open it", { skip: name !== "SQLite" && "SQLite's own" }, async () => {
@@ -1796,10 +1808,10 @@ describe("the SQLite store's schema", () => {
     assert.equal(await before.finish(old.id, "r1", { ...outcome, result: "said before", resultTruncated: true }), true);
     assert.equal((await before.task(old.id))!.result, "said before");
     await before.close();
-    // The database as the version before left it: without the two columns, at schema 7.
+    // The database as the version before left it: without the two columns (and what came after), at schema 7.
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(path);
-    db.exec("ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; PRAGMA user_version = 7");
+    db.exec("ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; DROP TABLE idempotency; PRAGMA user_version = 7");
     db.close();
     const store = await openStore(path);
     opened.push(() => store.close());
@@ -1810,6 +1822,34 @@ describe("the SQLite store's schema", () => {
     assert.equal(await store.finish(next.id, "r1", { ...outcome, result: "said after" }), true);
     const ended = (await store.task(next.id))!;
     assert.deepEqual([ended.result, ended.resultTruncated], ["said after", false]);
+  });
+});
+
+describe("the SQLite store's schema, before Idempotency-Keys", () => {
+  it("moves a database from before them on, and holds a key in it", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const old = await before.createTask("a", spec);
+    await before.close();
+    // The database as the version before left it: without the table, at schema 8.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("DROP TABLE idempotency; PRAGMA user_version = 8");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const after = new DatabaseSync(path);
+    const version = Number((after.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    after.close();
+    assert.ok(version >= 9, String(version));
+    assert.equal((await store.task(old.id))!.spec.prompt, "x");
+    const idem = { key: "k", hash: "h" };
+    const made = await store.createTask("a", spec, { now: new Date() }, idem);
+    assert.ok("id" in made);
+    assert.deepEqual(await store.createTask("a", spec, { now: new Date() }, idem), { replay: made, same: true });
+    assert.equal((await store.tasks("a")).length, 2);
   });
 });
 

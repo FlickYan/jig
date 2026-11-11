@@ -374,6 +374,46 @@ describe("the router", () => {
     assert.equal((await call(front.url, KEYS.globex, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 503);
   });
 
+  it("never fails over a new task with an Idempotency-Key, whose key only its home region knows", async () => {
+    const posted: string[] = [];
+    const serve = (name: string) => (req: IncomingMessage, res: ServerResponse) => {
+      posted.push(`${name} ${req.method} ${req.url} ${req.headers["idempotency-key"]}`);
+      res.writeHead(201, { "content-type": "application/json" }).end(JSON.stringify({ id: `task_${name}_${"f".repeat(32)}`, status: "queued" }));
+    };
+    const eu = await fakeRegion("eu", serve("eu"), 503);
+    const us = await fakeRegion("us", serve("us"));
+    const front = await router({ eu, us });
+    await until(() => front.regions().eu === false, "eu to be down");
+    const failovers = async () => /^jig_router_failovers_total\{from="eu",to="us"\} (\d+)$/m.exec(await (await fetch(`${front.metricsUrl}/metrics`)).text())?.[1] ?? "0";
+
+    const held = await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" }, { "idempotency-key": "order-1" });
+    assert.deepEqual([held.status, held.body.region], [503, "eu"]);
+    assert.equal(held.body.error, "Region eu is down: a create with an Idempotency-Key waits for its home region, where its key is known: try again once it is back");
+    assert.ok(Number(held.headers.get("retry-after")) >= 1);
+    assert.deepEqual(posted, []);
+    assert.equal(await failovers(), "0");
+
+    // Without a key the task still goes to the other region; with one and a region it names, to that one.
+    assert.equal((await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).headers.get("x-jig-region"), "us");
+    assert.equal(await failovers(), "1");
+    assert.equal((await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: "us" }, { "idempotency-key": "order-2" })).status, 201);
+    assert.deepEqual(posted, ["us POST /v1/tasks undefined", "us POST /v1/tasks order-2"]);
+    assert.equal(await failovers(), "1");
+  });
+
+  it("passes a new task's Idempotency-Key on to its home region as it came", async () => {
+    const keys: unknown[] = [];
+    const eu = await fakeRegion("eu", (req, res) => {
+      keys.push(req.headers["idempotency-key"]);
+      res.writeHead(201, { "content-type": "application/json" }).end(JSON.stringify({ id: `task_eu_${"f".repeat(32)}`, status: "queued" }));
+    });
+    const us = await fakeRegion("us", (_req, res) => res.writeHead(500).end());
+    const front = await router({ eu, us });
+    // The router checks nothing of it: the region's service says what is wrong with a key.
+    for (const key of ["order-1", "not a key!"]) assert.equal((await call(front.url, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" }, { "idempotency-key": key })).status, 201);
+    assert.deepEqual(keys, ["order-1", "not a key!"]);
+  });
+
   it("waits for a /readyz as long as a service's waits for its database, so it hears why the region is down", async () => {
     // A service's /readyz answers within the 2 s it gives its database's ping, and a little more.
     const lines: string[] = [];

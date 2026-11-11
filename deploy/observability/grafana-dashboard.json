@@ -150,7 +150,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Tasks created and refused",
-      "description": "Tasks posted each second, and those refused: queue (maxQueued), quota or invalid.",
+      "description": "Tasks posted each second, those refused: queue (maxQueued), quota or invalid, and the creates answered with an earlier task for their Idempotency-Key (replayed).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -196,6 +196,15 @@
           "expr": "sum by (reason) (rate(jig_service_tasks_refused_total{region=~\"$region\"}[$__rate_interval]))",
           "legendFormat": "refused: {{reason}}",
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(jig_service_tasks_replayed_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "replayed",
+          "refId": "C"
         }
       ]
     },
