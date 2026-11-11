@@ -380,7 +380,7 @@ describe("the local runner's disk cap", () => {
     const base = await tempDir("jig-disk-");
     const runner = new LocalRunner(options(base, { maxDiskBytes: 100_000, log: logTo(lines) }));
     const now = new Date().toISOString();
-    const task = (id: string, spec: Partial<Task["spec"]> = {}): Task => ({ id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, usage: null, cost: null });
+    const task = (id: string, spec: Partial<Task["spec"]> = {}): Task => ({ id, tenant: "acme", spec: { prompt: "hang", maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5", ...spec }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, result: null, resultTruncated: false, purged: null, usage: null, cost: null });
     // A task with approvals and nowhere to ask for them: its start throws once its folder is made.
     await assert.rejects(runner.start(task("task_unasked", { approvals: true }), TENANT), /needs the service's internalBaseUrl/);
     // The folder, grown past the cap now, is no one's to stop.

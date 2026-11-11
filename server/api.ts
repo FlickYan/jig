@@ -1,6 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { stat, statfs } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -8,7 +8,8 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
-import { sandboxProblem } from "../src/sandbox.ts";
+import { isolationProblem, sandboxProblem, sharedPlaces } from "../src/sandbox.ts";
+import { isInside } from "../src/tools/util.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
 import { checkedGit, type Runner, workspaceProblem } from "./runner.ts";
@@ -93,10 +94,12 @@ export interface Config {
   /** The hosts a workspace may be cloned from (default: any). */
   gitHosts?: string[];
   /**
-   * The local runner's: what else its tasks' commands can't read, as absolute paths; and whether it may run
-   * them with no sandbox, directly on this machine (one tenant only).
+   * The local runner's: what else its tasks' commands can't read, as absolute paths; whether it may run
+   * them with no sandbox, directly on this machine (one tenant only); and whether each task's commands get a
+   * /tmp, /var/tmp, /run and IPC of their own ("service", the default on Linux with the sandbox) or the
+   * machine's ("shared", as on macOS, where there is no other).
    */
-  local?: { hiddenPaths?: string[]; allowUnsandboxed?: boolean };
+  local?: { hiddenPaths?: string[]; allowUnsandboxed?: boolean; isolation?: "service" | "shared" };
   maxBodyBytes?: number;
   heartbeatSeconds?: number;
   /** Where tasks run: as processes on this machine (local, the default), in Docker containers or as Kubernetes Jobs. */
@@ -211,6 +214,11 @@ export async function startService(
   if (!runner && (config.runner ?? "local") === "local" && !config.local?.allowUnsandboxed) {
     const problem = sandboxProblem();
     if (problem) throw new Error(`The local runner runs its tasks' commands in jig's sandbox, and there is none here: ${problem}. Fix that, use the docker or kubernetes runner, or, with a single tenant, set local.allowUnsandboxed to run them directly on this machine.`);
+  }
+  // Nor where every task's jig would refuse the isolation its settings ask for.
+  if (!runner && (config.runner ?? "local") === "local" && isolates(config)) {
+    const problem = isolationProblem();
+    if (problem) throw new Error(`The local runner gives each task's commands a /tmp and /run of their own, which can't be done here: ${problem}. Fix that, use the docker or kubernetes runner, or set local.isolation to "shared".`);
   }
   const adminKey = config.adminKeyEnv === undefined ? undefined : process.env[config.adminKeyEnv];
   if (config.adminKeyEnv !== undefined && !adminKey) throw new Error(`Set ${config.adminKeyEnv}, the key to the service's /admin routes.`);
@@ -380,6 +388,14 @@ export async function startService(
 }
 
 /**
+ * Whether the local runner asks jig for isolation (see src/sandbox.ts's createSandbox): as local.isolation
+ * says, and left unset, on Linux, unless tasks may run with no sandbox, which it needs.
+ */
+function isolates(config: Config): boolean {
+  return (config.local?.isolation ?? (process.platform === "linux" && !config.local?.allowUnsandboxed ? "service" : "shared")) === "service";
+}
+
+/**
  * What the local runner's tasks could still do to the service or to each other. jig's sandbox hides dataDir
  * from their commands, but for the task's own project and home, and the database and the config's folder
  * (see runners/local.ts); without one (local.allowUnsandboxed), they run directly on the machine, as do
@@ -388,9 +404,12 @@ export async function startService(
  * the service's user can, and connect to the Unix sockets there, which a read-only file system doesn't stop.
  * And with dataDir in one of those, which they can write, a task's commands can change its home there, whose
  * git config jig's own git reads, outside the sandbox. A hidden folder (`folders`) that is the machine's
- * root, /etc, /usr or the service user's home hides what their commands need.
+ * root, /etc, /usr or the service user's home hides what their commands need. With isolation (see isolates)
+ * each task has its own /tmp, /var/tmp and /run, so what is left to share is the kernel and the Unix sockets
+ * elsewhere: those that take connections now are named, for the operator to hide their folders.
  */
 function localRisks(config: Config, folders: HiddenFolder[]): string[] {
+  const isolated = isolates(config);
   // The temp folders jig's sandbox lets commands write, as sandbox.ts's createSandbox has them, but the
   // task's own TMPDIR: not the service's.
   const temps = (process.platform === "darwin" ? ["/tmp", "/private/tmp"] : ["/tmp", "/var/tmp"]).flatMap((dir) => [dir, realOrSame(dir)]);
@@ -406,7 +425,8 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
     ...(config.local?.allowUnsandboxed
       ? ["local.allowUnsandboxed is set, so a local task whose jig can't make its sandbox (a check of it that fails or takes over 5 seconds) runs its commands directly on this machine, where they can read and write the database and the config: unset it to have such a task fail instead"]
       : []),
-    "a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine (Docker's, a local Postgres's or Redis's, an ssh-agent's): run the service as a user of its own, with no more than it needs",
+    `a local task's commands can read whatever the service's user can, but for dataDir, the database's files, the config's folder and local.hiddenPaths, and connect to the Unix sockets on this machine ${isolated ? "outside /tmp, /var/tmp and /run (an ssh-agent's or a database's kept elsewhere)" : "(Docker's, a local Postgres's or Redis's, an ssh-agent's)"}: run the service as a user of its own, with no more than it needs`,
+    ...(isolated ? openSockets(config, folders) : []),
     ...folders.flatMap(({ what, path }) => {
       const real = realOrSame(path);
       const home = realOrSame(homedir());
@@ -414,8 +434,12 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
       const fix = what === "the config's folder" ? "keep the config in a folder of its own" : "keep dataDir out of that checkout";
       return [`the local runner hides ${what}, ${path}, from its tasks' commands, and that is ${real === home ? "the service user's home directory, where the toolchains they use may be" : "a folder every task's commands need"}: ${fix}`];
     }),
-    ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
-    ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
+    ...(config.tenants.length <= 1
+      ? []
+      : isolated
+        ? ["the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel and the Unix sockets outside /tmp, /var/tmp and /run (the docker and kubernetes runners keep them apart)"]
+        : [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)${process.platform === "linux" ? ': set local.isolation to "service" to give each task its own /tmp, /var/tmp and /run' : ""}`]),
+    ...(inTemp(config.dataDir) ? [`dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox${isolated ? ", and each command's /tmp starts empty" : ""}: keep it elsewhere`] : []),
   ];
 }
 
@@ -455,6 +479,40 @@ async function nearest(path: string): Promise<string> {
     path = dirname(path);
   }
 }
+
+/**
+ * The warning that names the Unix sockets a local task's commands can still connect to under isolation, if
+ * there are any: those bound to a path that take connections now (a stream socket that listens, or a
+ * datagram one), as /proc/net/unix lists them, outside the shared places commands don't see, dataDir and
+ * the hidden paths. Up to ten of them: it is read once, at the start, to show the operator what is there.
+ */
+function openSockets(config: Config, folders: HiddenFolder[]): string[] {
+  const out = [...sharedPlaces(), ...[config.dataDir, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])].map((path) => realOrSame(resolve(path)))];
+  let lines: string[];
+  try {
+    lines = readFileSync("/proc/net/unix", "utf8").split("\n").slice(1);
+  } catch {
+    return []; // no /proc, or not to be read
+  }
+  const found = new Set<string>();
+  for (const line of lines) {
+    // "<address>: <references> <protocol> <flags> <type> <state> <inode> <path>": the path may hold spaces,
+    // is missing for a socket bound to none, and starts with @ for one that is no file.
+    const [, flags, type, path] = /^\S+ \S+ \S+ (\S+) (\S+) \S+ +\S+ (\/.*)$/.exec(line) ?? [];
+    if (path === undefined || !((Number.parseInt(flags, 16) & SO_ACCEPTCON) !== 0 || Number.parseInt(type, 16) === SOCK_DGRAM)) continue;
+    const real = realOrSame(path);
+    try {
+      // Bound in another mount namespace (a container's), the path can be none here, or lead through a file.
+      if (lstatSync(real).isSocket() && !out.some((dir) => isInside(dir, real))) found.add(real);
+    } catch {}
+  }
+  if (!found.size) return [];
+  const named = [...found].slice(0, 10);
+  return [`a local task's commands can connect to these Unix sockets: ${named.join(", ")}${found.size > named.length ? ` and ${found.size - named.length} more` : ""}; list their folders in local.hiddenPaths`];
+}
+
+const SO_ACCEPTCON = 0x10000; // in a socket's flags in /proc/net/unix: it listens
+const SOCK_DGRAM = 2;
 
 /** Whether the config's database is a SQLite file. */
 function sqliteFile(database: string): boolean {
@@ -576,7 +634,7 @@ function runnerFor(config: Config, secret: string, internalBaseUrl: string, log:
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
     const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
-    return new LocalRunner({ ...shared, maxDiskBytes, hidden, sandbox: !config.local?.allowUnsandboxed, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+    return new LocalRunner({ ...shared, maxDiskBytes, hidden, sandbox: !config.local?.allowUnsandboxed, isolation: isolates(config), jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
   if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared, maxDiskBytes });
   if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
@@ -698,6 +756,10 @@ function configProblem(config: Config): string | undefined {
       ? undefined
       : `local.hiddenPaths must be a list of absolute paths, not ${JSON.stringify(config.local.hiddenPaths)}`) ??
     (config.local?.allowUnsandboxed === undefined || typeof config.local.allowUnsandboxed === "boolean" ? undefined : "local.allowUnsandboxed must be true or false") ??
+    (config.local?.isolation === undefined || ["service", "shared"].includes(config.local.isolation) ? undefined : `local.isolation must be "service" or "shared", not ${JSON.stringify(config.local.isolation)}`) ??
+    // Asked for by name where it can't be had: a /tmp of its own is the sandbox's to give, on Linux.
+    (runner === "local" && config.local?.isolation === "service" && config.local.allowUnsandboxed ? 'local.isolation "service" needs jig\'s sandbox: unset local.allowUnsandboxed' : undefined) ??
+    (runner === "local" && config.local?.isolation === "service" && process.platform === "darwin" ? 'local.isolation "service" is Linux\'s for now' : undefined) ??
     // Without a sandbox a task's commands can read and write every other task's folder. The docker and
     // kubernetes runners don't read it.
     (runner === "local" && config.local?.allowUnsandboxed && Array.isArray(config.tenants) && config.tenants.length > 1 ? "local.allowUnsandboxed needs a single tenant: without a sandbox, a task's commands can read and change the other tenants' tasks" : undefined) ??

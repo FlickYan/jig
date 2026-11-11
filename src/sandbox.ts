@@ -122,19 +122,35 @@ const GIT_FILE_BYTES = 65_536; // read of a file that tells git where things are
  * `hidden` paths they can't read at all, nor jig's own directory but its skills (see ownRules), but for the
  * session's own places in a hidden directory (see ownPlaces). Returns undefined where there is no sandbox;
  * sandboxProblem says why.
+ *
+ * `isolated` is the settings' isolation: "service", which the service's local runner asks for each task, as
+ * many tenants' tasks run on one machine. Commands then have nothing of the places its users share (see
+ * sharedPlaces): /tmp and /var/tmp are the session's own, the temp directory jig itself has ($TMPDIR, which
+ * so can't be one of those), /run is empty, and each command has its own System V IPC and POSIX message
+ * queues (see bubblewrap). What is left of the machine: its kernel, the Unix sockets elsewhere, whatever the
+ * user can read, and its loopback when the network is on. Linux only: it throws on macOS, where Seatbelt's
+ * profile allows by default and nothing here could be tried, and where commands would lose what they run
+ * (see isolationProblem).
  */
 export function createSandbox(
   root: string,
-  { network, dirs = [], hidden = [], onFallback }: { network: boolean; dirs?: string[]; hidden?: string[]; onFallback?: () => void },
+  { network, dirs = [], hidden = [], onFallback, isolated = false }: { network: boolean; dirs?: string[]; hidden?: string[]; onFallback?: () => void; isolated?: boolean },
 ): Sandbox | undefined {
   if (sandboxProblem()) return undefined;
+  const own = realpathSync(tmpdir());
+  if (isolated) {
+    const problem = isolationProblem();
+    if (problem) throw new Error(problem);
+    // In a folder of one (TMPDIR=/tmp/mine) it is the session's own all the same.
+    if (sharedPlaces().includes(own)) throw new Error(`isolation: "service" needs a TMPDIR of the task's own, not ${own}`);
+  }
   const project = realpathSync(root); // Seatbelt sees real paths: /var is /private/var
   const unreadable = hidden.filter((path) => existsSync(path)).map((path) => realpathSync(path));
   const home = realTargetSync(jigHome()); // made with the first session, if it isn't there yet
   const added = dirs.map((dir) => realpathSync(dir));
-  const temp = process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"].filter((dir) => existsSync(dir));
+  const temp = isolated ? [] : process.platform === "darwin" ? ["/private/tmp"] : ["/tmp", "/var/tmp"].filter((dir) => existsSync(dir));
   const repo = gitDirs(project);
-  const writable = [project, repo?.common, ...added, realpathSync(tmpdir()), ...temp].filter(
+  const writable = [project, repo?.common, ...added, own, ...temp].filter(
     (dir, i, all): dir is string => !!dir && !all.slice(0, i).some((other) => other && isInside(other, dir)),
   );
   const where = `inside the project${added.length ? `, ${added.join(", ")}` : ""} and the temp directories`;
@@ -146,8 +162,37 @@ export function createSandbox(
   const sandbox =
     process.platform === "darwin"
       ? seatbelt(writable, network, where, unreadable, guarded, home, places)
-      : bubblewrap(writable, network, where, unreadable, guarded, home, onFallback, places);
+      : bubblewrap(writable, network, where, unreadable, guarded, home, onFallback, places, isolated ? own : undefined);
   return guarded ? { ...sandbox, gitChanges: gitWatch(guarded, project, repo?.tree) } : sandbox;
+}
+
+/**
+ * The places every user of a Linux machine shares whatever its file permissions say, by real path, those
+ * that are there: the temp directories anyone can write, /run with its daemons' sockets, and /dev/shm.
+ * With the settings' isolation, commands see none of them (see createSandbox), and the file tools follow
+ * no link into one (see run.ts).
+ */
+export function sharedPlaces(): string[] {
+  return process.platform === "linux" ? realDirs(["/tmp", "/var/tmp", "/run", "/var/run", "/dev/shm"]) : [];
+}
+
+/** Those of `paths` that are directories, by real path, each once (/var/run is a link to /run). */
+function realDirs(paths: string[]): string[] {
+  return [...new Set(paths.filter((path) => statSync(path, { throwIfNoEntry: false })?.isDirectory()).map((path) => realpathSync(path)))];
+}
+
+/**
+ * Why the settings' isolation can't be had on this machine, or undefined if it can: on macOS, which it
+ * isn't made for yet; and where bash or a folder on the PATH lies in /run (NixOS keeps the system's programs
+ * in /run/current-system), which is empty for commands, so every one of them would fail to start. Said when
+ * the session, or the service, starts, not by each command.
+ */
+export function isolationProblem(): string | undefined {
+  if (process.platform === "darwin") return `isolation: "service" is Linux's for now`;
+  const run = realDirs(["/run", "/var/run"]);
+  const inRun = (path: string) => [path, realTargetSync(path)].some((one) => one !== undefined && run.some((dir) => isInside(dir, one)));
+  const lost = [...(process.env.PATH ?? "").split(delimiter).filter((entry) => entry && existsSync(entry)), "/bin/bash"].find((entry) => inRun(resolve(entry)));
+  return lost === undefined ? undefined : `isolation: "service" empties /run for commands, and ${lost} is in it`;
 }
 
 /**
@@ -689,13 +734,28 @@ function deny(operation: string, filters: string[] = []): string[] {
  * the machine's others, and can't reach the host's mount namespace through /proc/<pid>/root of a process
  * outside the sandbox (see Keeper). A job a command leaves in the background keeps running, reparented to
  * the namespace's init, until jig exits, when the kernel ends every process in the namespace.
+ *
+ * With the settings' isolation, `own` is the session's temp directory, and commands get nothing of the
+ * machine's shared places (see sharedPlaces). /tmp and /var/tmp, each in one of two ways. Where none of the
+ * sandbox's mounts goes into it, or into `own`, `own` is bound there: /tmp is $TMPDIR, kept from one command to the next.
+ * Nothing else is then mounted in it, a hidden path's mask or a lock of git's: what they would cover isn't
+ * there, and bubblewrap makes a mount's place if it is missing, in a folder the last command could write. A
+ * link ../../oldroot/<folder> left there had it make directories in that folder of the machine's, outside
+ * every bind. So where a mount does go into it (the project in /tmp, or the service's dataDir, or
+ * TMPDIR=/tmp/mine), or into `own` (the project in $TMPDIR: its mounts aren't in a second view of it), it is a new, empty one for each command, the mounts on top: private too, but what a
+ * command leaves there is gone with it. /run is empty the same way, with the file /etc/resolv.conf leads to
+ * bound back when the network is on (systemd-resolved keeps it there). /dev is each command's own already.
+ * And each command has an IPC namespace of its own (--unshare-ipc): System V shared memory, semaphores and
+ * queues, and POSIX message queues, are named by number or by name, not by path, so no mount hides them.
+ * Not kept apart: Unix sockets at paths elsewhere, which would take seccomp to refuse.
  */
-function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void, places: Places = { roots: [] }): Sandbox {
+function bubblewrap(writable: string[], network: boolean, where: string, hidden: string[], git?: GitControl, home?: string, onFallback?: () => void, places: Places = { roots: [] }, own?: string): Sandbox {
   const bwrap = findProgram("bwrap")!;
-  const keeper = new Keeper(bwrap, hidden, home, onFallback);
+  const keeper = new Keeper(bwrap, hidden, home, onFallback, own !== undefined);
   // An empty directory over each hidden directory, and an empty file over each hidden file, the outermost
   // first: one in a place of the session's own that another holds is hidden after that place is shown again.
   const masks = [...hidden].sort((a, b) => a.length - b.length).map((path) => ({
+    path,
     mask: statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path],
     kept: keptIn(path, places),
   }));
@@ -706,24 +766,52 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     !home || (!isInside(path, home) && (!isInside(home, path) || writable.some((dir) => isInside(home, dir) && isInside(dir, path))));
   // Later mounts go over earlier ones: git's binds and the hidden paths hold in jig's directory too. --proc
   // mounts a fresh /proc for the session's PID namespace, so it shows only the session's processes.
+  // The isolation's temp directories: `fresh` where a mount goes into one (a writable directory, jig's own, a
+  // place a hidden directory keeps), which makes it an empty one for each command.
+  const into = [...writable, ...(home ? [home] : []), ...masks.flatMap(({ kept }) => kept)];
+  // And where the session's folder holds a mount other than its own (the project in $TMPDIR, a hidden file
+  // there, a lock of git's), or lies in a hidden path or a lock: bound at /tmp it would be seen a second
+  // time, without those mounts, the hidden file read and git's config written at /tmp/<...>.
+  const covered = [...into, ...hidden, ...holding(hidden, writable), ...(home ? ownFixed(home, writable) : []), ...(git ? [...git.fixed, ...git.locked] : [])];
+  const twice =
+    own !== undefined &&
+    (covered.some((to) => to !== own && isInside(own, to)) ||
+      masks.some(({ path, kept }) => isInside(path, own) && !kept.some((place) => isInside(place, own))) ||
+      !!git?.locked.some((path) => isInside(path, own)));
+  const temps = own === undefined ? [] : realDirs(["/tmp", "/var/tmp"]).map((dir) => ({ dir, fresh: twice || into.some((to) => isInside(dir, to)) }));
+  const bound = temps.filter(({ fresh }) => !fresh).map(({ dir }) => dir);
+  const elsewhere = (mounts: string[]) => (bound.length ? eachMount(mounts).filter((mount) => !bound.some((dir) => isInside(dir, mount.at(-1)!))).flat() : mounts);
+  const isolation = () => {
+    if (own === undefined) return [];
+    const resolv = network ? realTargetSync("/etc/resolv.conf") : undefined;
+    const run = realDirs(["/run", "/var/run"]);
+    return [
+      ...temps.flatMap(({ dir, fresh }) => (fresh ? ["--tmpfs", dir] : ["--bind", own, dir])),
+      ...run.flatMap((dir) => ["--tmpfs", dir]),
+      ...(resolv && existsSync(resolv) && run.some((dir) => isInside(dir, resolv)) ? ["--ro-bind", resolv, resolv] : []),
+    ];
+  };
   const args = (join: string[]) => {
-    const mounts = [
+    const mounts = elsewhere([
       ...writable.flatMap((dir) => ["--bind", dir, dir]),
       // Mount points a command can't move aside (see holding), before jig's and git's binds: bound after
       // them, one would show what those cover again. Only what exists, as binding a path that doesn't fails.
       ...holding(hidden, writable).filter((dir) => existsSync(dir)).flatMap((dir) => ["--bind", dir, dir]),
       ...(home ? ownBinds(home, writable) : []),
       ...(git ? gitBinds(git, shown) : []),
-    ];
+    ]);
     return [
       "--ro-bind", "/", "/",
       "--dev", "/dev",
       "--proc", "/proc",
+      // Before the mounts, which go on top of an empty /tmp or /run.
+      ...isolation(),
       ...mounts,
-      ...masks.flatMap(({ mask, kept }) => [...mask, ...shownAgain(kept, mounts)]),
+      ...elsewhere(masks.flatMap(({ mask, kept }) => [...mask, ...shownAgain(kept, mounts)])),
       // Join the session's namespaces, or in the fallback --unshare-pid and --die-with-parent: if jig is killed,
       // so are its commands, which a joined one is with the keeper (see Keeper).
       ...join,
+      ...(own === undefined ? [] : ["--unshare-ipc"]),
       ...(network ? [] : ["--unshare-net"]),
     ];
   };
@@ -731,9 +819,17 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
     ", and have no network: each command gets an empty one of its own, so it can't reach the internet, servers on this " +
     "machine's ports, or a server an earlier command started (start a server and use it in the same command)";
   const processes = " Commands see only this session's own processes, not the machine's others.";
+  const kept = "this session's own, the same folder as $TMPDIR, kept between commands";
+  const tmp = !temps.length
+    ? ""
+    : !temps.some(({ fresh }) => fresh)
+      ? ` /tmp and /var/tmp here are ${kept}.`
+      : temps[0].fresh
+        ? " /tmp here is empty for each command: keep files in $TMPDIR."
+        : ` /tmp here is ${kept}; /var/tmp is empty for each command.`;
   return {
     description: `bubblewrap sandbox${network ? "" : ", no network"}`,
-    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}`,
+    limits: `Commands can write only ${where}${network ? "" : offline}${gitNote(git)}${hiddenNote(hidden)}${ownNote(home)}.${processes}${tmp}`,
     wrap: (command) => {
       const { args: join, stdio, note, couldntJoin } = keeper.join();
       // bubblewrap leaves the namespace descriptors open in what it runs: CLEAN_START closes them.
@@ -751,11 +847,16 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
  * jig's own directory). Each is a mount point, which a command can't move aside. Only what exists.
  */
 function shownAgain(kept: string[], mounts: string[]): string[] {
-  // One mount each: --tmpfs <path>, or --bind or --ro-bind <from> <path>.
-  const each: string[][] = [];
-  for (let i = 0, size; i < mounts.length; i += size) each.push(mounts.slice(i, i + (size = mounts[i] === "--tmpfs" ? 2 : 3)));
+  const each = eachMount(mounts);
   const inside = (place: string) => each.filter((mount) => isInside(place, mount.at(-1)!)).flat();
   return kept.filter((place) => existsSync(place)).flatMap((place) => ["--ro-bind", place, place, ...inside(place)]);
+}
+
+/** bubblewrap's mount arguments, one mount each: --tmpfs <path>, or --bind or --ro-bind <from> <path>. */
+function eachMount(mounts: string[]): string[][] {
+  const each: string[][] = [];
+  for (let i = 0, size; i < mounts.length; i += size) each.push(mounts.slice(i, i + (size = mounts[i] === "--tmpfs" ? 2 : 3)));
+  return each;
 }
 
 /**
@@ -791,6 +892,10 @@ function shownAgain(kept: string[], mounts: string[]): string[] {
  * so once, and the model, whom the bash tool tells to leave a server running in the background, with the first
  * command's result. jig never runs commands in the host's PID namespace. The keeper gets jig's environment
  * without its keys, as commands do: they can read its environment in /proc/1.
+ *
+ * With the settings' isolation the keeper's root has nothing of the machine's shared places either: a /dev
+ * of its own and empty directories over /tmp, /var/tmp and /run, or a command read the machine's /tmp and
+ * /dev/shm, and connected to the sockets in /run, through /proc/1/root (see keeperHiding).
  */
 class Keeper {
   private started = false;
@@ -803,12 +908,14 @@ class Keeper {
   private readonly hidden: string[];
   private readonly home: string | undefined;
   private readonly onFallback?: () => void;
+  private readonly isolated: boolean;
 
-  constructor(bwrap: string, hidden: string[], home: string | undefined, onFallback?: () => void) {
+  constructor(bwrap: string, hidden: string[], home: string | undefined, onFallback?: () => void, isolated = false) {
     this.bwrap = bwrap;
     this.hidden = hidden;
     this.home = home;
     this.onFallback = onFallback;
+    this.isolated = isolated;
   }
 
   /**
@@ -864,7 +971,7 @@ class Keeper {
       // paths and jig's directory in the root, so reaching it directly through /proc/1/root grants nothing.
       // Its shell says it runs, after bwrap's report in the same file (see keeperChildPid), and closes its output.
       const shell = `echo ${KEEPER_RUNNING}; exec >&-; read x`;
-      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", ...keeperHiding(this.hidden, this.home), "--info-fd", "3", "--", "/bin/sh", "-c", shell];
+      const args = ["--unshare-pid", "--die-with-parent", "--ro-bind", "/", "/", "--proc", "/proc", ...keeperHiding(this.hidden, this.home, this.isolated), "--info-fd", "3", "--", "/bin/sh", "-c", shell];
       // Detached, so the terminal's Ctrl+C doesn't reach it: the session goes on after an interrupted command.
       // Its stdin is a pipe jig holds open; jig's death closes it, and the keeper's `read` then ends. Without
       // jig's keys, as commands get: they share its PID namespace and can read its environment in /proc/1.
@@ -996,9 +1103,12 @@ function probeJoin(bwrap: string, userFd: number, pidFd: number): boolean {
  * How the keeper masks what a command masks, so its read-only root is no way around the sandbox: an empty
  * directory over each hidden directory, /dev/null over each hidden file, and an empty directory over jig's
  * own directory (its skills aren't needed here, only in commands). Only over what is there, since the
- * keeper's root is read-only and a bind of a missing path would fail.
+ * keeper's root is read-only and a bind of a missing path would fail. With the settings' isolation, first a
+ * /dev of its own (the machine's /dev/shm is in the one it would have) and an empty directory over each
+ * other shared place: before the hidden paths, so one in /tmp is masked in the empty /tmp.
  */
-function keeperHiding(hidden: string[], home: string | undefined): string[] {
+function keeperHiding(hidden: string[], home: string | undefined, isolated: boolean): string[] {
+  const shared = isolated ? ["--dev", "/dev", ...realDirs(["/tmp", "/var/tmp", "/run", "/var/run"]).flatMap((dir) => ["--tmpfs", dir])] : [];
   const out = hidden.flatMap((path) => {
     try {
       return statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path];
@@ -1007,7 +1117,7 @@ function keeperHiding(hidden: string[], home: string | undefined): string[] {
     }
   });
   if (home && existsSync(home)) out.push("--tmpfs", home);
-  return out;
+  return [...shared, ...out];
 }
 
 /**

@@ -125,6 +125,9 @@ Why jig is built the way it is, one decision at a time. The [README](../README.m
   on macOS it isn't. Killing a command's process group still reaches everything inside, and
   `--die-with-parent` takes the sandbox down if jig dies. `--unshare-net` cuts off IP only: a daemon
   listening on a Unix socket (Docker's, say) stays within reach, and closing that would take seccomp.
+  The settings' `"isolation": "service"`, the task service's for many tenants' tasks on one machine, takes
+  the sockets in `/tmp` and `/run` away with those folders, which become the session's own, and adds an IPC
+  namespace for each command; sockets at other paths stay (docs/server.md: the local runner).
 - **One PID namespace per session.** bubblewrap ran commands in the host's PID namespace, with the host's
   `/proc`, and that was a hole: a command could step through `/proc/<pid>/root` of a process outside the
   sandbox (jig, the user's shell, anything of the same user) into the host's mount namespace, where the

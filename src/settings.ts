@@ -1,7 +1,7 @@
 // Settings, the user's (~/.jig/settings.json) and a project's (.jig/settings.json): which commands run
 // without asking and which never run, the sandbox and the network, hidden paths, hooks and MCP servers. A
 // project's settings could run programs, so apart from its deny rules and hidden paths they apply only once
-// the user trusts the file.
+// the user trusts the file. Isolation is the user's alone.
 
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -56,6 +56,12 @@ export interface Settings {
    * symlink in the project.
    */
   hiddenPaths: string[];
+  /**
+   * "service": commands get a /tmp, /var/tmp, /run and IPC of the session's own, not the machine's, as the
+   * service's local runner asks for each task (Linux only; see sandbox.ts's createSandbox). It needs the
+   * sandbox, and is read from the user's settings only: a project's file says nothing of the machine it is on.
+   */
+  isolation?: "service";
   hooks: Hook[];
   mcpServers: Record<string, McpServerConfig>;
 }
@@ -85,6 +91,10 @@ export function readSettings(root: string): { user: Settings; project?: ProjectS
   const text = readRegularFile(projectFile);
   if (text === undefined) throw new Error(`${projectFile} isn't a regular file (a named pipe, say), so jig doesn't read it.`);
   const settings = parse(text, projectFile, warnings);
+  if (settings.isolation !== undefined) {
+    delete settings.isolation;
+    warnings.push(`${projectFile}: "isolation" is only read from the user's settings.`);
+  }
   return { user, project: { path: projectFile, hash: createHash("sha256").update(text).digest("hex"), settings }, warnings };
 }
 
@@ -118,6 +128,7 @@ export function mergeSettings(user: Settings, project: Settings | undefined, tru
     hiddenPaths,
     sandbox: project.sandbox ?? user.sandbox,
     network: project.network ?? user.network,
+    ...(user.isolation && { isolation: user.isolation }),
     hooks: [...user.hooks, ...project.hooks],
     mcpServers: { ...user.mcpServers, ...project.mcpServers },
   };
@@ -166,6 +177,10 @@ function parse(text: string, file: string, warnings: string[]): Settings {
     if (data[key] === undefined) continue;
     if (typeof data[key] !== "boolean") fail(`"${key}" must be true or false`);
     settings[key] = data[key] as boolean;
+  }
+  if (data.isolation !== undefined) {
+    if (data.isolation !== "service") fail(`"isolation" must be "service"`);
+    settings.isolation = "service";
   }
   const hooks = (data.hooks ?? {}) as Record<string, unknown>;
   for (const [event, list] of Object.entries(hooks)) {
