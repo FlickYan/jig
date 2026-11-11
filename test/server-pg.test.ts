@@ -505,7 +505,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual([(await store.task(bad.id))!.status, (await store.task(plain.id))!.status, (await store.task(kept.id))!.status], ["cancelled", "cancelled", "queued"]);
   });
 
-  it("moves a database on whose tasks already hold a NUL, and ends them", async () => {
+  it("moves a database on whose tasks already hold a NUL or half a surrogate pair, and ends them", async () => {
     const url = await postgresDatabase();
     await (await openStore(url)).close();
     const db = pool(url);
@@ -520,6 +520,12 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     await insert("task_2", nul, "queued");
     await insert("task_3", nul, "running");
     await insert("task_4", plain, "running");
+    // Half a surrogate pair, which the API let through in a file's contents: ->> refuses that escape too.
+    const lone = { ...plain, workspace: { files: { "a.txt": "x\ud800y" } } };
+    await insert("task_5", lone, "queued");
+    await insert("task_6", lone, "running");
+    // Escapes the operator reads; the backfill passes these by all the same, as it looks for "\u" alone.
+    await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
     const store = await openStore(url);
     closers.push(() => store.close());
     assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 6);
@@ -529,12 +535,15 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
       { id: "task_2", model: null },
       { id: "task_3", model: null },
       { id: "task_4", model: "deepseek-flash" },
+      { id: "task_5", model: null },
+      { id: "task_6", model: null },
+      { id: "task_7", model: null },
     ]);
-    assert.equal(await store.cancelQueued("task_1"), true);
-    assert.equal(await store.cancelQueued("task_2"), true);
-    assert.deepEqual((await store.expire("its replica is gone")).sort(), ["task_3", "task_4"]);
+    for (const id of ["task_1", "task_2", "task_5", "task_7"]) assert.equal(await store.cancelQueued(id), true);
+    assert.deepEqual((await store.expire("its replica is gone")).sort(), ["task_3", "task_4", "task_6"]);
     assert.deepEqual((await store.task("task_3"))!.spec.workspace, WITH_NUL.workspace);
+    assert.deepEqual((await store.task("task_6"))!.spec.workspace, lone.workspace);
     const rows = await store.usage(byModel);
-    assert.deepEqual(rows.map((row) => [row.model, row.tasks]).sort(), [["", 2], ["deepseek-flash", 2]]);
+    assert.deepEqual(rows.map((row) => [row.model, row.tasks]).sort(), [["", 5], ["deepseek-flash", 2]]);
   });
 });

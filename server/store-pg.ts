@@ -55,8 +55,9 @@ const CREATE_LOCK = 7366;
 
 // Each entry moves the schema one version on (jig_schema counts them). Never edit one that has shipped:
 // add another. JSON is kept as `json`, which holds the text as it came, or as text: jsonb would turn away
-// a "\u0000" in a command's output. json's operators (->>, json_extract_path) turn one away too, anywhere in
-// the document, so no statement applies one to a document a tenant or a run wrote.
+// a "\u0000" in a command's output. json's operators (->>, json_extract_path) turn one away too, and half a
+// surrogate pair ("\ud800"), anywhere in the document, so no statement applies one to a document a tenant
+// or a run wrote.
 const MIGRATIONS = [
   `CREATE TABLE tenants (id text PRIMARY KEY, limits json NOT NULL);
    CREATE TABLE api_keys (hash text PRIMARY KEY, tenant text NOT NULL REFERENCES tenants (id));
@@ -88,10 +89,14 @@ const MIGRATIONS = [
   // Every tenant's usage over a range of days (the admin's report) reads the ledger by day alone.
   `CREATE INDEX usage_by_day ON usage (day);`,
   // A task's model, for the ledger, which read it from the spec: an error (22P05) for a spec holding "\u0000",
-  // in the statement ending the task and so for every task that statement ended. Specs stored with one keep
-  // no model here (their ledger rows say ''): chr(92) is the backslash, however the session reads strings.
+  // in the statement ending the task and so for every task that statement ended. The operator refuses half a
+  // surrogate pair too (22P02), and other escapes in a database that isn't UTF8, so the backfill reads only
+  // specs with no "\u" escape at all: one refusal would fail the migration, and the service couldn't start.
+  // JSON.stringify writes that escape for control characters and lone surrogates alone, so few specs have
+  // one; those keep no model here (their ledger rows say ''). chr(92) is the backslash, however the session
+  // reads strings.
   `ALTER TABLE tasks ADD COLUMN model text;
-   UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u0000') = 0;`,
+   UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u') = 0;`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
