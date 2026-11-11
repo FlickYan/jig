@@ -145,7 +145,8 @@ of everything. A `before` that isn't the id of one of the tenant's tasks in this
 `{"error": "before must be the id of one of your tasks here"}`, the same for an id that never was and
 another tenant's; it used to be an empty page, which reads as the end of the list. A path that is no
 route is a 404 `{"error": "No such route"}`, whatever the method; on a task's routes, a task that doesn't
-exist or is another tenant's is a 404 `{"error": "No such task"}`, and a wrong method a 405. A cancel
+exist or is another tenant's is a 404 `{"error": "No such task"}`, and a wrong method a 405. (Through the router, a path under `/v1/tasks/` whose id names no region is
+answered by the router itself, with `No such task`.) A cancel
 answers 200 for a queued task (it is cancelled at once), 202 for a running one
 (its jig and everything it started are killed, and the task ends `cancelled`) and 409 for one that has
 ended. A stream sends a comment every `heartbeatSeconds`, so proxies don't close it. It reads the stored
@@ -185,7 +186,9 @@ What a key doesn't do. It is known to one store: another region's service, or on
 makes the task again (Several regions, below). The request is checked before the key is looked up, so a
 replay whose body no longer passes, after a change of the config (a model removed, a lower limit), is a
 400. During a rolling upgrade a replica of the version before ignores the header and makes a task each
-time. The key isn't shown on the task. It stops holding after its 24 hours, when the same key makes a new
+time, and a task it makes meanwhile is ended with its model read from its spec (none in the ledger if the
+spec holds a `\\u` escape). The key isn't shown on the task. Keys past their 24 hours are deleted beside the
+folder sweep, so their table holds about a day of creates. It stops holding after its 24 hours, when the same key makes a new
 task, or sooner if its task's row is removed from the database. There is no key for a cancel or an
 approval's answer.
 
@@ -256,7 +259,7 @@ and the database's clock says what is old enough. During a rolling upgrade, a re
 neither refuses a purged task's late events nor answers 410.
 
 What a delete doesn't reach, so don't call it complete erasure: a task's folder kept with `keepTaskDirs`,
-the service's and the gateway's logs, approval webhooks already posted, what the model's provider keeps,
+the service's and the gateway's logs, approval webhooks already posted or still being tried again (for up to a minute after the request), what the model's provider keeps,
 and backups. On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
 stay in its `-wal` file until that is next reset (a checkpoint with no reader, or the service's stop). On
 Postgres the rows stay dead in the table until vacuum, and in WAL archives and on standbys as long as those
@@ -787,7 +790,8 @@ size. So while a task runs, the service measures its folder (`dataDir/tasks/<id>
 once it takes more than `maxTaskDiskBytes`: SIGTERM, to jig's process group or to the container, and
 SIGKILL 5 seconds later. The task ends as an `error` with stop `disk_limit` and the error `the task's folder
 grew past maxTaskDiskBytes (<n> bytes), so the service stopped the run`; what it spent until then is
-stored as for any run. The folder is then removed with the task, as any is.
+stored as for any run. A workspace that is past the cap by itself, or a clone stopped at it, ends the
+task the same way before any run. The folder is then removed with the task, as any is.
 
 What is counted is the blocks each file and folder takes on the disk, so a sparse file counts for what it
 holds, not its length. No link is followed and no other file system entered, and a file with several

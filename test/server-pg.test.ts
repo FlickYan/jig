@@ -567,6 +567,31 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual([(await store.task(bad.id))!.status, (await store.task(plain.id))!.status, (await store.task(kept.id))!.status], ["cancelled", "cancelled", "queued"]);
   });
 
+  it("reads the model from the spec of a task that a replica of the version before made, and forgets old keys", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const old = await store.createTask("a", PLAIN);
+    const nul = await store.createTask("a", WITH_NUL);
+    const db = pool(url);
+    {
+      // As the version before inserts: no model column.
+      await db.query("UPDATE tasks SET model = NULL");
+      assert.equal(await store.cancelQueued(old.id), true);
+      assert.equal(await store.cancelQueued(nul.id), true);
+      assert.deepEqual((await store.usage(byModel)).map((row) => [row.model, row.tasks]).sort(), [["", 1], ["deepseek-flash", 1]]);
+      // A key is deleted once its day is over, whoever's it is, and holds until then.
+      const now = new Date();
+      const made = await store.createTask("a", PLAIN, { now }, { key: "k", hash: "h" });
+      assert.ok("id" in made);
+      assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000 - 1)), 0);
+      assert.equal(Number((await db.query("SELECT count(*) AS n FROM idempotency")).rows[0].n), 1);
+      assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000)), 1);
+      assert.equal(Number((await db.query("SELECT count(*) AS n FROM idempotency")).rows[0].n), 0);
+    }
+  });
+
   it("moves a database on whose tasks already hold a NUL or half a surrogate pair, and ends them", async () => {
     const url = await postgresDatabase();
     await (await openStore(url)).close();

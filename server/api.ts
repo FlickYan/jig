@@ -1014,7 +1014,7 @@ async function admin(req: IncomingMessage, res: ServerResponse, url: URL, key: s
 /** What is wrong with a query's parameters, if one isn't among `allowed` or is there twice. */
 function badParams(params: URLSearchParams, allowed: string[]): string | undefined {
   const unknown = [...params.keys()].find((name) => !allowed.includes(name));
-  if (unknown) return `Unknown parameter: ${unknown}`;
+  if (unknown !== undefined) return `Unknown parameter: ${unknown}`;
   // Each is read once: tenant=a&tenant=b would otherwise report a alone.
   const twice = [...new Set(params.keys())].find((name) => params.getAll(name).length > 1);
   return twice && `${twice} may be given once`;

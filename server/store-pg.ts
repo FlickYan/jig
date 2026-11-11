@@ -16,6 +16,7 @@ import {
   ENDED,
   expired,
   type Idempotency,
+  IDEMPOTENCY_MS,
   idempotent,
   type Given,
   isoDay,
@@ -105,16 +106,19 @@ const MIGRATIONS = [
   // specs with no "\u" escape at all: one refusal would fail the migration, and the service couldn't start.
   // JSON.stringify writes that escape for control characters and lone surrogates alone, so few specs have
   // one; those keep no model here (their ledger rows say ''). chr(92) is the backslash, however the session
-  // reads strings.
+  // reads strings. Only the tasks that haven't ended are backfilled, as the ledger has the others' rows
+  // already: an update of every row would rewrite the table under the lock the new column takes, for longer
+  // than a query may take on a table of millions.
   `ALTER TABLE tasks ADD COLUMN model text;
-   UPDATE tasks SET model = spec->>'model' WHERE strpos(spec::text, chr(92) || 'u') = 0;`,
+   UPDATE tasks SET model = spec->>'model' WHERE status IN ('queued', 'running') AND strpos(spec::text, chr(92) || 'u') = 0;`,
   // The last text a run wrote, kept on its task: its events may be dropped past the caps, or be many pages.
   `ALTER TABLE tasks ADD COLUMN result text;
    ALTER TABLE tasks ADD COLUMN result_truncated boolean NOT NULL DEFAULT false;`,
   // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
   // adding it locks and scans nothing of tasks. No foreign key to tasks: it would take a lock on tasks to
   // add, and a key's row may outlive its task or go before it (a key whose task is gone is as one never used).
-  `CREATE TABLE idempotency (tenant text NOT NULL, key text NOT NULL, hash text NOT NULL, task text NOT NULL, created timestamptz NOT NULL, PRIMARY KEY (tenant, key))`,
+  `CREATE TABLE idempotency (tenant text NOT NULL, key text NOT NULL, hash text NOT NULL, task text NOT NULL, created timestamptz NOT NULL, PRIMARY KEY (tenant, key));
+   CREATE INDEX idempotency_by_created ON idempotency (created)`,
   // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
   // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged. Both
   // may be there already: made by hand ahead of the upgrade, on a large table (docs/server.md).
@@ -137,7 +141,8 @@ const LIVE = "live AS (SELECT id FROM tasks WHERE id = $1 AND purged IS NULL FOR
 const BLANK = "prompt = '', error = NULL, stats = NULL, result = NULL, result_truncated = false";
 
 /** What a statement that ends tasks returns of each, for the ledger: the model from its column, not the spec. */
-const DONE = `${ENDED}, model`;
+// A task a replica of the version before made meanwhile has no model column: its spec is read, where it can be.
+const DONE = `${ENDED}, coalesce(model, CASE WHEN strpos(spec::text, chr(92) || 'u') = 0 THEN spec->>'model' END) AS model`;
 
 /**
  * A CTE that writes the ledger's rows for the tasks in `done` (RETURNING DONE), in the statement that ends
@@ -485,6 +490,10 @@ export class PostgresStore implements Store {
       await db.query("DELETE FROM approvals WHERE task IN (SELECT json_object_keys($1::json))", [slim]);
       return rows.length;
     });
+  }
+
+  async forgetKeys(now: Date): Promise<number> {
+    return (await this.pool.query("DELETE FROM idempotency WHERE created <= $1", [new Date(now.getTime() - IDEMPOTENCY_MS)])).rowCount ?? 0;
   }
 
   async usage(query: UsageQuery): Promise<UsageRow[]> {

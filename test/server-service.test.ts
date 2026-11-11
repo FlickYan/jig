@@ -642,7 +642,7 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
       assert.deepEqual(await call(api, KEYS.acme, "GET", path), { status: 404, body: { error: "No such task" } }, path);
     }
     // A wrong method on a route is a 405, and a key is asked for before anything is said of the path.
-    assert.equal((await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`)).status, 405);
+    assert.equal((await call(api, KEYS.acme, "PUT", `/v1/tasks/${id}`)).status, 405);
     assert.equal((await call(api, undefined, "GET", "/v1/nope")).status, 401);
     // The routes the API has are the ones its requests are counted under.
     for (const path of ["/v1/nope", "/v1/tasks/", "/v1/task", `/v1/tasks/${id}`, `/v1/tasks/${id}/cancel`, `/v1/tasks/${id}/cancel/`, `/v1/tasks/${id}/approvals`, `/v1/tasks/${id}/approvals/ap_1`, `/v1/tasks/${id}/approvals/ap_1/x`, "/v1/usage", "/v1/limits", "/v1/limits/"]) {
@@ -2104,6 +2104,21 @@ describe("a task's result", () => {
 describe("the SQLite store's reads", () => {
   const limits = { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null };
   const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+
+  it("deletes the Idempotency-Keys whose day is over, and lets two processes open one file at once", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const [store, other] = await Promise.all([openStore(path), openStore(path)]);
+    opened.push(() => store.close(), () => other.close());
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    const made = await store.createTask("a", spec, { now }, { key: "k", hash: "h" });
+    assert.ok("id" in made);
+    assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000 - 1)), 0);
+    assert.deepEqual(await other.createTask("a", spec, { now }, { key: "k", hash: "h" }), { replay: made, same: true });
+    assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000)), 1);
+    const again = await store.createTask("a", spec, { now }, { key: "k", hash: "h" });
+    assert.ok("id" in again && again.id !== made.id);
+  });
 
   it("reads a task's events a page at a time, and all of them without a limit", async () => {
     const store = await openStore(":memory:");

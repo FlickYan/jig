@@ -5,7 +5,7 @@ import { hostname } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { createLog, type Log } from "../log.ts";
-import { checkDisk, type JigEvent, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk, workspaceProblem } from "../runner.ts";
+import { checkDisk, DiskLimit, type JigEvent, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk, workspaceProblem } from "../runner.ts";
 import type { Task, Tenant, Workspace } from "../store.ts";
 
 // Runs each task's jig as a process on this machine, in a folder of its own under the data directory:
@@ -190,7 +190,7 @@ export class LocalRunner implements Runner {
     } catch (err) {
       unwatch();
       // A clone the cap stopped fails as a clone: the task is told of the cap.
-      throw overDisk ? new Error(overDisk) : err;
+      throw overDisk ? new DiskLimit(overDisk) : err;
     }
   }
 

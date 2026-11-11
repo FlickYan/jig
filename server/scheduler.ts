@@ -4,7 +4,7 @@ import { hostname } from "node:os";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
 import { PgError } from "./pg.ts";
-import { checkedGit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
+import { checkedGit, DiskLimit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
 import { type Approval, diskFull, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
@@ -168,6 +168,7 @@ export class Scheduler {
     // Not waited for: a disk full of left folders, each run stopped in turn, mustn't hold up the API.
     void this.sweep();
     void this.retain();
+    void this.forget();
     this.timer = setInterval(() => void this.keep(), this.leaseMs / 3);
     void this.poke();
   }
@@ -200,6 +201,7 @@ export class Scheduler {
           if (++this.rounds % 10 === 0) {
             void this.sweep();
             void this.retain();
+            void this.forget();
           }
         }
         // A slot another replica freed, or a task it queued, is looked for here.
@@ -318,6 +320,16 @@ export class Scheduler {
       if (purged) this.log.info(`purged ${purged} task(s) that ended longer ago than retentionDays`);
     })().finally(() => (this.retaining = undefined));
     return this.retaining;
+  }
+
+  /** Deletes the Idempotency-Keys past their day, so their table holds a day of creates and no more. */
+  private async forget(): Promise<void> {
+    try {
+      await this.store.forgetKeys(new Date());
+    } catch (err) {
+      this.metrics.storeErrors.inc({ retried: "false" });
+      this.log.error("couldn't delete the Idempotency-Keys past their day", { err });
+    }
   }
 
   /** Counts a task that this replica ended, and how long it ran (in milliseconds) if it started. */
@@ -529,6 +541,10 @@ export class Scheduler {
       if (run.handle) {
         run.handle.cancel();
         exit = await run.handle.wait().catch(() => undefined);
+      } else if (err instanceof DiskLimit) {
+        // The cap stopped the start (a clone, or files past it): the task ends as a run stopped at it does.
+        failure = undefined;
+        exit = { exitCode: null, timedOut: false, overDisk: err.message };
       }
     }
     run.ended = true;

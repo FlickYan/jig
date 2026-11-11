@@ -6,7 +6,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { createLog, type Log } from "../log.ts";
 import { type Exited, type PoolConfig, type Started, type Warm, WarmPool } from "../pool.ts";
-import { checkDisk, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk } from "../runner.ts";
+import { checkDisk, DiskLimit, jigArgs, keyVariable, type Leftover, type RunExit, type RunHandle, type Runner, taskFolders, taskToken, watchDisk } from "../runner.ts";
 import type { Task, Tenant } from "../store.ts";
 import type { PoolAnswer } from "../worker.ts";
 import { lastLine, prepareWorkspace, readStats, TERM_MS, tail } from "./local.ts";
@@ -183,7 +183,7 @@ export class DockerRunner implements Runner {
       // A clone the cap stopped fails as a clone: the task is told of the cap.
       failed: (err) => {
         stop();
-        return why ? new Error(why) : err;
+        return why ? new DiskLimit(why) : err;
       },
     };
   }

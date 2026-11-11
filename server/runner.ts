@@ -178,13 +178,16 @@ export async function folderBytes(dir: string, limit: number, maxEntries = MAX_E
  * One check of the folder against the cap, before the task's jig starts: throws what the task is told if
  * its workspace alone is past it, or can't be measured. No limit (0), no check.
  */
+/** A start the disk cap stopped, before any run: its message is what the task is told, and its stop is disk_limit. */
+export class DiskLimit extends Error {}
+
 export async function checkDisk(dir: string, limit: number): Promise<void> {
   if (!limit) return;
   const bytes = await folderBytes(dir, limit).catch((err: unknown) => {
-    if (err instanceof Unmeasurable) throw new Error(DISK_UNMEASURABLE);
+    if (err instanceof Unmeasurable) throw new DiskLimit(DISK_UNMEASURABLE);
     throw err;
   });
-  if (bytes > limit) throw new Error(diskError(limit));
+  if (bytes > limit) throw new DiskLimit(diskError(limit));
 }
 
 /** Every watch's walks, one behind another: a machine full of big trees is read by one walk at a time. */

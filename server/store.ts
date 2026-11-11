@@ -348,6 +348,8 @@ export interface Store {
    * at it.
    */
   purgeEnded(olderThanMs: number, limit: number): Promise<number>;
+  /** Deletes the Idempotency-Keys that no longer hold at `now` (IDEMPOTENCY_MS after their create). How many. */
+  forgetKeys(now: Date): Promise<number>;
   /** The usage ledger summed by the query's groups, sorted by them; a group with no ended task is left out. */
   usage(query: UsageQuery): Promise<UsageRow[]>;
   /** Says the replica is up for `ms` more, and forgets those whose heartbeat ran out. */
@@ -423,7 +425,8 @@ const MIGRATIONS = [
   // The Idempotency-Keys of creates, each with its body's hash and the task it made. A table of its own, so
   // adding it locks and scans nothing of tasks. No foreign key to tasks: a key's row may outlive its task
   // or go before it, and a key whose task is gone is as one never used.
-  `CREATE TABLE idempotency (tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, task TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tenant, key));`,
+  `CREATE TABLE idempotency (tenant TEXT NOT NULL, key TEXT NOT NULL, hash TEXT NOT NULL, task TEXT NOT NULL, created TEXT NOT NULL, PRIMARY KEY (tenant, key));
+   CREATE INDEX idempotency_by_created ON idempotency (created);`,
   // When a task's content was deleted (Store.purge). The index holds only the ended tasks that still have
   // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged.
   `ALTER TABLE tasks ADD COLUMN purged TEXT;
@@ -499,11 +502,17 @@ class SqliteStore implements Store {
     // and events aren't left readable in the file's free pages. It costs where much is deleted: measured,
     // a task's 64 MiB of events go in about 0.3 s rather than 0.02, and the WAL grows by as much meanwhile.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;");
-    const version = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    const read = () => Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version);
+    const version = read();
     if (version > MIGRATIONS.length) throw new Error(`${path} was made by a newer version of the task service (schema ${version})`);
     for (let next = version; next < MIGRATIONS.length; next++) {
-      this.db.exec("BEGIN");
+      // The write lock first, then the version again: another process opening the file may have run this one.
+      this.db.exec("BEGIN IMMEDIATE");
       try {
+        if (read() > next) {
+          this.db.exec("COMMIT");
+          continue;
+        }
         this.db.exec(MIGRATIONS[next]);
         this.db.exec(`PRAGMA user_version = ${next + 1}`);
         this.db.exec("COMMIT");
@@ -788,6 +797,10 @@ class SqliteStore implements Store {
       this.blank(rows);
       return rows.length;
     }, "BEGIN IMMEDIATE");
+  }
+
+  async forgetKeys(now: Date): Promise<number> {
+    return Number(this.db.prepare("DELETE FROM idempotency WHERE created <= ?").run(new Date(now.getTime() - IDEMPOTENCY_MS).toISOString()).changes);
   }
 
   /** Deletes the content of ended tasks (their id and spec columns), inside a transaction: see Store.purge. */

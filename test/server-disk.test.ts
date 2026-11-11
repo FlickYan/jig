@@ -371,7 +371,7 @@ describe("the local runner's disk cap", () => {
       const { body } = await call(api, "GET", `/v1/tasks/${id}`);
       return body.status === "error" && body;
     }, "the task to end as an error");
-    assert.deepEqual([task.status, task.stop, task.exitCode, task.error], ["error", null, null, diskError(100_000)]);
+    assert.deepEqual([task.status, task.stop, task.exitCode, task.error], ["error", "disk_limit", null, diskError(100_000)]);
     assert.ok(!existsSync(join(runner.dir(id), "work", ".fake-jig.json")) && !existsSync(join(runner.dir(id), "events.jsonl")), "jig never started");
   });
 
@@ -415,7 +415,7 @@ describe("the Docker runner's disk cap", () => {
       const { body } = await call(api, "GET", `/v1/tasks/${heavy}`);
       return body.status === "error" && body;
     }, "the heavy task to end");
-    assert.deepEqual([refused.stop, refused.error], [null, diskError(MIB)]);
+    assert.deepEqual([refused.stop, refused.error], ["disk_limit", diskError(MIB)]);
     assert.equal((await kills()).length, 1);
 
     // And one within it runs to its end.
