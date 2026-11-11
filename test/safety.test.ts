@@ -1242,7 +1242,8 @@ describe("isolation: service", { skip: sandboxProblem() || (process.platform !==
     try {
       assert.match(sandbox.limits, / \/tmp here is empty for each command: keep files in \$TMPDIR\.$/);
       const first = await run(`echo ok > made.txt && cat made.txt ${join(home, "note")} && echo x > /tmp/${tag}-a && echo y > "$TMPDIR/keep" && ls /tmp && ls ${other}; cat ${join(other, "secret")}`, project, sandbox);
-      assert.match(first, new RegExp(`^ok\\nthe task's own note\\n${tag}-a\\njig-iso-[^\\n]+\\n`), first);
+      // ls sorts the two names in /tmp, the file's and the folder's with its random end, either way round.
+      assert.match(first, new RegExp(`^ok\\nthe task's own note\\n(${tag}-a\\njig-iso-[^\\n]+|jig-iso-[^\\n]+\\n${tag}-a)\\n`), first);
       assert.doesNotMatch(first, /another task's|secret\n/);
       assert.equal(existsSync(join(project, "made.txt")), true);
       const second = await run(`cat "$TMPDIR/keep"; cat /tmp/${tag}-a; ls /tmp`, project, sandbox);

@@ -893,8 +893,8 @@ function eachMount(mounts: string[]): string[][] {
  * command's result. jig never runs commands in the host's PID namespace. The keeper gets jig's environment
  * without its keys, as commands do: they can read its environment in /proc/1.
  *
- * With the settings' isolation the keeper's root has nothing of the machine's shared places either: a /dev
- * of its own and empty directories over /tmp, /var/tmp and /run, or a command read the machine's /tmp and
+ * With the settings' isolation the keeper's root has nothing of the machine's shared places either: empty
+ * directories over /dev/shm, /tmp, /var/tmp and /run, or a command read the machine's /tmp and
  * /dev/shm, and connected to the sockets in /run, through /proc/1/root (see keeperHiding).
  */
 class Keeper {
@@ -1103,12 +1103,13 @@ function probeJoin(bwrap: string, userFd: number, pidFd: number): boolean {
  * How the keeper masks what a command masks, so its read-only root is no way around the sandbox: an empty
  * directory over each hidden directory, /dev/null over each hidden file, and an empty directory over jig's
  * own directory (its skills aren't needed here, only in commands). Only over what is there, since the
- * keeper's root is read-only and a bind of a missing path would fail. With the settings' isolation, first a
- * /dev of its own (the machine's /dev/shm is in the one it would have) and an empty directory over each
- * other shared place: before the hidden paths, so one in /tmp is masked in the empty /tmp.
+ * keeper's root is read-only and a bind of a missing path would fail. With the settings' isolation, first an
+ * empty directory over the machine's /dev/shm and /dev/mqueue and over each other shared place: before the hidden paths, so one in /tmp is masked in the empty /tmp.
  */
 function keeperHiding(hidden: string[], home: string | undefined, isolated: boolean): string[] {
-  const shared = isolated ? ["--dev", "/dev", ...realDirs(["/tmp", "/var/tmp", "/run", "/var/run"]).flatMap((dir) => ["--tmpfs", dir])] : [];
+  // Not --dev /dev: for it, a bubblewrap that isn't root puts the keeper in a second user namespace, which
+  // doesn't own the PID one, and no command could join (every one would fall back to a namespace of its own).
+  const shared = isolated ? realDirs(["/dev/shm", "/dev/mqueue", "/tmp", "/var/tmp", "/run", "/var/run"]).flatMap((dir) => ["--tmpfs", dir]) : [];
   const out = hidden.flatMap((path) => {
     try {
       return statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path];
