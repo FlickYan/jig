@@ -513,7 +513,9 @@ only the sandbox can do it, and the two together are refused. With it:
   task's `$TMPDIR` (`home/tmp`), the same folder under three names, kept from one command to the next. With
   `dataDir` in `/tmp` (or `/var/tmp`), that one is a new, empty folder for each command, with the task's
   project, home and `$TMPDIR` bound on top: private too, but a file a command leaves in `/tmp` is gone
-  with it, so `$TMPDIR` is where to keep one (jig tells the model which it is). The service warns of it.
+  with it, so `$TMPDIR` is where to keep one (jig tells the model which it is). The service warns of it. (Outside
+  the service, jig does the same where the project, a hidden path or jig's directory lies in `$TMPDIR`:
+  bound at `/tmp`, the folder would show them a second time, without the sandbox's protections.)
 - `/run` is empty (and `/var/run`), and `/dev/shm` each command's own. So there is no D-Bus, no
   `docker.sock`, no socket in `/run/postgresql`: a database a task needs is one it starts itself. With the
   network on, the file `/etc/resolv.conf` leads to is bound back if it is in `/run` (systemd-resolved's).

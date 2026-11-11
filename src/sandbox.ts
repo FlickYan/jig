@@ -737,12 +737,12 @@ function deny(operation: string, filters: string[] = []): string[] {
  *
  * With the settings' isolation, `own` is the session's temp directory, and commands get nothing of the
  * machine's shared places (see sharedPlaces). /tmp and /var/tmp, each in one of two ways. Where none of the
- * sandbox's mounts goes into it, `own` is bound there: /tmp is $TMPDIR, kept from one command to the next.
+ * sandbox's mounts goes into it, or into `own`, `own` is bound there: /tmp is $TMPDIR, kept from one command to the next.
  * Nothing else is then mounted in it, a hidden path's mask or a lock of git's: what they would cover isn't
  * there, and bubblewrap makes a mount's place if it is missing, in a folder the last command could write. A
  * link ../../oldroot/<folder> left there had it make directories in that folder of the machine's, outside
  * every bind. So where a mount does go into it (the project in /tmp, or the service's dataDir, or
- * TMPDIR=/tmp/mine), it is a new, empty one for each command, the mounts on top: private too, but what a
+ * TMPDIR=/tmp/mine), or into `own` (the project in $TMPDIR: its mounts aren't in a second view of it), it is a new, empty one for each command, the mounts on top: private too, but what a
  * command leaves there is gone with it. /run is empty the same way, with the file /etc/resolv.conf leads to
  * bound back when the network is on (systemd-resolved keeps it there). /dev is each command's own already.
  * And each command has an IPC namespace of its own (--unshare-ipc): System V shared memory, semaphores and
@@ -755,6 +755,7 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   // An empty directory over each hidden directory, and an empty file over each hidden file, the outermost
   // first: one in a place of the session's own that another holds is hidden after that place is shown again.
   const masks = [...hidden].sort((a, b) => a.length - b.length).map((path) => ({
+    path,
     mask: statSync(path).isDirectory() ? ["--tmpfs", path] : ["--ro-bind", "/dev/null", path],
     kept: keptIn(path, places),
   }));
@@ -768,7 +769,16 @@ function bubblewrap(writable: string[], network: boolean, where: string, hidden:
   // The isolation's temp directories: `fresh` where a mount goes into one (a writable directory, jig's own, a
   // place a hidden directory keeps), which makes it an empty one for each command.
   const into = [...writable, ...(home ? [home] : []), ...masks.flatMap(({ kept }) => kept)];
-  const temps = own === undefined ? [] : realDirs(["/tmp", "/var/tmp"]).map((dir) => ({ dir, fresh: into.some((to) => isInside(dir, to)) }));
+  // And where the session's folder holds a mount other than its own (the project in $TMPDIR, a hidden file
+  // there, a lock of git's), or lies in a hidden path or a lock: bound at /tmp it would be seen a second
+  // time, without those mounts, the hidden file read and git's config written at /tmp/<...>.
+  const covered = [...into, ...hidden, ...holding(hidden, writable), ...(home ? ownFixed(home, writable) : []), ...(git ? [...git.fixed, ...git.locked] : [])];
+  const twice =
+    own !== undefined &&
+    (covered.some((to) => to !== own && isInside(own, to)) ||
+      masks.some(({ path, kept }) => isInside(path, own) && !kept.some((place) => isInside(place, own))) ||
+      !!git?.locked.some((path) => isInside(path, own)));
+  const temps = own === undefined ? [] : realDirs(["/tmp", "/var/tmp"]).map((dir) => ({ dir, fresh: twice || into.some((to) => isInside(dir, to)) }));
   const bound = temps.filter(({ fresh }) => !fresh).map(({ dir }) => dir);
   const elsewhere = (mounts: string[]) => (bound.length ? eachMount(mounts).filter((mount) => !bound.some((dir) => isInside(dir, mount.at(-1)!))).flat() : mounts);
   const isolation = () => {

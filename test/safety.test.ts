@@ -1290,6 +1290,38 @@ describe("isolation: service", { skip: sandboxProblem() || (process.platform !==
     }
   });
 
+  it("gives each command an empty /tmp where the project lies in $TMPDIR, so nothing there is seen a second time", async () => {
+    // Bound at /tmp, the session's folder showed the project again without the sandbox's mounts in it: the
+    // hidden file was read, and git's config written, at /tmp/project/.
+    const base = await folder(join(homedir(), ".jig-iso-"));
+    const own = join(base, "tmp");
+    const project = join(own, "project");
+    await mkdir(project, { recursive: true });
+    setEnv({ TMPDIR: own, JIG_HOME: join(base, ".jig") });
+    execFileSync("git", ["init", "-q", project]);
+    await writeFile(join(project, ".env"), "SECRET\n");
+    const config = await readFile(join(project, ".git", "config"), "utf8");
+    const attempt = `cat .env /tmp/project/.env /var/tmp/project/.env; for c in .git/config /tmp/project/.git/config /var/tmp/project/.git/config; do printf '[core]\\n\\tfsmonitor = id\\n' >> $c; done; echo ok > made.txt; echo done`;
+    for (const isolated of [true, false]) {
+      const sandbox = createSandbox(project, { network: false, hidden: [join(project, ".env")], isolated })!;
+      try {
+        if (isolated) assert.match(sandbox.limits, / \/tmp here is empty for each command: keep files in \$TMPDIR\.$/);
+        const out = await run(attempt, project, sandbox);
+        assert.match(out, /done\n/, out);
+        assert.doesNotMatch(out, /SECRET/, out);
+        assert.equal(await readFile(join(project, ".git", "config"), "utf8"), config);
+        assert.equal(existsSync(join(project, "made.txt")), true);
+        // $TMPDIR is still kept from one command to the next.
+        assert.match(await run(`echo kept > "$TMPDIR/${tag}-k" && echo x > /tmp/${tag}-gone`, project, sandbox), /^(?!.*denied)/s);
+        assert.match(await run(`cat "$TMPDIR/${tag}-k"`, project, sandbox), /^kept\n/);
+        if (isolated) assert.match(await run(`cat /tmp/${tag}-gone`, project, sandbox), /No such file or directory/);
+        await rm(`/tmp/${tag}-gone`, { force: true });
+      } finally {
+        sandbox.close?.();
+      }
+    }
+  });
+
   it("keeps commands from the Unix sockets in /tmp and /run, through the session's first process too", async () => {
     const { project } = await outsideTmp();
     const listening: Server[] = [];

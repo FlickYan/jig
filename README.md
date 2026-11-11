@@ -466,7 +466,7 @@ home-directory checks, which are the process's, as `HOME` is. The CLI runs the s
   which the task service's local runner sets for each task (Linux only; docs/server.md): commands then get
   a `/tmp`, `/var/tmp`, `/run` and IPC of the session's own instead of the machine's, `/tmp` being `$TMPDIR`
   (which so can't be `/tmp` itself), or empty for each command where the project or jig's directory lies
-  in `/tmp`. It needs the sandbox: without one jig stops. The file tools only work in the project and the
+  in `/tmp`, or the project or a hidden path in `$TMPDIR`. It needs the sandbox: without one jig stops. The file tools only work in the project and the
   `--add-dir` folders, so for them it only stops a link there that leads into the machine's `/tmp`, `/run`
   or `/dev/shm`.
 - **Project trust.** A repository's `.jig/settings.json` could start programs (hooks, MCP servers) or
