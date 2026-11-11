@@ -3,7 +3,9 @@
 // went), scripts go by EVALSHA with EVAL when Redis doesn't have them yet, and an error reply rejects its
 // command's promise. A lost connection rejects what was in flight, since there is no knowing whether it
 // ran; for a backoff time after (50 ms, doubling to 2 s) commands fail at once, then the next one connects
-// again. A client that subscribes to channels reconnects by itself and subscribes again.
+// again. A command that never left (it waited for a connection that failed, or was refused during the
+// backoff) fails with a RedisUnsentError; with any other error it may have run. A client that subscribes
+// to channels reconnects by itself and subscribes again.
 //
 //   redis://[[username]:password@]host[:port][/db], or rediss:// for TLS
 
@@ -14,6 +16,11 @@ import { connect as tlsConnect } from "node:tls";
 /** An error reply from Redis: its text, as Redis gave it ("ERR ...", "NOSCRIPT ...", "WRONGPASS ..."). */
 export class RedisError extends Error {
   override name = "RedisError";
+}
+
+/** The command was never written to Redis, so it did not run: the connection failed first, or is in its backoff. */
+export class RedisUnsentError extends Error {
+  override name = "RedisUnsentError";
 }
 
 /** A reply: a simple or bulk string, an integer, null (a null bulk string or array), an error inside an array, or an array. */
@@ -134,7 +141,7 @@ export class Redis {
   /** Waiting for the connection. */
   private readonly queued: Pending[] = [];
   private readonly channels = new Set<string>();
-  private lastError = new Error("Redis is not connected");
+  private lastError: Error = new RedisUnsentError("Redis is not connected");
   private backoff = 0;
   private retry?: NodeJS.Timeout;
 
@@ -261,14 +268,18 @@ export class Redis {
   /** The connection is lost: what was sent or waiting fails, and commands fail at once until the backoff is over. */
   private fail(err: Error): void {
     if (this.state === "closed" || this.state === "down") return;
-    this.lastError = err;
+    // What was written may have run; what only waited, and what the backoff refuses, did not.
+    const unsent = new RedisUnsentError(err.message);
+    this.lastError = unsent;
     this.socket?.destroy();
     this.socket = undefined;
     this.buffer = Buffer.alloc(0);
     this.state = "down";
-    for (const pending of [...this.sent.splice(0), ...this.queued.splice(0)]) {
-      clearTimeout(pending.timer);
-      pending.reject(err);
+    for (const [waiting, error] of [[this.sent, err], [this.queued, unsent]] as const) {
+      for (const pending of waiting.splice(0)) {
+        clearTimeout(pending.timer);
+        pending.reject(error);
+      }
     }
     this.backoff = Math.min(MAX_BACKOFF_MS, this.backoff ? this.backoff * 2 : FIRST_BACKOFF_MS);
     this.retry = setTimeout(() => {

@@ -1257,7 +1257,7 @@
       "id": 27,
       "type": "timeseries",
       "title": "Redis errors",
-      "description": "Reads and writes of the shared state that failed.",
+      "description": "Reads and writes of the shared state that failed, and the slots given back to Redis late after it: replayed, expired or dropped.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1294,6 +1294,15 @@
           "expr": "sum(increase(jig_gateway_state_errors_total{region=~\"$region\"}[$__rate_interval]))",
           "legendFormat": "state errors",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (outcome) (increase(jig_gateway_state_late_releases_total{region=~\"$region\"}[$__rate_interval]))",
+          "legendFormat": "slots given back late: {{outcome}}",
+          "refId": "B"
         }
       ]
     },

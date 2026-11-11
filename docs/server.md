@@ -1159,6 +1159,7 @@ without the block there is none, and the public port never serves metrics. Each 
 | `jig_gateway_keys` | `upstream`, `state` | gauge: how many keys are `ok`, `resting` or `refused` |
 | `jig_gateway_refused_total` | `tenant`, `reason` | calls the gateway turned away itself: `auth`, `budget`, `rate`, `concurrency` or `quota` |
 | `jig_gateway_state_errors_total` | | reads and writes of Redis that failed, a scrape's own reads of the keys' standing included |
+| `jig_gateway_state_late_releases_total` | `outcome` | slots given back to Redis late, after it could not be reached: `replayed` (given back once it answered), `expired` (the lease ended first) or `dropped` (more than 10,000 to remember) |
 
 No label holds a key, a token, a prompt or a task. Every reply carries `x-request-id`: the client's, if it
 sent one of 1 to 128 letters, digits, `_`, `.` and `-`, or else a new one. It isn't sent to the provider.
@@ -1216,7 +1217,23 @@ and quotas count only what went through that replica during the outage: each rep
 so a task that had already spent its budget can spend it again on each replica, and what is spent while
 Redis is down is never written to Redis, so it is missing from `/usage` and from the billing days once
 Redis is back. Choose `open` only where availability matters more than holding budgets and billing exactly. Either way the gateway says so once on stderr and counts each failure in
-`jig_gateway_state_errors_total`.
+`jig_gateway_state_errors_total`; once it says Redis is back, it gives back the slots it could not
+meanwhile, counted in `jig_gateway_state_late_releases_total`.
+
+A request that ends while Redis can't be reached can't give its slot back, and nothing renews it any more.
+The replica remembers such slots (up to 10,000, each for `leaseMs` at most) and gives them back, a thousand
+in a round, about a second after Redis answers again, rather than leave the tenant short of them on every
+replica until their leases end. A slot Redis may have taken for a request whose answer was lost is given
+back the same way, when Redis ran the request before the connection was lost. What this leaves:
+
+- What a gateway owes when it stops, and what is over 10,000, expires with its lease; the list is each
+  replica's own, in memory.
+- A request Redis let through only after the gateway had given up on it holds its slot for one lease, and
+  the rate token such a request took is not returned.
+- With `open`, a waiting request whose slot is being given back goes by this replica's own limits until
+  Redis has answered the give-back.
+- Spending lost in an outage stays lost, and a reply that outlasts an outage longer than `leaseMs` loses
+  its lease, as before.
 
 ## Several regions
 

@@ -485,7 +485,7 @@ describe("the task service's metrics on the Docker runner, with a warm pool", ()
 describe("the observability deploy files", () => {
   // The gateway's and the router's metrics, as their contracts name them (docs/server.md), histograms
   // marked: the files below cover all three parts.
-  const GATEWAY = ["jig_gateway_requests_total", "jig_gateway_request_seconds:h", "jig_gateway_first_byte_seconds:h", "jig_gateway_queue_seconds:h", "jig_gateway_inflight", "jig_gateway_waiting", "jig_gateway_tokens_total", "jig_gateway_cost_usd_total", "jig_gateway_failovers_total", "jig_gateway_upstream_open", "jig_gateway_keys", "jig_gateway_refused_total", "jig_gateway_state_errors_total"];
+  const GATEWAY = ["jig_gateway_requests_total", "jig_gateway_request_seconds:h", "jig_gateway_first_byte_seconds:h", "jig_gateway_queue_seconds:h", "jig_gateway_inflight", "jig_gateway_waiting", "jig_gateway_tokens_total", "jig_gateway_cost_usd_total", "jig_gateway_failovers_total", "jig_gateway_upstream_open", "jig_gateway_keys", "jig_gateway_refused_total", "jig_gateway_state_errors_total", "jig_gateway_state_late_releases_total"];
   const ROUTER = ["jig_router_requests_total", "jig_router_region_up", "jig_router_failovers_total", "jig_router_request_seconds:h"];
 
   /** Every series name a query may use: the service's registrations, those in the server's code, and the contracts'. */

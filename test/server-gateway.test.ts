@@ -8,8 +8,8 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { costOf } from "../src/prices.ts";
 import { Breaker, type Gateway, type GatewayConfig, startGateway, withModel } from "../server/gateway.ts";
-import { Redis } from "../server/redis.ts";
-import { MemoryState, RedisState, SharedState, utcDay } from "../server/state.ts";
+import { Redis, RedisUnsentError } from "../server/redis.ts";
+import { MemoryState, RedisState, SharedState, StateError, utcDay } from "../server/state.ts";
 import { mintToken, type TokenPayload, verifyToken } from "../server/token.ts";
 import { fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -943,6 +943,9 @@ describe("the gateway's metrics and logs", () => {
       ['jig_gateway_keys{upstream="first",state="ok"}', 1],
       ['jig_gateway_keys{upstream="second",state="ok"}', 2],
       ["jig_gateway_state_errors_total", 0],
+      ['jig_gateway_state_late_releases_total{outcome="replayed"}', 0],
+      ['jig_gateway_state_late_releases_total{outcome="expired"}', 0],
+      ['jig_gateway_state_late_releases_total{outcome="dropped"}', 0],
     ];
     await until(async () => (await metric(gw, 'jig_gateway_request_seconds_count{upstream="none"}')) === 2, "every call to be counted");
     for (const [series, value] of expected) assert.equal(await metric(gw, series), value, series);
@@ -1186,6 +1189,163 @@ describe("the gateway without its Redis", () => {
     assert.deepEqual(said.map(([level, line]) => [level, line.split(";")[0]]), [["warn", "jig gateway: Redis can't be reached (refused)"], ["info", "jig gateway: Redis is back"]]);
   });
 
+  /** A stand-in RedisState the test takes away and brings back, recording the admits it got and the slots given back. */
+  function awayRedis(leaseMs = 60_000) {
+    const fake = {
+      leaseMs,
+      up: false,
+      error: new Error("refused") as Error,
+      admits: [] as string[],
+      given: [] as { tenant: string; id: string }[][],
+      tries: 0,
+      hold: undefined as Promise<void> | undefined,
+      async admit(_tenant: string, id: string) {
+        fake.admits.push(id);
+        if (!fake.up) throw fake.error;
+        return 0;
+      },
+      async release() {
+        if (!fake.up) throw fake.error;
+      },
+      async releaseAll(slots: { tenant: string; id: string }[]) {
+        fake.tries++;
+        if (!fake.up) throw fake.error;
+        fake.given.push(slots);
+        await fake.hold;
+      },
+      close() {},
+    };
+    return fake;
+  }
+
+  /** A SharedState over `redis` that tries to give back every 20 ms, with what it counted and said. */
+  function sharedOver(redis: ReturnType<typeof awayRedis>, onStateError: "closed" | "open" = "open") {
+    const late: [string, number][] = [];
+    const errors: Error[] = [];
+    const said: string[] = [];
+    const options = { onStateError, onError: (err: Error) => void errors.push(err), log: (line: string) => void said.push(line), onLate: (outcome: string, n: number) => void late.push([outcome, n]), giveBackMs: 20 };
+    const state = new SharedState(redis as unknown as RedisState, options);
+    closing.push(() => state.close());
+    return { state, late, errors, said };
+  }
+
+  const pause = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+  it("gives back a slot it could not release once Redis answers again, with no request to prompt it", async () => {
+    const redis = awayRedis();
+    const { state, late, errors, said } = sharedOver(redis);
+    await state.release("acme", "x");
+    // It tries by itself while Redis is away, and neither counts nor says those failures.
+    await until(() => redis.tries >= 3, "it to try giving the slot back");
+    assert.deepEqual([errors.length, said.length, late.length], [1, 1, 0]);
+    redis.up = true;
+    await until(() => late.length === 1, "the slot to be given back");
+    assert.deepEqual([redis.given, late], [[[{ tenant: "acme", id: "x" }]], [["replayed", 1]]]);
+    // With nothing owed, nothing more is tried.
+    let tries = redis.tries;
+    await pause(80);
+    assert.equal(redis.tries, tries);
+
+    // Closed, it forgets what it owes, and a release Redis fails as it closes is not remembered.
+    redis.up = false;
+    await state.release("acme", "y");
+    let fail!: (err: Error) => void;
+    redis.release = () => new Promise<void>((_, reject) => (fail = reject));
+    const pending = state.release("acme", "z");
+    state.close();
+    fail(new Error("The Redis client is closed."));
+    await pending;
+    redis.up = true;
+    tries = redis.tries;
+    await pause(80);
+    assert.deepEqual([redis.tries, redis.given.length], [tries, 1]);
+  });
+
+  it("gives back the slot of an admit Redis may have run, and none for one that never left", async () => {
+    const limits = { tenant: {}, global: {} };
+    for (const onStateError of ["closed", "open"] as const) {
+      const redis = awayRedis();
+      const { state, late } = sharedOver(redis, onStateError);
+      for (const [id, error] of [["unsent", new RedisUnsentError("refused")], ["lost", new Error("The connection to Redis closed.")]] as const) {
+        redis.error = error;
+        if (onStateError === "closed") await assert.rejects(state.admit("acme", id, limits), StateError);
+        else assert.equal(await state.admit("acme", id, limits), 0);
+      }
+      redis.up = true;
+      await until(() => late.length === 1, "the slot to be given back");
+      await pause(60);
+      assert.deepEqual([redis.given, late], [[[{ tenant: "acme", id: "lost" }]], [["replayed", 1]]], onStateError);
+    }
+  });
+
+  it("does not ask Redis again for a request whose slot it is still giving back", async () => {
+    const redis = awayRedis();
+    const { state, late, errors } = sharedOver(redis);
+    // This replica's own one slot is taken, so the next request waits.
+    const limits = { tenant: { concurrent: 1 }, global: {} };
+    redis.error = new RedisUnsentError("refused");
+    assert.equal(await state.admit("acme", "x", limits), 0);
+    redis.error = new Error("The connection to Redis closed.");
+    assert.equal(await state.admit("acme", "y", limits), Infinity);
+    // Redis is back, and slow to answer the give-back.
+    let answer!: () => void;
+    redis.hold = new Promise((done) => (answer = done));
+    redis.up = true;
+    await until(() => redis.given.length === 1, "the give-back to be sent");
+    const before = [redis.admits.length, errors.length];
+    assert.equal(await state.admit("acme", "y", limits), Infinity);
+    assert.deepEqual([redis.admits.length, errors.length], before, "Redis wasn't asked, and no error counted");
+    answer();
+    await until(() => late.length === 1, "the give-back to be answered");
+    assert.equal(await state.admit("acme", "y", limits), 0);
+    assert.deepEqual(redis.admits, ["x", "y", "y"]);
+  });
+
+  it("remembers 10,000 slots to give back and no more, and gives them back a thousand at a time", async () => {
+    const redis = awayRedis();
+    const { state, late, said } = sharedOver(redis);
+    for (let i = 0; i <= 10_000; i++) await state.release(`tenant${i % 3}`, `r${i}`);
+    assert.deepEqual(late, [["dropped", 1]]);
+    redis.up = true;
+    await until(() => late.reduce((sum, [outcome, n]) => sum + (outcome === "replayed" ? n : 0), 0) === 10_000, "the slots to be given back");
+    await pause(60);
+    const given = redis.given.flat().map((slot) => slot.id);
+    assert.deepEqual([given.length, new Set(given).size, given.includes("r10000"), given[0]], [10_000, 10_000, false, "r0"]);
+    assert.ok(redis.given.every((slots) => slots.length <= 1000), "a thousand slots at most in one give-back");
+    assert.deepEqual(redis.given[0].slice(0, 2), [{ tenant: "tenant0", id: "r0" }, { tenant: "tenant1", id: "r1" }]);
+    assert.equal(said.filter((line) => line.includes("more than 10000 slots to give back")).length, 1);
+  });
+
+  it("gives back no slot whose lease ended before Redis answered again", async () => {
+    const redis = awayRedis(100);
+    const { state, late } = sharedOver(redis);
+    await state.release("acme", "x");
+    await pause(150);
+    redis.up = true;
+    await until(() => late.length === 1, "the slot to be forgotten");
+    await pause(60);
+    assert.deepEqual([redis.given, late], [[], [["expired", 1]]]);
+  });
+
+  it("goes on when counting a give-back throws", async () => {
+    const unhandled: unknown[] = [];
+    const hook = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", hook);
+    try {
+      const redis = awayRedis();
+      redis.up = true;
+      redis.release = async () => Promise.reject(new Error("refused"));
+      const state = new SharedState(redis as unknown as RedisState, { onStateError: "open", onError: () => {}, log: () => {}, giveBackMs: 20, onLate: () => { throw new Error("no counter"); } });
+      closing.push(() => state.close());
+      await state.release("acme", "x");
+      await until(() => redis.given.length === 1, "the slot to be given back");
+      await pause(60);
+      assert.deepEqual([redis.given.length, unhandled], [1, []]);
+    } finally {
+      process.off("unhandledRejection", hook);
+    }
+  });
+
   it("lets go of its Redis when it can't listen, so a program that started it can end", async () => {
     // A stand-in Redis that keeps every connection it is given, and a port already taken.
     const open = new Set<Socket>();
@@ -1238,6 +1398,43 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
       }, ms);
     });
     return { ...provider, most: () => most };
+  }
+
+  /**
+   * Redis behind a proxy the test can cut and bring back on the same port, or have lose one reply: the
+   * command reaches Redis and runs, and the client's connection closes in place of its reply.
+   */
+  async function cuttable(): Promise<{ url: string; cut(): Promise<void>; listen(): Promise<void>; loseReply(): void }> {
+    const target = new URL(REDIS!);
+    const sockets = new Set<Socket>();
+    let proxy: Server | undefined;
+    let port = 0;
+    let lose = false;
+    const listen = async () => {
+      proxy = createTcpServer((socket) => {
+        const upstream = connect(Number(target.port || 6379), target.hostname);
+        for (const s of [socket, upstream]) {
+          sockets.add(s);
+          s.on("error", () => {}).on("close", () => (socket.destroy(), upstream.destroy(), sockets.delete(s)));
+        }
+        socket.pipe(upstream);
+        upstream.on("data", (chunk) => {
+          if (!lose) return void socket.write(chunk);
+          lose = false;
+          socket.destroy();
+        });
+      });
+      await new Promise<void>((done) => proxy!.listen(port, "127.0.0.1", done));
+      port = (proxy.address() as AddressInfo).port;
+    };
+    const cut = async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((done) => proxy!.close(done));
+    };
+    await listen();
+    closing.push(() => proxy?.listening && cut());
+    const url = `${target.protocol}//${target.username}${target.password ? `:${target.password}` : ""}@127.0.0.1:${port}${target.pathname}`;
+    return { url, cut, listen, loseReply: () => void (lose = true) };
   }
 
   it("holds a tenant to its concurrency and rate across two gateways", async () => {
@@ -1465,29 +1662,7 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
   });
 
   it("answers 503 when Redis goes away mid-run, or goes on alone, and comes back with it", async () => {
-    // Redis behind a proxy the test can cut.
-    const target = new URL(REDIS!);
-    const sockets = new Set<Socket>();
-    let proxy: Server | undefined;
-    const listen = async (port = 0) => {
-      proxy = createTcpServer((socket) => {
-        const upstream = connect(Number(target.port || 6379), target.hostname);
-        for (const s of [socket, upstream]) {
-          sockets.add(s);
-          s.on("error", () => {}).on("close", () => (socket.destroy(), upstream.destroy(), sockets.delete(s)));
-        }
-        socket.pipe(upstream).pipe(socket);
-      });
-      await new Promise<void>((done) => proxy!.listen(port, "127.0.0.1", done));
-      return (proxy.address() as AddressInfo).port;
-    };
-    const cut = async () => {
-      for (const socket of sockets) socket.destroy();
-      await new Promise((done) => proxy!.close(done));
-    };
-    const port = await listen();
-    closing.push(() => proxy?.listening && cut());
-    const redis = `${target.protocol}//${target.username}${target.password ? `:${target.password}` : ""}@127.0.0.1:${port}${target.pathname}`;
+    const { url: redis, cut, listen } = await cuttable();
     const provider = await fakeProvider();
     const prefixed = prefix();
     const closed = await gateway(provider.url, { state: { redis, prefix: prefixed } });
@@ -1498,7 +1673,71 @@ describe("gateways sharing a Redis", { skip: !REDIS && "set JIG_TEST_REDIS_URL t
     assert.deepEqual([refused.status, refused.headers.get("retry-after")], [503, "1"]);
     assert.equal((await ask(open, token())).status, 200);
     assert.equal(provider.seen.length, 3);
-    await listen(port);
+    await listen();
     await until(async () => (await ask(closed, token())).status === 200, "the gateway to reach Redis again");
+  });
+
+  it("gives back, once Redis is back, the slots it could not while Redis was away, long before their leases end", async () => {
+    const two = { tenant: { concurrent: 2 }, global: {} };
+    for (const onStateError of ["closed", "open"] as const) {
+      const { url, cut, listen } = await cuttable();
+      const shared = prefix();
+      const state = new SharedState(new RedisState(url, { prefix: shared }), { onStateError, onError: () => {}, log: () => {} });
+      closing.push(() => state.close());
+      // Another replica, which reaches Redis all along.
+      const other = new RedisState(REDIS!, { prefix: shared });
+      closing.push(() => other.close());
+      assert.deepEqual([await state.admit("acme", "a", two), await state.admit("acme", "b", two), await other.admit("acme", "c", two)], [0, 0, Infinity]);
+      await cut();
+      const released = await Promise.allSettled([state.release("acme", "a"), state.release("acme", "b")]);
+      for (const result of released) {
+        if (onStateError === "open") assert.equal(result.status, "fulfilled");
+        else assert.ok(result.status === "rejected" && result.reason instanceof StateError);
+      }
+      await listen();
+      // The leases are of 60 seconds: until() gives the slots 5 to come back.
+      await until(async () => (await other.admit("acme", "c", two)) === 0, `the tenant's slots to be given back (${onStateError})`);
+    }
+  });
+
+  it("gives back the slot Redis took for a request that never heard so", async () => {
+    const one = { tenant: { concurrent: 1 }, global: {} };
+    const direct = new Redis(REDIS!);
+    closing.push(() => direct.close());
+    for (const onStateError of ["closed", "open"] as const) {
+      const { url, loseReply } = await cuttable();
+      const shared = prefix();
+      const state = new SharedState(new RedisState(url, { prefix: shared }), { onStateError, onError: () => {}, log: () => {} });
+      closing.push(() => state.close());
+      // A first request, so that Redis has the script and the lost reply is the admit's own.
+      assert.equal(await state.admit("acme", "first", one), 0);
+      await state.release("acme", "first");
+      loseReply();
+      if (onStateError === "closed") await assert.rejects(state.admit("acme", "lost", one), StateError);
+      else assert.equal(await state.admit("acme", "lost", one), 0);
+      const held = () => direct.command(["ZCARD", `${shared}inflight:acme`]);
+      assert.equal(await held(), 1, "Redis took the slot");
+      await until(async () => (await held()) === 0, `the slot to be given back (${onStateError})`);
+    }
+  });
+
+  it("lets a tenant's next request through soon after an outage that kept its last slot", async () => {
+    const { url, cut, listen } = await cuttable();
+    const provider = await slowProvider(400);
+    const gw = await gateway(provider.url, { state: { redis: url, prefix: prefix() }, limits: { maxWaitMs: 5000, tenantDefaults: { concurrent: 1 } } });
+    const first = outcome(ask(gw, token()));
+    await until(() => provider.seen.length === 1, "the request to reach the provider");
+    await cut();
+    assert.equal((await first)[0], 200);
+    // Its slot could not be given back: Redis was away when the reply ended.
+    await until(async () => (await metric(gw, 'jig_gateway_inflight{tenant="acme"}')) === 0, "the reply to be over");
+    await new Promise((done) => setTimeout(done, 100));
+    await listen();
+    const start = Date.now();
+    const statuses: number[] = [];
+    await until(async () => statuses.push((await outcome(ask(gw, token())))[0]) > 0 && statuses.at(-1) === 200, "a request to be let through");
+    assert.ok(statuses.every((status) => status === 200 || status === 503), `none turned away for the slot: ${statuses}`);
+    assert.ok(Date.now() - start < 5000, `within 5 seconds (${Date.now() - start} ms)`);
+    assert.ok((await metric(gw, 'jig_gateway_state_late_releases_total{outcome="replayed"}'))! >= 1);
   });
 });
