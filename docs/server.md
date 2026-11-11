@@ -71,7 +71,11 @@ never touched, and a row per task and the usage ledger stay. Take a backup befor
 the first sweep deletes the content of every task older than that. A misspelt field in the config is
 silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB) is the most of a run's last text that is kept as the
 task's `result` (below); setting it over 1 MiB does nothing more, as a longer line of events is never read.
-`keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed. A config the
+`keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed.
+`maxTaskDiskBytes` (4294967296, 4 GiB; 0 for none) is the most a task's folder may take on `dataDir`'s
+disk before its run is stopped (the disk cap, below). It is the local and docker runners': with `runner`
+`kubernetes` it is refused, as a pod's `ephemeral-storage` limit does that there. It is on by default, so
+a deployment whose tasks need more than 4 GiB each must raise it. A config the
 service can't run with (`concurrency` 0, a key's hash given to two tenants, a field of the wrong type, a
 runner without its `image` or `network`, a time past what a timer can wait: `graceSeconds` and
 `leaseSeconds` over 86,400, `heartbeatSeconds` and `kubernetes.terminationGraceSeconds` over 3,600, a
@@ -192,11 +196,13 @@ A task is `queued`, then `running`, then one of:
 | `stopped` | the run stopped short at a limit: steps (exit 2), the output limit or context window (3), repeating itself (6), the time limit (7, or the runner's stop past it), empty replies (8), an interruption (130) |
 | `failed` | the model declined (4), or tool calls needed approval (5) |
 | `cancelled` | cancelled through the API |
-| `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, or the service stopping while it ran |
+| `error` | anything else: jig's own failure (1, with the last line it printed), a workspace that couldn't be made, a folder past the disk cap, or the service stopping while it ran |
 
 `stop` is how jig's run ended, from its `end` event (or its exit code, without one; a run stopped by a
 cancel or by the service, with no `end` event, has stop `interrupted`), and `usage` and `cost` come from
-that event too. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
+that event too. A run stopped at the disk cap (below) is an `error` with stop `disk_limit`, though jig's
+own `end` says `interrupted`; a task whose workspace alone is past the cap is an `error` before jig starts,
+with no `stop`. A NUL character in `stop` or `error`, which come from what the run wrote, is stored as
 U+FFFD.
 
 `result` is the last text the run wrote (its last `text` event), on `GET /v1/tasks/:id` and, with
@@ -324,6 +330,18 @@ left to its lease, which ends the task as an `error` with nothing spent in the u
 cancel or a shutdown, a write of a run's events or approvals isn't tried again, as the run is stopping:
 past the first failure, its events aren't stored. Its outcome is still tried again. On Postgres, an error in the data itself (SQLSTATE class 22 or 23) isn't
 tried again, as it would fail each time.
+
+A SQLite database whose disk is full (SQLite's `SQLITE_FULL`) is tried again like any other failure:
+stopping a run can't make room, and the task that filled the disk is stopped by its disk cap and its folder
+removed, which the other runs' tries ride out. A run whose events still can't be written after half a lease
+ends as an `error` that says the service's database couldn't be written because its disk is full. Before
+a run's outcome is tried again after that failure, its folder is removed (unless `keepTaskDirs`), as it may
+be what filled the disk. The API's own writes (a new task, an approval's answer) are answered 503 with
+`retry-after: 30` and `{"error": "The service's database is out of disk space"}`, not 500. `/readyz` stays
+200, as reads still work. Other signs of a full disk (a quota, a `-shm` file that can't grow, a journal that
+can't be made, Postgres's own disk) come as other errors, and are plain store failures. With `keepTaskDirs`,
+or a disk that something else filled, nothing makes room: the outcome is given up on after half a lease, and
+the task ends when its lease runs out, with the lease's text.
 
 ### Several replicas, on Postgres
 
@@ -709,7 +727,48 @@ is on that network too, but takes only tenants' keys, which no task holds.
 The daemon binds the task folders by their path on its own machine, so a service in a container must have
 `dataDir` at the same path as on the host. A service running as root gives each task folder to
 `docker.user` (10001:10001, the image's `jig` user); one that doesn't must run as that user. The task
-folders are on the host's disk with no quota of their own: put `dataDir` on a file system of its own.
+folders are on the host's disk with no quota of their own; the disk cap (below) stops a run whose folder
+grows past `maxTaskDiskBytes`, but it is a check and not a quota. So still put `dataDir` on a file system
+of its own: what gets past the cap then fills that one, not the database's or the host's.
+
+### The disk cap
+
+The local and Docker runners keep each task's folder on the service's machine, where nothing limits its
+size. So while a task runs, the service measures its folder (`dataDir/tasks/<id>`, or the slot's
+`pool_<hex>` on a warm worker: the workspace, jig's home, the events and `output.log`), and stops the run
+once it takes more than `maxTaskDiskBytes`: SIGTERM, to jig's process group or to the container, and
+SIGKILL 5 seconds later. The task ends as an `error` with stop `disk_limit` and the error `the task's folder
+grew past maxTaskDiskBytes (<n> bytes), so the service stopped the run`; what it spent until then is
+stored as for any run. The folder is then removed with the task, as any is.
+
+What is counted is the blocks each file and folder takes on the disk, so a sparse file counts for what it
+holds, not its length. No link is followed and no other file system entered, and a file with several
+names is counted once. The folder is measured every 5 seconds, from before the workspace is made (a clone
+that goes past the cap is stopped too) until the run ends; after a walk that took long, the next waits ten
+times as long as it took, and one folder is walked at a time across all the tasks, so a machine of big
+trees is read by one walk, not by one for each task.
+
+It is a check, not a quota, and these are its limits:
+
+- A task can go past the cap by what the disk takes in the time between two checks and the 5 seconds
+  between SIGTERM and SIGKILL. The room to leave for that is the operator's to judge.
+- Not counted: a file written while it has no name (opened, then removed), `/tmp` and `/var/tmp` on the
+  local runner (the machine's own, which tasks share; a task's `TMPDIR` is in its folder and is counted),
+  Docker's own log of the container, the folders `keepTaskDirs` keeps after their tasks, and a warm worker's
+  folder while it waits for a task.
+- A task that times the walk can move data round it, or make a tree it has to give up on. The cap is
+  against tasks that run away, not hostile ones: for those, a file system with quotas, or the Kubernetes
+  runner.
+- A folder that can't be measured (a folder in it the service's user can't read, a path too long to name,
+  over 1,000,000 files) on two checks in a row ends the task as an `error` that says so, as it can't be held
+  to the cap. One such check may only have met a folder as it was made.
+- On a file system that compresses, the blocks are what is stored, so the cap undercounts what was written.
+
+At its start the service warns when `dataDir`'s file system has less free than `concurrency` ×
+`maxTaskDiskBytes`, what the tasks running at once may take: 17.2 GB with the defaults (4 tasks of 4 GiB),
+34.4 GB with `deploy/service.docker.json`'s `concurrency` 8. It warns too when `maxTaskDiskBytes` is 0, and
+in both says so if the SQLite database is on that file system: once it is full, the database's writes fail
+(Scheduling, above). It starts all the same.
 
 ### The Kubernetes runner
 
@@ -750,7 +809,8 @@ what it requests. A warm worker's Job and Secret are made the same way.
   "resources": { "requests": { "cpu": "250m", "memory": "1Gi" }, "limits": { "cpu": "1", "memory": "2Gi", "ephemeral-storage": "4Gi" } } }
 ```
 
-A pod's files are on its node, out of the service's reach, so the events come in its log: the pod runs
+A pod's files are on its node, out of the service's reach (so `maxTaskDiskBytes` doesn't apply: the pod's
+`ephemeral-storage` limit holds them), and the events come in its log: the pod runs
 `node server/worker.ts`, which makes `HOME` and the workspace (writing the files, or cloning the repository there),
 starts `jig --no-sandbox ... --events -` with the prompt on stdin, and after jig's events prints a line
 with its exit code and `--stats`. The service follows the log (from the start again, without the events

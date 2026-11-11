@@ -1,6 +1,7 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { stat, statfs } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { homedir } from "node:os";
@@ -20,6 +21,7 @@ import {
   type Approval,
   type Counts,
   type Decision,
+  diskFull,
   FINISHED,
   isoDay,
   openStore,
@@ -115,6 +117,11 @@ export interface Config {
   keepTaskDirs?: boolean;
   /** Days after a task ends that its content is deleted (as DELETE /v1/tasks/:id does); kept for good without it. */
   retentionDays?: number;
+  /**
+   * The most bytes a task's folder may take on dataDir's disk before the local or docker runner stops its
+   * run (default 4 GiB; 0: no cap). Not for kubernetes, whose pods have an ephemeral-storage limit.
+   */
+  maxTaskDiskBytes?: number;
   /** The environment variable that holds the key to /admin/usage; without it, /admin is 404. */
   adminKeyEnv?: string;
   /** The listener that serves GET /metrics and GET /healthz, and nothing else (none without it; host 127.0.0.1 by default). */
@@ -125,7 +132,10 @@ export interface Config {
 }
 
 /** What every runner takes from the config's top level, and the service's log. */
-type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log";
+type Shared = "dataDir" | "gatewayBaseUrl" | "gatewaySecret" | "graceSeconds" | "gitProtocols" | "gitRedirects" | "internalBaseUrl" | "log" | "maxDiskBytes" | "diskPollMs";
+
+/** A task's folder may take this much of the disk unless the config says: what a Kubernetes task's pod may, by default. */
+const MAX_TASK_DISK_BYTES = 4 * 1024 ** 3;
 
 const DEFAULT_LIMITS: Required<Limits> = { concurrency: 2, maxSteps: 50, timeLimit: 1800, budgetUsd: null, maxQueued: 1000, approvalTimeout: 600, quotas: {}, maxStreams: 20 };
 /** The most event streams open at once on a replica, across tenants, unless the config says. */
@@ -216,7 +226,9 @@ export async function startService(
   const answers = new Answers(store);
   /**
    * Serves a listener's requests, each answered with its x-request-id and logged at debug once it is over,
-   * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged.
+   * and on the API's listener (`api`) counted by its route. One that fails is a 500, and logged; one whose
+   * write found the database's disk full is a 503 to try again later, as room may be made (a task that
+   * ends, an operator), where a 500 would read as a fault in the request.
    */
   const handler =
     (serve: (req: IncomingMessage, res: ServerResponse, request: ServedRequest) => Promise<void>, api = false) =>
@@ -237,8 +249,9 @@ export async function startService(
         request.log.debug("request", { method: req.method, path, status: res.statusCode, ms: Math.round(seconds * 1000), tenant: request.tenant });
       });
       void serve(req, res, request).catch((err) => {
-        if (!res.headersSent) reply(res, 500, { error: "Internal error" });
-        else res.end();
+        if (res.headersSent) res.end();
+        else if (diskFull(err)) reply(res, 503, { error: "The service's database is out of disk space" }, { "retry-after": "30" });
+        else reply(res, 500, { error: "Internal error" });
         request.log.error("request failed", { err, tenant: request.tenant });
       });
     };
@@ -324,9 +337,12 @@ export async function startService(
     if (metricsServer) metricsUrl = await listen(metricsServer, config.metrics!.port, config.metrics!.host ?? "127.0.0.1");
     // What the local runner hides beside dataDir that holds more than the service's own files.
     const folders = !runner && (config.runner ?? "local") === "local" ? hiddenFolders(config.dataDir, configFile) : [];
+    // A runner given (by a test) has its own disk cap, or none: the config's says nothing of it.
+    const disk = runner ? [] : await diskRisks(config, log);
     runner ??= runnerFor(config, secret, config.internalBaseUrl ?? internalUrl, log, folders);
     runner.warm?.(config.internalBaseUrl ?? internalUrl);
     if (runner instanceof LocalRunner) for (const warning of localRisks(config, folders)) log.warn(warning);
+    for (const warning of disk) log.warn(warning);
     // The Kubernetes runner's clone is in the task's pod, on its network.
     if (!config.gitHosts && (runner instanceof LocalRunner || runner instanceof DockerRunner)) {
       log.warn(`a ${runner instanceof LocalRunner ? "local" : "docker"} task's workspace.git is cloned by the service, on this machine's network, from any host a tenant names: list the hosts it may clone from in gitHosts`);
@@ -401,6 +417,43 @@ function localRisks(config: Config, folders: HiddenFolder[]): string[] {
     ...(config.tenants.length > 1 ? [`the local runner keeps tenants apart only by jig's sandbox: a task's commands can't read the database's files or the other tasks' folders, but share the machine's kernel, /tmp and /var/tmp, and on macOS its processes and localhost${process.platform === "darwin" ? ", so they can read the service's own environment, its secrets included" : ""} (the docker and kubernetes runners keep them apart)`] : []),
     ...(inTemp(config.dataDir) ? ["dataDir is in a temp folder, where a local task's commands can write their task's home, whose git config jig's own git reads outside the sandbox: keep it elsewhere"] : []),
   ];
+}
+
+/**
+ * What the tasks' folders could do to dataDir's disk, on the local and docker runners: nothing holds them
+ * to maxTaskDiskBytes but a check every few seconds (runner.ts's watchDisk), so the tasks running at once
+ * need that much room each, and a SQLite database on the same file system fails with it when it is full.
+ * Never a reason not to start: a file system that can't be asked (none yet, or one that doesn't say) gives
+ * no line.
+ */
+export async function diskRisks(config: Config, log?: Log): Promise<string[]> {
+  if ((config.runner ?? "local") === "kubernetes") return [];
+  const cap = config.maxTaskDiskBytes ?? MAX_TASK_DISK_BYTES;
+  const concurrency = config.concurrency ?? 4;
+  try {
+    // dataDir is made by the first task, and the database's folder by the store: each is on the file
+    // system of the nearest folder that is there.
+    const dataDir = await nearest(resolve(config.dataDir));
+    const sameFs = sqliteFile(config.database) && config.database !== "" && (await stat(await nearest(dirname(resolve(config.database))))).dev === (await stat(dataDir)).dev;
+    const tail = sameFs ? ", and the SQLite database is on that file system too: once it is full the database's writes fail and every running task ends as an error. Keep the database, or dataDir, on a file system of its own" : "";
+    if (cap === 0) return [`maxTaskDiskBytes is 0, so a task's folder has no size limit and one task can fill dataDir's file system${tail}`];
+    const { bavail, bsize } = await statfs(dataDir);
+    const free = bavail * bsize;
+    if (free >= concurrency * cap) return [];
+    return [`dataDir's file system has ${free} bytes free, less than concurrency × maxTaskDiskBytes (${concurrency} × ${cap}): the tasks running at once could fill it${tail}; lower either, or give dataDir more room`];
+  } catch (err) {
+    log?.debug("couldn't look at dataDir's file system for its free space", { err });
+    return [];
+  }
+}
+
+/** The path, or the nearest folder above it that is there. */
+async function nearest(path: string): Promise<string> {
+  for (;;) {
+    if (await stat(path).then(() => true, () => false)) return path;
+    if (dirname(path) === path) return path;
+    path = dirname(path);
+  }
 }
 
 /** Whether the config's database is a SQLite file. */
@@ -518,12 +571,14 @@ function webhooksOf(tenants: TenantConfig[]): Map<string, Webhook> {
 function runnerFor(config: Config, secret: string, internalBaseUrl: string, log: Log, folders: HiddenFolder[]): Runner {
   const shared = { dataDir: config.dataDir, gatewayBaseUrl: config.gatewayBaseUrl, gatewaySecret: secret, graceSeconds: config.graceSeconds ?? 30, gitProtocols: config.gitProtocols, gitRedirects: !config.gitHosts, internalBaseUrl, log };
   const { runner = "local", docker, kubernetes } = config;
+  // The local and docker runners': a Kubernetes pod's ephemeral-storage limit is its cap.
+  const maxDiskBytes = config.maxTaskDiskBytes ?? MAX_TASK_DISK_BYTES;
   if (runner === "local") {
     const database = sqliteFile(config.database) ? ["", "-wal", "-shm", "-journal"].map((end) => config.database + end) : [];
     const hidden = [...new Set([...database, ...folders.map(({ path }) => path), ...(config.local?.hiddenPaths ?? [])])];
-    return new LocalRunner({ ...shared, hidden, sandbox: !config.local?.allowUnsandboxed, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
+    return new LocalRunner({ ...shared, maxDiskBytes, hidden, sandbox: !config.local?.allowUnsandboxed, jig: config.jig ?? [process.execPath, join(import.meta.dirname, "..", "src", "cli.ts")] });
   }
-  if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared });
+  if (runner === "docker" && docker?.image && docker.network) return new DockerRunner({ ...docker, ...shared, maxDiskBytes });
   if (runner === "docker") throw new Error('The docker runner needs "docker": {"image", "network"}: the worker image, and an internal network the gateway is on');
   if (runner === "kubernetes" && kubernetes?.image) return new KubernetesRunner({ ...kubernetes, ...shared });
   if (runner === "kubernetes") throw new Error('The kubernetes runner needs "kubernetes": {"image"}: the worker image');
@@ -664,6 +719,9 @@ function configProblem(config: Config): string | undefined {
     poolProblem("docker", config.docker?.pool) ??
     poolProblem("kubernetes", config.kubernetes?.pool) ??
     (fields.keepTaskDirs === undefined || typeof fields.keepTaskDirs === "boolean" ? undefined : "keepTaskDirs must be true or false") ??
+    // A pod's disk is held by the kubelet, not by this service: a value here would be taken for a cap that isn't one.
+    (runner === "kubernetes" && fields.maxTaskDiskBytes !== undefined ? "maxTaskDiskBytes is for the local and docker runners: on kubernetes, set the ephemeral-storage limit in kubernetes.resources" : undefined) ??
+    whole("maxTaskDiskBytes", config.maxTaskDiskBytes, 0) ??
     text("adminKeyEnv", config.adminKeyEnv, false) ??
     (config.metrics === undefined || isObject(config.metrics) ? undefined : "metrics must be an object, {host, port}") ??
     text("metrics.host", config.metrics?.host, false) ??

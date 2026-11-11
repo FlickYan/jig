@@ -1,7 +1,8 @@
 import { createHmac } from "node:crypto";
-import { readdir, stat } from "node:fs/promises";
+import { lstat, opendir, readdir, stat } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { isAbsolute, join } from "node:path";
+import { createLog, type Log } from "./log.ts";
 import type { Task, TaskStatus, Tenant } from "./store.ts";
 
 // What runs a task: the interface every runner keeps (runners/local.ts, docker.ts and k8s.ts),
@@ -25,6 +26,8 @@ export interface RunExit {
   stats?: unknown;
   /** Why it failed, where jig said so (the last line it printed). */
   message?: string;
+  /** The runner stopped it because its folder went past the disk cap, or couldn't be measured: what the task is told. */
+  overDisk?: string;
 }
 
 export interface RunHandle {
@@ -87,6 +90,161 @@ export async function taskFolders(dataDir: string): Promise<Leftover[]> {
       }),
   );
   return folders.filter((folder) => folder !== undefined);
+}
+
+// The disk cap (docs/server.md): the local and Docker runners keep each task's folder on this machine's
+// disk, which has no quota for it, so they measure the folder while the task runs and stop a run whose
+// folder went past maxTaskDiskBytes. A check, not a quota: a task can overshoot by what it writes between
+// two checks.
+
+/** The task's folder went away while it was measured: its run has ended, and there is nothing to hold. */
+export class Gone extends Error {}
+
+/** The folder can't be measured, so it can't be held to a cap: `code` is the error's, or "too many" (entries). */
+export class Unmeasurable extends Error {
+  code: string;
+  constructor(code: string) {
+    super(`the folder can't be measured (${code})`);
+    this.code = code;
+  }
+}
+
+/** The most entries a walk reads: past it, a task could hold the walks up for as long as it liked. */
+export const MAX_ENTRIES = 1_000_000;
+// What a task's commands can make of their folder so that it can't be read.
+const UNREADABLE = new Set(["EACCES", "EPERM", "ENAMETOOLONG", "ELOOP"]);
+
+/** What the task is told when its folder went past the cap. No byte count: the walk stops at the limit. */
+export const diskError = (limit: number) => `the task's folder grew past maxTaskDiskBytes (${limit} bytes), so the service stopped the run`;
+export const DISK_UNMEASURABLE = `the task's folder can't be measured (a folder the service can't read, a path too long, or over ${MAX_ENTRIES} files), so it can't be held to maxTaskDiskBytes: the service stopped the run`;
+
+/**
+ * The bytes the folder takes on its disk, or some number over `limit` as soon as the sum is over it: the
+ * blocks of the folder and of everything in it, so a sparse file counts for what it holds. No link is
+ * followed, and no folder on another file system entered (the walk only lstats, and descends by what lstat
+ * says): a task's commands could otherwise send it round the machine. A file with several names is
+ * counted once. What goes away during the walk is left out; the folder itself gone throws Gone, and one
+ * that can't be read through, or holds over `maxEntries` entries, Unmeasurable.
+ */
+export async function folderBytes(dir: string, limit: number, maxEntries = MAX_ENTRIES): Promise<number> {
+  const gone = (err: NodeJS.ErrnoException) => err.code === "ENOENT" || err.code === "ENOTDIR";
+  const unreadable = (err: NodeJS.ErrnoException): never => {
+    throw UNREADABLE.has(err.code ?? "") ? new Unmeasurable(err.code!) : err;
+  };
+  const root = await lstat(dir, { bigint: true }).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") throw new Gone(`${dir} is gone`);
+    return unreadable(err);
+  });
+  let sum = Number(root.blocks) * 512;
+  let entries = 0;
+  /** The files with several names counted so far, by device and inode. */
+  const linked = new Map<bigint, Set<bigint>>();
+  const folders = [dir];
+  for (let folder; sum <= limit && (folder = folders.pop()) !== undefined; ) {
+    let handle;
+    try {
+      handle = await opendir(folder);
+    } catch (err) {
+      if (!gone(err as NodeJS.ErrnoException)) unreadable(err as NodeJS.ErrnoException);
+      if (folder === dir) throw new Gone(`${dir} is gone`);
+      continue;
+    }
+    // The loop closes the folder however it is left.
+    for await (const entry of handle) {
+      if (++entries > maxEntries) throw new Unmeasurable("too many");
+      const path = join(folder, entry.name);
+      let stats;
+      try {
+        stats = await lstat(path, { bigint: true });
+      } catch (err) {
+        if (gone(err as NodeJS.ErrnoException)) continue;
+        return unreadable(err as NodeJS.ErrnoException);
+      }
+      if (stats.isDirectory()) {
+        if (stats.dev === root.dev) folders.push(path);
+      } else if (stats.nlink > 1n) {
+        const seen = linked.get(stats.dev) ?? linked.set(stats.dev, new Set()).get(stats.dev)!;
+        if (seen.has(stats.ino)) continue;
+        seen.add(stats.ino);
+      }
+      sum += Number(stats.blocks) * 512;
+      if (sum > limit) break;
+    }
+  }
+  return sum;
+}
+
+/**
+ * One check of the folder against the cap, before the task's jig starts: throws what the task is told if
+ * its workspace alone is past it, or can't be measured. No limit (0), no check.
+ */
+export async function checkDisk(dir: string, limit: number): Promise<void> {
+  if (!limit) return;
+  const bytes = await folderBytes(dir, limit).catch((err: unknown) => {
+    if (err instanceof Unmeasurable) throw new Error(DISK_UNMEASURABLE);
+    throw err;
+  });
+  if (bytes > limit) throw new Error(diskError(limit));
+}
+
+/** Every watch's walks, one behind another: a machine full of big trees is read by one walk at a time. */
+let walks: Promise<void> = Promise.resolve();
+
+/**
+ * Measures the folder while its task runs, and calls `over` once, with what the task is told, when it is
+ * past `limit`; then the watch is over. The first walk is `everyMs` after the call, and each next one that
+ * long after the last ended, or ten times what the last took if that is longer, so walks take a tenth of the
+ * time at most however big the tree. A folder that can't be measured on two walks in a row is over too, as
+ * it can't be held to the cap; one walk may only have met a folder as the task made it. A folder that is
+ * gone ends the watch. Any other failure is logged once, and the watch goes on. Returns what stops it; a
+ * walk then in flight comes to nothing. Its timers don't keep the process going.
+ */
+export function watchDisk(
+  dir: string,
+  limit: number,
+  over: (why: string) => void,
+  everyMs = 5000,
+  { log = createLog("service"), measure = folderBytes }: { log?: Log; measure?: (dir: string, limit: number) => Promise<number> } = {},
+): () => void {
+  let stopped = false;
+  let timer: NodeJS.Timeout | undefined;
+  let unmeasured = false;
+  let warned = false;
+  const end = (why?: string) => {
+    stopped = true;
+    if (why) over(why);
+  };
+  const walk = async () => {
+    if (stopped) return;
+    const began = Date.now();
+    try {
+      const bytes = await measure(dir, limit);
+      if (stopped) return;
+      unmeasured = false;
+      if (bytes > limit) return end(diskError(limit));
+    } catch (err) {
+      if (stopped) return;
+      if (err instanceof Gone) return end();
+      if (err instanceof Unmeasurable) {
+        if (unmeasured) return end(DISK_UNMEASURABLE);
+        unmeasured = true;
+      } else if (!warned) {
+        warned = true;
+        log.warn("couldn't measure a task's folder; the check goes on", { dir, err });
+      }
+    }
+    wait(Math.max(everyMs, 10 * (Date.now() - began)));
+  };
+  const wait = (ms: number) => {
+    // The queue goes on whatever a walk, or what `over` does, throws.
+    timer = setTimeout(() => void (walks = walks.then(walk).catch((err: unknown) => log.warn("a check of a task's folder failed", { dir, err }))), ms);
+    timer.unref();
+  };
+  wait(everyMs);
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+  };
 }
 
 /** A gateway token's payload (the token contract). */
@@ -166,10 +324,13 @@ export function stopFor(exitCode: number | null): string {
  * A finished run's status. succeeded: the model finished (0). stopped: the run stopped short at a limit:
  * steps (2), the output limit or context window (3), repeating itself (6), the time limit (7, or the runner's
  * own stop past it), empty replies (8), or an interruption (130). failed: the model declined (4), or tool
- * calls needed approval (5). error: anything else, jig's own failures (1) and an unexplained signal included.
+ * calls needed approval (5). error: anything else, jig's own failures (1) and an unexplained signal included,
+ * and a run stopped at the disk cap.
  */
-export function statusFor(exit: { exitCode: number | null; timedOut?: boolean; cancelled?: boolean }): TaskStatus {
+export function statusFor(exit: { exitCode: number | null; timedOut?: boolean; cancelled?: boolean; overDisk?: string }): TaskStatus {
   if (exit.cancelled) return "cancelled";
+  // The cap outranks the time limit, and a run that ended by itself in the same moment.
+  if (exit.overDisk) return "error";
   if (exit.timedOut) return "stopped";
   switch (exit.exitCode) {
     case 0:
