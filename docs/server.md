@@ -1471,7 +1471,7 @@ kind and kubectl needed): it makes the cluster, with Calico, which enforces the 
 two images and loads them, applies `deploy/k8s` as it is, then the Secrets it leaves to you, a Postgres,
 and a fake model provider the gateway calls in place of DeepSeek, so no task reaches a model API or spends
 anything; it points the router at the service, posts a task through it (the fake provider has `run: <a
-command>` run in bash), prints its events, and shows what a pod labelled as a task's reaches. `deploy/kind.sh
+command>` run in bash), prints its events and the file it handed back, and shows what a pod labelled as a task's reaches. `deploy/kind.sh
 down` deletes the cluster. `SERVICE='{"kubernetes": {"pool": {"size": 1}}}'` adds to the service's config,
 and `BUILD=0` keeps the images there are. kind's own network plugin needs the kernel's nft queue for
 NetworkPolicy, which some kernels lack, hence Calico; and the cluster has containerd keep the pods'
@@ -1482,7 +1482,9 @@ streamed, asked for approvals at the internal listener, were cancelled and stopp
 and Jobs' deadlines, took warm workers, and outlived a replica killed mid-task, whose Jobs the other
 deleted; a tenant whose id has a space was labelled with its hash, the API server took a Secret of 1 MiB and
 refused one byte more, as the runner's check has it, and a log of 30 MB, rotated by the kubelet on the way,
-was read to its end. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
+was read to its end. Later (kind 0.27, Kubernetes 1.32) a task handed back its `outputs` from its pod (a
+file's text, and `not_a_file` for a named pipe and for a link to `/etc/passwd`), an `Idempotency-Key` was
+replayed through the router, and a `DELETE` purged a task. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
 metrics ports answered only the `monitoring` namespace, and Redis only the gateway. The fake API server in
 the tests didn't show two things. The kubelet ends a log's stream a moment before the pod's status says the
 container has ended, so a log followed while its container ran is read again once it has ended: only a read

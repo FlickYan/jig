@@ -135,9 +135,11 @@ k -n jig port-forward service/jig-router 18090:8090 >/dev/null &
 forward=$!
 trap 'kill $forward' EXIT
 for i in $(seq 1 30); do curl -fs localhost:18090/healthz >/dev/null && break; sleep 1; done
-task=$(curl -fsS localhost:18090/v1/tasks -H "Authorization: Bearer $KEY" -d '{"prompt": "run: echo hello from $(hostname)"}' | node -pe 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).id')
+task=$(curl -fsS localhost:18090/v1/tasks -H "Authorization: Bearer $KEY" -d '{"prompt": "run: echo hello from $(hostname) | tee out.txt", "outputs": ["out.txt"]}' | node -pe 'JSON.parse(require("node:fs").readFileSync(0, "utf8")).id')
 echo "task $task"
 curl -fsSN "localhost:18090/v1/tasks/$task/events" -H "Authorization: Bearer $KEY" | grep '^data:'
+# The file it was asked to hand back, as the task has it.
+curl -fsS "localhost:18090/v1/tasks/$task" -H "Authorization: Bearer $KEY" | node -pe '"outputs: " + JSON.stringify(JSON.parse(require("node:fs").readFileSync(0, "utf8")).outputs)'
 
 # What a pod labelled as a task's reaches: the gateway, the service's internal listener and DNS alone.
 k -n jig delete pod reach --ignore-not-found >/dev/null
