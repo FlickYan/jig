@@ -162,6 +162,37 @@ describe("readOutputs", () => {
     ]);
   });
 
+  it("says the same for a name that is there and one that isn't, behind a folder link that leads out or into what is hidden", async () => {
+    await mkdir(join(project, "kept"));
+    await writeFile(join(project, "kept", "db.sqlite"), "x");
+    await symlink(outside, join(project, "out"));
+    await symlink(join(project, "kept"), join(project, "in"));
+    assert.deepEqual([one("out/secret.txt"), one("out/nope")], [{ path: "out/secret.txt", problem: "not_a_file" }, { path: "out/nope", problem: "not_a_file" }]);
+    const hides = hiddenTest([join(project, "kept")]);
+    assert.deepEqual([one("in/db.sqlite", hides), one("in/nope", hides)], [{ path: "in/db.sqlite", problem: "hidden" }, { path: "in/nope", problem: "hidden" }]);
+    // A link that stays in the project and out of what is hidden still tells a missing file from one that is there.
+    assert.deepEqual([one("in/db.sqlite"), one("in/nope")], [{ path: "in/db.sqlite", text: "x" }, { path: "in/nope", problem: "missing" }]);
+  });
+
+  it("bounds the texts as the event will hold them, after the redaction that can make them longer", async () => {
+    // A URL's password is rewritten to [REDACTED], longer than what it stood for.
+    const grows = "db://:abc@h\n".repeat(Math.floor(OUTPUT_BYTES / 11) - 1);
+    await writeFile(join(project, "big.txt"), grows);
+    const [big] = readOutputs(project, ["big.txt"]);
+    assert.deepEqual(big, { path: "big.txt", problem: "too_large" });
+    const fits = "db://:abc@h\n".repeat(1000);
+    for (const name of ["a", "b", "c"]) await writeFile(join(project, name), fits);
+    const files = readOutputs(project, ["a", "b", "c"]);
+    assert.ok(files.every((file) => "text" in file && file.text.includes("[REDACTED]") && !file.text.includes("abc")), JSON.stringify(files).slice(0, 200));
+    assert.ok(Buffer.byteLength(JSON.stringify(files)) < OUTPUTS_BYTES + 4096);
+  });
+
+  it("refuses a path the events couldn't hold as it was asked", () => {
+    assert.match(outputProblem("sk-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.md") ?? "", /looks like a secret/);
+    assert.match(outputProblem("a\ud800.txt") ?? "", /surrogate/);
+    assert.equal(outputProblem("report.md"), undefined);
+  });
+
   it("takes at most 20 paths", async () => {
     const paths = Array.from({ length: 25 }, (_, i) => `f${i}`);
     assert.equal(readOutputs(project, paths).length, MAX_OUTPUTS);

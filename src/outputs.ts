@@ -8,7 +8,8 @@
 // end may be written from jig's exit handler.
 
 import { closeSync, constants, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
+import { redactSecrets } from "./secrets.ts";
 import { decodeUTF8, isInside } from "./tools/util.ts";
 
 /** The most files a run hands back. */
@@ -42,6 +43,9 @@ export function outputProblem(path: string): string | undefined {
   const parts = path.split(/[\\/]/);
   if (parts.includes("..")) return "leads out of the project (..)";
   if (["", "."].includes(parts.at(-1)!)) return "names a folder, not a file";
+  // The event's entry must say the path as it was asked, or the service can't tell whose it is: the events'
+  // redaction rewrites what looks like a secret, and half a surrogate pair doesn't come through argv.
+  if (!path.isWellFormed() || redactSecrets(path).text !== path) return "isn't text an event can hold as it is (it looks like a secret, or holds half a surrogate pair)";
   return undefined;
 }
 
@@ -65,10 +69,13 @@ export function readOutputs(root: string, paths: string[], hides: (real: string)
   return [...new Set(paths)].slice(0, MAX_OUTPUTS).map((path): Output => {
     const read = realRoot === undefined ? "missing" : readOutput(root, realRoot, path, hides);
     if (typeof read === "string") return { path, problem: read };
-    const bytes = eventBytes(read.text);
-    if (total + bytes > OUTPUTS_BYTES) return { path, problem: "too_large" };
+    // As the event will hold it: the events' redaction can make a text longer (a URL's password becomes
+    // [REDACTED]), so it is done here, before the bounds, and finds nothing more when the event is written.
+    const text = redactSecrets(read.text).text;
+    const bytes = eventBytes(text);
+    if (Buffer.byteLength(text) > OUTPUT_BYTES || total + bytes > OUTPUTS_BYTES) return { path, problem: "too_large" };
     total += bytes;
-    return { path, text: read.text };
+    return { path, text };
   });
 }
 
@@ -93,6 +100,24 @@ function readOutput(root: string, realRoot: string, path: string, hides: (real: 
   const allowed = (real: string): OutputProblem | undefined => (!isInside(realRoot, real) ? "not_a_file" : hides(real) ? "hidden" : undefined);
   let fd: number | undefined;
   try {
+    // A link among the folders on the way is followed only if it stays in the project and out of what is
+    // hidden: asked before the file is looked for, or "missing" against "not_a_file" would say which names
+    // there are in a folder the sandbox hides from the task's commands.
+    let dir = root;
+    for (const part of abs.slice(root.length).split(sep).filter(Boolean).slice(0, -1)) {
+      dir = join(dir, part);
+      const on = lstatSync(dir, { throwIfNoEntry: false });
+      if (!on) return "missing";
+      if (!on.isSymbolicLink()) continue;
+      let led: string;
+      try {
+        led = realpathSync(dir);
+      } catch {
+        return "not_a_file"; // a link to nothing, or round in a circle
+      }
+      const refused = allowed(led);
+      if (refused) return refused;
+    }
     const named = lstatSync(abs, { throwIfNoEntry: false });
     if (!named) return "missing";
     if (!named.isFile()) return "not_a_file";

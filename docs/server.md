@@ -234,7 +234,8 @@ task's commands can write its events, so the result is the task's word, not the 
 the stream's `done`, the webhooks or the usage ledger.
 
 `outputs` is how a task hands files back: in the request, a list of 1 to 20 paths in its workspace, each
-once, relative and without `..` as `workspace.files`' paths are, 512 characters at most, with any workspace
+once, relative and without `..` as `workspace.files`' paths are, 512 characters at most and not a name the
+events would blank out as a secret, with any workspace
 or none (the run may write the files itself). jig is given each (`--outputs`), and when its run ends by its
 own doing, whichever way (the model finished, `max_steps`, the time limit jig keeps, an error, a cancel or a
 stop it had the time to act on), it reads them and writes one `outputs` event just before its `end`. The
@@ -244,8 +245,8 @@ task then has `outputs` on `GET /v1/tasks/:id`: an entry for each path, in the o
 | problem | the path |
 |---------|----------|
 | `missing` | has no file |
-| `not_a_file` | is a folder, a symlink (to a file in the workspace too), a named pipe, a socket or a device, leads through a folder that is a link out of the workspace, or can't be opened |
-| `too_large` | is over 256 KiB, or would take all the texts together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes); the files before it are kept |
+| `not_a_file` | is a folder, a symlink (to a file in the workspace too), a named pipe, a socket or a device, leads through a folder that is a link out of the workspace (whether or not a file is there), or can't be opened |
+| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the texts together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes); the files before it are kept |
 | `not_text` | isn't valid UTF-8, or holds a NUL |
 | `hidden` | lies in a path jig's file tools refuse (`local.hiddenPaths`, jig's own directory) |
 

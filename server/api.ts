@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { isolationProblem, sandboxProblem, sharedPlaces } from "../src/sandbox.ts";
-import { MAX_OUTPUT_PATH, MAX_OUTPUTS } from "../src/outputs.ts";
+import { MAX_OUTPUT_PATH, MAX_OUTPUTS, outputProblem } from "../src/outputs.ts";
 import { isInside } from "../src/tools/util.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
@@ -1181,7 +1181,7 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
   if (outputs !== undefined) {
     if (!Array.isArray(outputs) || !outputs.length || outputs.length > MAX_OUTPUTS || outputs.some((path) => typeof path !== "string")) return `outputs must be a list of 1 to ${MAX_OUTPUTS} paths in the workspace`;
     for (const [i, path] of (outputs as string[]).entries()) {
-      const problem = workspaceProblem(path) ?? (path.length > MAX_OUTPUT_PATH ? `is longer than ${MAX_OUTPUT_PATH} characters` : outputs.indexOf(path) !== i ? "is there twice" : undefined);
+      const problem = workspaceProblem(path) ?? outputProblem(path) ?? (path.length > MAX_OUTPUT_PATH ? `is longer than ${MAX_OUTPUT_PATH} characters` : outputs.indexOf(path) !== i ? "is there twice" : undefined);
       if (problem) return `outputs: ${JSON.stringify(path)} ${problem}`;
     }
   }
