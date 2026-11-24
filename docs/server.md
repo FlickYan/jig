@@ -1142,8 +1142,11 @@ streamed reply counting until it ends); `tenants` sets them per tenant, `tenantD
 the same fields at the top of `limits` hold for all tenants together, where `concurrent` is the most the
 gateway sends upstream at once. Any left out is no limit. A request over a limit waits for its turn in a
 queue that serves the tenants in turn, a request of each, so a tenant with a thousand requests waiting
-delays another tenant's request by one slot at most. After `maxWaitMs` (30 seconds by default) it gets 429
-with `retry-after`, and jig's SDK waits that long and tries again, twice at most.
+delays another tenant's request by one slot at most; or, when there was room for more and the gateway had
+asked for several of the tenant's slots at once (64 at most, see "What the gateway itself takes"), by
+those it had already asked for when the other's request came, which matters when they were the last of
+the room. After `maxWaitMs` (30 seconds by default) it gets 429 with `retry-after`, and jig's SDK waits
+that long and tries again, twice at most.
 
 **Quotas.** `dailyUsd` and `monthlyUsd`, in `tenantDefaults` or a tenant's own entry in `tenants` (not at
 the top of `limits`, and above 0 where given), are the most a tenant may spend in a UTC day and in a UTC
@@ -1329,36 +1332,48 @@ budget on every other task), so each is checked on every call. It checks what it
 status 1 otherwise: every request's body reached the provider byte for byte with the pool's key, every
 reply came back whole and byte for byte, each task's and tenant's spending is what the provider sent, the
 provider never held more calls at once than the caps allow, and nothing is left in flight, in the gateways
-or in Redis. With `JIG_TEST_REDIS_URL` it measures the state in Redis too, with one gateway and with two.
-On 4 cores (Node 22, Redis 7 on the same machine), 40 tasks of 4 tenants, 32 calls at a time:
+or in Redis. The measured calls seldom reach a cap, so after them come bursts of twice each cap, of each
+tenant alone and then of all, in which the provider must have held exactly the cap: more, and the cap is
+not kept; fewer, and a slot was never given back. With `JIG_TEST_REDIS_URL` it measures the state in Redis
+too, with one gateway and with two. On 4 cores (Node 22, Redis 7 on the same machine), 40 tasks of 4
+tenants, 32 calls at a time:
 
 | replies of 100 chunks over 250 ms, requests of 32 KB | no gateway | in memory | Redis | Redis, two gateways |
 |---|---|---|---|---|
-| calls a second (the streams allow 128) | 126 | 125 | 124 | 125 |
-| to the first byte, p50 (p99) | 0.8 ms (8 ms) | 1.8 ms (26 ms) | 3.5 ms (24 ms) | 2.5 ms (22 ms) |
-| to the reply's end, p50 (p99) | 252 ms (262 ms) | 253 ms (271 ms) | 255 ms (278 ms) | 254 ms (277 ms) |
-| the gateways' CPU a call | | 4.1 ms | 4.5 ms | 5.1 ms |
-| waiting for a slot, a call | | 0 | 1.0 ms | 0.6 ms |
+| calls a second (the streams allow 128) | 126 | 124 | 123 | 123 |
+| to the first byte, p50 (p99) | 0.8 ms (9 ms) | 2.4 ms (29 ms) | 3.8 ms (29 ms) | 3.5 ms (32 ms) |
+| to the reply's end, p50 (p99) | 252 ms (263 ms) | 254 ms (279 ms) | 256 ms (287 ms) | 255 ms (302 ms) |
+| the gateways' CPU a call | | 3.3 ms | 3.8 ms | 4.2 ms |
+| waiting for a slot, a call | | 0.8 ms | 1.8 ms | 1.8 ms |
 
 | replies of one chunk at once, requests of 4 KB | no gateway | in memory | Redis | Redis, two gateways |
 |---|---|---|---|---|
-| calls a second | 8,300 | 2,000 | 1,900 | 2,000 |
-| to the reply's end, p50 (p99) | 3 ms (11 ms) | 16 ms (32 ms) | 15 ms (45 ms) | 14 ms (47 ms) |
-| the gateways' CPU a call | | 0.6 ms | 0.7 ms | 1.0 ms |
-| waiting for a slot, a call | | 0 | 2.5 ms | 2.9 ms |
+| calls a second | 10,000 | 1,900 | 1,450 | 1,250 |
+| to the reply's end, p50 (p99) | 2 ms (14 ms) | 15 ms (53 ms) | 20 ms (67 ms) | 21 ms (94 ms) |
+| the gateways' CPU a call | | 0.41 ms | 0.51 ms | 0.74 ms |
+| waiting for a slot, a call | | 0 | 3.4 ms | 3.8 ms |
 
-The second load is `CHUNKS=1 STREAM_MS=0 BODY_KB=4 REQUESTS=4000`; `REQUESTS`, `CLIENTS`, `TASKS`, `TENANTS`
-and the caps change it too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. The machine was
-shared with other work, so a run's calls a second and its times can differ from the next run's by half, and
-its CPU by a fifth: the table is one run, and the CPU a call is the number to compare.
+The second load is `CHUNKS=1 STREAM_MS=0 BODY_KB=4 REQUESTS=12000` (with fewer calls, a gateway still
+warming up is much of what is measured); `REQUESTS`, `CLIENTS`, `TASKS`, `TENANTS` and the caps change it
+too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. The machine was shared with other work, so
+a run's calls a second and its times can differ from the next run's by half, and its CPU by a fifth: each
+table is one run, and the CPU a call is the number to compare. In the first load a tenant's cap (14 of the
+32 calls at a time) is reached now and then, as the calls fall on the tenants by chance: that is its wait
+for a slot in memory, where the second load has none.
 
-How to read it. A small call costs the gateway about 0.6 ms of one core (0.7 ms with Redis: eight or nine
-commands a call, each a write of its own), and then some 35 microseconds for each chunk of the reply it
-passes on. So a core passes about 250 calls a second of 100 chunks each, or some 25,000 chunks
+How to read it. A small call costs the gateway about 0.4 ms of one core (0.5 ms with Redis: eight or nine
+commands a call, each a write of its own), and then 30 to 40 microseconds for each chunk of the reply it
+passes on. So a core passes 250 to 300 calls a second of 100 chunks each, or some 25,000 to 30,000 chunks
 a second however many calls they belong to: a model that sends 50 chunks a second to each call keeps one
-gateway busy with about 500 calls in flight. The gateway is one thread, so past that it is replicas with
-`state` that add room, not cores; in these runs two gateways passed no more than one, because the clients
-and the provider, a process each, were what held the second load back. What the gateway adds to a call
+gateway busy with 500 to 600 calls in flight. The gateway is one thread, so past that it is replicas with
+`state` that add room, not cores. Each run says how much of a core each process had meanwhile. On the
+second load with Redis, three runs of one gateway and three of two, turn about: one gateway had 112%, 92%
+and 94% of a core (its garbage collector's threads included) with the clients at 29% to 36% and the
+provider at 16% to 20%, so it was the gateway that was measured, and it passed 2,121, 1,709 and 1,813
+calls a second at 0.53, 0.54 and 0.52 ms of CPU a call. Two gateways passed 1,752, 2,058 and 2,089, no
+more than one within what runs differ by, at 0.71, 0.68 and 0.71 ms a call: on 4 cores shared with Redis,
+the clients, the provider and other work, each gateway got about two thirds of a core (62% to 74%), so
+this machine does not show what a second replica adds on cores of its own. What the gateway adds to a call
 that is not waiting for a slot is a millisecond or two before its first byte, and nothing that shows over
 a reply of seconds.
 
@@ -1374,9 +1389,15 @@ however much room the limits left: with calls arriving faster than that, every c
 and the asking again that each arrival and each reply's end set off cost CPU besides. Now a round asks for
 a request of each tenant at once, in the order of the turns, and for twice as many as the last (64 of a
 tenant at most) once a round has let through all it asked for, back to one at the first that must wait;
-Redis answers in the order it is asked, so the slots go to the same requests as before. On the second
-load with one tenant and one gateway, three runs before and three after, turn about: 1,077, 1,122 and 1,081
-calls a second became 1,607, 1,698 and 1,542; the wait for a slot 23, 21 and 23 ms a call became 3.0, 2.9
+Redis answers in the order it is asked, so the slots go to the same requests as before, but for a request
+of another tenant that comes while a round is with Redis: the slots that round asked for are the first
+tenant's, where before only one was, and the next is the other's. The gain is there while every request
+of a round is let through: with any tenant waiting at a limit the rounds are of one request of each tenant,
+as before, and what follows is the best case, one tenant and no cap reached. In an outage of Redis with
+`onStateError: "open"` every request of a round is a question that fails, so
+`jig_gateway_state_errors_total` grows faster than it did. On the second load with one tenant and one
+gateway (4,000 calls a run), three runs before and three after, turn about: 1,077, 1,122 and 1,081 calls
+a second became 1,607, 1,698 and 1,542; the wait for a slot 23, 21 and 23 ms a call became 3.0, 2.9
 and 3.1 ms; the gateway's CPU 1.02, 0.98 and 1.04 ms a call became 0.70, 0.72 and 0.73 ms. On the first
 load with one tenant, where calls come at half of what a gateway carries, the wait went from 2.6, 2.5 and
 1.9 ms a call to 1.3, 1.4 and 1.2 ms, and nothing else moved beyond what one run differs from the next.

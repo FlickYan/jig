@@ -1206,6 +1206,35 @@ describe("the gateway's queue", () => {
     await until(() => released.length === 1, "the slot to be given back");
     assert.ok("release" in (await limiter.acquire("acme")));
   });
+
+  it("gives a slot let to a request that left to the tenant's next waiting, and gives back the one left over", async () => {
+    // The second request leaves while the round that asks for it and the third is with the state.
+    const gone = new AbortController();
+    const { state, trips, released } = distant((_tenant, _id, asked) => (asked === 2 && gone.abort(), 0));
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    const [first, second, third] = await Promise.all([limiter.acquire("acme"), limiter.acquire("acme", gone.signal), limiter.acquire("acme")]);
+    assert.ok("release" in first && "retryAfter" in second && "release" in third);
+    await until(() => released.length === 1, "the slot nobody was left for to be given back");
+    assert.equal(trips.length, 2);
+    // The third went under the id the second was asked for with, and its own went back.
+    assert.deepEqual(released, [trips[1][1]]);
+    third.release();
+    await until(() => released.length === 2, "the third request's slot to be given back");
+    assert.equal(released[1], trips[1][0]);
+  });
+
+  it("holds another tenant's request back by the slots already asked for when it came, and no more", async () => {
+    // The other tenant comes while a round of 16 of the flood's requests is with the state: those are the
+    // flood's, and the next slot is the other's, before any of the 269 the flood still has waiting.
+    const order: string[] = [];
+    const want = (tenant: string) => void limiter.acquire(tenant).then((admission) => "release" in admission && order.push(tenant));
+    const { state, trips } = distant((_tenant, _id, asked) => (asked === 16 && want("other"), 0));
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    for (let i = 0; i < 300; i++) want("flood");
+    await until(() => order.length === 301, "all to be let through");
+    assert.deepEqual(trips.slice(0, 5).map((trip) => trip.length), [1, 2, 4, 8, 16]);
+    assert.equal(order.indexOf("other"), 31);
+  });
 });
 
 describe("the gateway's state in memory", () => {

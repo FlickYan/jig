@@ -7,7 +7,7 @@
 //   node bench/gateway-load.ts                                    the state in memory
 //   JIG_TEST_REDIS_URL=redis://... node bench/gateway-load.ts     in Redis too, with one gateway and with two
 // REQUESTS (2000), CLIENTS (32), TASKS (40), TENANTS (4), CHUNKS (100), STREAM_MS (250) and BODY_KB (32)
-// change the load; TENANT_CONCURRENT and CONCURRENT the caps (by default a quarter over a tenant's even share
+// change the load; TENANT_CONCURRENT and CONCURRENT the caps (by default three quarters over a tenant's even share
 // of the clients, and the clients' number); WARM (twice the clients) is how many calls go first, unmeasured,
 // so a gateway just started isn't what is timed. GATEWAY_PROF=<dir> writes each gateway's CPU profile there,
 // and SCENARIOS=memory,redis1 runs only those (direct, memory, redis1, redis2).
@@ -15,7 +15,11 @@
 // It checks what it measures: every request's body reached the provider byte for byte and with the pool's
 // key, every reply came back whole and byte for byte, what the gateway counted for each task and tenant is
 // what the provider sent, the provider never held more calls at once than the caps allow, and nothing is left
-// in flight after. Any of these failing ends it with status 1.
+// in flight after. The measured calls alone would not show a cap that is not kept (the clients are no more
+// than the cap for all, and a tenant's share of them seldom over its own), so after them, unmeasured, come
+// bursts of twice each cap, of each tenant alone and then of all: the provider must have held exactly the
+// cap of each, no more (the cap is kept) and no less (no slot of an earlier call was left taken). Any of
+// these failing ends it with status 1.
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -36,15 +40,18 @@ const env = (name: string, fallback: number) => Number(process.env[name] ?? fall
 const REQUESTS = env("REQUESTS", 2000);
 const CLIENTS = env("CLIENTS", 32);
 const TASKS = env("TASKS", 40);
-const TENANTS = env("TENANTS", 4);
+const TENANTS = Math.min(env("TENANTS", 4), TASKS); // task n is tenant n's, so each tenant has one
 const CHUNKS = Math.max(1, env("CHUNKS", 100));
 const STREAM_MS = env("STREAM_MS", 250);
 const BODY_KB = env("BODY_KB", 32);
 const WARM = env("WARM", 2 * CLIENTS);
-// A quarter over the even share: the calls fall on the tenants unevenly, so the cap is reached now and then,
-// without the wait for a slot being most of what is measured.
-const TENANT_CONCURRENT = env("TENANT_CONCURRENT", Math.ceil((CLIENTS / TENANTS) * 1.25));
+// Three quarters over the even share: the calls fall on the tenants as unevenly as chance has it, so the cap
+// is reached now and then (by 32 clients of 4 tenants, one time in twenty), without the wait for a slot
+// being most of what is measured.
+const TENANT_CONCURRENT = env("TENANT_CONCURRENT", Math.ceil((CLIENTS / TENANTS) * 1.75));
 const CONCURRENT = env("CONCURRENT", CLIENTS);
+/** How long the provider holds a reply of the bursts that end a load: long enough that a burst's calls are all there at once. */
+const BURST_MS = Math.max(STREAM_MS, 200);
 const SECRET = "the load test's secret";
 const POOL_KEY = "load-pool-key";
 const ADMIN = "load-admin-token";
@@ -80,11 +87,16 @@ function tail(i: number): string {
 
 /** The stand-in provider, a process of its own: `node bench/gateway-load.ts upstream` prints its URL and serves until killed. */
 async function upstream(): Promise<void> {
-  const stats = { requests: 0, wrong: [] as string[], most: 0, mostOfTenant: 0 };
+  const stats = { requests: 0, wrong: [] as string[], most: 0, mostOf: {} as Record<string, number> };
   let inflight = 0;
   const tenants = new Map<string, number>();
   const server = createServer((req, res) => {
-    if (req.method === "GET") return void res.end(JSON.stringify(stats));
+    if (req.method === "GET") {
+      // What it saw; and with /reset the most at once counted anew, for the bursts to be counted alone.
+      res.end(JSON.stringify(stats));
+      if (req.url === "/reset") Object.assign(stats, { most: 0, mostOf: {} });
+      return;
+    }
     const chunks: Buffer[] = [];
     req.on("data", (chunk: Buffer) => chunks.push(chunk));
     req.on("end", () => {
@@ -98,17 +110,19 @@ async function upstream(): Promise<void> {
       if (createHash("sha256").update(Buffer.concat(chunks)).digest("hex") !== req.headers["x-load-sha256"]) wrong("the body was not the bytes sent");
       stats.most = Math.max(stats.most, ++inflight);
       tenants.set(tenant, (tenants.get(tenant) ?? 0) + 1);
-      stats.mostOfTenant = Math.max(stats.mostOfTenant, tenants.get(tenant)!);
+      stats.mostOf[tenant] = Math.max(stats.mostOf[tenant] ?? 0, tenants.get(tenant)!);
       res.once("close", () => {
         inflight--;
         tenants.set(tenant, tenants.get(tenant)! - 1);
       });
       res.writeHead(200, { "content-type": "text/event-stream", "request-id": `req_load_${i}` });
       // The start of the reply at once, then each chunk at its time from the start, the last with the reply's
-      // end after STREAM_MS. A late timer doesn't make the stream longer: the chunks that are due go together.
+      // end after STREAM_MS (or what a call of a burst asks for). A late timer doesn't make the stream longer:
+      // the chunks that are due go together.
       res.write(head(i));
       const start = performance.now();
-      const due = (k: number) => start + ((k + 1) * STREAM_MS) / CHUNKS;
+      const over = Number(req.headers["x-load-stream-ms"] ?? STREAM_MS);
+      const due = (k: number) => start + ((k + 1) * over) / CHUNKS;
       let k = 0;
       const write = () => {
         if (res.destroyed) return;
@@ -166,8 +180,15 @@ const quantile = (sorted: number[], q: number) => sorted[Math.min(sorted.length 
 const ms = (n: number) => `${n.toFixed(n < 10 ? 1 : 0)} ms`;
 const spread = (took: number[]) => (took.sort((a, b) => a - b), `p50 ${ms(quantile(took, 0.5))}, p99 ${ms(quantile(took, 0.99))}, max ${ms(took.at(-1)!)}`);
 
-/** The task of call `i` and its tenant: scattered, so the tenants' calls in flight rise and fall. */
-const taskOf = (i: number) => (Math.imul(i + 1, 2654435761) >>> 0) % TASKS;
+/**
+ * The task of call `i` and its tenant: scattered, so the tenants' calls in flight rise and fall. A hash
+ * with its bits mixed: the product alone goes round the tasks, and so the tenants, as evenly as can be.
+ */
+function taskOf(i: number): number {
+  let hash = Math.imul(i + 1, 2654435761);
+  hash = Math.imul(hash ^ (hash >>> 15), 2246822519);
+  return ((hash ^ (hash >>> 13)) >>> 0) % TASKS;
+}
 const tenantOf = (task: number) => `tenant-${task % TENANTS}`;
 
 /** A request body as jig sends one, of BODY_KB: a model, a long conversation, spaces and escapes that a rewrite would lose. */
@@ -186,10 +207,10 @@ const close = (a: number, b: number) => Math.abs(a - b) <= 1e-9 * Math.max(1, Ma
 
 /**
  * WARM calls unmeasured, then REQUESTS calls, CLIENTS at a time, to `targets` in turn (the gateways, or the
- * provider itself with `direct`), then the checks, of them all. Answers what was wrong, which is nothing
- * when all is well.
+ * provider itself with `direct`), then the bursts at the caps and the checks, of them all. Answers what was
+ * wrong, which is nothing when all is well.
  */
-async function load(targets: Target[], provider: string, direct: boolean): Promise<string[]> {
+async function load(targets: Target[], provider: Target, direct: boolean): Promise<string[]> {
   const wrong: string[] = [];
   const failed = (what: string) => wrong.length < 10 && wrong.push(what);
   const exp = Math.floor(Date.now() / 1000) + 3600;
@@ -200,10 +221,12 @@ async function load(targets: Target[], provider: string, direct: boolean): Promi
   const firstByte: number[] = [];
   const whole: number[] = [];
   const day = new Date().toISOString().slice(0, 10);
+  /** The task of each call made, the bursts' too: what the spending is checked against. */
+  const made: number[] = [];
 
-  const call = (i: number): Promise<void> =>
+  const call = (i: number, task = taskOf(i), streamMs?: number): Promise<void> =>
     new Promise((done) => {
-      const task = taskOf(i);
+      made[i] = task;
       const body = bodyOf(i, padding);
       const start = performance.now();
       let first: number | undefined;
@@ -218,6 +241,7 @@ async function load(targets: Target[], provider: string, direct: boolean): Promi
           "x-load-call": String(i),
           "x-load-tenant": tenantOf(task),
           "x-load-sha256": createHash("sha256").update(body).digest("hex"),
+          ...(streamMs !== undefined && { "x-load-stream-ms": String(streamMs) }),
           "content-length": String(body.length),
         },
       });
@@ -254,10 +278,10 @@ async function load(targets: Target[], provider: string, direct: boolean): Promi
   await calls(WARM);
   firstByte.length = whole.length = 0;
   const before = targets.map(({ pid }) => (pid ? cpuSeconds(pid) : undefined));
+  const others = { clients: process.cpuUsage(), provider: cpuSeconds(provider.pid!) };
   const from = performance.now();
   await calls(WARM + REQUESTS);
   const seconds = (performance.now() - from) / 1000;
-  agent.destroy();
   console.log(`  ${REQUESTS} calls, ${CLIENTS} at a time: ${Math.round(REQUESTS / seconds)}/s${STREAM_MS ? ` (the streams alone allow ${Math.round((CLIENTS * 1000) / STREAM_MS)}/s)` : ""}`);
   if (firstByte.length) console.log(`  to the first byte: ${spread(firstByte)}; to the end: ${spread(whole)}`);
   const used = targets.map(({ pid }, n) => (pid && before[n] !== undefined ? cpuSeconds(pid)! - before[n] : undefined));
@@ -265,19 +289,68 @@ async function load(targets: Target[], provider: string, direct: boolean): Promi
     const total = used.reduce((sum, cpu) => sum + cpu!, 0);
     console.log(`  the gateway${used.length > 1 ? "s'" : "'s"} CPU: ${used.map((cpu) => `${cpu!.toFixed(2)} s`).join(" + ")}, ${((total * 1000) / REQUESTS).toFixed(2)} ms a call, so a core passes about ${Math.round(REQUESTS / total)} such calls a second`);
   }
+  // Who was busy: a gateway near a whole core is what held the calls back; the clients or the provider near
+  // one, and it is they that were measured; none of them, and the machine's cores were shared out.
+  const share = (cpu: number | undefined) => (cpu === undefined ? "?" : `${Math.round((100 * cpu) / seconds)}%`);
+  const clients = process.cpuUsage(others.clients);
+  const providerUsed = others.provider === undefined ? undefined : cpuSeconds(provider.pid!)! - others.provider;
+  console.log(`  of a core meanwhile: ${!direct ? `the gateway${used.length > 1 ? "s" : ""} ${used.map(share).join(" and ")}, ` : ""}the clients ${share((clients.user + clients.system) / 1e6)}, the provider ${share(providerUsed)}`);
 
-  const seen = (await (await fetch(provider)).json()) as { requests: number; wrong: string[]; most: number; mostOfTenant: number };
+  type Seen = { requests: number; wrong: string[]; most: number; mostOf: Record<string, number> };
+  const atProvider = async (path = "") => (await (await fetch(provider.url + path)).json()) as Seen;
+  const overCaps = ({ most, mostOf }: Seen) => {
+    if (most > CONCURRENT) failed(`the provider held ${most} calls at once, over the cap of ${CONCURRENT}`);
+    for (const [tenant, held] of Object.entries(mostOf)) if (held > TENANT_CONCURRENT) failed(`the provider held ${held} calls of ${tenant} at once, over its cap of ${TENANT_CONCURRENT}`);
+  };
+  /** How many calls waited for a slot, and for how long together, by the gateways' metrics. */
+  const queue = async () => {
+    let waited = 0;
+    let seconds = 0;
+    for (const { metricsUrl } of targets) {
+      for (const line of (await (await fetch(`${metricsUrl}/metrics`)).text()).split("\n")) {
+        // A call that never waited for a slot is in the bucket of 5 ms; the wait of those that did is in the sum.
+        if (line.startsWith("jig_gateway_queue_seconds_sum")) seconds += Number(line.split(" ").pop());
+        if (line.startsWith("jig_gateway_queue_seconds_bucket") && line.includes('le="0.005"')) waited -= Number(line.split(" ").pop());
+        if (line.startsWith("jig_gateway_queue_seconds_count")) waited += Number(line.split(" ").pop());
+      }
+    }
+    return { waited, seconds };
+  };
+  if (!direct) {
+    // Of the calls so far, before the bursts, whose calls wait by design.
+    const measured = await atProvider("/reset");
+    overCaps(measured);
+    const { waited, seconds: waitedSeconds } = await queue();
+    console.log(`  at the provider at once: ${measured.most} of ${CONCURRENT} in all, ${Math.max(...Object.values(measured.mostOf))} of a tenant's ${TENANT_CONCURRENT}; ${waited} calls waited over 5 ms for a slot (${ms((waitedSeconds * 1000) / (WARM + REQUESTS))} a call over them all)`);
+    // The caps, reached on purpose: twice a tenant's cap of calls at once, of each tenant alone, then twice
+    // the cap for all, a tenant's after another's. The provider holds each reply long enough that all a
+    // burst's calls let through are with it together.
+    const burst = (tasks: number[]) => Promise.all(tasks.map((task) => call(next++, task, BURST_MS)));
+    for (let tenant = 0; tenant < TENANTS; tenant++) await burst(Array.from({ length: 2 * TENANT_CONCURRENT }, () => tenant));
+    await burst(Array.from({ length: 2 * CONCURRENT }, (_, k) => k % TENANTS));
+  }
+  agent.destroy();
+
+  const seen = await atProvider();
   for (const what of seen.wrong) failed(`at the provider, ${what}`);
-  if (seen.requests !== WARM + REQUESTS) failed(`the provider had ${seen.requests} requests, not ${WARM + REQUESTS}`);
+  if (seen.requests !== made.length) failed(`the provider had ${seen.requests} requests, not ${made.length}`);
   if (direct) return wrong;
-  if (seen.most > CONCURRENT) failed(`the provider held ${seen.most} calls at once, over the cap of ${CONCURRENT}`);
-  if (seen.mostOfTenant > TENANT_CONCURRENT) failed(`the provider held ${seen.mostOfTenant} calls of one tenant at once, over its cap of ${TENANT_CONCURRENT}`);
+  // In the bursts, exactly the caps: over one, and it is not kept; under, and a slot of an earlier call was
+  // never given back (or the machine was so busy that a burst's calls came 200 ms apart: run it again).
+  const cap = Math.min(CONCURRENT, TENANTS * TENANT_CONCURRENT);
+  const tenantCap = Math.min(TENANT_CONCURRENT, CONCURRENT);
+  overCaps(seen);
+  if (seen.most < cap) failed(`the provider held ${seen.most} calls at once at most, where a burst of ${2 * CONCURRENT} should have had ${cap} let through: a slot was not given back`);
+  for (let tenant = 0; tenant < TENANTS; tenant++) {
+    const most = seen.mostOf[`tenant-${tenant}`] ?? 0;
+    if (most < tenantCap) failed(`the provider held ${most} calls of tenant-${tenant} at once at most, where a burst of ${2 * TENANT_CONCURRENT} should have had ${tenantCap} let through: a slot was not given back`);
+  }
 
   // What the gateway counted against what was sent: each task's, by its own token, and each tenant's day.
   const sent = Array.from({ length: TASKS }, () => ({ requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, costUsd: 0 }));
-  for (let i = 0; i < WARM + REQUESTS; i++) {
+  for (const [i, task] of made.entries()) {
     const usage = usageOf(i);
-    const total = sent[taskOf(i)];
+    const total = sent[task];
     total.requests++;
     for (const field of ["input", "cacheRead", "cacheWrite", "output"] as const) total[field] += usage[field];
     total.costUsd += costOf(MODEL, usage)!;
@@ -302,21 +375,14 @@ async function load(targets: Target[], provider: string, direct: boolean): Promi
   }
 
   // Nothing left: no call in flight or waiting on any gateway, and no read or write of Redis that failed.
-  let waited = 0;
-  let waitedSeconds = 0;
   for (const { metricsUrl } of targets) {
     const lines = (await (await fetch(`${metricsUrl}/metrics`)).text()).split("\n");
     for (const line of lines) {
       if (/^jig_gateway_(inflight|waiting|state_errors_total|state_late_releases_total)(\{.*\})? [^0]/.test(line)) failed(`after the load, ${line}`);
       if (/^jig_gateway_requests_total\{.*status="(?!200")/.test(line)) failed(`after the load, ${line}`);
-      // A call that never waited for a slot is in the bucket of 5 ms; the wait of those that did is in the sum.
-      if (line.startsWith("jig_gateway_queue_seconds_sum")) waitedSeconds += Number(line.split(" ").pop());
-      if (line.startsWith("jig_gateway_queue_seconds_bucket") && line.includes('le="0.005"')) waited -= Number(line.split(" ").pop());
-      if (line.startsWith("jig_gateway_queue_seconds_count")) waited += Number(line.split(" ").pop());
     }
   }
-  console.log(`  at the provider at once: ${seen.most} of ${CONCURRENT} in all, ${seen.mostOfTenant} of a tenant's ${TENANT_CONCURRENT}; ${waited} calls waited over 5 ms for a slot (${ms((waitedSeconds * 1000) / (WARM + REQUESTS))} a call over them all)`);
-  if (!wrong.length) console.log(`  every body and reply byte for byte, the spending of ${TASKS} tasks and ${TENANTS} tenants as sent, nothing left in flight`);
+  if (!wrong.length) console.log(`  every body and reply byte for byte, the spending of ${TASKS} tasks and ${TENANTS} tenants as sent, bursts of twice the caps held to exactly ${cap} in all and ${tenantCap} of each tenant, nothing left in flight`);
   return wrong;
 }
 
@@ -348,7 +414,7 @@ async function scenario(name: string, gateways: number, redis?: string): Promise
       children.push(gateway.process);
       targets.push({ url: gateway.match[1], metricsUrl: gateway.match[2], pid: gateway.process.pid });
     }
-    const wrong = await load(gateways ? targets : [{ url: providerUrl }], providerUrl, !gateways);
+    const wrong = await load(gateways ? targets : [{ url: providerUrl }], { url: providerUrl, pid: provider.process.pid }, !gateways);
     if (redis && !wrong.length) {
       // The slots are leases in Redis: none may be left there either, once the gateways have given theirs back.
       const client = new Redis(redis);

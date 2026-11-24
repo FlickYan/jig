@@ -1,8 +1,10 @@
 // Admission for the model gateway: requests a minute (a token bucket) and requests in flight, for each
 // tenant and for all of them together. A request over a limit waits in a queue that serves the tenants
-// in turn, so one tenant flooding the gateway delays another's request by one slot at most, and after
-// the longest wait it is turned away with a time to try again. The counts are the State's (state.ts), in
-// this process or in Redis, shared by several gateways; the queue is each gateway's own.
+// in turn, so one tenant flooding the gateway delays another's request by one slot at most (or, when
+// there was room and the state had been asked for several of the flooder's slots at once, by those already
+// asked for when the other's request came: MOST_ASKED at most), and after the longest wait it is turned
+// away with a time to try again. The counts are the State's (state.ts), in this process or in Redis,
+// shared by several gateways; the queue is each gateway's own.
 
 import { randomUUID } from "node:crypto";
 import type { State } from "./state.ts";
