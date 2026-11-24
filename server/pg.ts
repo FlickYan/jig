@@ -245,6 +245,8 @@ interface Pending {
   fields: { name: string; type: number }[];
   rows: Row[];
   rowCount: number;
+  /** For statements sent together (Connection.together): each one's result, kept as its command completes. */
+  each?: Result[];
   error?: Error;
   done(error: Error | undefined, result: Result): void;
 }
@@ -419,6 +421,11 @@ export class Connection extends EventEmitter {
     } else if (type === "C") {
       const tag = body.toString("utf8", 0, body.length - 1);
       pending.rowCount = Number(/ (\d+)$/.exec(tag)?.[1] ?? 0);
+      if (pending.each) {
+        pending.each.push({ rows: pending.rows, rowCount: pending.rowCount });
+        pending.rows = [];
+        pending.rowCount = 0;
+      }
     } else if (type === "Z") {
       this.status = String.fromCharCode(body[0]);
       this.pending = undefined;
@@ -439,21 +446,20 @@ export class Connection extends EventEmitter {
 
   /** Runs one statement with its $n parameters; a query past `timeoutMs` is cancelled and the connection dropped. */
   query(text: string, params: unknown[] = [], timeoutMs = 0): Promise<Result> {
-    const bind = new Out().str("").str("").i16(0).i16(params.length);
-    for (const value of params) {
-      const encoded = encode(value);
-      if (encoded === null) bind.i32(-1);
-      else bind.i32(encoded.length).bytes(encoded);
-    }
-    bind.i16(0);
-    const messages = [
-      new Out().str("").str(text).i16(0).build("P"),
-      bind.build("B"),
-      new Out().bytes(Buffer.from("P")).str("").build("D"),
-      new Out().str("").i32(0).build("E"),
-      new Out().build("S"),
-    ];
-    return this.send(Buffer.concat(messages), timeoutMs);
+    return this.send(Buffer.concat([...statement(text, params), new Out().build("S")]), timeoutMs);
+  }
+
+  /**
+   * Runs several statements, each with its $n parameters, sent together and answered together: the server
+   * runs them one after another as one transaction, with no wait for this client between them, and commits
+   * at the end, so a lock one of them takes for the transaction is held only while the server works, never
+   * while this process is busy or frozen. Each statement reads the database as it is when its turn comes
+   * (READ COMMITTED). If one fails none is kept, and the error is thrown; else each one's result, in order.
+   */
+  async together(statements: [text: string, params?: unknown[]][], timeoutMs = 0): Promise<Result[]> {
+    const each: Result[] = [];
+    await this.send(Buffer.concat([...statements.flatMap(([text, params = []]) => statement(text, params)), new Out().build("S")]), timeoutMs, each);
+    return each;
   }
 
   /** Runs statements in the simple protocol (DDL, LISTEN), with no parameters. */
@@ -461,7 +467,7 @@ export class Connection extends EventEmitter {
     return this.send(new Out().str(text).build("Q"), timeoutMs);
   }
 
-  private send(bytes: Buffer, timeoutMs: number): Promise<Result> {
+  private send(bytes: Buffer, timeoutMs: number, each?: Result[]): Promise<Result> {
     if (this.broken) return Promise.reject(new Error(LOST));
     if (this.pending) return Promise.reject(new Error("The connection is running another query"));
     return new Promise<Result>((done, fail) => {
@@ -478,6 +484,7 @@ export class Connection extends EventEmitter {
         fields: [],
         rows: [],
         rowCount: 0,
+        each,
         done: (error, result) => {
           if (timer) clearTimeout(timer);
           if (error) fail(error);
@@ -508,6 +515,18 @@ export class Connection extends EventEmitter {
     this.broken = true;
     this.socket.destroy();
   }
+}
+
+/** The extended protocol's messages for one statement with its $n parameters: parse, bind, describe, execute. */
+function statement(text: string, params: unknown[]): Buffer[] {
+  const bind = new Out().str("").str("").i16(0).i16(params.length);
+  for (const value of params) {
+    const encoded = encode(value);
+    if (encoded === null) bind.i32(-1);
+    else bind.i32(encoded.length).bytes(encoded);
+  }
+  bind.i16(0);
+  return [new Out().str("").str(text).i16(0).build("P"), bind.build("B"), new Out().bytes(Buffer.from("P")).str("").build("D"), new Out().str("").i32(0).build("E")];
 }
 
 /** Asks the server for TLS and starts it, the certificate checked against the CAs and the host's name. */
@@ -613,6 +632,16 @@ export class Pool implements Client {
     } catch (err) {
       if (!connection.broken) await connection.query("ROLLBACK", [], timeout).catch(() => {});
       throw err;
+    } finally {
+      this.give(connection);
+    }
+  }
+
+  /** Runs statements sent together on one connection, as one transaction (Connection.together). */
+  async together(statements: [text: string, params?: unknown[]][]): Promise<Result[]> {
+    const connection = await this.take();
+    try {
+      return await connection.together(statements, this.options.queryTimeoutMs);
     } finally {
       this.give(connection);
     }

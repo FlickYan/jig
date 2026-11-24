@@ -4,6 +4,7 @@
 // a deployment can't pass by adding workers. From the repository's root:
 //   node bench/service-load.ts                                        SQLite, one replica
 //   JIG_TEST_POSTGRES_URL=postgres://... node bench/service-load.ts   Postgres too, with two replicas
+// (in this one process: bench/service-replicas.ts gives each replica a process of its own)
 // TASKS (2000), CLIENTS (32), CONCURRENCY (64), EVENTS (20) and RUN_MS (200) change the load.
 
 import { createHash } from "node:crypto";
@@ -110,7 +111,7 @@ async function scenario(name: string, database: () => Promise<string>, replicas:
     console.log(`limits:                                               ${await load(400, CLIENTS, async () => void (await (await fetch(`${apis[0].url}/v1/limits`, { headers })).arrayBuffer()))}`);
     await Promise.all(apis.map((api) => api.close()));
 
-    // Throughput: every task runs, CONCURRENCY at a time on each replica, each writing EVENTS events.
+    // Throughput: every task runs, CONCURRENCY at a time (the cap is the replicas' together), each writing EVENTS events.
     const shared = await database();
     apis = await Promise.all(Array.from({ length: replicas }, (_, n) => service(shared, join(base, `r${n}`), runner(EVENTS, RUN_MS), CONCURRENCY, `replica-${n}`)));
     const made: string[] = [];
@@ -143,9 +144,9 @@ async function scenario(name: string, database: () => Promise<string>, replicas:
     const seconds = (performance.now() - from) / 1000;
     const failed = ((await (await fetch(`${apis[0].url}/v1/tasks?status=error,stopped,cancelled&limit=1`, { headers })).json()) as { tasks: unknown[] }).tasks.length;
     const statuses = failed ? "SOME DIDN'T SUCCEED" : "all succeeded";
-    console.log(`run (${replicas} replica${replicas > 1 ? "s" : ""} × ${CONCURRENCY} at a time, ${EVENTS} events and ${RUN_MS} ms a run):`);
+    console.log(`run (${replicas} replica${replicas > 1 ? "s" : ""}, ${CONCURRENCY} at a time in all, ${EVENTS} events and ${RUN_MS} ms a run):`);
     console.log(`  created while running:   ${created}`);
-    console.log(`  all ${TASKS} ended in ${seconds.toFixed(1)} s: ${Math.round(TASKS / seconds)} tasks/s, ${Math.round((TASKS * EVENTS) / seconds)} events/s stored (the runs alone allow ${Math.round((replicas * CONCURRENCY * 1000) / RUN_MS)} tasks/s)`);
+    console.log(`  all ${TASKS} ended in ${seconds.toFixed(1)} s: ${Math.round(TASKS / seconds)} tasks/s, ${Math.round((TASKS * EVENTS) / seconds)} events/s stored (the runs alone allow ${Math.round((CONCURRENCY * 1000) / RUN_MS)} tasks/s)`);
     console.log(`  ${streams.length} streams followed to their end, ${streams.reduce((sum, stream) => sum + stream.events, 0)} events, none missed; ${statuses}`);
     const errors = (await apis[0].metrics.registry.render()).split("\n").filter((line) => /^jig_service_(store|lease)_errors_total.* [1-9]/.test(line));
     if (errors.length) console.log(`  store errors: ${errors.join("; ")}`);
