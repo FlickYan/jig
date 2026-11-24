@@ -641,7 +641,15 @@ export class Pool implements Client {
   async together(statements: [text: string, params?: unknown[]][]): Promise<Result[]> {
     const connection = await this.take();
     try {
-      return await connection.together(statements, this.options.queryTimeoutMs);
+      const timeout = this.options.queryTimeoutMs;
+      if (!(timeout > 0)) return await connection.together(statements, timeout);
+      // The server commits these without waiting for this process, so it must give up on them before this
+      // process does: a statement still waiting for a lock when the query's time is up here would go on,
+      // and commit, after its caller was told it failed. Each statement gets a share of the time that
+      // leaves all of them done, or undone, short of it.
+      const share = Math.max(1, Math.floor((timeout * 0.8) / statements.length));
+      const [, ...results] = await connection.together([[`SET LOCAL statement_timeout = ${share}`], ...statements], timeout);
+      return results;
     } finally {
       this.give(connection);
     }

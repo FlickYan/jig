@@ -119,6 +119,9 @@ function replica(): void {
   let store: Report["store"];
   let from = 0;
   let cpu = process.cpuUsage();
+  // A parent that was killed leaves no replica polling the database behind it.
+  let reported = false;
+  process.on("disconnect", () => void (reported || process.exit(1)));
   process.on("message", async (message: { start?: Start; stop?: true }) => {
     if (message.start) {
       const { database, dataDir, replicaId, tenants, tenantConcurrency } = message.start;
@@ -151,6 +154,7 @@ function replica(): void {
       await api.close();
       const report: Report = { ran, cpu: (used.user + used.system) / 1e6, seconds, poolWaiting, storeErrors, store };
       // Exits once the report is sent, by itself, so a CPU profile is written.
+      reported = true;
       process.send!({ report }, () => process.disconnect?.());
     }
   });

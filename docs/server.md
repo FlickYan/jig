@@ -429,7 +429,12 @@ counts the running tasks in the database under a lock it holds to its transactio
 and each tenant's own hold across the replicas, and two can't both take the last slot; the turn among
 tenants is each replica's own. The lock and the claim are sent to the database together, and it commits
 without waiting for the replica again, so the lock, which every replica's claims wait for, is held only
-while the database works: a replica that is busy, or frozen, in the middle of a claim holds up no other. A run's events are stored and announced (`NOTIFY jig_events`), so a stream
+while the database works: a replica that is busy, or frozen, in the middle of a claim holds up no other.
+So a claim that was sent is carried out though its replica died meanwhile: that task is `running` for a
+replica that is gone, and ends as an error when its lease runs out, as a crashed replica's tasks do. For a
+replica that lives, the database gives up on a claim (its `statement_timeout`, set for those statements)
+before the replica's own wait for the query is over, so none is made after the replica was told it failed.
+A run's events are stored and announced (`NOTIFY jig_events`), so a stream
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,

@@ -748,6 +748,27 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     }
   });
 
+  it("gives up in the database on statements sent together before the client does, so none is committed behind its back", async () => {
+    const url = await postgresDatabase();
+    const db = pool(url);
+    await db.simple("CREATE TABLE claimed (n integer)");
+    // Another replica holds a lock (as the claims' is held) past this one's patience, and lets go just as
+    // the query's time is up here: what was sent with the wait for it must not be carried out then.
+    const held = db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(4242)");
+      await new Promise((done) => setTimeout(done, 380));
+    });
+    await new Promise((done) => setTimeout(done, 50));
+    const hasty = pool(url, { queryTimeoutMs: 400 });
+    await assert.rejects(hasty.together([["SELECT pg_advisory_xact_lock(4242)"], ["INSERT INTO claimed VALUES (1)"]]), /statement timeout|took over/);
+    await held;
+    await new Promise((done) => setTimeout(done, 300));
+    assert.equal(Number((await db.query("SELECT count(*) AS n FROM claimed")).rows[0].n), 0);
+    // With time enough, both are carried out, and the results are the statements' own.
+    const [, inserted] = await hasty.together([["SELECT pg_advisory_xact_lock(4242)"], ["INSERT INTO claimed VALUES (2) RETURNING n"]]);
+    assert.deepEqual(inserted.rows, [{ n: 2 }]);
+  });
+
   it("writes the events that wait in one statement, and one the database refuses fails alone", async () => {
     const url = await postgresDatabase();
     const store = await openStore(url);
