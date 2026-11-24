@@ -1108,12 +1108,12 @@ describe("the gateway's queue", () => {
     const admissions = await Promise.all(Array.from({ length: 64 }, () => limiter.acquire("acme")));
     assert.ok(admissions.every((admission) => "release" in admission));
     // One, then twice as many each time all that were asked for went through.
-    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, 16, 32, 1]);
+    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, 16, 16, 16, 1]);
     assert.equal(new Set(trips.flat()).size, 64, "each request asked for once, under an id of its own");
-    // And 64 of a tenant in a round at most, however long there is room.
+    // And 16 of a tenant in a round at most, however long there is room.
     trips.length = 0;
     await Promise.all(Array.from({ length: 300 }, () => limiter.acquire("acme")));
-    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, 16, 32, 64, 64, 64, 45]);
+    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, ...Array.from({ length: 17 }, () => 16), 13]);
   });
 
   it("keeps to the requests that wait, through a long run of rounds with room for all", async () => {

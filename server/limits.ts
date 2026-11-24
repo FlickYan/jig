@@ -42,7 +42,7 @@ export type Admission = { release(): void } | { retryAfter: number; error?: Erro
 const POLL_MS = 250;
 
 /** The most of one tenant's waiting requests the state is asked about at once. */
-const MOST_ASKED = 64;
+const MOST_ASKED = 16;
 
 interface Waiter {
   tenant: string;

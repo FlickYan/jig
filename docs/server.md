@@ -1151,7 +1151,7 @@ the same fields at the top of `limits` hold for all tenants together, where `con
 gateway sends upstream at once. Any left out is no limit. A request over a limit waits for its turn in a
 queue that serves the tenants in turn, a request of each, so a tenant with a thousand requests waiting
 delays another tenant's request by one slot at most; or, when there was room for more and the gateway had
-asked for several of the tenant's slots at once (64 at most, see "What the gateway itself takes"), by
+asked for several of the tenant's slots at once (16 at most, see "What the gateway itself takes"), by
 those it had already asked for when the other's request came, which matters when they were the last of
 the room. After `maxWaitMs` (30 seconds by default) it gets 429 with `retry-after`, and jig's SDK waits
 that long and tries again, twice at most.
@@ -1395,7 +1395,7 @@ What did hold calls back was the queue with Redis. It asked for one slot at a ti
 answer before asking for the next, so a gateway let through one call for each turn of its event loop,
 however much room the limits left: with calls arriving faster than that, every call waited in the queue,
 and the asking again that each arrival and each reply's end set off cost CPU besides. Now a round asks for
-a request of each tenant at once, in the order of the turns, and for twice as many as the last (64 of a
+a request of each tenant at once, in the order of the turns, and for twice as many as the last (16 of a
 tenant at most) once a round has let through all it asked for, back to one at the first that must wait;
 Redis answers in the order it is asked, so the slots go to the same requests as before, but for a request
 of another tenant that comes while a round is with Redis: the slots that round asked for are the first
