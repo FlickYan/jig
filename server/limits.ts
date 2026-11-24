@@ -1,8 +1,10 @@
 // Admission for the model gateway: requests a minute (a token bucket) and requests in flight, for each
 // tenant and for all of them together. A request over a limit waits in a queue that serves the tenants
-// in turn, so one tenant flooding the gateway delays another's request by one slot at most, and after
-// the longest wait it is turned away with a time to try again. The counts are the State's (state.ts), in
-// this process or in Redis, shared by several gateways; the queue is each gateway's own.
+// in turn, so one tenant flooding the gateway delays another's request by one slot at most (or, when
+// there was room and the state had been asked for several of the flooder's slots at once, by those already
+// asked for when the other's request came: MOST_ASKED at most), and after the longest wait it is turned
+// away with a time to try again. The counts are the State's (state.ts), in this process or in Redis,
+// shared by several gateways; the queue is each gateway's own.
 
 import { randomUUID } from "node:crypto";
 import type { State } from "./state.ts";
@@ -38,6 +40,9 @@ export type Admission = { release(): void } | { retryAfter: number; error?: Erro
 
 /** With shared state, how often the waiting requests try again when no release has been heard of. */
 const POLL_MS = 250;
+
+/** The most of one tenant's waiting requests the state is asked about at once. */
+const MOST_ASKED = 64;
 
 interface Waiter {
   tenant: string;
@@ -161,40 +166,67 @@ export class Limiter {
    * A request of each tenant in turn, starting after the last one served, until none can go; answers the
    * milliseconds until one may. The turn goes by tenant, not by request: a tenant with a thousand requests
    * waiting gets one slot, then the next tenant does.
+   *
+   * A round asks the state for all its requests at once, in the order of the turns, and the state answers
+   * in that order (this process, or one connection to Redis, which runs what it is sent as it comes), so the
+   * slots go as they would one question at a time; but the questions share a round trip, where with Redis
+   * each used to wait for the one before, and a gateway let through one request for each turn of its event
+   * loop, however much room there was. A round asks for one request of each tenant, and for twice as many
+   * as the last (MOST_ASKED at most) once a round has let through all it asked for: a burst there is room
+   * for is through in a few rounds. At the first that must wait it is one again, so a tenant at its limit
+   * costs a question a round.
    */
   private async serve(): Promise<number> {
     let soonest = Infinity;
+    let depth = 1;
     for (let served = true; served; ) {
       served = false;
       soonest = Infinity;
-      for (let i = 0; i < this.order.length; i++) {
-        const index = (this.next + i) % this.order.length;
-        const tenant = this.order[index];
-        const waiter = this.queues.get(tenant)?.[0];
-        if (!waiter) continue;
-        let wait: number;
-        try {
-          wait = await this.state.admit(tenant, waiter.id, this.limits(tenant));
-        } catch (err) {
-          if (this.remove(waiter)) waiter.done({ retryAfter: 1, error: err as Error });
-          served = true;
-          break;
+      const asked: { index: number; tenant: string; id: string }[] = [];
+      for (let rank = 0; rank < depth; rank++) {
+        for (let i = 0; i < this.order.length; i++) {
+          const index = (this.next + i) % this.order.length;
+          const tenant = this.order[index];
+          const waiter = this.queues.get(tenant)?.[rank];
+          if (waiter) asked.push({ index, tenant, id: waiter.id });
         }
-        if (wait > 0) {
-          this.waits.set(tenant, wait);
-          soonest = Math.min(soonest, wait);
+      }
+      const answers = await Promise.all(asked.map(({ tenant, id }) => this.state.admit(tenant, id, this.limits(tenant)).catch((err: Error) => err)));
+      let room = true;
+      for (const [n, { index, tenant, id }] of asked.entries()) {
+        const answer = answers[n];
+        const queue = this.queues.get(tenant) ?? [];
+        // Not there any more if it left while the state answered.
+        const waiter = queue.find((waiting) => waiting.id === id);
+        if (answer instanceof Error) {
+          room = false;
+          if (waiter && this.remove(waiter)) waiter.done({ retryAfter: 1, error: answer });
+          served = true;
           continue;
         }
-        if (this.remove(waiter)) {
-          this.next = index + 1;
-          this.grant(waiter);
-        } else {
-          // It left while the state answered: the slot it was given goes back.
-          void this.state.release(tenant, waiter.id).catch(() => {});
+        if (answer > 0) {
+          room = false;
+          this.waits.set(tenant, answer);
+          soonest = Math.min(soonest, answer);
+          continue;
         }
         served = true;
-        break;
+        // The slot is the tenant's, and goes to its first request waiting: the one asked for, but when
+        // another gateway gave a slot back between two questions of a round, the one before it that was
+        // told to wait. An id only names a slot, so the two change theirs. With none waiting (they left
+        // while the state answered), the slot goes back.
+        const first = queue[0];
+        if (!first) {
+          void this.state.release(tenant, id).catch(() => {});
+          continue;
+        }
+        if (waiter && waiter !== first) waiter.id = first.id;
+        first.id = id;
+        this.remove(first);
+        this.next = index + 1;
+        this.grant(first);
       }
+      depth = room ? Math.min(depth * 2, MOST_ASKED) : 1;
     }
     // Tenants with nothing waiting leave the turns, so they don't pile up; but for the one served last, which
     // marks whose turn is next: a tenant that comes along goes before it has another.
