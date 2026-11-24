@@ -1278,8 +1278,9 @@ keys, which a cluster refuses across slots, and `server/redis.ts` does not follo
 Redis on its own clock. A tenant's and the global rate buckets and requests in flight hold across all
 replicas; a request in flight is a lease that its gateway renews every `leaseMs`/3 while the reply goes
 on, so the slots of a replica that died come back within `leaseMs` (60 seconds; 100 ms at least). The queue that takes the
-tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
-the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
+tenants in turn is each replica's own, and asks Redis for a round's slots in one round trip: a replica that
+gives back a slot says so on a Redis channel, and the others' waiting requests try again at once, and every
+250 ms anyway. A task's spending is kept until a
 week after its token expires, a tenant's day for 35 days and its month for 400 (a hash each,
 `<prefix>day:<tenant>:<YYYY-MM-DD>` and `<prefix>month:<tenant>:<YYYY-MM>`, added to in the same script); a key the provider refused or rate-limited is
 passed over by every replica (Redis has only a hash of it, never the key), a rate-limited one until its rest is
@@ -1318,6 +1319,67 @@ to expire with their leases. What this leaves:
   Redis has answered the give-back.
 - Spending lost in an outage stays lost, and a reply that outlasts an outage longer than `leaseMs` loses
   its lease, as before.
+
+### What the gateway itself takes
+
+`node bench/gateway-load.ts` measures the gateway with no model behind it: each gateway a process of its
+own, started as a deployment starts it, a stand-in provider in another that streams a reply as the Messages
+API does, and the clients in a third. Every limit is set (rates, both concurrency caps, both quotas, a
+budget on every other task), so each is checked on every call. It checks what it measures, and ends with
+status 1 otherwise: every request's body reached the provider byte for byte with the pool's key, every
+reply came back whole and byte for byte, each task's and tenant's spending is what the provider sent, the
+provider never held more calls at once than the caps allow, and nothing is left in flight, in the gateways
+or in Redis. With `JIG_TEST_REDIS_URL` it measures the state in Redis too, with one gateway and with two.
+On 4 cores (Node 22, Redis 7 on the same machine), 40 tasks of 4 tenants, 32 calls at a time:
+
+| replies of 100 chunks over 250 ms, requests of 32 KB | no gateway | in memory | Redis | Redis, two gateways |
+|---|---|---|---|---|
+| calls a second (the streams allow 128) | 126 | 125 | 124 | 125 |
+| to the first byte, p50 (p99) | 0.8 ms (8 ms) | 1.8 ms (26 ms) | 3.5 ms (24 ms) | 2.5 ms (22 ms) |
+| to the reply's end, p50 (p99) | 252 ms (262 ms) | 253 ms (271 ms) | 255 ms (278 ms) | 254 ms (277 ms) |
+| the gateways' CPU a call | | 4.1 ms | 4.5 ms | 5.1 ms |
+| waiting for a slot, a call | | 0 | 1.0 ms | 0.6 ms |
+
+| replies of one chunk at once, requests of 4 KB | no gateway | in memory | Redis | Redis, two gateways |
+|---|---|---|---|---|
+| calls a second | 8,300 | 2,000 | 1,900 | 2,000 |
+| to the reply's end, p50 (p99) | 3 ms (11 ms) | 16 ms (32 ms) | 15 ms (45 ms) | 14 ms (47 ms) |
+| the gateways' CPU a call | | 0.6 ms | 0.7 ms | 1.0 ms |
+| waiting for a slot, a call | | 0 | 2.5 ms | 2.9 ms |
+
+The second load is `CHUNKS=1 STREAM_MS=0 BODY_KB=4 REQUESTS=4000`; `REQUESTS`, `CLIENTS`, `TASKS`, `TENANTS`
+and the caps change it too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. The machine was
+shared with other work, so a run's calls a second and its times can differ from the next run's by half, and
+its CPU by a fifth: the table is one run, and the CPU a call is the number to compare.
+
+How to read it. A small call costs the gateway about 0.6 ms of one core (0.7 ms with Redis: eight or nine
+commands a call, each a write of its own), and then some 35 microseconds for each chunk of the reply it
+passes on. So a core passes about 250 calls a second of 100 chunks each, or some 25,000 chunks
+a second however many calls they belong to: a model that sends 50 chunks a second to each call keeps one
+gateway busy with about 500 calls in flight. The gateway is one thread, so past that it is replicas with
+`state` that add room, not cores; in these runs two gateways passed no more than one, because the clients
+and the provider, a process each, were what held the second load back. What the gateway adds to a call
+that is not waiting for a slot is a millisecond or two before its first byte, and nothing that shows over
+a reply of seconds.
+
+Where the time goes, by the profile of the first load: 45% of a busy gateway's time is the kernel's, writing
+each chunk to jig as it comes, one write a chunk; most of the rest is Node's HTTP and streams and the
+garbage they leave. The gateway's own code is a tenth, and most of that is reading the usage out of the
+stream (7%), which parses every event to find the two that carry it. With Redis, its commands are another
+6%. None of these is worth giving up the reply passed on as it arrives for.
+
+What did hold calls back was the queue with Redis. It asked for one slot at a time and waited for Redis's
+answer before asking for the next, so a gateway let through one call for each turn of its event loop,
+however much room the limits left: with calls arriving faster than that, every call waited in the queue,
+and the asking again that each arrival and each reply's end set off cost CPU besides. Now a round asks for
+a request of each tenant at once, in the order of the turns, and for twice as many as the last (64 of a
+tenant at most) once a round has let through all it asked for, back to one at the first that must wait;
+Redis answers in the order it is asked, so the slots go to the same requests as before. On the second
+load with one tenant and one gateway, three runs before and three after, turn about: 1,077, 1,122 and 1,081
+calls a second became 1,607, 1,698 and 1,542; the wait for a slot 23, 21 and 23 ms a call became 3.0, 2.9
+and 3.1 ms; the gateway's CPU 1.02, 0.98 and 1.04 ms a call became 0.70, 0.72 and 0.73 ms. On the first
+load with one tenant, where calls come at half of what a gateway carries, the wait went from 2.6, 2.5 and
+1.9 ms a call to 1.3, 1.4 and 1.2 ms, and nothing else moved beyond what one run differs from the next.
 
 ## Several regions
 
