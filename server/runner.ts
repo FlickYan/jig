@@ -282,7 +282,8 @@ export function keyVariable(model: string): string {
 /**
  * jig's arguments for a task, its prompt to come on stdin (`-`), which keeps it out of the process list. A
  * task with approvals runs in its mode and asks at the service's internal listener (`internalBaseUrl`)
- * before the tool calls that mode doesn't allow; any other runs with --yes.
+ * before the tool calls that mode doesn't allow; any other runs with --yes. A task that asked for outputs
+ * gets --outputs for each, and jig writes them as its outputs event.
  */
 export function jigArgs(task: Task, tenant: Tenant, paths: { cwd: string; events: string; stats: string; baseUrl: string; internalBaseUrl?: string }): string[] {
   const { model, maxSteps, timeLimit, approvals, mode = "edits" } = task.spec;
@@ -290,7 +291,10 @@ export function jigArgs(task: Task, tenant: Tenant, paths: { cwd: string; events
   const asks = approvals
     ? ["--mode", mode, "--approve-via", `${paths.internalBaseUrl!.replace(/\/+$/, "")}/internal/approvals`, "--approval-timeout", String(tenant.limits.approvalTimeout ?? 600)]
     : ["--yes"];
-  return [...asks, "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, "-C", paths.cwd, "-"];
+  // The files the task hands back (docs/server.md): each in one argument with its flag, as a path may start
+  // with a dash, which jig's parser wouldn't take for a value in an argument of its own.
+  const outputs = (task.spec.outputs ?? []).map((path) => `--outputs=${path}`);
+  return [...asks, "--model", model, "--base-url", paths.baseUrl, "--max-steps", String(maxSteps), "--time-limit", String(timeLimit), "--events", paths.events, "--stats", paths.stats, ...outputs, "-C", paths.cwd, "-"];
 }
 
 /** Why a workspace file's path can't be written, or undefined if it lies inside the workspace. */

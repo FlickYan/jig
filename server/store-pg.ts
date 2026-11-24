@@ -124,6 +124,11 @@ const MIGRATIONS = [
   // may be there already: made by hand ahead of the upgrade, on a large table (docs/server.md).
   `ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz;
    CREATE INDEX IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL`,
+  // The files a run handed back (its last outputs event). A nullable column with no default: Postgres changes
+  // its catalog only, and no row is rewritten or read. A replica of the version before neither names it in an
+  // insert nor sets it as a task ends, so it stays null for the tasks it ends. json, as the spec: a run wrote
+  // it, so no statement applies an operator to it.
+  `ALTER TABLE tasks ADD COLUMN outputs json`,
 ];
 
 /** The statement's rows, each announced as a task that ended (its id and status columns). */
@@ -138,7 +143,7 @@ const IDS = "SELECT json_array_elements_text($1::json)";
  */
 const LIVE = "live AS (SELECT id FROM tasks WHERE id = $1 AND purged IS NULL FOR KEY SHARE)";
 /** What a purge leaves of a task's row, but for its spec: see Store.purge. */
-const BLANK = "prompt = '', error = NULL, stats = NULL, result = NULL, result_truncated = false";
+const BLANK = "prompt = '', error = NULL, stats = NULL, result = NULL, result_truncated = false, outputs = NULL";
 
 /** What a statement that ends tasks returns of each, for the ledger: the model from its column, not the spec. */
 // A task a replica of the version before made meanwhile has no model column: its spec is read, where it can be.
@@ -372,9 +377,9 @@ export class PostgresStore implements Store {
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     const { input, output, cacheRead, cacheWrite, costUsd } = spentOf(outcome);
     const { rows } = await this.pool.query(
-      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, result = $15, result_truncated = $16::boolean, ended = now()
+      `WITH done AS (UPDATE tasks SET status = $3, exit_code = $4, stop = $5, error = $6, stats = $7, usage = $8, cost = $9, result = $15, result_truncated = $16::boolean, outputs = $17, ended = now()
        WHERE id = $1 AND status = 'running' AND owner = $2 RETURNING ${DONE}), ${ledger("$10::bigint, $11::bigint, $12::bigint, $13::bigint, $14::double precision")} ${NOTIFY_DONE}`,
-      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd, outcome.result ?? null, outcome.resultTruncated ?? false],
+      [id, owner, outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, input, output, cacheRead, cacheWrite, costUsd, outcome.result ?? null, outcome.resultTruncated ?? false, json(outcome.outputs)],
     );
     return rows.length === 1;
   }

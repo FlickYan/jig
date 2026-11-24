@@ -148,7 +148,12 @@ export interface TaskSpec {
   /** Ask before the tool calls `mode` doesn't allow, through the API, rather than run with --yes. */
   approvals?: boolean;
   mode?: ApprovalMode;
+  /** The files of its workspace the run is to hand back when it ends (Task.outputs), by their paths in it. */
+  outputs?: string[];
 }
+
+/** One file a run handed back: its text, or why there is none (jig's outputs event, src/outputs.ts). */
+export type TaskOutput = { path: string; text: string } | { path: string; problem: string };
 
 export interface Usage {
   input: number;
@@ -176,6 +181,11 @@ export interface Task {
   result: string | null;
   /** Whether the result is only the start of that text. */
   resultTruncated: boolean;
+  /**
+   * The files the run handed back, of those its spec asked for; null if it asked for none, wrote none, or
+   * hasn't ended. A list leaves them out, as it does the result.
+   */
+  outputs: TaskOutput[] | null;
   /** When its content was deleted (Store.purge), by a DELETE or by retention; null while it is kept. */
   purged: string | null;
 }
@@ -192,6 +202,8 @@ export interface Outcome {
   /** The run's last text, already cut to size, with no NUL (Postgres text can't hold one); none when left out. */
   result?: string | null;
   resultTruncated?: boolean;
+  /** The files the run handed back, already checked and cut to size (scheduler.ts's outputsOf); none when left out. */
+  outputs?: TaskOutput[] | null;
 }
 
 export type Decision = "allow" | "deny";
@@ -336,7 +348,7 @@ export interface Store {
   pendingApprovals(tasks: string[]): Promise<Map<string, number>>;
   /**
    * Deletes an ended task's content, in one transaction: its events and approvals, its prompt (left empty),
-   * its error, stats and result, and its spec but for slimSpec's fields. Its row stays, with its status,
+   * its error, stats, result and outputs, and its spec but for slimSpec's fields. Its row stays, with its status,
    * times, usage and cost, and so do its row of the usage ledger and its Idempotency-Key. Undefined if there
    * is no such task; one that hasn't ended is left as it is, and comes back with `purged` null. `first` says
    * this call is the one that purged it: a task purged already is purged again, and keeps its time.
@@ -431,6 +443,9 @@ const MIGRATIONS = [
   // theirs, in the order they ended, so retention's look for the next ones doesn't read the purged.
   `ALTER TABLE tasks ADD COLUMN purged TEXT;
    CREATE INDEX tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL;`,
+  // The files a run handed back (its last outputs event), as JSON. Null for every task there is, and for
+  // those a process of the version before ends meanwhile: nothing is rewritten.
+  `ALTER TABLE tasks ADD COLUMN outputs TEXT;`,
 ];
 
 type Row = Record<string, unknown>;
@@ -445,14 +460,15 @@ export function diskFull(err: unknown): boolean {
   return code === "ERR_SQLITE_ERROR" && typeof errcode === "number" && (errcode & 0xff) === 13;
 }
 
-/** A task's columns but its prompt and its result, which a list leaves out. */
+/** A task's columns but its prompt and its result, which a list leaves out, and its outputs, which a list never has. */
 export const TASK_COLUMNS = "id, tenant, spec, status, exit_code, stop, error, created, started, ended, stats, usage, cost, result_truncated, purged";
 /** The two it leaves out, or what stands in their place, for a list's SELECT. */
 export const longColumns = (prompts: boolean): string => (prompts ? "prompt, result" : "'' AS prompt, NULL AS result");
 
 /**
  * What is left of a purged task's spec: its limits, its model and how it asked, which the API's views show.
- * The workspace (its files, or its repository's URL, which may hold a token) goes, as the prompt does.
+ * The workspace (its files, or its repository's URL, which may hold a token) goes, as the prompt does, and
+ * the paths of the outputs it asked for, which say what it worked on.
  * Computed here, from the spec as it was read, and written back whole: SQL's JSON operators refuse a stored
  * "\u0000" on Postgres.
  */
@@ -715,9 +731,9 @@ class SqliteStore implements Store {
   async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
     return this.atomically(() => {
       const rows = this.db
-        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, result = ?, result_truncated = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
+        .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, result = ?, result_truncated = ?, outputs = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
         // node:sqlite binds neither undefined nor a boolean.
-        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, outcome.result ?? null, outcome.resultTruncated ? 1 : 0, new Date().toISOString(), id, owner) as Row[];
+        .all(outcome.status, outcome.exitCode, outcome.stop, outcome.error, json(outcome.stats), json(outcome.usage), outcome.cost, outcome.result ?? null, outcome.resultTruncated ? 1 : 0, json(outcome.outputs), new Date().toISOString(), id, owner) as Row[];
       this.ledger(rows, spentOf(outcome));
       return rows.length === 1;
     });
@@ -806,7 +822,7 @@ class SqliteStore implements Store {
   /** Deletes the content of ended tasks (their id and spec columns), inside a transaction: see Store.purge. */
   private blank(rows: Row[]): void {
     const now = new Date().toISOString();
-    const update = this.db.prepare("UPDATE tasks SET prompt = '', spec = ?, error = NULL, stats = NULL, result = NULL, result_truncated = 0, purged = coalesce(purged, ?) WHERE id = ?");
+    const update = this.db.prepare("UPDATE tasks SET prompt = '', spec = ?, error = NULL, stats = NULL, result = NULL, result_truncated = 0, outputs = NULL, purged = coalesce(purged, ?) WHERE id = ?");
     const events = this.db.prepare("DELETE FROM events WHERE task = ?");
     const approvals = this.db.prepare("DELETE FROM approvals WHERE task = ?");
     for (const row of rows) {
@@ -1065,6 +1081,9 @@ export function toTask(row: Row): Task {
     result: (row.result as string | null | undefined) ?? null,
     // A list that leaves the result out says nothing of its cut either.
     resultTruncated: row.result != null && Boolean(row.result_truncated),
+    // None for a purged task even if its row has some: a process of the version before, which doesn't know
+    // the column, purged it (docs/server.md, Upgrading).
+    outputs: row.purged == null ? ((parsed(row.outputs) as TaskOutput[] | null | undefined) ?? null) : null,
     purged: time(row.purged),
   };
 }

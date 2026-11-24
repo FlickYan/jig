@@ -9,6 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { isolationProblem, sandboxProblem, sharedPlaces } from "../src/sandbox.ts";
+import { MAX_OUTPUT_PATH, MAX_OUTPUTS } from "../src/outputs.ts";
 import { isInside } from "../src/tools/util.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
@@ -898,7 +899,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   const [, , action, approval] = match;
   if (!action) {
     if (req.method === "DELETE") return purge(res, task, context);
-    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
+    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true, outputs: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
   }
   // A purged task has neither events nor approvals left: said once, here, for every way of asking for them,
   // rather than an empty stream or list that would read as a run that wrote nothing. A cancel says it has ended.
@@ -997,7 +998,7 @@ async function purge(res: ServerResponse, task: Task, { store, metrics, region }
   if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
   // Once a task, however many deletes it gets, at once or one after another.
   if (purged.first) metrics.purged.inc({ reason: "api" });
-  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
+  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true, outputs: true }, new Map(), region));
 }
 
 /** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */
@@ -1147,9 +1148,9 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
  */
 export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, gitHosts?: string[]): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
-  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode"].includes(key));
+  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode", "outputs"].includes(key));
   if (unknown) return `Unknown field: ${unknown}`;
-  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel, approvals = false, mode } = input;
+  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel, approvals = false, mode, outputs } = input;
   if (typeof prompt !== "string" || !prompt.trim()) return "prompt must be a string that isn't empty";
   if (prompt.length > MAX_PROMPT) return `prompt must be at most ${MAX_PROMPT} characters`;
   // Postgres text can't hold one, and jig has no use for it: refused on every store alike.
@@ -1162,7 +1163,16 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
   // Without approvals the run asks nothing (--yes), so a mode would mean nothing.
   if (mode !== undefined && !approvals) return "mode goes with approvals: true";
   if (mode !== undefined && !APPROVAL_MODES.includes(mode as never)) return `mode must be one of: ${APPROVAL_MODES.join(", ")}`;
-  const asks = approvals ? { approvals, mode: (mode ?? "edits") as TaskSpec["mode"] } : {};
+  // The files the run hands back: paths in its workspace, as workspace.files' are, whatever the workspace is
+  // made from (the run may write them itself). Few and short, as jig is given each on its command line.
+  if (outputs !== undefined) {
+    if (!Array.isArray(outputs) || !outputs.length || outputs.length > MAX_OUTPUTS || outputs.some((path) => typeof path !== "string")) return `outputs must be a list of 1 to ${MAX_OUTPUTS} paths in the workspace`;
+    for (const [i, path] of (outputs as string[]).entries()) {
+      const problem = workspaceProblem(path) ?? (path.length > MAX_OUTPUT_PATH ? `is longer than ${MAX_OUTPUT_PATH} characters` : outputs.indexOf(path) !== i ? "is there twice" : undefined);
+      if (problem) return `outputs: ${JSON.stringify(path)} ${problem}`;
+    }
+  }
+  const asks = { ...(approvals && { approvals, mode: (mode ?? "edits") as TaskSpec["mode"] }), ...(outputs !== undefined && { outputs: outputs as string[] }) };
   if (workspace === undefined) return { prompt, maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
   if (!isObject(workspace)) return "workspace must be an object";
   const extra = Object.keys(workspace).find((key) => !["files", "git", "ref"].includes(key));
@@ -1196,12 +1206,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
- * (none, once it has ended); the list leaves out the stats, and the prompt and the result unless asked.
+ * (none, once it has ended); the list leaves out the stats and the outputs, and the prompt and the result
+ * unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean }, pending: Map<string, number>, region: string | null) {
-  const { spec, tenant, stats, result, resultTruncated, ...rest } = task;
+function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean; outputs?: boolean }, pending: Map<string, number>, region: string | null) {
+  const { spec, tenant, stats, result, resultTruncated, outputs, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }), ...(show.outputs && { outputs }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

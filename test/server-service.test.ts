@@ -15,7 +15,7 @@ import { createLog } from "../server/log.ts";
 import { PgError } from "../server/pg.ts";
 import { type JigEvent, type RunHandle, type Runner, statusFor } from "../server/runner.ts";
 import { LocalRunner } from "../server/runners/local.ts";
-import { outcomeOf, resultOf, Scheduler } from "../server/scheduler.ts";
+import { outcomeOf, outputsOf, resultOf, Scheduler } from "../server/scheduler.ts";
 import { routeOf, serviceMetrics } from "../server/service-metrics.ts";
 import { openStore, type Store, type Task, type Tenant, UNPURGED } from "../server/store.ts";
 import { sandboxProblem } from "../src/sandbox.ts";
@@ -432,6 +432,17 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.match(await refused({ prompt: "hi", maxSteps: 51 }), /maxSteps must be a whole number from 1 to 50/);
     assert.match(await refused({ prompt: "hi", model: "gpt-5" }), /Claude or DeepSeek/);
     assert.match(await refused({ prompt: "hi", promt: "typo" }), /Unknown field: promt/);
+    // The files to hand back: 1 to 20 paths in the workspace, each once.
+    for (const outputs of ["a.txt", [], {}, [1], ["a", null], Array.from({ length: 21 }, (_, i) => `f${i}`)]) {
+      assert.equal(await refused({ prompt: "hi", outputs }), "outputs must be a list of 1 to 20 paths in the workspace", JSON.stringify(outputs));
+    }
+    assert.equal(await refused({ prompt: "hi", outputs: ["../escape"] }), 'outputs: "../escape" leads out of the workspace (..)');
+    assert.equal(await refused({ prompt: "hi", outputs: ["ok.txt", "/etc/passwd"] }), 'outputs: "/etc/passwd" is absolute');
+    assert.equal(await refused({ prompt: "hi", outputs: ["dir/"] }), 'outputs: "dir/" names a folder, not a file');
+    assert.equal(await refused({ prompt: "hi", outputs: ["a\u0000b"] }), 'outputs: "a\\u0000b" is empty or holds a NUL byte');
+    assert.equal(await refused({ prompt: "hi", outputs: [""] }), 'outputs: "" is empty or holds a NUL byte');
+    assert.equal(await refused({ prompt: "hi", outputs: ["a.txt", "b.txt", "a.txt"] }), 'outputs: "a.txt" is there twice');
+    assert.match(await refused({ prompt: "hi", outputs: ["x".repeat(513)] }), /^outputs: "x+" is longer than 512 characters$/);
     assert.match(await refused({ prompt: "hi", workspace: { git: "--upload-pack=touch /tmp/x" } }), /workspace\.git/);
     assert.match(await refused("{"), /isn't JSON/);
     // Postgres text can't hold a NUL: it is refused on both stores, not stored on one and a 500 on the other.
@@ -707,6 +718,48 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual([task.result, task.resultTruncated], ["Done.", false]);
     // The text itself was past the cap: no event holds it.
     assert.ok((await api.store.events(id)).every(({ event }) => (event as { type: string }).type !== "text"));
+  });
+
+  it("hands back the files a task asked for as its outputs, whatever its workspace, and never in a list", async () => {
+    const api = await service();
+    const body = { prompt: "exit 0", workspace: { files: { "notes/a.txt": "given\n", "-dash.txt": "dashed\n" } }, outputs: ["notes/a.txt", "-dash.txt", "never.txt", "x".repeat(512)] };
+    const made = await call(api, KEYS.acme, "POST", "/v1/tasks", body);
+    assert.equal(made.status, 201, JSON.stringify(made.body));
+    const task = await statusOf(api, made.body.id, "succeeded");
+    assert.deepEqual(task.outputs, [
+      { path: "notes/a.txt", text: "given\n" },
+      { path: "-dash.txt", text: "dashed\n" },
+      { path: "never.txt", problem: "missing" },
+      { path: "x".repeat(512), problem: "missing" },
+    ]);
+    // jig was given each path with its flag, in one argument.
+    const { args } = JSON.parse(await readFile(join(work(api, made.body.id), ".fake-jig.json"), "utf8"));
+    assert.deepEqual(args.filter((arg: string) => arg.startsWith("--outputs")), body.outputs.map((path) => `--outputs=${path}`));
+    // The event went through the stream as any event does.
+    const stored = (await api.store.events(made.body.id)).map(({ event }) => (event as { type: string }).type);
+    assert.deepEqual(stored.slice(-2), ["outputs", "end"]);
+    // A list has none, full or not; nor has a task that asked for none, with a workspace or without.
+    for (const query of ["", "?full=1"]) assert.ok((await call(api, KEYS.acme, "GET", `/v1/tasks${query}`)).body.tasks.every((listed: object) => !("outputs" in listed)), query);
+    const plain = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
+    assert.equal((await statusOf(api, plain, "succeeded")).outputs, null);
+    // Without a workspace too, and null while it runs.
+    const bare = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "wait", outputs: ["made.txt"] })).body.id;
+    assert.equal((await statusOf(api, bare, "running")).outputs, null);
+    await until(() => existsSync(work(api, bare)), "the task's project");
+    await writeFile(join(work(api, bare), "made.txt"), "made by the run\n");
+    await writeFile(join(work(api, bare), "go"), "");
+    assert.deepEqual((await statusOf(api, bare, "succeeded")).outputs, [{ path: "made.txt", text: "made by the run\n" }]);
+  });
+
+  it("keeps of a run's outputs only what the task asked for, each path once, from its last outputs event", async () => {
+    const api = await service();
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "forge outputs", workspace: { files: { "a.txt": "the file's\n" } }, outputs: ["a.txt", "b.txt"] })).body.id;
+    const task = await statusOf(api, id, "succeeded");
+    assert.deepEqual(task.outputs, [
+      { path: "a.txt", text: "the file's\n" },
+      { path: "b.txt", problem: "missing" },
+    ]);
+    assert.doesNotMatch(JSON.stringify(task), /root:x/);
   });
 
   it("lists tasks without their results unless asked", async () => {
@@ -1103,8 +1156,10 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
   it("deletes an ended task's content with DELETE, and keeps its row, its usage and its cost", async () => {
     const api = await service();
     const older = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0" })).body.id;
-    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "secret.txt": "a secret\n" } }, model: "claude-haiku-4-5" })).body.id;
+    const id = (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", workspace: { files: { "secret.txt": "a secret\n" } }, model: "claude-haiku-4-5", outputs: ["secret.txt"] })).body.id;
     const before = await statusOf(api, id, "succeeded");
+    assert.deepEqual(before.outputs, [{ path: "secret.txt", text: "a secret\n" }]);
+    assert.deepEqual((await api.store.task(id))!.spec.outputs, ["secret.txt"]);
     await statusOf(api, older, "succeeded");
     await api.scheduler.settled();
     await api.store.addApproval(id, { id: "ap_1", step: 1, tool: "bash", description: "rm -rf build" });
@@ -1115,14 +1170,14 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(await call(api, KEYS.globex, "DELETE", `/v1/tasks/${id}`), { status: 404, body: { error: "No such task" } });
     assert.deepEqual(await call(api, KEYS.acme, "DELETE", "/v1/tasks/task_none"), { status: 404, body: { error: "No such task" } });
     assert.deepEqual(await call(api, KEYS.acme, "PUT", `/v1/tasks/${id}`), { status: 405, body: { error: "Use GET or DELETE" } });
-    assert.deepEqual([(await api.store.events(id)).length, (await api.store.approvals(id)).length, (await api.store.task(id))!.spec.prompt], [7, 1, "exit 0"]);
+    assert.deepEqual([(await api.store.events(id)).length, (await api.store.approvals(id)).length, (await api.store.task(id))!.spec.prompt], [8, 1, "exit 0"]);
 
     const deleted = await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`);
     assert.equal(deleted.status, 200);
     const { purged } = deleted.body;
     assert.equal(new Date(purged).toISOString(), purged);
     // What it was, but for what the tenant and the run wrote.
-    assert.deepEqual(deleted.body, { ...before, purged, prompt: "", stats: null, result: null, resultTruncated: false });
+    assert.deepEqual(deleted.body, { ...before, purged, prompt: "", stats: null, result: null, resultTruncated: false, outputs: null });
     assert.deepEqual([deleted.body.status, deleted.body.model, deleted.body.usage, deleted.body.cost], ["succeeded", "claude-haiku-4-5", { input: 20, cacheRead: 0, cacheWrite: 0, output: 10 }, 0.002]);
     assert.deepEqual((await call(api, KEYS.acme, "GET", `/v1/tasks/${id}`)).body, deleted.body);
     assert.deepEqual([await api.store.events(id), await api.store.approvals(id)], [[], []]);
@@ -1644,11 +1699,11 @@ const schedulerTests = () => {
   }
 
   /** The task of a run that wrote these events (each given its seq and time) and exited 0, once it has ended. */
-  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner | number) => {
+  const ranWith = async (events: Record<string, unknown>[], options: Partial<ConstructorParameters<typeof Scheduler>[2]> = {}, runner?: Runner | number, outputs?: string[]) => {
     const store = await newStore();
     await store.putTenant({ id: "a", limits: { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
-    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" });
-    assert.deepEqual([task.result, task.resultTruncated], [null, false]);
+    const task = await store.createTask("a", { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash", ...(outputs && { outputs }) });
+    assert.deepEqual([task.result, task.resultTruncated, task.outputs], [null, false, null]);
     // A number is the exit code of a run that writes the events; a runner is used as it is.
     const exitCode = typeof runner === "number" ? runner : 0;
     if (typeof runner !== "object") runner = {
@@ -1727,6 +1782,97 @@ const schedulerTests = () => {
     const { ended, stored } = await ranWith(events);
     assert.deepEqual([ended.status, ended.result, ended.resultTruncated], ["succeeded", "part two ends it.", false]);
     assert.deepEqual(stored.filter((type) => type === "text").length, 2);
+  });
+
+  it("keeps the files of a run's last outputs event as its task's outputs, past maxEvents too", async () => {
+    const files = [{ path: "a.txt", text: "a\n" }, { path: "b.txt", problem: "missing" }];
+    const { ended } = await ranWith([{ type: "text", step: 1, text: "done" }, { type: "outputs", files: [{ path: "a.txt", text: "earlier\n" }] }, { type: "outputs", files }, END], {}, 0, ["a.txt", "b.txt"]);
+    assert.deepEqual([ended.status, ended.result, ended.outputs], ["succeeded", "done", files]);
+    // However the run ended, and though the event itself was dropped.
+    const notices = Array.from({ length: 5 }, (_, i) => ({ type: "notice", text: `notice ${i}` }));
+    const stopped = await ranWith([...notices, { type: "outputs", files }, { type: "end", stop: "max_steps" }], { maxEvents: 3 }, 2, ["a.txt", "b.txt"]);
+    assert.deepEqual(stopped.stored, ["notice", "notice", "notice", "notice", "end"]);
+    assert.deepEqual([stopped.ended.status, stopped.ended.outputs], ["stopped", files]);
+    // Past maxEventBytes likewise.
+    const big = await ranWith([{ type: "outputs", files }, END], { maxEventBytes: 10 }, 0, ["a.txt", "b.txt"]);
+    assert.deepEqual(big.ended.outputs, files);
+  });
+
+  it("leaves the outputs null for a task that asked for none, a run that wrote none, and an event that isn't one", async () => {
+    const files = [{ path: "a.txt", text: "a\n" }];
+    assert.equal((await ranWith([{ type: "outputs", files }, END])).ended.outputs, null);
+    assert.equal((await ranWith([END], {}, 0, ["a.txt"])).ended.outputs, null);
+    for (const wrong of [undefined, "a.txt", { path: "a.txt", text: "a\n" }, 7]) {
+      assert.equal((await ranWith([{ type: "outputs", files: wrong }, END], {}, 0, ["a.txt"])).ended.outputs, null, JSON.stringify(wrong));
+    }
+    // Nothing of an event with no entry worth keeping.
+    assert.equal((await ranWith([{ type: "outputs", files: [{ path: "other.txt", text: "x" }] }, END], {}, 0, ["a.txt"])).ended.outputs, null);
+  });
+
+  it("takes an outputs event as the run's word: only the paths asked for, each once, texts held to jig's bounds, no NUL", () => {
+    const asked = ["a.txt", "b.txt", "c.txt", "d.txt"];
+    const forged = [
+      { path: "/etc/passwd", text: "root:x:0:0\n" },
+      { path: "../other-task/secret", text: "theirs\n" },
+      "a.txt",
+      null,
+      ["a.txt"],
+      { text: "no path" },
+      { path: 7, text: "x" },
+      { path: "a.txt", text: 7 },
+      { path: "a.txt" },
+      { path: "a.txt", text: "both", problem: "missing" },
+      { path: "a.txt", problem: "made_up" },
+      { path: "a.txt", problem: 7 },
+      { path: "a.txt", text: "a\u0000b \ud800 c", extra: "field" },
+      { path: "a.txt", text: "again" },
+      { path: "b.txt", problem: "hidden", extra: 1 },
+      { path: "b.txt", text: "after its problem" },
+      { path: "c.txt", text: "x".repeat(256 * 1024 + 1) },
+      { path: "d.txt", text: "é".repeat(128 * 1024) },
+    ];
+    assert.deepEqual(outputsOf(forged, asked), [
+      { path: "a.txt", text: "a\ufffdb \ufffd c" },
+      { path: "b.txt", problem: "hidden" },
+      { path: "c.txt", problem: "too_large" },
+      { path: "d.txt", text: "é".repeat(128 * 1024) },
+    ]);
+    assert.equal(outputsOf(forged, undefined), undefined);
+    assert.equal(outputsOf(forged, []), undefined);
+    assert.equal(outputsOf([], asked), undefined);
+    // All together 768 KiB as JSON writes them: the third 256 KiB fits, a byte more doesn't, nor do escapes.
+    const full = ["1", "2", "3", "4"].map((path) => ({ path, text: path.repeat(256 * 1024) }));
+    assert.deepEqual(outputsOf(full, ["1", "2", "3", "4"])!.map((file) => "problem" in file && file.problem), [false, false, false, "too_large"]);
+    const lines = ["1", "2", "3"].map((path) => ({ path, text: "\n".repeat(200 * 1024) }));
+    assert.deepEqual(outputsOf(lines, ["1", "2", "3"])!.map((file) => "problem" in file && file.problem), [false, "too_large", "too_large"]);
+    // What is kept always fits a line a runner reads, and the store.
+    const kept = outputsOf([...full, ...forged], ["1", "2", "3", "4", ...asked])!;
+    assert.ok(Buffer.byteLength(JSON.stringify(kept)) < 1024 * 1024);
+    assert.ok(!JSON.stringify(kept).includes("\\u0000"));
+  });
+
+  it("stores an outcome's outputs, a NUL-free text and a lone surrogate's escape among them, and never lists them", async () => {
+    const store = await newStore();
+    await store.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const spec = { prompt: "a0", maxSteps: 5, timeLimit: 60, model: "deepseek-flash", outputs: ["a.txt", "b.txt"] };
+    const [first, second] = [await store.createTask("a", spec), await store.createTask("a", spec)];
+    assert.deepEqual([first.spec.outputs, first.outputs], [["a.txt", "b.txt"], null]);
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    for (const task of [first, second]) assert.equal(((await store.claim("a", terms)) as Task).id, task.id);
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    // As a caller written before the outputs were: no field.
+    assert.equal(await store.finish(first.id, "r1", outcome), true);
+    const outputs = [{ path: "a.txt", text: "quotes \" and \\ and ' and é and \n and \ud83d\ude00 and \ud800\n" }, { path: "b.txt", problem: "missing" }];
+    assert.equal(await store.finish(second.id, "r1", { ...outcome, outputs }), true);
+    assert.equal((await store.task(first.id))!.outputs, null);
+    assert.deepEqual((await store.task(second.id))!.outputs, outputs);
+    assert.deepEqual((await store.task(second.id))!.spec.outputs, ["a.txt", "b.txt"]);
+    for (const prompts of [true, false]) assert.deepEqual((await store.tasks("a", { prompts })).map((task) => task.outputs), [null, null]);
+    // A purge takes them, and the paths the task asked for.
+    const purged = (await store.purge(second.id))!;
+    assert.deepEqual([purged.first, purged.task.outputs, purged.task.spec.outputs], [true, null, undefined]);
+    assert.deepEqual([(await store.task(second.id))!.outputs, (await store.task(second.id))!.spec.outputs], [null, undefined]);
+    await store.close();
   });
 
   it("stores an outcome with a result, or without the result's fields, and lists results only with prompts", async () => {
@@ -2270,7 +2416,7 @@ describe("the SQLite store's schema", () => {
     // The database as the version before left it: without the two columns (and what came after), at schema 7.
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(path);
-    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; DROP TABLE idempotency; PRAGMA user_version = 7");
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; ALTER TABLE tasks DROP COLUMN outputs; ALTER TABLE tasks DROP COLUMN result; ALTER TABLE tasks DROP COLUMN result_truncated; DROP TABLE idempotency; PRAGMA user_version = 7");
     db.close();
     const store = await openStore(path);
     opened.push(() => store.close());
@@ -2295,7 +2441,7 @@ describe("the SQLite store's schema, before Idempotency-Keys", () => {
     // The database as the version before left it: without the table (and what came after), at schema 8.
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(path);
-    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; DROP TABLE idempotency; PRAGMA user_version = 8");
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; ALTER TABLE tasks DROP COLUMN outputs; DROP TABLE idempotency; PRAGMA user_version = 8");
     db.close();
     const store = await openStore(path);
     opened.push(() => store.close());
@@ -2326,7 +2472,7 @@ describe("the SQLite store's schema, before tasks could be purged", () => {
     // The database as the version before left it: without the column and its index, at schema 9.
     const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
     const db = new DatabaseSync(path);
-    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; PRAGMA user_version = 9");
+    db.exec("DROP INDEX tasks_unpurged; ALTER TABLE tasks DROP COLUMN purged; ALTER TABLE tasks DROP COLUMN outputs; PRAGMA user_version = 9");
     db.close();
     const store = await openStore(path);
     opened.push(() => store.close());
@@ -2334,6 +2480,53 @@ describe("the SQLite store's schema, before tasks could be purged", () => {
     assert.deepEqual([moved.status, moved.purged, moved.spec.prompt, (await store.events(old.id)).length], ["succeeded", null, "x", 1]);
     const purged = (await store.purge(old.id))!;
     assert.deepEqual([purged.first, typeof purged.task.purged, purged.task.spec.prompt, (await store.events(old.id)).length], [true, "string", "", 0]);
+  });
+});
+
+describe("the SQLite store's schema, before a task's outputs", () => {
+  it("moves a database from before them on without touching its tasks, keeps a task's outputs in it, and deletes them with a purge", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+    const terms = { owner: "r1", leaseMs: 60_000, concurrency: 4, tenantConcurrency: 2 };
+    const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+    const before = await openStore(path);
+    await before.putTenant({ id: "a", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const old = await before.createTask("a", spec);
+    await before.claim("a", terms);
+    assert.equal(await before.finish(old.id, "r1", { ...outcome, result: "said" }), true);
+    await before.close();
+    // The database as the version before left it: without the column, at schema 10.
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const db = new DatabaseSync(path);
+    db.exec("ALTER TABLE tasks DROP COLUMN outputs; PRAGMA user_version = 10");
+    db.close();
+    const store = await openStore(path);
+    opened.push(() => store.close());
+    const raw = new DatabaseSync(path);
+    opened.push(async () => raw.close());
+    assert.equal(Number((raw.prepare("PRAGMA user_version").get() as { user_version: number }).user_version), 11);
+    const moved = (await store.task(old.id))!;
+    assert.deepEqual([moved.status, moved.result, moved.outputs], ["succeeded", "said", null]);
+    // A process of the version before, on the same file, names its columns: it still makes and ends a task.
+    raw.prepare("INSERT INTO tasks (id, tenant, prompt, spec, status, created, started, owner) VALUES ('task_old', 'a', 'x', ?, 'running', ?, ?, 'r0')").run(JSON.stringify({ maxSteps: 5, timeLimit: 60, model: "deepseek-flash" }), moved.created, moved.created);
+    raw.prepare("UPDATE tasks SET status = 'succeeded', result = 'said', ended = ? WHERE id = 'task_old'").run(new Date().toISOString());
+    assert.deepEqual([(await store.task("task_old"))!.status, (await store.task("task_old"))!.outputs], ["succeeded", null]);
+    const outputs = [{ path: "a.txt", text: "a\n" }, { path: "b.txt", problem: "missing" }];
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const next = await store.createTask("a", { ...spec, outputs: ["a.txt", "b.txt"] });
+      await store.claim("a", terms);
+      assert.equal(await store.finish(next.id, "r1", { ...outcome, outputs }), true);
+      assert.deepEqual((await store.task(next.id))!.outputs, outputs);
+      ids.push(next.id);
+    }
+    // The column itself, and the paths in the spec, after a purge by its id and one by its age.
+    const kept = (id: string) => raw.prepare("SELECT outputs, spec FROM tasks WHERE id = ?").get(id) as { outputs: string | null; spec: string };
+    assert.deepEqual(JSON.parse(kept(ids[0]).outputs!), outputs);
+    assert.equal((await store.purge(ids[0]))!.first, true);
+    await new Promise((done) => setTimeout(done, 20));
+    assert.ok((await store.purgeEnded(1, 10)) >= 1);
+    for (const id of ids) assert.deepEqual([kept(id).outputs, /outputs|a\.txt/.test(kept(id).spec), (await store.task(id))!.outputs], [null, false, null]);
   });
 });
 
