@@ -838,7 +838,8 @@ class SqliteStore implements Store {
    * Each body sees what the ones before it in the turn wrote, as if they had been committed: a create counts
    * the tasks made before it, a claim the ones claimed. The transaction takes SQLite's write lock before
    * the first body (BEGIN IMMEDIATE), so no other process writes between them, and it is over before
-   * anything waits. A body that throws undoes only what it wrote itself (its savepoint) and fails alone.
+   * anything waits. A body that throws undoes only what it wrote itself (its savepoint) and fails alone; if
+   * its error undid the whole transaction, the others are made again without it (flush).
    *
    * The writes a task makes once or more go through here: its create, claim, end and events. The rest are
    * left to commit alone, as they come: a lease's renewal and a replica's heartbeat are one statement every
@@ -853,16 +854,27 @@ class SqliteStore implements Store {
   }
 
   /**
-   * Commits the writes that wait, together. A commit that fails (a full disk, a lock another process held
-   * too long) is the failure of every write in it, whatever its body returned, a refusal too: what a body
-   * saw may have been another's write that wasn't kept. Each is tried again, or not, by its caller.
+   * Commits the writes that wait, together.
+   *
+   * If the transaction is lost under them, each is made again alone, in a commit of its own, as it was
+   * before writes shared one: SQLite rolls all of a transaction back, not a savepoint, when a statement
+   * finds the disk or the file's size limit full, and a COMMIT may fail for the same; the one write too
+   * large to fit would otherwise fail every other of each turn it is tried in. Nothing of the first try is
+   * left, in the database or in an answer, so a body run twice has written once, and each write gets its
+   * own result or error: a commit that fails for all of them (a disk with no room at all) still fails each.
+   *
+   * Not so when the write lock couldn't be had (BEGIN IMMEDIATE, after busy_timeout): no body has run, and
+   * each try alone would hold the event loop that long again. That is the failure of every write of the
+   * turn, each tried again, or not, by its caller.
    */
   private flush(): void {
     const batch = this.pending.splice(0);
     if (!batch.length) return;
     const results: ({ result: unknown } | { err: unknown })[] = [];
+    let began = false;
     try {
       this.db.exec("BEGIN IMMEDIATE");
+      began = true;
       for (const { body } of batch) {
         this.db.exec("SAVEPOINT one");
         try {
@@ -870,8 +882,7 @@ class SqliteStore implements Store {
           this.db.exec("RELEASE one");
           results.push({ result });
         } catch (err) {
-          // An error that left no transaction (SQLite may roll all of it back when the disk fills) lost the
-          // writes before this one too.
+          // An error that left no transaction lost the writes before this one too.
           if (!this.db.isTransaction) throw err;
           this.db.exec("ROLLBACK TO one; RELEASE one");
           results.push({ err });
@@ -883,6 +894,7 @@ class SqliteStore implements Store {
       try {
         this.rollback();
       } catch {}
+      if (began && batch.length > 1) return this.alone(batch);
       for (const { failed } of batch) failed(err);
       return;
     }
@@ -891,6 +903,34 @@ class SqliteStore implements Store {
       if ("err" in outcome) failed(outcome.err);
       else made(outcome.result as never);
     });
+  }
+
+  /**
+   * Makes each write of a batch whose transaction was lost in a commit of its own, in their order (flush).
+   * Once the write lock can't be had, the rest fail with that write: see flush.
+   */
+  private alone(batch: SqliteStore["pending"]): void {
+    let locked: { err: unknown } | undefined;
+    for (const { body, made, failed } of batch) {
+      if (locked) {
+        failed(locked.err);
+        continue;
+      }
+      let began = false;
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+        began = true;
+        const result = body();
+        this.db.exec("COMMIT");
+        made(result as never);
+      } catch (err) {
+        try {
+          this.rollback();
+        } catch {}
+        if (!began) locked = { err };
+        failed(err);
+      }
+    }
   }
 
   // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a

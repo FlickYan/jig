@@ -1480,16 +1480,20 @@ the same turn of the event loop, the events too, in one transaction that holds S
 first write to its commit, and each is answered only once that commit is made: a `201` is of a task the
 disk has. Each write sees what those before it in the turn wrote, so the queue's cap, the quotas and an
 `Idempotency-Key` hold among them as they did one at a time; a write the database refuses is undone alone
-(a savepoint) and fails alone; a commit that fails is the failure of every write in it, a refusal too. One
+(a savepoint) and fails alone. If the transaction itself is lost (a write that finds the disk full undoes
+all of it, and a commit may fail), each of its writes is made again in a commit of its own and answered
+with what it did then, so the one that doesn't fit fails alone there too; only when another process holds
+the write lock past the five seconds a write waits for it do all the writes of the turn fail together. One
 write alone is a commit of its own, as before, and so are the writes of two processes on one file, one
 process's after the other's. The same measure makes 4,100 commits, and the SQLite column above is from
-it. Measured before and after in turn, three times each, on that machine a little less loaded than for the
+it. Measured three times before, then three times after, on that machine a little less loaded than for the
 Postgres columns: tasks made with none running went from 795, 763 and 837 a second to 1,234, 1,277 and
 1,278; made beside the runs, from 803, 735 and 747 to 1,380, 1,188 and 1,190; run to their end, from 216,
-202 and 206 to 236, 225 and 228. The runs gain least because their events come a few to a turn, spread
-over the 200 ms: the turns are many, each still ends in a commit (0.8 ms with a turn's events in it), and
-those 4,100 commits are a quarter of what the process does. Holding a turn's writes back for the next
-ones would join more of them, at the price of every answer waiting that long; the service doesn't.
+202 and 206 to 236, 225 and 228 (more on a busier machine, where more writes share a turn). The runs gain
+least because their events come a few to a turn, spread over the 200 ms: the turns are many, each still
+ends in a commit (0.8 ms with a turn's events in it), and those 4,100 commits are a quarter of what the
+process does. Holding a turn's writes back for the next ones would join more of them, at the price of
+every answer waiting that long; the service doesn't.
 
 ### Database size and upgrades
 

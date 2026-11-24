@@ -2601,7 +2601,7 @@ describe("the SQLite store's writes", () => {
     assert.equal(await store.finish(task.id, "r0", outcome), true);
   });
 
-  it("fails every write of a commit that fails, a refusal too, and keeps none of them", async () => {
+  it("fails every write of a turn whose commits all fail, a refusal too, and keeps none of them", async () => {
     const { store } = await open();
     await store.putTenant({ id: "a", limits }, []);
     const now = new Date();
@@ -2626,27 +2626,63 @@ describe("the SQLite store's writes", () => {
     assert.deepEqual(refused, { quota: "maxQueued", limit: 2, used: 2 });
   });
 
-  it("fails every write of a turn when one's error left SQLite with no transaction", async () => {
+  it("makes the other writes of a turn alone when one finds the database full, which undoes all of the transaction", async () => {
     const { store } = await open();
     await store.putTenant({ id: "a", limits }, []);
     const now = new Date();
-    // As a disk that fills under a statement: SQLite rolls the whole transaction back, then says why.
-    let releases = 0;
+    const [task] = [await store.createTask("a", spec)];
+    // The file may grow by 30 pages, on the store's own connection: room for small writes, not for a prompt
+    // of 400 kB. SQLite answers that insert by rolling back the transaction, not the write's savepoint.
+    const { db } = store as unknown as { db: InstanceType<typeof DatabaseSync> };
+    const { page_count: pages } = db.prepare("PRAGMA page_count").get() as { page_count: number };
+    db.exec(`PRAGMA max_page_count = ${pages + 30}`);
+    const counted = commits();
+    const writes = await Promise.allSettled([
+      store.createTask("a", spec, { maxQueued: 3, now }, { key: "k", hash: "h" }),
+      store.createTask("a", { ...spec, prompt: "x".repeat(400_000) }, { now }),
+      store.addEvent(task.id, 1, { seq: 1 }),
+      store.createTask("a", spec, { maxQueued: 3, now }),
+      // The fourth in the queue, counted against what the ones before it wrote when made again.
+      store.createTask("a", spec, { maxQueued: 3, now }),
+    ]);
+    assert.deepEqual(writes.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    assert.match(String((writes[1] as PromiseRejectedResult).reason), /database or disk is full/);
+    assert.deepEqual((writes[4] as PromiseFulfilledResult<unknown>).value, { quota: "maxQueued", limit: 3, used: 3 });
+    // The turn's commit was never reached; each of the four that fit is one of its own.
+    assert.equal(counted.n, 4);
+    assert.equal((await store.tasks("a")).length, 3);
+    assert.equal((await store.events(task.id)).length, 1);
+    // Made once, though its body ran twice: the key replays the one task.
+    const first = (writes[0] as PromiseFulfilledResult<Task>).value;
+    assert.deepEqual(await store.createTask("a", spec, { now }, { key: "k", hash: "h" }), { replay: first, same: true });
+  });
+
+  it("makes each write of a commit that fails again alone, and answers each with what it did then", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    // The turn's commit fails, as on a disk that had no room for it; the ones after it are made.
+    let failures = 1;
+    const counted = { n: 0 };
     DatabaseSync.prototype.exec = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
-      if (sql === "RELEASE one" && ++releases === 2) {
-        exec.call(this, "ROLLBACK");
-        throw Object.assign(new Error("database or disk is full"), { code: "ERR_SQLITE_ERROR", errcode: 13 });
-      }
+      if (sql === "COMMIT" && failures-- > 0) throw Object.assign(new Error("database or disk is full"), { code: "ERR_SQLITE_ERROR", errcode: 13 });
+      if (sql === "COMMIT") counted.n++;
       return exec.call(this, sql);
     };
-    // The one before it, whose body had returned; the one it struck; and the one after, whose body never ran.
-    const lost = await Promise.allSettled([store.createTask("a", spec, { now }), store.createTask("a", spec, { now }), store.createTask("a", spec, { now })]);
-    assert.deepEqual(lost.map((write) => write.status), ["rejected", "rejected", "rejected"]);
-    assert.ok(lost.every((write) => /disk is full/.test(String((write as PromiseRejectedResult).reason))));
-    assert.equal((await store.tasks("a")).length, 0);
-    // No transaction is left open: the next write is made.
-    assert.ok("id" in ((await store.createTask("a", spec, { now })) as Task));
-    assert.equal((await store.tasks("a")).length, 1);
+    const writes = await Promise.allSettled([
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.createTask("nobody", spec, { now }),
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.claim("a", terms),
+    ]);
+    assert.deepEqual(writes.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    assert.match(String((writes[1] as PromiseRejectedResult).reason), /FOREIGN KEY constraint failed/);
+    assert.deepEqual((writes[3] as PromiseFulfilledResult<unknown>).value, { quota: "maxQueued", limit: 2, used: 2 });
+    assert.equal(counted.n, 4);
+    const [first, , second, , claimed] = writes.map((write) => (write as PromiseFulfilledResult<Task>).value);
+    assert.equal(claimed.id, first.id);
+    assert.deepEqual((await store.tasks("a")).map(({ id, status }) => ({ id, status })).sort((a, b) => a.status.localeCompare(b.status)), [{ id: second.id, status: "queued" }, { id: first.id, status: "running" }]);
   });
 
   it("makes the writes that wait when it is closed, and fails those that come after", async () => {
