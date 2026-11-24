@@ -173,6 +173,9 @@ const observeTests = () => {
     assert.equal((await call(api, KEYS.initech, "POST", "/v1/tasks", { prompt: "exit 0" })).status, 429);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "" })).status, 400);
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", "{")).status, 400);
+    // A region that is no name, and one this service isn't: refused as invalid too.
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: 5 })).status, 400);
+    assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "exit 0", region: "eu" })).status, 400);
     await until(async () => (await call(api, KEYS.acme, "GET", `/v1/tasks/${first}`)).body.status === "running", "the first to run");
     // Running is stored as the run starts, a moment before its workspace is made: the test writes there below.
     await until(() => readdir(join(api.dataDir, "tasks", first, "work")).then(() => true, () => false), "the first's workspace");
@@ -189,7 +192,7 @@ const observeTests = () => {
     assert.equal(value('jig_service_tasks_created_total{tenant="globex"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="globex",reason="quota"}'), 1);
     assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="queue"}'), 1);
-    assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 2);
+    assert.equal(value('jig_service_tasks_refused_total{tenant="acme",reason="invalid"}'), 4);
     // Each tenant's series start at 0, so increase() sees its first refusals.
     assert.equal(value('jig_service_tasks_refused_total{tenant="initech",reason="quota"}'), 0);
     assert.equal(value("jig_service_replicas"), 1);
@@ -568,6 +571,11 @@ describe("the observability deploy files", () => {
         queries.push(target.expr);
       }
     }
+    // The creates answered with an earlier task (Idempotency-Key) have a series of their own, by its name
+    // in the legend: beside the creates and the refusals, which a replay is neither of.
+    const replayed = panels.flatMap((panel: any) => panel.targets).filter((target: any) => target.legendFormat === "replayed");
+    assert.deepEqual(replayed.map((target: any) => used(target.expr)), [["jig_service_tasks_replayed_total"]]);
+    assert.ok(panels.find((panel: any) => panel.targets.includes(replayed[0])).targets.some((target: any) => used(target.expr).includes("jig_service_tasks_created_total")), "charted with the creates");
     const charted = new Set(queries.flatMap(used).map((name) => name.replace(/_(bucket|sum|count)$/, "")));
     for (const [, name] of (await serviceMetrics().registry.render()).matchAll(/^# TYPE (\S+) \S+$/gm)) assert.ok(charted.has(name), `${name} isn't charted`);
     for (const entry of [...GATEWAY, ...ROUTER]) assert.ok(charted.has(entry.replace(/:h$/, "")), `${entry} isn't charted`);

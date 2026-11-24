@@ -166,14 +166,15 @@ export class DockerRunner implements Runner {
     let stopRun = () => preparing.abort();
     const over = (text: string) => {
       why ??= text;
-      this.log.warn("stopping a task whose folder went past the disk cap", { tenant: tenant.id, task: task.id, why });
+      // `why` says which: the folder went past the cap, or couldn't be measured against it.
+      this.log.warn("stopping a task at the disk cap: its folder went past it, or can't be measured", { tenant: tenant.id, task: task.id, why });
       stopRun();
     };
     const stop = maxDiskBytes ? watchDisk(dir, maxDiskBytes, over, diskPollMs, { log: this.log }) : () => {};
     return {
       signal: preparing.signal,
       // A workspace past the cap by itself never starts its jig.
-      check: () => checkDisk(dir, maxDiskBytes),
+      check: () => checkDisk(dir, maxDiskBytes, this.log.with({ tenant: tenant.id, task: task.id })),
       bind: (run) => {
         stopRun = run;
         if (why) run();

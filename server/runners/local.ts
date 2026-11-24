@@ -115,7 +115,8 @@ export class LocalRunner implements Runner {
     let stopRun = () => preparing.abort();
     const over = (why: string) => {
       overDisk ??= why;
-      this.log.warn("stopping a task whose folder went past the disk cap", { tenant: tenant.id, task: task.id, why });
+      // `why` says which: the folder went past the cap, or couldn't be measured against it.
+      this.log.warn("stopping a task at the disk cap: its folder went past it, or can't be measured", { tenant: tenant.id, task: task.id, why });
       stopRun();
     };
     const unwatch = maxDiskBytes ? watchDisk(dir, maxDiskBytes, over, this.config.diskPollMs, { log: this.log }) : () => {};
@@ -123,7 +124,7 @@ export class LocalRunner implements Runner {
     try {
       await prepareWorkspace(work, task.spec.workspace, this.config.gitProtocols ?? ["https"], this.log.with({ tenant: tenant.id, task: task.id }), this.config.gitRedirects, preparing.signal);
       // A workspace past the cap by itself never starts its jig.
-      await checkDisk(dir, maxDiskBytes);
+      await checkDisk(dir, maxDiskBytes, this.log.with({ tenant: tenant.id, task: task.id }));
 
       const timeLimit = task.spec.timeLimit;
       const token = taskToken(this.config.gatewaySecret, task, tenant, graceSeconds);
