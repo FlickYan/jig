@@ -1450,12 +1450,12 @@ clients all in one process, 2,000 tasks, 64 running at a time on each replica:
 
 | | SQLite | Postgres | Postgres, two replicas |
 |---|---|---|---|
-| tasks made a second, none running (p99) | 600 (280 ms) | 470 (97 ms) | 455 (95 ms) |
-| tasks made a second while the others run (p99) | 530 (350 ms) | 490 (91 ms) | 450 (97 ms) |
-| tasks run to their end a second | 176 | 175 | 187 |
-| events stored a second | 3,500 | 3,500 | 3,700 |
-| `GET /v1/tasks/:id` a second (p99) | 2,100 (33 ms) | 2,600 (21 ms) | 3,100 (19 ms) |
-| a list of 100 a second (p99) | 740 (72 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
+| tasks made a second, none running (p99) | 1,280 (186 ms) | 470 (97 ms) | 455 (95 ms) |
+| tasks made a second while the others run (p99) | 1,190 (135 ms) | 490 (91 ms) | 450 (97 ms) |
+| tasks run to their end a second | 228 | 175 | 187 |
+| events stored a second | 4,550 | 3,500 | 3,700 |
+| `GET /v1/tasks/:id` a second (p99) | 2,540 (37 ms) | 2,600 (21 ms) | 3,100 (19 ms) |
+| a list of 100 a second (p99) | 810 (62 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
 
 Every task succeeded and every followed stream had each of its events once, in order, then `done`. The two
 replicas don't run more than one does here because they share the one process, and so one core, with the
@@ -1471,6 +1471,25 @@ together, and each is stored for its run only once that commit is made, so nothi
 disk doesn't have; one run alone commits each event by itself, as before. On Postgres an event the database
 refuses is written again alone with the rest of its batch, so it fails alone. That took the same load from
 107 to 176 tasks a second on SQLite, and from 88 to 175 on Postgres.
+
+On SQLite a task's own writes were the commits left: of the 9,200 one such measure made, 4,000 were the
+creates (2,000 with nothing running, 2,000 beside the runs), 2,060 the claims, 2,000 the ends and 1,070 the
+events' (40,000 events, some 37 to a commit); the leases' renewals, the heartbeats and the rest were 40.
+Now a create, a claim, an end and a cancel of a queued task are committed with whatever else is written in
+the same turn of the event loop, the events too, in one transaction that holds SQLite's write lock from its
+first write to its commit, and each is answered only once that commit is made: a `201` is of a task the
+disk has. Each write sees what those before it in the turn wrote, so the queue's cap, the quotas and an
+`Idempotency-Key` hold among them as they did one at a time; a write the database refuses is undone alone
+(a savepoint) and fails alone; a commit that fails is the failure of every write in it, a refusal too. One
+write alone is a commit of its own, as before, and so are the writes of two processes on one file, one
+process's after the other's. The same measure makes 4,100 commits, and the SQLite column above is from
+it. Measured before and after in turn, three times each, on that machine a little less loaded than for the
+Postgres columns: tasks made with none running went from 795, 763 and 837 a second to 1,234, 1,277 and
+1,278; made beside the runs, from 803, 735 and 747 to 1,380, 1,188 and 1,190; run to their end, from 216,
+202 and 206 to 236, 225 and 228. The runs gain least because their events come a few to a turn, spread
+over the 200 ms: the turns are many, each still ends in a commit (0.8 ms with a turn's events in it), and
+those 4,100 commits are a quarter of what the process does. Holding a turn's writes back for the next
+ones would join more of them, at the price of every answer waiting that long; the service doesn't.
 
 ### Database size and upgrades
 
