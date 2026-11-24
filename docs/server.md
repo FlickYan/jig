@@ -1348,24 +1348,24 @@ tenants, 32 calls at a time:
 
 | replies of 100 chunks over 250 ms, requests of 32 KB | no gateway | in memory | Redis | Redis, two gateways |
 |---|---|---|---|---|
-| calls a second (the streams allow 128) | 126 | 124 | 123 | 123 |
-| to the first byte, p50 (p99) | 0.8 ms (9 ms) | 2.4 ms (29 ms) | 3.8 ms (29 ms) | 3.5 ms (32 ms) |
-| to the reply's end, p50 (p99) | 252 ms (263 ms) | 254 ms (279 ms) | 256 ms (287 ms) | 255 ms (302 ms) |
-| the gateways' CPU a call | | 3.3 ms | 3.8 ms | 4.2 ms |
-| waiting for a slot, a call | | 0.8 ms | 1.8 ms | 1.8 ms |
+| calls a second (the streams allow 128) | 126 | 125 | 123 | 125 |
+| to the first byte, p50 (p99) | 0.6 ms (5 ms) | 1.9 ms (23 ms) | 3.0 ms (30 ms) | 2.2 ms (21 ms) |
+| to the reply's end, p50 (p99) | 251 ms (257 ms) | 253 ms (270 ms) | 255 ms (283 ms) | 254 ms (274 ms) |
+| the gateways' CPU a call | | 3.9 ms | 4.3 ms | 4.4 ms |
+| waiting for a slot, a call | | 0.9 ms | 1.8 ms | 1.4 ms |
 
 | replies of one chunk at once, requests of 4 KB | no gateway | in memory | Redis | Redis, two gateways |
 |---|---|---|---|---|
-| calls a second | 10,000 | 1,900 | 1,450 | 1,250 |
-| to the reply's end, p50 (p99) | 2 ms (14 ms) | 15 ms (53 ms) | 20 ms (67 ms) | 21 ms (94 ms) |
-| the gateways' CPU a call | | 0.41 ms | 0.51 ms | 0.74 ms |
-| waiting for a slot, a call | | 0 | 3.4 ms | 3.8 ms |
+| calls a second | 10,900 | 3,400 | 2,300 | 2,900 |
+| to the reply's end, p50 (p99) | 2 ms (13 ms) | 8 ms (29 ms) | 13 ms (30 ms) | 9 ms (33 ms) |
+| the gateways' CPU a call | | 0.34 ms | 0.51 ms | 0.70 ms |
+| waiting for a slot, a call | | 0 | 2.1 ms | 1.6 ms |
 
 The second load is `CHUNKS=1 STREAM_MS=0 BODY_KB=4 REQUESTS=12000` (with fewer calls, a gateway still
 warming up is much of what is measured); `REQUESTS`, `CLIENTS`, `TASKS`, `TENANTS` and the caps change it
-too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. The machine was shared with other work, so
-a run's calls a second and its times can differ from the next run's by half, and its CPU by a fifth: each
-table is one run, and the CPU a call is the number to compare. In the first load a tenant's cap (14 of the
+too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. Each table is one run, with nothing else
+at work on the machine; beside other work a run's calls a second and its times can be half of these, and
+its CPU a call a fifth off, so the CPU a call is the number to compare. In the first load a tenant's cap (14 of the
 32 calls at a time) is reached now and then, as the calls fall on the tenants by chance: that is its wait
 for a slot in memory, where the second load has none.
 
@@ -1541,16 +1541,20 @@ clients all in one process, 2,000 tasks, 64 running at a time (`concurrency` is 
 
 | | SQLite | Postgres | Postgres, two replicas |
 |---|---|---|---|
-| tasks made a second, none running (p99) | 1,280 (186 ms) | 470 (97 ms) | 455 (95 ms) |
-| tasks made a second while the others run (p99) | 1,190 (135 ms) | 490 (91 ms) | 450 (97 ms) |
-| tasks run to their end a second | 228 | 175 | 187 |
-| events stored a second | 4,550 | 3,500 | 3,700 |
-| `GET /v1/tasks/:id` a second (p99) | 2,540 (37 ms) | 2,600 (21 ms) | 3,100 (19 ms) |
-| a list of 100 a second (p99) | 810 (62 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
+| tasks made a second, none running (p99) | 1,690 (130 ms) | 630 (78 ms) | 720 (61 ms) |
+| tasks made a second while the others run (p99) | 1,640 (108 ms) | 670 (72 ms) | 600 (79 ms) |
+| tasks run to their end a second | 261 | 201 | 209 |
+| events stored a second | 5,200 | 4,000 | 4,200 |
+| `GET /v1/tasks/:id` a second (p99) | 3,100 (18 ms) | 3,300 (16 ms) | 3,600 (22 ms) |
+| a list of 100 a second (p99) | 940 (49 ms) | 1,060 (39 ms) | 1,310 (29 ms) |
+
+(Each number is the median of three runs of the code as it is now, on that machine with nothing else at
+work; the befores and afters told below were measured as each change was made, some of them beside other
+work, and are to be read against each other.)
 
 Every task succeeded and every followed stream had each of its events once, in order, then `done`. The two
 replicas share the one process here, and so one core, with the clients: the measure says what a core of the
-service does, some 180 tasks of 20 events a second. A real task's jig makes a few model calls of seconds
+service does, some 200 to 260 tasks of 20 events a second. A real task's jig makes a few model calls of seconds
 each, so the service is far from what holds a deployment back: the model, then the runner's containers, are.
 
 The events were most of that work. Each was a commit of its own: on SQLite a write the event loop waits
@@ -1575,9 +1579,8 @@ all of it, and a commit may fail), each of its writes is made again in a commit 
 with what it did then, so the one that doesn't fit fails alone there too; only when another process holds
 the write lock past the five seconds a write waits for it do all the writes of the turn fail together. One
 write alone is a commit of its own, as before, and so are the writes of two processes on one file, one
-process's after the other's. The same measure makes 4,100 commits, and the SQLite column above is from
-it. Measured three times before, then three times after, on that machine a little less loaded than for the
-Postgres columns: tasks made with none running went from 795, 763 and 837 a second to 1,234, 1,277 and
+process's after the other's. The same measure makes 4,100 commits. Measured three times
+before, then three times after, beside other work on that machine: tasks made with none running went from 795, 763 and 837 a second to 1,234, 1,277 and
 1,278; made beside the runs, from 803, 735 and 747 to 1,380, 1,188 and 1,190; run to their end, from 216,
 202 and 206 to 236, 225 and 228 (more on a busier machine, where more writes share a turn). The runs gain
 least because their events come a few to a turn, spread over the 200 ms: the turns are many, each still
@@ -1590,18 +1593,17 @@ replica is a process of its own there, with the same stand-in runs, on the one P
 are a process too, posting to the replicas in turn and following one task in ten through another replica
 than the one it was posted to. `concurrency` is 192 whatever the number of replicas, as it is the cap of
 all of them together, so every column is the same load; the tasks are one tenant's, or 8 tenants' that may
-each run 36 at once. On the same 4 cores, which Postgres, the replicas and the clients share, and which
-were busy with other work besides (so read the columns against each other, not as the most a machine
-does), the medians of three runs:
+each run 36 at once. On the same 4 cores, which Postgres, the replicas and the clients share (so read the
+columns against each other, not as the most a machine does), the medians of three runs:
 
 | | 1 replica | 2 replicas | 3 replicas |
 |---|---|---|---|
-| one tenant: tasks made a second (p99) | 336 (145 ms) | 297 (168 ms) | 222 (219 ms) |
-| one tenant: tasks run to their end a second | 182 | 188 | 215 |
-| 8 tenants: tasks made a second (p99) | 799 (109 ms) | 683 (106 ms) | 547 (141 ms) |
-| 8 tenants: tasks run to their end a second | 283 | 276 | 277 |
-| 8 tenants: events stored a second | 5,700 | 5,500 | 5,500 |
-| 8 tenants: each replica's CPU, of one core | 50% | 32% | 25% |
+| one tenant: tasks made a second (p99) | 577 (103 ms) | 553 (101 ms) | 377 (129 ms) |
+| one tenant: tasks run to their end a second | 316 | 317 | 355 |
+| 8 tenants: tasks made a second (p99) | 1,417 (76 ms) | 1,033 (75 ms) | 933 (91 ms) |
+| 8 tenants: tasks run to their end a second | 444 | 405 | 423 |
+| 8 tenants: events stored a second | 8,900 | 8,100 | 8,500 |
+| 8 tenants: each replica's CPU, of one core | 61% | 39% | 30% |
 
 In every run each task succeeded, was started once, by one replica, and has its 20 events and one row in
 the usage ledger; the followed streams had each event once, in order, then `done`; and by the runners' own
