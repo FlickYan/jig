@@ -1428,6 +1428,14 @@ placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for th
 refuses to start with it. Set its `gitHosts` to the hosts your tenants clone from: the service clones on
 the host's network, not on `jig-tasks` (see Clones and gitHosts).
 
+`node deploy/smoke-docker.ts` tries the Docker runner on a real Docker, from the repository's root, with the
+gateway and the service in its own process and a fake model provider, so nothing is spent: it builds
+`Dockerfile.worker`'s image (`BUILD=0` to use `IMAGE` as it is), and checks that a task runs in a container
+and hands back its `outputs`, that an `Idempotency-Key` makes one task, that a warm worker takes a task, that
+a folder past `maxTaskDiskBytes` stops its container as `disk_limit`, that an approval asked from inside a
+container is answered through the API, that a cancel kills the container, that a `DELETE` purges, and that
+no container or folder of a task is left. It exits 0 only if all of them passed.
+
 ### Database size and upgrades
 
 Deleting tasks' content (`DELETE /v1/tasks/:id`, `retentionDays`) frees space inside the database, not on
