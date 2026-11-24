@@ -2463,6 +2463,295 @@ describe("the SQLite store's reads", () => {
   });
 });
 
+describe("the SQLite store's writes", () => {
+  const limits = { concurrency: 1, maxSteps: 5, timeLimit: 60, budgetUsd: null };
+  const spec = { prompt: "x", maxSteps: 5, timeLimit: 60, model: "deepseek-flash" };
+  const outcome = { status: "succeeded" as const, exitCode: 0, stop: "end_turn", error: null, stats: null, usage: null, cost: null };
+  const terms = { owner: "r0", leaseMs: 60_000, concurrency: 100, tenantConcurrency: 100 };
+  const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+  const exec = DatabaseSync.prototype.exec;
+  /** The commits made from here on, counted; or each failed, as a full disk fails it. */
+  const commits = (fail = false) => {
+    const counted = { n: 0 };
+    DatabaseSync.prototype.exec = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (sql === "COMMIT") {
+        counted.n++;
+        if (fail) throw Object.assign(new Error("database or disk is full"), { code: "ERR_SQLITE_ERROR", errcode: 13 });
+      }
+      return exec.call(this, sql);
+    };
+    return counted;
+  };
+  afterEach(() => void (DatabaseSync.prototype.exec = exec));
+
+  const open = async (path?: string) => {
+    const store = await openStore(path ?? join(await tempDir("jig-service-"), "jig.db"));
+    const state = { open: true };
+    opened.push(async () => void (state.open && (await store.close())));
+    return { store, state };
+  };
+
+  it("commits a task's create, claim and end with the writes of the same turn of the event loop, each answered only once the commit is made", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    let counted = commits();
+    const creates = Array.from({ length: 20 }, () => store.createTask("a", spec, { now: new Date() }));
+    // Nothing is there, and nobody is answered, until the turn is over; then all of it is, by one commit.
+    assert.equal((await store.tasks("a")).length, 0);
+    const made = (await Promise.all(creates)) as Task[];
+    assert.equal(counted.n, 1);
+    // In the order they were asked for.
+    assert.deepEqual((await store.inStatus("queued")).map((task) => task.id), made.map((task) => task.id));
+
+    // Claims, an event, an end and a cancel that come together: each sees what the ones before it wrote.
+    counted = commits();
+    const claims = [store.claim("a", terms), store.claim("a", { ...terms, tenantConcurrency: 1 }), store.claim("a", terms)];
+    const rest = [store.addEvent(made[0].id, 1, { seq: 1 }), store.finish(made[0].id, "r0", outcome), store.finish(made[0].id, "r0", outcome), store.cancelQueued(made[19].id), store.cancelQueued(made[19].id)];
+    assert.equal((await store.inStatus("running")).length, 0);
+    const claimed = await Promise.all(claims);
+    assert.deepEqual(claimed.map((task) => (typeof task === "object" ? task.id : task)), [made[0].id, "tenant full", made[1].id]);
+    assert.deepEqual(await Promise.all(rest), [undefined, true, false, true, false]);
+    assert.equal(counted.n, 1);
+    assert.equal((await store.task(made[0].id))!.status, "succeeded");
+    assert.equal((await store.events(made[0].id)).length, 1);
+    assert.equal((await store.task(made[19].id))!.status, "cancelled");
+    // The ledger has a row for each task that ended, once.
+    assert.equal((await store.usage({ from: "0000-01-01", to: "9999-12-31", group: [] }))[0].tasks, 2);
+
+    // One write alone is a commit of its own.
+    counted = commits();
+    await store.createTask("a", spec, { now: new Date() });
+    await store.claim("a", terms);
+    assert.equal(counted.n, 2);
+  });
+
+  it("holds the caps and the Idempotency-Keys among the creates of one turn", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    await store.putTenant({ id: "b", limits }, []);
+    const now = new Date();
+    const counted = commits();
+    // Twenty creates against a queue of five: the first five are made, and each of the rest is told of five queued.
+    const queue = Array.from({ length: 20 }, () => store.createTask("a", spec, { maxQueued: 5, now }));
+    // A key used twice in the turn makes one task: the second is a replay of the first, and says so if its body differs.
+    const keyed = [
+      store.createTask("b", spec, { tasksPerDay: 2, now }, { key: "k", hash: "h" }),
+      store.createTask("b", spec, { tasksPerDay: 2, now }, { key: "k", hash: "h" }),
+      store.createTask("b", spec, { tasksPerDay: 2, now }, { key: "k", hash: "other" }),
+      store.createTask("b", spec, { tasksPerDay: 2, now }, { key: "k2", hash: "h" }),
+      store.createTask("b", spec, { tasksPerDay: 2, now }, { key: "k3", hash: "h" }),
+    ];
+    const queued = await Promise.all(queue);
+    assert.equal(counted.n, 1);
+    assert.ok(queued.slice(0, 5).every((made) => "id" in made));
+    assert.deepEqual(queued.slice(5), Array.from({ length: 15 }, () => ({ quota: "maxQueued", limit: 5, used: 5 })));
+    assert.equal((await store.tasks("a")).length, 5);
+    const [first, same, other, second, third] = await Promise.all(keyed);
+    assert.ok("id" in first && "id" in second && second.id !== first.id);
+    assert.deepEqual(same, { replay: first, same: true });
+    assert.deepEqual(other, { replay: first, same: false });
+    assert.deepEqual(third, { quota: "tasksPerDay", limit: 2, used: 2 });
+    assert.equal((await store.tasks("b")).length, 2);
+    // A refusal recorded nothing: its key is free.
+    assert.ok("id" in ((await store.createTask("b", spec, { now }, { key: "k3", hash: "h" })) as Task));
+
+    // What a task that ends in the turn spent is counted by the create that comes after it, not the one before.
+    const [running] = [await store.claim("a", terms)] as Task[];
+    const spending = [
+      store.createTask("a", spec, { usdPerDay: 1, now: new Date() }),
+      store.finish(running.id, "r0", { ...outcome, cost: 1.5 }),
+      store.createTask("a", spec, { usdPerDay: 1, now: new Date() }),
+    ] as const;
+    const [before, ended, after] = await Promise.all(spending);
+    assert.ok("id" in before && ended);
+    assert.deepEqual(after, { quota: "usdPerDay", limit: 1, used: 1.5 });
+  });
+
+  it("fails alone the write that the database refuses, undoing only what it wrote", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    const [task] = [await store.createTask("a", spec)];
+    await store.claim("a", terms);
+    const counted = commits();
+    const writes = [
+      store.createTask("a", spec, { now }, { key: "one", hash: "h" }),
+      // Its task is added, then its key refused (a hash can't be null): the task goes with it.
+      store.createTask("a", spec, { now }, { key: "bad", hash: null as never }),
+      store.addEvent(task.id, 1, { seq: 1 }),
+      // A status can't be null either.
+      store.finish(task.id, "r0", { ...outcome, status: null as never }),
+      // A tenant there isn't.
+      store.createTask("nobody", spec, { now }),
+      store.createTask("a", spec, { now }, { key: "two", hash: "h" }),
+    ];
+    const settled = await Promise.allSettled(writes);
+    assert.deepEqual(settled.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "rejected", "rejected", "fulfilled"]);
+    assert.match(String((settled[1] as PromiseRejectedResult).reason), /NOT NULL constraint failed: idempotency\.hash/);
+    assert.match(String((settled[3] as PromiseRejectedResult).reason), /NOT NULL constraint failed: tasks\.status/);
+    assert.match(String((settled[4] as PromiseRejectedResult).reason), /FOREIGN KEY constraint failed/);
+    assert.equal(counted.n, 1);
+    // The two creates around the refused ones were made, and nothing of the refused: three tasks, two queued, one still running.
+    assert.equal((await store.tasks("a")).length, 3);
+    assert.equal((await store.inStatus("queued")).length, 2);
+    assert.equal((await store.task(task.id))!.status, "running");
+    assert.equal((await store.events(task.id)).length, 1);
+    // The refused key is free, and the task ends when asked rightly.
+    assert.ok("id" in ((await store.createTask("a", spec, { now }, { key: "bad", hash: "h" })) as Task));
+    assert.equal(await store.finish(task.id, "r0", outcome), true);
+  });
+
+  it("fails every write of a turn whose commits all fail, a refusal too, and keeps none of them", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    const [task] = [await store.createTask("a", spec)];
+    commits(true);
+    const lost = await Promise.allSettled([
+      store.createTask("a", spec, { maxQueued: 2, now }, { key: "k", hash: "h" }),
+      // Refused by the count of a task that wasn't kept: not an answer to give.
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.claim("a", terms),
+      store.addEvent(task.id, 1, {}),
+      store.cancelQueued(task.id),
+    ]);
+    assert.deepEqual(lost.map((write) => write.status), Array.from({ length: 5 }, () => "rejected"));
+    assert.ok(lost.every((write) => /disk is full/.test(String((write as PromiseRejectedResult).reason))));
+    DatabaseSync.prototype.exec = exec;
+    assert.deepEqual((await store.tasks("a")).map(({ id, status }) => ({ id, status })), [{ id: task.id, status: "queued" }]);
+    assert.equal((await store.events(task.id)).length, 0);
+    // The next ones are made: the key wasn't kept, nor the queue's count.
+    const [made, refused] = await Promise.all([store.createTask("a", spec, { maxQueued: 2, now }, { key: "k", hash: "h" }), store.createTask("a", spec, { maxQueued: 2, now })]);
+    assert.ok("id" in made);
+    assert.deepEqual(refused, { quota: "maxQueued", limit: 2, used: 2 });
+  });
+
+  it("makes the other writes of a turn alone when one finds the database full, which undoes all of the transaction", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    const [task] = [await store.createTask("a", spec)];
+    // The file may grow by 30 pages, on the store's own connection: room for small writes, not for a prompt
+    // of 400 kB. SQLite answers that insert by rolling back the transaction, not the write's savepoint.
+    const { db } = store as unknown as { db: InstanceType<typeof DatabaseSync> };
+    const { page_count: pages } = db.prepare("PRAGMA page_count").get() as { page_count: number };
+    db.exec(`PRAGMA max_page_count = ${pages + 30}`);
+    const counted = commits();
+    const writes = await Promise.allSettled([
+      store.createTask("a", spec, { maxQueued: 3, now }, { key: "k", hash: "h" }),
+      store.createTask("a", { ...spec, prompt: "x".repeat(400_000) }, { now }),
+      store.addEvent(task.id, 1, { seq: 1 }),
+      store.createTask("a", spec, { maxQueued: 3, now }),
+      // The fourth in the queue, counted against what the ones before it wrote when made again.
+      store.createTask("a", spec, { maxQueued: 3, now }),
+    ]);
+    assert.deepEqual(writes.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    assert.match(String((writes[1] as PromiseRejectedResult).reason), /database or disk is full/);
+    assert.deepEqual((writes[4] as PromiseFulfilledResult<unknown>).value, { quota: "maxQueued", limit: 3, used: 3 });
+    // The turn's commit was never reached; each of the four that fit is one of its own.
+    assert.equal(counted.n, 4);
+    assert.equal((await store.tasks("a")).length, 3);
+    assert.equal((await store.events(task.id)).length, 1);
+    // Made once, though its body ran twice: the key replays the one task.
+    const first = (writes[0] as PromiseFulfilledResult<Task>).value;
+    assert.deepEqual(await store.createTask("a", spec, { now }, { key: "k", hash: "h" }), { replay: first, same: true });
+  });
+
+  it("makes each write of a commit that fails again alone, and answers each with what it did then", async () => {
+    const { store } = await open();
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    // The turn's commit fails, as on a disk that had no room for it; the ones after it are made.
+    let failures = 1;
+    const counted = { n: 0 };
+    DatabaseSync.prototype.exec = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (sql === "COMMIT" && failures-- > 0) throw Object.assign(new Error("database or disk is full"), { code: "ERR_SQLITE_ERROR", errcode: 13 });
+      if (sql === "COMMIT") counted.n++;
+      return exec.call(this, sql);
+    };
+    const writes = await Promise.allSettled([
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.createTask("nobody", spec, { now }),
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.createTask("a", spec, { maxQueued: 2, now }),
+      store.claim("a", terms),
+    ]);
+    assert.deepEqual(writes.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    assert.match(String((writes[1] as PromiseRejectedResult).reason), /FOREIGN KEY constraint failed/);
+    assert.deepEqual((writes[3] as PromiseFulfilledResult<unknown>).value, { quota: "maxQueued", limit: 2, used: 2 });
+    assert.equal(counted.n, 4);
+    const [first, , second, , claimed] = writes.map((write) => (write as PromiseFulfilledResult<Task>).value);
+    assert.equal(claimed.id, first.id);
+    assert.deepEqual((await store.tasks("a")).map(({ id, status }) => ({ id, status })).sort((a, b) => a.status.localeCompare(b.status)), [{ id: second.id, status: "queued" }, { id: first.id, status: "running" }]);
+  });
+
+  it("makes the writes that wait when it is closed, and fails those that come after", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const { store, state } = await open(path);
+    await store.putTenant({ id: "a", limits }, []);
+    const counted = commits();
+    const waiting = [store.createTask("a", spec, { now: new Date() }), store.createTask("a", spec, { now: new Date() }), store.claim("a", terms)] as const;
+    await store.close();
+    state.open = false;
+    assert.equal(counted.n, 1);
+    const [one, two, claimed] = await Promise.all(waiting);
+    assert.ok("id" in one && "id" in two && typeof claimed === "object" && claimed.id === one.id);
+    await assert.rejects(store.createTask("a", spec, { now: new Date() }), /not open/);
+    const { store: again } = await open(path);
+    assert.deepEqual((await again.tasks("a")).map((task) => task.status), ["queued", "running"]);
+  });
+
+  it("holds the caps, and hands each task to one claim, between two stores on one file", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const [{ store }, { store: other }] = [await open(path), await open(path)];
+    await store.putTenant({ id: "a", limits }, []);
+    const now = new Date();
+    // The two stores' creates of one turn are two commits, one after the other: the second counts the first's.
+    const both = await Promise.all(Array.from({ length: 20 }, (_, at) => (at % 2 ? other : store).createTask("a", spec, { maxQueued: 5, now })));
+    assert.equal(both.filter((made) => "id" in made).length, 5);
+    assert.equal((await other.tasks("a")).length, 5);
+    const claims = await Promise.all(Array.from({ length: 12 }, (_, at) => (at % 2 ? other : store).claim("a", { ...terms, owner: `r${at % 2}`, concurrency: 4 })));
+    const ids = claims.filter((claim) => typeof claim === "object").map((task) => task.id);
+    assert.equal(new Set(ids).size, 4);
+    assert.equal(claims.filter((claim) => claim === "full").length, 8);
+  });
+
+  it("holds the caps, and hands each task to one claim, between two processes writing at once", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const { store } = await open(path);
+    await store.putTenant({ id: "a", limits }, []);
+    // Each process makes 150 tasks against a day's 200 (the queue's cap wouldn't say: the other's claims
+    // empty it meanwhile), ten to a turn, then claims what is queued, eight to a turn, 120 running at most
+    // across both; they start at the same moment.
+    const script = `
+      const { openStore } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, "..", "server", "store.ts")).href)});
+      const [path, owner, at] = process.argv.slice(1);
+      const store = await openStore(path);
+      const spec = ${JSON.stringify(spec)};
+      await new Promise((done) => setTimeout(done, Number(at) - Date.now()));
+      let made = 0;
+      for (let round = 0; round < 15; round++) made += (await Promise.all(Array.from({ length: 10 }, () => store.createTask("a", spec, { tasksPerDay: 200, now: new Date(Number(at)) })))).filter((task) => "id" in task).length;
+      const claimed = [];
+      for (;;) {
+        const tasks = (await Promise.all(Array.from({ length: 8 }, () => store.claim("a", { owner, leaseMs: 60000, concurrency: 120, tenantConcurrency: 1000 })))).filter((task) => typeof task === "object");
+        if (!tasks.length) break;
+        claimed.push(...tasks.map((task) => task.id));
+      }
+      await store.close();
+      console.log(JSON.stringify({ made, claimed }));`;
+    const at = String(Date.now() + 1500);
+    const run = (owner: string) => promisify(execFile)(process.execPath, ["--input-type=module", "-e", script, path, owner, at]);
+    const [one, two] = (await Promise.all([run("r1"), run("r2")])).map(({ stdout }) => JSON.parse(stdout) as { made: number; claimed: string[] });
+    assert.equal(one.made + two.made, 200);
+    assert.equal((await store.tasks("a", { limit: 1000 })).length, 200);
+    const claimed = [...one.claimed, ...two.claimed];
+    assert.equal(claimed.length, 120);
+    assert.equal(new Set(claimed).size, 120);
+    assert.deepEqual((await store.inStatus("running")).map((task) => task.id).sort(), [...claimed].sort());
+    for (const [owner, ids] of [["r1", one.claimed], ["r2", two.claimed]] as const) assert.equal(await store.finish(ids[0] ?? "none", owner, outcome), ids.length > 0);
+  });
+});
+
 describe("the SQLite store's schema", () => {
   it("moves a database from before tasks had a result on, and stores results in it", async () => {
     const path = join(await tempDir("jig-service-"), "jig.db");
