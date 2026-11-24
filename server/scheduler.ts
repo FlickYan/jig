@@ -682,6 +682,7 @@ export function resultOf(text: string, maxBytes: number): Said {
 }
 
 /** The problems jig gives for a file it doesn't hand back (src/outputs.ts's OutputProblem). */
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 const OUTPUT_PROBLEMS = ["missing", "not_a_file", "too_large", "not_text", "hidden"];
 
 /**
@@ -702,9 +703,20 @@ export function outputsOf(files: unknown[], asked: string[] | undefined): TaskOu
     // Every asked path has its entry: nothing after it would be kept.
     if (seen.size === asked.length) break;
     if (typeof file !== "object" || file === null) continue;
-    const { path, text, problem } = file as Record<string, unknown>;
+    const { path, text, base64, problem } = file as Record<string, unknown>;
     if (typeof path !== "string" || !asked.includes(path) || seen.has(path)) continue;
-    if (typeof text === "string" && problem === undefined) {
+    if (typeof base64 === "string" && text === undefined && problem === undefined) {
+      // A file that isn't text, as its bytes: only what base64 is, and no more of it than a file may have.
+      if (!BASE64.test(base64) || base64.length % 4 !== 0) continue;
+      seen.add(path);
+      const decoded = (base64.length / 4) * 3 - (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0);
+      if (decoded > OUTPUT_BYTES || total + base64.length > OUTPUTS_BYTES) {
+        kept.push({ path, problem: "too_large" });
+        continue;
+      }
+      total += base64.length;
+      kept.push({ path, base64 });
+    } else if (typeof text === "string" && base64 === undefined && problem === undefined) {
       seen.add(path);
       const clean = withoutNul(text).toWellFormed();
       const bytes = eventBytes(clean);
@@ -714,7 +726,7 @@ export function outputsOf(files: unknown[], asked: string[] | undefined): TaskOu
       }
       total += bytes;
       kept.push({ path, text: clean });
-    } else if (typeof problem === "string" && text === undefined && OUTPUT_PROBLEMS.includes(problem)) {
+    } else if (typeof problem === "string" && text === undefined && base64 === undefined && OUTPUT_PROBLEMS.includes(problem)) {
       seen.add(path);
       kept.push({ path, problem });
     }

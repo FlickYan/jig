@@ -153,7 +153,7 @@ export interface TaskSpec {
 }
 
 /** One file a run handed back: its text, or why there is none (jig's outputs event, src/outputs.ts). */
-export type TaskOutput = { path: string; text: string } | { path: string; problem: string };
+export type TaskOutput = { path: string; text: string } | { path: string; base64: string } | { path: string; problem: string };
 
 export interface Usage {
   input: number;

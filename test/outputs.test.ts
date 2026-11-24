@@ -123,7 +123,7 @@ describe("readOutputs", () => {
     await writeFile(join(project, "small"), "still fits\n");
     const files = readOutputs(project, ["1", "2", "3", "4", "small"]);
     assert.deepEqual(
-      files.map((file) => ("problem" in file ? file.problem : file.text.length)),
+      files.map((file) => ("problem" in file ? file.problem : "text" in file ? file.text.length : file)),
       [OUTPUT_BYTES, OUTPUT_BYTES, OUTPUT_BYTES, "too_large", "too_large"],
     );
     // JSON's escapes count: 200 KiB of newlines are 400 KiB of the line, so two such files fill it.
@@ -140,13 +140,20 @@ describe("readOutputs", () => {
     assert.deepEqual(one("bells"), { path: "bells", problem: "too_large" });
   });
 
-  it("says not_text for bytes that aren't UTF-8, and for text with a NUL", async () => {
+  it("hands back bytes that aren't UTF-8, and text with a NUL, in base64, held to the same bounds", async () => {
     await writeFile(join(project, "latin1.txt"), Buffer.from([0x63, 0x61, 0x66, 0xe9]));
     await writeFile(join(project, "blob.bin"), Buffer.from([0x89, 0x50, 0x00, 0x01]));
     await writeFile(join(project, "nul.txt"), "before\0after");
     // Cut in the middle of a character.
     await writeFile(join(project, "cut.txt"), Buffer.from("✓").subarray(0, 2));
-    for (const path of ["latin1.txt", "blob.bin", "nul.txt", "cut.txt"]) assert.deepEqual(one(path), { path, problem: "not_text" });
+    const bytes = { "latin1.txt": [0x63, 0x61, 0x66, 0xe9], "blob.bin": [0x89, 0x50, 0x00, 0x01], "nul.txt": [...Buffer.from("before\0after")], "cut.txt": [0xe2, 0x9c] };
+    for (const [path, expected] of Object.entries(bytes)) assert.deepEqual(one(path), { path, base64: Buffer.from(expected).toString("base64") });
+    // Three files of 256 KiB are 1 MiB in base64: the third is past what the event's line holds.
+    for (const name of ["a.bin", "b.bin", "c.bin"]) await writeFile(join(project, name), Buffer.alloc(OUTPUT_BYTES, 0xff));
+    const files = readOutputs(project, ["a.bin", "b.bin", "c.bin"]);
+    assert.deepEqual(files.map((file) => ("base64" in file ? Buffer.from(file.base64, "base64").length : file)), [OUTPUT_BYTES, OUTPUT_BYTES, { path: "c.bin", problem: "too_large" }]);
+    await writeFile(join(project, "over.bin"), Buffer.alloc(OUTPUT_BYTES + 1, 0xff));
+    assert.deepEqual(one("over.bin"), { path: "over.bin", problem: "too_large" });
   });
 
   it("says hidden for a file in a path the file tools refuse, however it is reached", async () => {

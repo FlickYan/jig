@@ -240,19 +240,21 @@ or none (the run may write the files itself). jig is given each (`--outputs`), a
 own doing, whichever way (the model finished, `max_steps`, the time limit jig keeps, an error, a cancel or a
 stop it had the time to act on), it reads them and writes one `outputs` event just before its `end`. The
 task then has `outputs` on `GET /v1/tasks/:id`: an entry for each path, in the order asked, `{"path",
-"text"}` for a file that was read, or `{"path", "problem"}`:
+"text"}` for a file that was read, `{"path", "base64"}` with its bytes for one that isn't valid UTF-8 or
+holds a NUL (an image, an archive), or `{"path", "problem"}`:
 
 | problem | the path |
 |---------|----------|
 | `missing` | has no file |
 | `not_a_file` | is a folder, a symlink (to a file in the workspace too), a named pipe, a socket or a device, leads through a folder that is a link out of the workspace (whether or not a file is there), or can't be opened |
-| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the texts together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes); the files before it are kept |
-| `not_text` | isn't valid UTF-8, or holds a NUL |
+| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the files together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes; base64 is four bytes for three, so two files of 256 KiB that aren't text fit, and not a third); the files before it are kept |
+| `not_text` | isn't valid UTF-8, or holds a NUL: only from a worker image whose jig is older than `base64` entries |
 | `hidden` | lies in a path jig's file tools refuse (`local.hiddenPaths`, jig's own directory) |
 
 The limits keep the event's line under the mebibyte a runner reads of one; a file past them must be pushed,
 or split. As in every event, what looks like a secret in a text (an API key, a private key, a password's
-value) is blanked out as `[REDACTED]`, so a file isn't always byte for byte what the run wrote. `outputs`
+value) is blanked out as `[REDACTED]`, so a file isn't always byte for byte what the run wrote; nothing is
+blanked out in `base64`, which is the bytes as they are. `outputs`
 is `null` while the task is queued or running, for a task that asked for none, and for one whose run wrote
 no such event: one that never ran, whose jig was killed before it could write its end (a stop it didn't
 act on within the grace, a lost replica) or failed before it had read its settings. It is kept even when the event itself was past `maxEvents` or `maxEventBytes`; within them, the
@@ -1038,7 +1040,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it, 0 before the first), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
-| `outputs` | `files`: with `--outputs`, once, just before the `end`: for each path `{path, text}`, or `{path, problem}` with `missing`, `not_a_file`, `too_large`, `not_text` or `hidden` (see `outputs` under The API, above) |
+| `outputs` | `files`: with `--outputs`, once, just before the `end`: for each path `{path, text}`, `{path, base64}` for a file that isn't UTF-8 text, or `{path, problem}` with `missing`, `not_a_file`, `too_large` or `hidden` (see `outputs` under The API, above) |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
@@ -1428,6 +1430,14 @@ placeholder in `deploy/service.docker.json` (and in `deploy/router.json`, for th
 refuses to start with it. Set its `gitHosts` to the hosts your tenants clone from: the service clones on
 the host's network, not on `jig-tasks` (see Clones and gitHosts).
 
+`node deploy/smoke-docker.ts` tries the Docker runner on a real Docker, from the repository's root, with the
+gateway and the service in its own process and a fake model provider, so nothing is spent: it builds
+`Dockerfile.worker`'s image (`BUILD=0` to use `IMAGE` as it is), and checks that a task runs in a container
+and hands back its `outputs`, that an `Idempotency-Key` makes one task, that a warm worker takes a task, that
+a folder past `maxTaskDiskBytes` stops its container as `disk_limit`, that an approval asked from inside a
+container is answered through the API, that a cancel kills the container, that a `DELETE` purges, and that
+no container or folder of a task is left. It exits 0 only if all of them passed.
+
 ### Database size and upgrades
 
 Deleting tasks' content (`DELETE /v1/tasks/:id`, `retentionDays`) frees space inside the database, not on
@@ -1463,7 +1473,7 @@ kind and kubectl needed): it makes the cluster, with Calico, which enforces the 
 two images and loads them, applies `deploy/k8s` as it is, then the Secrets it leaves to you, a Postgres,
 and a fake model provider the gateway calls in place of DeepSeek, so no task reaches a model API or spends
 anything; it points the router at the service, posts a task through it (the fake provider has `run: <a
-command>` run in bash), prints its events, and shows what a pod labelled as a task's reaches. `deploy/kind.sh
+command>` run in bash), prints its events and the file it handed back, and shows what a pod labelled as a task's reaches. `deploy/kind.sh
 down` deletes the cluster. `SERVICE='{"kubernetes": {"pool": {"size": 1}}}'` adds to the service's config,
 and `BUILD=0` keeps the images there are. kind's own network plugin needs the kernel's nft queue for
 NetworkPolicy, which some kernels lack, hence Calico; and the cluster has containerd keep the pods'
@@ -1474,7 +1484,9 @@ streamed, asked for approvals at the internal listener, were cancelled and stopp
 and Jobs' deadlines, took warm workers, and outlived a replica killed mid-task, whose Jobs the other
 deleted; a tenant whose id has a space was labelled with its hash, the API server took a Secret of 1 MiB and
 refused one byte more, as the runner's check has it, and a log of 30 MB, rotated by the kubelet on the way,
-was read to its end. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
+was read to its end. Later (kind 0.27, Kubernetes 1.32) a task handed back its `outputs` from its pod (a
+file's text, and `not_a_file` for a named pipe and for a link to `/etc/passwd`), an `Idempotency-Key` was
+replayed through the router, and a `DELETE` purged a task. A task's pod reached the gateway, the internal listener and DNS, and nothing else; the
 metrics ports answered only the `monitoring` namespace, and Redis only the gateway. The fake API server in
 the tests didn't show two things. The kubelet ends a log's stream a moment before the pod's status says the
 container has ended, so a log followed while its container ran is read again once it has ended: only a read
