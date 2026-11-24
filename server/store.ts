@@ -496,8 +496,8 @@ const RUNNING = "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'runni
 // made by another process are found by looking again, and claims take its write lock.
 class SqliteStore implements Store {
   private db: DatabaseSync;
-  /** The events to commit together at the end of this turn of the event loop (addEvent). */
-  private pending: { task: string; seq: number; json: string; stored: () => void; failed: (err: unknown) => void }[] = [];
+  /** The writes to commit together at the end of this turn of the event loop (write). */
+  private pending: { body: () => unknown; made: (result: never) => void; failed: (err: unknown) => void }[] = [];
   private insertEvent?: ReturnType<DatabaseSync["prepare"]>;
   // Each stream and each wait for an approval's answer listens.
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
@@ -579,8 +579,8 @@ class SqliteStore implements Store {
 
   createTask(tenant: string, spec: TaskSpec): Promise<Task>;
   createTask(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay>;
-  async createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
-    return caps ? this.admit(tenant, spec, caps, idem) : this.insert(tenant, spec, new Date());
+  createTask(tenant: string, spec: TaskSpec, caps?: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
+    return this.write(() => (caps ? this.admit(tenant, spec, caps, idem) : this.read(this.add(tenant, spec, new Date()))!));
   }
 
   /** Adds the task, created at `created`: its id. */
@@ -591,47 +591,43 @@ class SqliteStore implements Store {
     return id;
   }
 
-  private async insert(tenant: string, spec: TaskSpec, created: Date): Promise<Task> {
-    return (await this.task(this.add(tenant, spec, created)))!;
+  /**
+   * createTask with its caps, as a write's body: under SQLite's write lock, which other processes wait
+   * for, and after the creates that came before it in the turn, whose tasks and keys it counts and finds as
+   * if they had each been committed. The task is created at the caps' `now`, the clock the quotas' days are
+   * read from, so it is counted on the day they say. A task whose key can't be kept is undone with it, by
+   * the write's savepoint.
+   */
+  private admit(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Task | Refusal | Replay {
+    if (idem) {
+      const row = this.db.prepare(IDEMPOTENT).get(tenant, idem.key) as Row | undefined;
+      // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
+      if (row && row.id !== null && !expired(String(row.idem_created), caps.now)) return { replay: toTask(row), same: row.idem_hash === idem.hash };
+      // Run out, or its task is gone: the key is free again.
+      if (row) this.db.prepare("DELETE FROM idempotency WHERE tenant = ? AND key = ?").run(tenant, idem.key);
+    }
+    const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
+    const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
+    const refused = refusal(caps, (cap) =>
+      cap === "maxQueued" ? one(USED.maxQueued)
+      : cap === "tasksPerDay" ? one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString())
+      : cap === "usdPerDay" ? one(USED.usdPerDay, day)
+      : one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
+    );
+    if (refused) return refused;
+    const id = this.add(tenant, spec, caps.now);
+    // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
+    if (idem) this.db.prepare("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES (?, ?, ?, ?, ?)").run(tenant, idem.key, idem.hash, id, caps.now.toISOString());
+    return this.read(id)!;
   }
 
-  /**
-   * createTask with its caps, under SQLite's write lock, which other processes wait for. Nothing here
-   * waits, so no other statement of this process's runs inside it. The task is created at the caps' `now`,
-   * the clock the quotas' days are read from, so it is counted on the day they say.
-   *
-   * atomically commits when its body returns, so every statement here is synchronous and comes before
-   * the first await: the key's lookup, the removal of one that ran out, the caps, the task's insert and the
-   * key's. The task is read back (this.task, which reads before it first waits) as the body's last step.
-   */
-  private admit(tenant: string, spec: TaskSpec, caps: Caps, idem?: Idempotency): Promise<Task | Refusal | Replay> {
-    return this.atomically(() => {
-      if (idem) {
-        const row = this.db.prepare(IDEMPOTENT).get(tenant, idem.key) as Row | undefined;
-        // Before the caps: a retry of a create that was made isn't a new task for the queue or the quotas.
-        if (row && row.id !== null && !expired(String(row.idem_created), caps.now)) return Promise.resolve({ replay: toTask(row), same: row.idem_hash === idem.hash });
-        // Run out, or its task is gone: the key is free again.
-        if (row) this.db.prepare("DELETE FROM idempotency WHERE tenant = ? AND key = ?").run(tenant, idem.key);
-      }
-      const { day, dayStart, nextDay, monthStart, nextMonth } = periods(caps.now);
-      const one = (sql: string, ...params: string[]) => Number(Object.values(this.db.prepare(sql).get(tenant, ...params) as Row)[0]);
-      const refused = refusal(caps, (cap) =>
-        cap === "maxQueued" ? one(USED.maxQueued)
-        : cap === "tasksPerDay" ? one(USED.tasksPerDay, dayStart.toISOString(), nextDay.toISOString())
-        : cap === "usdPerDay" ? one(USED.usdPerDay, day)
-        : one(USED.usdPerMonth, isoDay(monthStart), isoDay(nextMonth)),
-      );
-      if (refused) return Promise.resolve(refused);
-      const id = this.add(tenant, spec, caps.now);
-      // Not an upsert: a key already there would be a fault in the above, and fails the create, task and all.
-      if (idem) this.db.prepare("INSERT INTO idempotency (tenant, key, hash, task, created) VALUES (?, ?, ?, ?, ?)").run(tenant, idem.key, idem.hash, id, caps.now.toISOString());
-      return this.task(id) as Promise<Task>;
-    }, "BEGIN IMMEDIATE");
+  private read(id: string): Task | undefined {
+    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row | undefined;
+    return row && toTask(row);
   }
 
   async task(id: string): Promise<Task | undefined> {
-    const row = this.db.prepare("SELECT * FROM tasks WHERE id = ?").get(id) as Row | undefined;
-    return row && toTask(row);
+    return this.read(id);
   }
 
   /** No statement here waits for another, so the five counts are of one moment. */
@@ -677,27 +673,19 @@ class SqliteStore implements Store {
     return rows.map((row) => String(row.id));
   }
 
-  async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {
-    // IMMEDIATE takes the write lock first, so another process can't count the same free slot meanwhile.
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
+  claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {
+    // A write holds the write lock from before its first body, so another process can't count the same free
+    // slot meanwhile, nor take the same task; and the claims of one turn each count the ones before.
+    return this.write(() => {
       const counts = this.db.prepare("SELECT count(*) AS total, count(*) FILTER (WHERE tenant = ?) AS mine FROM tasks WHERE status = 'running'").get(tenant) as Row;
-      let result: Task | "full" | "tenant full" | undefined;
-      if (Number(counts.total) >= concurrency) result = "full";
-      else if (Number(counts.mine) >= tenantConcurrency) result = "tenant full";
-      else {
-        const now = Date.now();
-        const row = this.db
-          .prepare("UPDATE tasks SET status = 'running', started = ?, owner = ?, lease_until = ?, cancel_requested = 0 WHERE id = (SELECT id FROM tasks WHERE tenant = ? AND status = 'queued' ORDER BY rowid LIMIT 1) RETURNING *")
-          .get(new Date(now).toISOString(), owner, new Date(now + leaseMs).toISOString(), tenant) as Row | undefined;
-        result = row && toTask(row);
-      }
-      this.db.exec("COMMIT");
-      return result;
-    } catch (err) {
-      this.rollback();
-      throw err;
-    }
+      if (Number(counts.total) >= concurrency) return "full";
+      if (Number(counts.mine) >= tenantConcurrency) return "tenant full";
+      const now = Date.now();
+      const row = this.db
+        .prepare("UPDATE tasks SET status = 'running', started = ?, owner = ?, lease_until = ?, cancel_requested = 0 WHERE id = (SELECT id FROM tasks WHERE tenant = ? AND status = 'queued' ORDER BY rowid LIMIT 1) RETURNING *")
+        .get(new Date(now).toISOString(), owner, new Date(now + leaseMs).toISOString(), tenant) as Row | undefined;
+      return row && toTask(row);
+    });
   }
 
   async renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]> {
@@ -723,16 +711,16 @@ class SqliteStore implements Store {
     return this.db.prepare("UPDATE tasks SET cancel_requested = 1 WHERE id = ? AND status = 'running'").run(id).changes === 1;
   }
 
-  async cancelQueued(id: string): Promise<boolean> {
-    return this.atomically(() => {
+  cancelQueued(id: string): Promise<boolean> {
+    return this.write(() => {
       const rows = this.db.prepare(`UPDATE tasks SET status = 'cancelled', ended = ? WHERE id = ? AND status = 'queued' RETURNING ${ENDED}`).all(new Date().toISOString(), id) as Row[];
       this.ledger(rows);
       return rows.length === 1;
     });
   }
 
-  async finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
-    return this.atomically(() => {
+  finish(id: string, owner: string, outcome: Outcome): Promise<boolean> {
+    return this.write(() => {
       const rows = this.db
         .prepare(`UPDATE tasks SET status = ?, exit_code = ?, stop = ?, error = ?, stats = ?, usage = ?, cost = ?, result = ?, result_truncated = ?, outputs = ?, ended = ? WHERE id = ? AND status = 'running' AND owner = ? RETURNING ${ENDED}`)
         // node:sqlite binds neither undefined nor a boolean.
@@ -836,36 +824,123 @@ class SqliteStore implements Store {
     }
   }
 
-  // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a
-  // replica that hadn't heard. Silently, as for a seq already kept.
-  //
-  // A commit is a write to the disk that waits for it (an fsync), some 0.2 ms each on an SSD, and it holds
-  // the event loop meanwhile: with many runs writing at once, their events were most of what the service
-  // did. So the events that come in one turn of the event loop are committed together, and each is stored,
-  // for its caller, only once that commit is made: nothing is told of an event the disk doesn't have. One
-  // run alone commits each of its events by itself, as before.
-  addEvent(task: string, seq: number, event: object): Promise<void> {
-    return new Promise((stored, failed) => {
-      this.pending.push({ task, seq, json: JSON.stringify(event), stored, failed });
+  /**
+   * Makes a write (`body`: its statements, none of which waits) and answers with what it returns, once it
+   * is committed.
+   *
+   * A commit is a write to the disk that waits for it (an fsync), some 0.2 ms each on an SSD, and it holds
+   * the event loop meanwhile: with many runs at once, their events' commits, then their tasks' (a create, a
+   * claim and an end each), were most of what the service did. So the writes that come in one turn of the
+   * event loop are made in one transaction, in the order they came, and each is answered only once that
+   * commit is made: nothing is told of a write the disk doesn't have. One write alone is committed by
+   * itself, as before.
+   *
+   * Each body sees what the ones before it in the turn wrote, as if they had been committed: a create counts
+   * the tasks made before it, a claim the ones claimed. The transaction takes SQLite's write lock before
+   * the first body (BEGIN IMMEDIATE), so no other process writes between them, and it is over before
+   * anything waits. A body that throws undoes only what it wrote itself (its savepoint) and fails alone; if
+   * its error undid the whole transaction, the others are made again without it (flush).
+   *
+   * The writes a task makes once or more go through here: its create, claim, end and events. The rest are
+   * left to commit alone, as they come: a lease's renewal and a replica's heartbeat are one statement every
+   * few seconds, an approval waits for a person, and a purge, an expiry or a config's tenants may write
+   * much, which the answers of the others in its turn would wait for.
+   */
+  private write<T>(body: () => T): Promise<T> {
+    return new Promise((made, failed) => {
+      this.pending.push({ body, made, failed });
       if (this.pending.length === 1) setImmediate(() => this.flush());
     });
   }
 
-  /** Commits the events that wait, together. A failure (a full disk, a lock another process held too long) is each one's: each is tried again by its caller. */
+  /**
+   * Commits the writes that wait, together.
+   *
+   * If the transaction is lost under them, each is made again alone, in a commit of its own, as it was
+   * before writes shared one: SQLite rolls all of a transaction back, not a savepoint, when a statement
+   * finds the disk or the file's size limit full, and a COMMIT may fail for the same; the one write too
+   * large to fit would otherwise fail every other of each turn it is tried in. Nothing of the first try is
+   * left, in the database or in an answer, so a body run twice has written once, and each write gets its
+   * own result or error: a commit that fails for all of them (a disk with no room at all) still fails each.
+   *
+   * Not so when the write lock couldn't be had (BEGIN IMMEDIATE, after busy_timeout): no body has run, and
+   * each try alone would hold the event loop that long again. That is the failure of every write of the
+   * turn, each tried again, or not, by its caller.
+   */
   private flush(): void {
     const batch = this.pending.splice(0);
     if (!batch.length) return;
+    const results: ({ result: unknown } | { err: unknown })[] = [];
+    let began = false;
     try {
-      this.insertEvent ??= this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`);
-      const insert = this.insertEvent;
-      this.atomically(() => {
-        for (const { task, seq, json } of batch) insert.run(task, seq, json);
-      }, "BEGIN IMMEDIATE");
+      this.db.exec("BEGIN IMMEDIATE");
+      began = true;
+      for (const { body } of batch) {
+        this.db.exec("SAVEPOINT one");
+        try {
+          const result = body();
+          this.db.exec("RELEASE one");
+          results.push({ result });
+        } catch (err) {
+          // An error that left no transaction lost the writes before this one too.
+          if (!this.db.isTransaction) throw err;
+          this.db.exec("ROLLBACK TO one; RELEASE one");
+          results.push({ err });
+        }
+      }
+      this.db.exec("COMMIT");
     } catch (err) {
+      // A closed database has no transaction to ask after: the error that says so is the one to give.
+      try {
+        this.rollback();
+      } catch {}
+      if (began && batch.length > 1) return this.alone(batch);
       for (const { failed } of batch) failed(err);
       return;
     }
-    for (const { stored } of batch) stored();
+    batch.forEach(({ made, failed }, at) => {
+      const outcome = results[at];
+      if ("err" in outcome) failed(outcome.err);
+      else made(outcome.result as never);
+    });
+  }
+
+  /**
+   * Makes each write of a batch whose transaction was lost in a commit of its own, in their order (flush).
+   * Once the write lock can't be had, the rest fail with that write: see flush.
+   */
+  private alone(batch: SqliteStore["pending"]): void {
+    let locked: { err: unknown } | undefined;
+    for (const { body, made, failed } of batch) {
+      if (locked) {
+        failed(locked.err);
+        continue;
+      }
+      let began = false;
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+        began = true;
+        const result = body();
+        this.db.exec("COMMIT");
+        made(result as never);
+      } catch (err) {
+        try {
+          this.rollback();
+        } catch {}
+        if (!began) locked = { err };
+        failed(err);
+      }
+    }
+  }
+
+  // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a
+  // replica that hadn't heard. Silently, as for a seq already kept.
+  async addEvent(task: string, seq: number, event: object): Promise<void> {
+    const json = JSON.stringify(event);
+    return this.write(() => {
+      this.insertEvent ??= this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`);
+      this.insertEvent.run(task, seq, json);
+    });
   }
 
   async events(task: string, after = 0, limit?: number, bytes = Infinity): Promise<{ seq: number; event: object }[]> {
@@ -932,7 +1007,7 @@ class SqliteStore implements Store {
   }
 
   async close(): Promise<void> {
-    // The events that wait are stored first, or told that they weren't.
+    // The writes that wait are made first, or told that they weren't.
     this.flush();
     this.insertEvent = undefined;
     this.db.close();

@@ -427,13 +427,21 @@ no `--outputs` either).
 A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
 counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`
 and each tenant's own hold across the replicas, and two can't both take the last slot; the turn among
-tenants is each replica's own. A run's events are stored and announced (`NOTIFY jig_events`), so a stream
+tenants is each replica's own. The lock and the claim are sent to the database together, and it commits
+without waiting for the replica again, so the lock, which every replica's claims wait for, is held only
+while the database works: a replica that is busy, or frozen, in the middle of a claim holds up no other.
+So a claim that was sent is carried out though its replica died meanwhile: that task is `running` for a
+replica that is gone, and ends as an error when its lease runs out, as a crashed replica's tasks do. For a
+replica that lives, the database gives up on a claim (its `statement_timeout`, set for those statements)
+before the replica's own wait for the query is over, so none is made after the replica was told it failed.
+A run's events are stored and announced (`NOTIFY jig_events`), so a stream
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
 and it connects again. Each connection asks the server to end a transaction left idle for over a minute
-(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
-lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
+(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds a tenant's
+lock on its new tasks (a create is several statements under it) holds up that tenant's creates through the
+others for that long at most, not until the server's TCP keepalive notices. A
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
 out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
 longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
@@ -1142,8 +1150,11 @@ streamed reply counting until it ends); `tenants` sets them per tenant, `tenantD
 the same fields at the top of `limits` hold for all tenants together, where `concurrent` is the most the
 gateway sends upstream at once. Any left out is no limit. A request over a limit waits for its turn in a
 queue that serves the tenants in turn, a request of each, so a tenant with a thousand requests waiting
-delays another tenant's request by one slot at most. After `maxWaitMs` (30 seconds by default) it gets 429
-with `retry-after`, and jig's SDK waits that long and tries again, twice at most.
+delays another tenant's request by one slot at most; or, when there was room for more and the gateway had
+asked for several of the tenant's slots at once (16 at most, see "What the gateway itself takes"), by
+those it had already asked for when the other's request came, which matters when they were the last of
+the room. After `maxWaitMs` (30 seconds by default) it gets 429 with `retry-after`, and jig's SDK waits
+that long and tries again, twice at most.
 
 **Quotas.** `dailyUsd` and `monthlyUsd`, in `tenantDefaults` or a tenant's own entry in `tenants` (not at
 the top of `limits`, and above 0 where given), are the most a tenant may spend in a UTC day and in a UTC
@@ -1278,8 +1289,9 @@ keys, which a cluster refuses across slots, and `server/redis.ts` does not follo
 Redis on its own clock. A tenant's and the global rate buckets and requests in flight hold across all
 replicas; a request in flight is a lease that its gateway renews every `leaseMs`/3 while the reply goes
 on, so the slots of a replica that died come back within `leaseMs` (60 seconds; 100 ms at least). The queue that takes the
-tenants in turn is each replica's own: a replica that gives back a slot says so on a Redis channel, and
-the others' waiting requests try again at once, and every 250 ms anyway. A task's spending is kept until a
+tenants in turn is each replica's own, and asks Redis for a round's slots in one round trip: a replica that
+gives back a slot says so on a Redis channel, and the others' waiting requests try again at once, and every
+250 ms anyway. A task's spending is kept until a
 week after its token expires, a tenant's day for 35 days and its month for 400 (a hash each,
 `<prefix>day:<tenant>:<YYYY-MM-DD>` and `<prefix>month:<tenant>:<YYYY-MM>`, added to in the same script); a key the provider refused or rate-limited is
 passed over by every replica (Redis has only a hash of it, never the key), a rate-limited one until its rest is
@@ -1318,6 +1330,85 @@ to expire with their leases. What this leaves:
   Redis has answered the give-back.
 - Spending lost in an outage stays lost, and a reply that outlasts an outage longer than `leaseMs` loses
   its lease, as before.
+
+### What the gateway itself takes
+
+`node bench/gateway-load.ts` measures the gateway with no model behind it: each gateway a process of its
+own, started as a deployment starts it, a stand-in provider in another that streams a reply as the Messages
+API does, and the clients in a third. Every limit is set (rates, both concurrency caps, both quotas, a
+budget on every other task), so each is checked on every call. It checks what it measures, and ends with
+status 1 otherwise: every request's body reached the provider byte for byte with the pool's key, every
+reply came back whole and byte for byte, each task's and tenant's spending is what the provider sent, the
+provider never held more calls at once than the caps allow, and nothing is left in flight, in the gateways
+or in Redis. The measured calls seldom reach a cap, so after them come bursts of twice each cap, of each
+tenant alone and then of all, in which the provider must have held exactly the cap: more, and the cap is
+not kept; fewer, and a slot was never given back. With `JIG_TEST_REDIS_URL` it measures the state in Redis
+too, with one gateway and with two. On 4 cores (Node 22, Redis 7 on the same machine), 40 tasks of 4
+tenants, 32 calls at a time:
+
+| replies of 100 chunks over 250 ms, requests of 32 KB | no gateway | in memory | Redis | Redis, two gateways |
+|---|---|---|---|---|
+| calls a second (the streams allow 128) | 126 | 125 | 123 | 125 |
+| to the first byte, p50 (p99) | 0.6 ms (5 ms) | 1.9 ms (23 ms) | 3.0 ms (30 ms) | 2.2 ms (21 ms) |
+| to the reply's end, p50 (p99) | 251 ms (257 ms) | 253 ms (270 ms) | 255 ms (283 ms) | 254 ms (274 ms) |
+| the gateways' CPU a call | | 3.9 ms | 4.3 ms | 4.4 ms |
+| waiting for a slot, a call | | 0.9 ms | 1.8 ms | 1.4 ms |
+
+| replies of one chunk at once, requests of 4 KB | no gateway | in memory | Redis | Redis, two gateways |
+|---|---|---|---|---|
+| calls a second | 10,900 | 3,400 | 2,300 | 2,900 |
+| to the reply's end, p50 (p99) | 2 ms (13 ms) | 8 ms (29 ms) | 13 ms (30 ms) | 9 ms (33 ms) |
+| the gateways' CPU a call | | 0.34 ms | 0.51 ms | 0.70 ms |
+| waiting for a slot, a call | | 0 | 2.1 ms | 1.6 ms |
+
+The second load is `CHUNKS=1 STREAM_MS=0 BODY_KB=4 REQUESTS=12000` (with fewer calls, a gateway still
+warming up is much of what is measured); `REQUESTS`, `CLIENTS`, `TASKS`, `TENANTS` and the caps change it
+too, and `GATEWAY_PROF=<dir>` writes each gateway's CPU profile. Each table is one run, with nothing else
+at work on the machine; beside other work a run's calls a second and its times can be half of these, and
+its CPU a call a fifth off, so the CPU a call is the number to compare. In the first load a tenant's cap (14 of the
+32 calls at a time) is reached now and then, as the calls fall on the tenants by chance: that is its wait
+for a slot in memory, where the second load has none.
+
+How to read it. A small call costs the gateway about 0.4 ms of one core (0.5 ms with Redis: eight or nine
+commands a call, each a write of its own), and then 30 to 40 microseconds for each chunk of the reply it
+passes on. So a core passes 250 to 300 calls a second of 100 chunks each, or some 25,000 to 30,000 chunks
+a second however many calls they belong to: a model that sends 50 chunks a second to each call keeps one
+gateway busy with 500 to 600 calls in flight. The gateway is one thread, so past that it is replicas with
+`state` that add room, not cores. Each run says how much of a core each process had meanwhile. On the
+second load with Redis, three runs of one gateway and three of two, turn about: one gateway had 112%, 92%
+and 94% of a core (its garbage collector's threads included) with the clients at 29% to 36% and the
+provider at 16% to 20%, so it was the gateway that was measured, and it passed 2,121, 1,709 and 1,813
+calls a second at 0.53, 0.54 and 0.52 ms of CPU a call. Two gateways passed 1,752, 2,058 and 2,089, no
+more than one within what runs differ by, at 0.71, 0.68 and 0.71 ms a call: on 4 cores shared with Redis,
+the clients, the provider and other work, each gateway got about two thirds of a core (62% to 74%), so
+this machine does not show what a second replica adds on cores of its own. What the gateway adds to a call
+that is not waiting for a slot is a millisecond or two before its first byte, and nothing that shows over
+a reply of seconds.
+
+Where the time goes, by the profile of the first load: 45% of a busy gateway's time is the kernel's, writing
+each chunk to jig as it comes, one write a chunk; most of the rest is Node's HTTP and streams and the
+garbage they leave. The gateway's own code is a tenth, and most of that is reading the usage out of the
+stream (7%), which parses every event to find the two that carry it. With Redis, its commands are another
+6%. None of these is worth giving up the reply passed on as it arrives for.
+
+What did hold calls back was the queue with Redis. It asked for one slot at a time and waited for Redis's
+answer before asking for the next, so a gateway let through one call for each turn of its event loop,
+however much room the limits left: with calls arriving faster than that, every call waited in the queue,
+and the asking again that each arrival and each reply's end set off cost CPU besides. Now a round asks for
+a request of each tenant at once, in the order of the turns, and for twice as many as the last (16 of a
+tenant at most) once a round has let through all it asked for, back to one at the first that must wait;
+Redis answers in the order it is asked, so the slots go to the same requests as before, but for a request
+of another tenant that comes while a round is with Redis: the slots that round asked for are the first
+tenant's, where before only one was, and the next is the other's. The gain is there while every request
+of a round is let through: with any tenant waiting at a limit the rounds are of one request of each tenant,
+as before, and what follows is the best case, one tenant and no cap reached. In an outage of Redis with
+`onStateError: "open"` every request of a round is a question that fails, so
+`jig_gateway_state_errors_total` grows faster than it did. On the second load with one tenant and one
+gateway (4,000 calls a run), three runs before and three after, turn about: 1,077, 1,122 and 1,081 calls
+a second became 1,607, 1,698 and 1,542; the wait for a slot 23, 21 and 23 ms a call became 3.0, 2.9
+and 3.1 ms; the gateway's CPU 1.02, 0.98 and 1.04 ms a call became 0.70, 0.72 and 0.73 ms. On the first
+load with one tenant, where calls come at half of what a gateway carries, the wait went from 2.6, 2.5 and
+1.9 ms a call to 1.3, 1.4 and 1.2 ms, and nothing else moved beyond what one run differs from the next.
 
 ## Several regions
 
@@ -1446,22 +1537,25 @@ many tasks at once, the runs a stand-in that writes 20 events over 200 ms and en
 model), with a follower on one task's stream in ten. It is the ceiling adding workers can't pass. With
 `JIG_TEST_POSTGRES_URL` it measures Postgres too, with one replica and with two. On 4 cores with a local
 SSD (Node 22, Postgres 16 on the same machine, its `fsync` on), the service, the two replicas and the 32
-clients all in one process, 2,000 tasks, 64 running at a time on each replica:
+clients all in one process, 2,000 tasks, 64 running at a time (`concurrency` is the replicas' together):
 
 | | SQLite | Postgres | Postgres, two replicas |
 |---|---|---|---|
-| tasks made a second, none running (p99) | 600 (280 ms) | 470 (97 ms) | 455 (95 ms) |
-| tasks made a second while the others run (p99) | 530 (350 ms) | 490 (91 ms) | 450 (97 ms) |
-| tasks run to their end a second | 176 | 175 | 187 |
-| events stored a second | 3,500 | 3,500 | 3,700 |
-| `GET /v1/tasks/:id` a second (p99) | 2,100 (33 ms) | 2,600 (21 ms) | 3,100 (19 ms) |
-| a list of 100 a second (p99) | 740 (72 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
+| tasks made a second, none running (p99) | 1,690 (130 ms) | 630 (78 ms) | 720 (61 ms) |
+| tasks made a second while the others run (p99) | 1,640 (108 ms) | 670 (72 ms) | 600 (79 ms) |
+| tasks run to their end a second | 261 | 201 | 209 |
+| events stored a second | 5,200 | 4,000 | 4,200 |
+| `GET /v1/tasks/:id` a second (p99) | 3,100 (18 ms) | 3,300 (16 ms) | 3,600 (22 ms) |
+| a list of 100 a second (p99) | 940 (49 ms) | 1,060 (39 ms) | 1,310 (29 ms) |
+
+(Each number is the median of three runs of the code as it is now, on that machine with nothing else at
+work; the befores and afters told below were measured as each change was made, some of them beside other
+work, and are to be read against each other.)
 
 Every task succeeded and every followed stream had each of its events once, in order, then `done`. The two
-replicas don't run more than one does here because they share the one process, and so one core, with the
-clients: the measure says what a core of the service does, some 180 tasks of 20 events a second, not what
-two machines would. A real task's jig makes a few model calls of seconds each, so the service is far from
-what holds a deployment back: the model, then the runner's containers, are.
+replicas share the one process here, and so one core, with the clients: the measure says what a core of the
+service does, some 200 to 260 tasks of 20 events a second. A real task's jig makes a few model calls of seconds
+each, so the service is far from what holds a deployment back: the model, then the runner's containers, are.
 
 The events were most of that work. Each was a commit of its own: on SQLite a write the event loop waits
 for (0.2 ms on that SSD), and on Postgres a statement on one of the pool's ten connections, where with its
@@ -1471,6 +1565,88 @@ together, and each is stored for its run only once that commit is made, so nothi
 disk doesn't have; one run alone commits each event by itself, as before. On Postgres an event the database
 refuses is written again alone with the rest of its batch, so it fails alone. That took the same load from
 107 to 176 tasks a second on SQLite, and from 88 to 175 on Postgres.
+
+On SQLite a task's own writes were the commits left: of the 9,200 one such measure made, 4,000 were the
+creates (2,000 with nothing running, 2,000 beside the runs), 2,060 the claims, 2,000 the ends and 1,070 the
+events' (40,000 events, some 37 to a commit); the leases' renewals, the heartbeats and the rest were 40.
+Now a create, a claim, an end and a cancel of a queued task are committed with whatever else is written in
+the same turn of the event loop, the events too, in one transaction that holds SQLite's write lock from its
+first write to its commit, and each is answered only once that commit is made: a `201` is of a task the
+disk has. Each write sees what those before it in the turn wrote, so the queue's cap, the quotas and an
+`Idempotency-Key` hold among them as they did one at a time; a write the database refuses is undone alone
+(a savepoint) and fails alone. If the transaction itself is lost (a write that finds the disk full undoes
+all of it, and a commit may fail), each of its writes is made again in a commit of its own and answered
+with what it did then, so the one that doesn't fit fails alone there too; only when another process holds
+the write lock past the five seconds a write waits for it do all the writes of the turn fail together. One
+write alone is a commit of its own, as before, and so are the writes of two processes on one file, one
+process's after the other's. The same measure makes 4,100 commits. Measured three times
+before, then three times after, beside other work on that machine: tasks made with none running went from 795, 763 and 837 a second to 1,234, 1,277 and
+1,278; made beside the runs, from 803, 735 and 747 to 1,380, 1,188 and 1,190; run to their end, from 216,
+202 and 206 to 236, 225 and 228 (more on a busier machine, where more writes share a turn). The runs gain
+least because their events come a few to a turn, spread over the 200 ms: the turns are many, each still
+ends in a commit (0.8 ms with a turn's events in it), and those 4,100 commits are a quarter of what the
+process does. Holding a turn's writes back for the next ones would join more of them, at the price of
+every answer waiting that long; the service doesn't.
+
+What replicas add is `node bench/service-replicas.ts`'s to say (it needs `JIG_TEST_POSTGRES_URL`): each
+replica is a process of its own there, with the same stand-in runs, on the one Postgres, and the 32 clients
+are a process too, posting to the replicas in turn and following one task in ten through another replica
+than the one it was posted to. `concurrency` is 192 whatever the number of replicas, as it is the cap of
+all of them together, so every column is the same load; the tasks are one tenant's, or 8 tenants' that may
+each run 36 at once. On the same 4 cores, which Postgres, the replicas and the clients share (so read the
+columns against each other, not as the most a machine does), the medians of three runs:
+
+| | 1 replica | 2 replicas | 3 replicas |
+|---|---|---|---|
+| one tenant: tasks made a second (p99) | 577 (103 ms) | 553 (101 ms) | 377 (129 ms) |
+| one tenant: tasks run to their end a second | 316 | 317 | 355 |
+| 8 tenants: tasks made a second (p99) | 1,417 (76 ms) | 1,033 (75 ms) | 933 (91 ms) |
+| 8 tenants: tasks run to their end a second | 444 | 405 | 423 |
+| 8 tenants: events stored a second | 8,900 | 8,100 | 8,500 |
+| 8 tenants: each replica's CPU, of one core | 61% | 39% | 30% |
+
+In every run each task succeeded, was started once, by one replica, and has its 20 events and one row in
+the usage ledger; the followed streams had each event once, in order, then `done`; and by the runners' own
+clocks never more than 192 ran at once over the replicas, nor more than 36 of a tenant's (with three
+replicas it reached 185 to 190, and 36). The script prints those checks, each replica's CPU, and the most queries that waited for a
+connection of its pool at once; `STORE_TIMES=1` adds what each of the store's calls took, and
+`PROFILE=<dir>` has each replica write a CPU profile.
+
+So replicas don't add to what the service itself does: two or three run what one does, each with less of
+its core. A replica isn't what is short. Its CPU profile is half idle, waiting for the database, and what
+the rate hangs on is in the database they share, where `pg_stat_activity`, read every 20 ms through a run
+of 3 replicas and 8 tenants, shows what waits:
+
+- A tenant's creates are made one at a time, under its lock, so that its caps are counted with the insert
+  (Quotas and usage): 5 connections on average wait for a tenant's lock, and 5 more are in a create's
+  transaction, between two statements, waiting for their replica to send the next. One tenant's creates
+  get slower as replicas are added (336 a second to 222) because the lock is then passed between
+  processes; 8 tenants' go on side by side, 550 to 800 a second.
+- Postgres commits the transactions that announce something (`NOTIFY`: every batch of events, every task's
+  end) one at a time, behind a lock on its queue of notices (`Lock:object` in `pg_stat_activity`): 2
+  connections wait for it on average, and 2 more for the log to reach the disk (`WALWrite`, `WALSync`),
+  which each of those commits waits for in its turn. A run's events are written one after another, so
+  what a commit takes is what a run takes, and with a fixed number running, what the service does.
+- A claim is one task and one commit under the claims' lock, which all replicas share, and a replica makes
+  one at a time. With `concurrency` at 600 (and 4,000 tasks) no more than 230 ever ran at once, with tasks
+  queued all the while, and 250 to 380 a second ended, by one replica or by three: the rate the claims
+  went at.
+- The pool's 10 connections are all in use during the creates (some 35 queries waited for one at once, on
+  one replica), but a pool of 40 (`POOL=40`) ran no more: what a query waits for is behind the connection.
+
+Replicas are for surviving the loss of one, and for the room their machines give the runs (the local
+runner's jigs, a Docker daemon's containers); a deployment whose tasks make model calls of seconds each is
+far under these rates.
+
+Claims held the replicas back more before. A claim was a transaction made a statement at a time (the lock,
+the count, the update, the commit), so the claims' lock was held through three of its replica's turns to
+read a reply, and a replica that is storing its runs' events is slow to take its turn: with 3 replicas, of
+the three connections claiming, 1.5 on average were waiting for the lock while the one holding it sat idle
+two thirds of the time, waiting for its replica, and about 100 tasks ran at once of the 192 allowed. Now
+the lock and the claim are sent together and the database commits without waiting for the replica (Several
+replicas, above): 185 run at once, and the same load, run before and after three times each, went from 224
+tasks a second to 283 with one replica and 8 tenants, 224 to 276 with two and 201 to 277 with three (with
+one tenant, whose creates take most of the pool: 172 to 182, 153 to 188 and 194 to 215).
 
 ### Database size and upgrades
 

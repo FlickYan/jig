@@ -171,6 +171,19 @@ const shifted = (sql: string, by: number) => sql.replace(/\$([2-9])/g, (_, n: st
 const STANDING = `SELECT (${USED.maxQueued}) AS queued, (SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'running') AS running,
   (${USED.tasksPerDay}) AS tasks_today, (${shifted(USED.usdPerDay, 2)}) AS usd_today, (${shifted(USED.usdPerMonth, 3)}) AS usd_this_month`;
 
+/**
+ * A claim, after the claims' lock is taken: the running tasks counted, and the tenant's ($1) oldest queued
+ * task made running if fewer run than the service's cap ($4) and fewer of the tenant's than its own ($5).
+ * One row: the counts, and the task if one was claimed. A statement of its own, after the lock's, so it sees
+ * what the claim before this one committed. SKIP LOCKED passes over a task a cancel is changing meanwhile,
+ * rather than waiting for it.
+ */
+const CLAIM = `WITH running AS (SELECT count(*) AS total, count(*) FILTER (WHERE tenant = $1) AS mine FROM tasks WHERE status = 'running'),
+  claimed AS (
+    UPDATE tasks SET status = 'running', started = now(), owner = $2, lease_until = now() + $3 * interval '1 millisecond', cancel_requested = false
+    WHERE id = (SELECT id FROM tasks WHERE tenant = $1 AND status = 'queued' AND (SELECT total < $4 AND mine < $5 FROM running) ORDER BY n LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *)
+  SELECT running.total, running.mine, claimed.* FROM running LEFT JOIN claimed ON true`;
+
 /** The most events one statement writes: three parameters each, of the 65,535 a statement may have. */
 const EVENT_BATCH = 1000;
 
@@ -331,23 +344,15 @@ export class PostgresStore implements Store {
   }
 
   async claim(tenant: string, { owner, leaseMs, concurrency, tenantConcurrency }: ClaimTerms): Promise<Task | "full" | "tenant full" | undefined> {
-    return this.pool.transaction(async (db) => {
-      // Held to the transaction's end: the count below and the claim are one replica's at a time. The
-      // count is a statement of its own, so it sees what the claim before this one committed.
-      await db.query(`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`);
-      const [counts] = (await db.query("SELECT count(*) AS total, count(*) FILTER (WHERE tenant = $1) AS mine FROM tasks WHERE status = 'running'", [tenant])).rows;
-      if (Number(counts.total) >= concurrency) return "full";
-      if (Number(counts.mine) >= tenantConcurrency) return "tenant full";
-      // SKIP LOCKED passes over a task a cancel is changing meanwhile, rather than waiting for it.
-      const [row] = (
-        await db.query(
-          `UPDATE tasks SET status = 'running', started = now(), owner = $2, lease_until = now() + $3 * interval '1 millisecond', cancel_requested = false
-           WHERE id = (SELECT id FROM tasks WHERE tenant = $1 AND status = 'queued' ORDER BY n LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`,
-          [tenant, owner, leaseMs],
-        )
-      ).rows;
-      return row && toTask(row);
-    });
+    // The lock is held to the transaction's end: the count and the claim are one replica's at a time. Both
+    // statements are sent together, and the server commits after the second without waiting for this
+    // process: the lock is every replica's, and a transaction made a statement at a time held it through
+    // each of this replica's turns to read a reply, so a busy replica held up the claims of all.
+    const [, { rows }] = await this.pool.together([[`SELECT pg_advisory_xact_lock(${CLAIM_LOCK})`], [CLAIM, [tenant, owner, leaseMs, concurrency, tenantConcurrency]]]);
+    const [row] = rows;
+    if (Number(row.total) >= concurrency) return "full";
+    if (Number(row.mine) >= tenantConcurrency) return "tenant full";
+    return row.id === null ? undefined : toTask(row);
   }
 
   async renew(ids: string[], owner: string, leaseMs: number): Promise<{ id: string; cancel: boolean }[]> {

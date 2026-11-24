@@ -8,8 +8,9 @@ import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { costOf } from "../src/prices.ts";
 import { Breaker, type Gateway, type GatewayConfig, startGateway, withModel } from "../server/gateway.ts";
+import { type Admission, Limiter } from "../server/limits.ts";
 import { Redis, RedisUnsentError } from "../server/redis.ts";
-import { MemoryState, RedisState, SharedState, StateError, utcDay } from "../server/state.ts";
+import { MemoryState, RedisState, SharedState, type State, StateError, utcDay } from "../server/state.ts";
 import { mintToken, type TokenPayload, verifyToken } from "../server/token.ts";
 import { fakeMessagesApi, messagesReply, runJig } from "./fake-api.ts";
 import { removeTempDirs, tempDir } from "./temp-dirs.ts";
@@ -1072,6 +1073,169 @@ async function deadPort(): Promise<number> {
   await new Promise((done) => server.close(done));
   return port;
 }
+
+// The queue (limits.ts) over a state that is a round trip away, as Redis is: what it asks at once shares the trip.
+describe("the gateway's queue", () => {
+  /**
+   * A state that answers a turn of the event loop after it is asked, in the order asked, with what `answer`
+   * says. `trips` are the ids asked for in each round trip; `released`, the slots given back.
+   */
+  function distant(answer: (tenant: string, id: string, asked: number) => number | Promise<number>): { state: State; trips: string[][]; released: string[] } {
+    const trips: string[][] = [];
+    const released: string[] = [];
+    let trip: string[] | undefined;
+    let asked = 0;
+    const state = {
+      admit(tenant: string, id: string) {
+        if (!trip) {
+          trips.push((trip = []));
+          setImmediate(() => (trip = undefined));
+        }
+        trip.push(id);
+        const n = ++asked;
+        return new Promise<number>((done) => setImmediate(() => done(answer(tenant, id, n))));
+      },
+      release: async (_: string, id: string) => void released.push(id),
+      renew: async () => {},
+      onRelease: () => {},
+    } as unknown as State;
+    return { state, trips, released };
+  }
+
+  it("asks for a burst's slots together: a few round trips to the state, not one for each request", async () => {
+    const { state, trips } = distant(() => 0);
+    const limiter = new Limiter({ global: { concurrent: 100 }, maxWaitMs: 5000 }, state);
+    const admissions = await Promise.all(Array.from({ length: 64 }, () => limiter.acquire("acme")));
+    assert.ok(admissions.every((admission) => "release" in admission));
+    // One, then twice as many each time all that were asked for went through.
+    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, 16, 16, 16, 1]);
+    assert.equal(new Set(trips.flat()).size, 64, "each request asked for once, under an id of its own");
+    // And 16 of a tenant in a round at most, however long there is room.
+    trips.length = 0;
+    await Promise.all(Array.from({ length: 300 }, () => limiter.acquire("acme")));
+    assert.deepEqual(trips.map((trip) => trip.length), [1, 2, 4, 8, ...Array.from({ length: 17 }, () => 16), 13]);
+  });
+
+  it("keeps to the requests that wait, through a long run of rounds with room for all", async () => {
+    // Each request let through brings the next while the round after is on its way, so every round finds
+    // some waiting and lets all of them through.
+    const { state, trips } = distant(() => 0);
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    const chain = async (tenant: string) => {
+      for (let i = 0; i < 100; i++) {
+        const admission = await limiter.acquire(tenant);
+        assert.ok("release" in admission);
+        admission.release();
+      }
+    };
+    await Promise.all(["a", "b", "c", "a", "b", "c"].map(chain));
+    assert.equal(trips.flat().length, 600);
+    assert.ok(trips.every((trip) => trip.length <= 6), `the rounds: ${trips.map((trip) => trip.length).join(" ")}`);
+  });
+
+  it("asks for one request of each tenant at once, and of a tenant at its limit once a round", async () => {
+    const { state, trips } = distant((tenant) => (tenant === "full" ? Infinity : 0));
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    const full = Array.from({ length: 5 }, () => limiter.acquire("full"));
+    const others = ["a", "b", "c"].map((tenant) => limiter.acquire(tenant));
+    for (const admission of await Promise.all(others)) assert.ok("release" in admission);
+    await new Promise((done) => setTimeout(done, 20));
+    // The first question went alone, as the first request came; then one of each tenant, and of the full one again.
+    assert.deepEqual(trips.map((trip) => trip.length), [1, 4, 1]);
+    assert.equal(new Set(trips.flat()).size, 4, "only the full tenant's first request was asked for, each round");
+    limiter.close();
+    for (const admission of await Promise.all(full)) assert.ok("retryAfter" in admission);
+  });
+
+  it("serves the tenants in turn all the same, and never lets through more than the state does", async () => {
+    const memory = new MemoryState();
+    closing.push(() => memory.close());
+    const { state } = distant((tenant, id) => memory.admit(tenant, id, { tenant: {}, global: { concurrent: 2 } }));
+    state.release = (tenant) => memory.release(tenant);
+    const limiter = new Limiter({ global: { concurrent: 2 }, maxWaitMs: 5000 }, state);
+    const order: string[] = [];
+    const releases: (() => void)[] = [];
+    let held = 0;
+    let most = 0;
+    const want = (tenant: string, name: string) =>
+      void limiter.acquire(tenant).then((admission) => {
+        assert.ok("release" in admission);
+        order.push(name);
+        most = Math.max(most, ++held);
+        releases.push(() => (held--, admission.release()));
+      });
+    for (let i = 0; i < 6; i++) want("flood", `flood-${i}`);
+    await until(() => order.length === 2, "the first two to be let through");
+    want("other", "other-0");
+    want("other", "other-1");
+    await new Promise((done) => setTimeout(done, 20));
+    for (let served = 2; served < 8; served++) {
+      releases.shift()!();
+      await until(() => order.length === served + 1, `request ${served + 1} to be let through`);
+    }
+    assert.deepEqual(order, ["flood-0", "flood-1", "other-0", "flood-2", "other-1", "flood-3", "flood-4", "flood-5"]);
+    assert.equal(most, 2);
+  });
+
+  it("gives a slot to the tenant's first waiting request, when a round let a later one through", async () => {
+    // The third question is let through though the second, asked in the same round trip, was not: as when
+    // another gateway gives a slot back between the two.
+    const { state, trips, released } = distant((_tenant, _id, asked) => (asked === 1 || asked === 3 ? 0 : Infinity));
+    const limiter = new Limiter({ global: { concurrent: 2 }, maxWaitMs: 5000 }, state);
+    const settled: (Admission | undefined)[] = [undefined, undefined, undefined];
+    const waiting = [0, 1, 2].map((n) => limiter.acquire("acme").then((admission) => (settled[n] = admission)));
+    await until(() => trips.length >= 3, "the queue to ask again for the one left");
+    const [first, second, third] = trips.flat();
+    assert.deepEqual(trips.slice(0, 3), [[first], [second, third], [second]], "the request still waiting asks under the id the other gave up");
+    assert.ok(settled[0] && settled[1] && !settled[2], "the second request went before the third");
+    assert.ok("release" in settled[1]);
+    settled[1].release();
+    await until(() => released.length === 1, "the slot to be given back");
+    assert.deepEqual(released, [third], "under the id the state let through");
+    limiter.close();
+    await Promise.all(waiting);
+  });
+
+  it("gives back a slot the state let to a request that left meanwhile", async () => {
+    const { state, released } = distant(() => 0);
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    const gone = new AbortController();
+    const leaving = limiter.acquire("acme", gone.signal);
+    gone.abort();
+    assert.ok("retryAfter" in (await leaving));
+    await until(() => released.length === 1, "the slot to be given back");
+    assert.ok("release" in (await limiter.acquire("acme")));
+  });
+
+  it("gives a slot let to a request that left to the tenant's next waiting, and gives back the one left over", async () => {
+    // The second request leaves while the round that asks for it and the third is with the state.
+    const gone = new AbortController();
+    const { state, trips, released } = distant((_tenant, _id, asked) => (asked === 2 && gone.abort(), 0));
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    const [first, second, third] = await Promise.all([limiter.acquire("acme"), limiter.acquire("acme", gone.signal), limiter.acquire("acme")]);
+    assert.ok("release" in first && "retryAfter" in second && "release" in third);
+    await until(() => released.length === 1, "the slot nobody was left for to be given back");
+    assert.equal(trips.length, 2);
+    // The third went under the id the second was asked for with, and its own went back.
+    assert.deepEqual(released, [trips[1][1]]);
+    third.release();
+    await until(() => released.length === 2, "the third request's slot to be given back");
+    assert.equal(released[1], trips[1][0]);
+  });
+
+  it("holds another tenant's request back by the slots already asked for when it came, and no more", async () => {
+    // The other tenant comes while a round of 16 of the flood's requests is with the state: those are the
+    // flood's, and the next slot is the other's, before any of the 269 the flood still has waiting.
+    const order: string[] = [];
+    const want = (tenant: string) => void limiter.acquire(tenant).then((admission) => "release" in admission && order.push(tenant));
+    const { state, trips } = distant((_tenant, _id, asked) => (asked === 16 && want("other"), 0));
+    const limiter = new Limiter({ global: {}, maxWaitMs: 5000 }, state);
+    for (let i = 0; i < 300; i++) want("flood");
+    await until(() => order.length === 301, "all to be let through");
+    assert.deepEqual(trips.slice(0, 5).map((trip) => trip.length), [1, 2, 4, 8, 16]);
+    assert.equal(order.indexOf("other"), 31);
+  });
+});
 
 describe("the gateway's state in memory", () => {
   it("forgets a task a day past its token, and a tenant's bucket once it is full again", async () => {

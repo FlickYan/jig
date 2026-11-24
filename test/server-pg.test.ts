@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash, randomBytes, randomInt } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { TLSSocket } from "node:tls";
+import { pathToFileURL } from "node:url";
 import { Connection, parseUrl, Pool, redactUrl, Scram } from "../server/pg.ts";
 import { openStore, type Store, type Task } from "../server/store.ts";
 import { dropPostgresDatabases, NO_POSTGRES, POSTGRES_URL, postgresDatabase } from "./postgres.ts";
@@ -295,6 +297,37 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     assert.deepEqual((await db.query("SELECT n FROM t ORDER BY n")).rows, [{ n: 2 }, { n: 3 }]);
   });
 
+  it("runs statements sent together as one transaction, each seeing the one before, and keeps none if one fails", async () => {
+    const database = await postgresDatabase();
+    const [db, other] = [pool(database, { max: 1 }), pool(database)];
+    await db.simple("CREATE TABLE t (n integer)");
+    const key = randomInt(2 ** 40);
+    const [locked, inserted, counted] = await db.together([["SELECT pg_advisory_xact_lock($1)", [key]], ["INSERT INTO t VALUES ($1), ($2) RETURNING n", [1, 2]], ["SELECT count(*) AS n, txid_current_if_assigned() IS NOT NULL AS writing FROM t"]]);
+    assert.equal(locked.rows.length, 1);
+    assert.deepEqual([inserted.rows, inserted.rowCount], [[{ n: 1 }, { n: 2 }], 2]);
+    assert.deepEqual(counted.rows, [{ n: 2, writing: true }]);
+    // Committed, and its lock let go, by the time it is answered: the connection is in no transaction.
+    assert.equal((await other.query("SELECT pg_try_advisory_xact_lock($1) AS free", [key])).rows[0].free, true);
+    await assert.rejects(db.together([["INSERT INTO t VALUES (3)"], ["SELECT 1 / 0"], ["INSERT INTO t VALUES (4)"]]), /division by zero/);
+    assert.deepEqual((await db.query("SELECT n FROM t ORDER BY n")).rows, [{ n: 1 }, { n: 2 }]);
+    // A statement that waited for a lock reads what was committed while it waited for it, as a claim's count must.
+    let release!: () => void;
+    const held = new Promise<void>((done) => (release = done));
+    let holds = false;
+    const holding = other.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock($1)", [key]);
+      await tx.query("INSERT INTO t VALUES (5)");
+      holds = true;
+      await held;
+    });
+    await until(() => holds, "the lock to be taken");
+    const waiting = db.together([["SELECT pg_advisory_xact_lock($1)", [key]], ["SELECT count(*) AS n FROM t"]]);
+    await new Promise((done) => setTimeout(done, 100));
+    release();
+    await holding;
+    assert.equal((await waiting)[1].rows[0].n, 3);
+  });
+
   it("opens no more connections than its most, and queries wait for one", async () => {
     const db = pool(url, { max: 2 });
     const pids = await Promise.all(Array.from({ length: 6 }, async () => (await db.query("SELECT pg_backend_pid() AS pid, pg_sleep(0.05)")).rows[0].pid));
@@ -352,7 +385,7 @@ describe("the Postgres client, on a real Postgres", { skip: NO_POSTGRES }, () =>
     await until(async () => (await admin.query("SELECT count(*) AS n FROM pg_stat_activity WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid()", [`%${mark}%`])).rows[0].n === 0, "the server to stop the query");
   });
 
-  it("has the server end a transaction left idle, so a replica that froze holding the claims' lock lets it go", async () => {
+  it("has the server end a transaction left idle, so a replica that froze holding a tenant's lock on its creates lets it go", async () => {
     assert.equal((await pool(url).query("SHOW idle_in_transaction_session_timeout")).rows[0].idle_in_transaction_session_timeout, "1min");
     const key = randomInt(2 ** 40);
     const frozen = pool(url, { idleInTransactionMs: 500 });
@@ -406,6 +439,67 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     closers.push(() => sqlite.close());
     await sqlite.ping!();
     assert.equal(sqlite.poolStats, undefined);
+  });
+
+  it("lets the others claim while a replica is frozen in the middle of its own claims", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    await store.putTenant({ id: "acme", limits: { concurrency: 2, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const terms = { owner: "this-one", leaseMs: 30_000, concurrency: 2, tenantConcurrency: 2 };
+    // Another replica, a process of its own, that claims without a pause: nothing is queued, so each claim
+    // takes the claims' lock, counts, finds no task and commits.
+    const claiming = `import { PostgresStore } from ${JSON.stringify(pathToFileURL(join(import.meta.dirname, "..", "server", "store-pg.ts")).href)};
+      const store = await PostgresStore.open(process.argv[1]);
+      console.log("claiming");
+      for (;;) await store.claim("acme", { owner: "frozen", leaseMs: 30000, concurrency: 2, tenantConcurrency: 2 });`;
+    const other = spawn(process.execPath, ["--input-type=module", "-e", claiming, url], { stdio: ["ignore", "pipe", "inherit"] });
+    closers.push(() => other.kill("SIGKILL"));
+    let printed = "";
+    other.stdout!.on("data", (chunk) => (printed += chunk));
+    await until(() => printed.includes("claiming"), "the other replica to claim");
+    // Frozen wherever it is in a claim, twenty times over: it never holds the lock then, as the server ends
+    // each claim it was sent without waiting for it. (A claim made a statement at a time held the lock through
+    // three of its replica's turns, so most of the time.)
+    for (let round = 0; round < 20; round++) {
+      await new Promise((done) => setTimeout(done, 10 + randomInt(10)));
+      other.kill("SIGSTOP");
+      const began = Date.now();
+      const claimed = await Promise.race([store.claim("acme", terms), new Promise<"held up">((done) => setTimeout(done, 3000, "held up").unref())]);
+      assert.equal(claimed, undefined, `round ${round}: after ${Date.now() - began} ms`);
+      other.kill("SIGCONT");
+    }
+  });
+
+  it("claims what the caps leave through two replicas at once: each tenant's oldest, each once, or why none", async () => {
+    const url = await postgresDatabase();
+    const [one, two] = [await openStore(url), await openStore(url)];
+    closers.push(() => one.close(), () => two.close());
+    await one.putTenant({ id: "acme", limits: { concurrency: 3, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    await one.putTenant({ id: "bolt", limits: { concurrency: 9, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    const made: string[] = [];
+    for (let n = 0; n < 12; n++) made.push((await one.createTask(n % 2 ? "bolt" : "acme", { prompt: `task ${n}` } as Task["spec"])).id);
+    const terms = (owner: string, tenant: string) => ({ owner, leaseMs: 30_000, concurrency: 5, tenantConcurrency: tenant === "acme" ? 3 : 9 });
+    // Twenty claims at once through two replicas: five tasks in all, three of acme's at most, each once.
+    const claims = await Promise.all(Array.from({ length: 20 }, (_, n) => (n % 2 ? one : two).claim(n % 4 < 2 ? "acme" : "bolt", terms(n % 2 ? "one" : "two", n % 4 < 2 ? "acme" : "bolt"))));
+    const tasks = claims.filter((claim): claim is Task => typeof claim === "object");
+    assert.equal(tasks.length, 5);
+    assert.equal(new Set(tasks.map((task) => task.id)).size, 5);
+    assert.ok(tasks.filter((task) => task.tenant === "acme").length <= 3);
+    assert.ok(tasks.every((task) => task.status === "running" && task.started));
+    // Each tenant's are its oldest, in the order they were made.
+    for (const tenant of ["acme", "bolt"]) {
+      const mine = tasks.filter((task) => task.tenant === tenant).map((task) => task.id);
+      assert.deepEqual([...mine].sort((a, b) => made.indexOf(a) - made.indexOf(b)), made.filter((_, n) => (n % 2 ? "bolt" : "acme") === tenant).slice(0, mine.length));
+    }
+    assert.ok(claims.every((claim) => typeof claim === "object" || claim === "full" || claim === "tenant full"));
+    assert.equal(await one.claim("bolt", terms("one", "bolt")), "full");
+    // With room in the service, acme takes its own three and no more, and a tenant with nothing queued none.
+    const roomy = { owner: "one", leaseMs: 30_000, concurrency: 9, tenantConcurrency: 3 };
+    for (let mine = tasks.filter((task) => task.tenant === "acme").length; mine < 3; mine++) assert.equal(typeof (await one.claim("acme", roomy)), "object");
+    assert.equal(await two.claim("acme", roomy), "tenant full");
+    await one.putTenant({ id: "idle", limits: { concurrency: 3, maxSteps: 5, timeLimit: 60, budgetUsd: null } }, []);
+    assert.equal(await two.claim("idle", roomy), undefined);
   });
 
   it("takes only max and acquireTimeoutMs from openStore's pool, and keeps the default max for one left undefined", async () => {
@@ -652,6 +746,27 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
       assert.equal(await store.forgetKeys(new Date(now.getTime() + 24 * 3600_000)), 1);
       assert.equal(Number((await db.query("SELECT count(*) AS n FROM idempotency")).rows[0].n), 0);
     }
+  });
+
+  it("gives up in the database on statements sent together before the client does, so none is committed behind its back", async () => {
+    const url = await postgresDatabase();
+    const db = pool(url);
+    await db.simple("CREATE TABLE claimed (n integer)");
+    // Another replica holds a lock (as the claims' is held) past this one's patience, and lets go just as
+    // the query's time is up here: what was sent with the wait for it must not be carried out then.
+    const held = db.transaction(async (tx) => {
+      await tx.query("SELECT pg_advisory_xact_lock(4242)");
+      await new Promise((done) => setTimeout(done, 380));
+    });
+    await new Promise((done) => setTimeout(done, 50));
+    const hasty = pool(url, { queryTimeoutMs: 400 });
+    await assert.rejects(hasty.together([["SELECT pg_advisory_xact_lock(4242)"], ["INSERT INTO claimed VALUES (1)"]]), /statement timeout|took over/);
+    await held;
+    await new Promise((done) => setTimeout(done, 300));
+    assert.equal(Number((await db.query("SELECT count(*) AS n FROM claimed")).rows[0].n), 0);
+    // With time enough, both are carried out, and the results are the statements' own.
+    const [, inserted] = await hasty.together([["SELECT pg_advisory_xact_lock(4242)"], ["INSERT INTO claimed VALUES (2) RETURNING n"]]);
+    assert.deepEqual(inserted.rows, [{ n: 2 }]);
   });
 
   it("writes the events that wait in one statement, and one the database refuses fails alone", async () => {
