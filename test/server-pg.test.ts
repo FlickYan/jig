@@ -654,6 +654,35 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     }
   });
 
+  it("writes the events that wait in one statement, and one the database refuses fails alone", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const one = await store.createTask("a", PLAIN);
+    const two = await store.createTask("a", PLAIN);
+    // The statements that write events, counted as the store's pool sends them.
+    const query = Pool.prototype.query;
+    let statements = 0;
+    Pool.prototype.query = function (this: Pool, sql: string, ...rest: unknown[]) {
+      if (/INSERT INTO events/.test(sql)) statements++;
+      return (query as (...args: unknown[]) => unknown).call(this, sql, ...rest);
+    } as typeof query;
+    closers.push(() => void (Pool.prototype.query = query));
+    const writes = [];
+    for (let seq = 1; seq <= 40; seq++) for (const task of [one, two]) writes.push(store.addEvent(task.id, seq, { seq, text: "x\u0000y" }));
+    await Promise.all(writes);
+    assert.ok(statements <= 4, String(statements));
+    assert.deepEqual((await store.events(two.id)).map(({ seq }) => seq), Array.from({ length: 40 }, (_, i) => i + 1));
+    assert.equal((await store.events(one.id)).length, 40);
+    // A seq no integer column holds, among others: it alone isn't stored, and it alone is told so.
+    const mixed = await Promise.allSettled([store.addEvent(one.id, 41, {}), store.addEvent(two.id, 2 ** 40, {}), store.addEvent(two.id, 41, {}), store.addEvent("task_none", 1, {})]);
+    assert.deepEqual(mixed.map((write) => write.status), ["fulfilled", "rejected", "fulfilled", "fulfilled"]);
+    assert.deepEqual([(await store.events(one.id)).length, (await store.events(two.id)).length], [41, 41]);
+    // 80 events at once took a few statements, not 80; the four after them one, then one each.
+    assert.ok(statements <= 4 + 5, String(statements));
+  });
+
   it("moves a database on whose tasks already hold a NUL or half a surrogate pair, and ends them", async () => {
     const url = await postgresDatabase();
     await (await openStore(url)).close();

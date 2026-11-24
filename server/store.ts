@@ -496,6 +496,9 @@ const RUNNING = "SELECT count(*) FROM tasks WHERE tenant = ? AND status = 'runni
 // made by another process are found by looking again, and claims take its write lock.
 class SqliteStore implements Store {
   private db: DatabaseSync;
+  /** The events to commit together at the end of this turn of the event loop (addEvent). */
+  private pending: { task: string; seq: number; json: string; stored: () => void; failed: (err: unknown) => void }[] = [];
+  private insertEvent?: ReturnType<DatabaseSync["prepare"]>;
   // Each stream and each wait for an approval's answer listens.
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   readonly live = false;
@@ -835,8 +838,34 @@ class SqliteStore implements Store {
 
   // Nothing is stored for a purged task, or for one the store doesn't have: a run's late event, say, from a
   // replica that hadn't heard. Silently, as for a seq already kept.
-  async addEvent(task: string, seq: number, event: object): Promise<void> {
-    this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`).run(task, seq, JSON.stringify(event));
+  //
+  // A commit is a write to the disk that waits for it (an fsync), some 0.2 ms each on an SSD, and it holds
+  // the event loop meanwhile: with many runs writing at once, their events were most of what the service
+  // did. So the events that come in one turn of the event loop are committed together, and each is stored,
+  // for its caller, only once that commit is made: nothing is told of an event the disk doesn't have. One
+  // run alone commits each of its events by itself, as before.
+  addEvent(task: string, seq: number, event: object): Promise<void> {
+    return new Promise((stored, failed) => {
+      this.pending.push({ task, seq, json: JSON.stringify(event), stored, failed });
+      if (this.pending.length === 1) setImmediate(() => this.flush());
+    });
+  }
+
+  /** Commits the events that wait, together. A failure (a full disk, a lock another process held too long) is each one's: each is tried again by its caller. */
+  private flush(): void {
+    const batch = this.pending.splice(0);
+    if (!batch.length) return;
+    try {
+      this.insertEvent ??= this.db.prepare(`INSERT OR IGNORE INTO events (task, seq, json) SELECT ?1, ?2, ?3 WHERE ${LIVE}`);
+      const insert = this.insertEvent;
+      this.atomically(() => {
+        for (const { task, seq, json } of batch) insert.run(task, seq, json);
+      }, "BEGIN IMMEDIATE");
+    } catch (err) {
+      for (const { failed } of batch) failed(err);
+      return;
+    }
+    for (const { stored } of batch) stored();
   }
 
   async events(task: string, after = 0, limit?: number, bytes = Infinity): Promise<{ seq: number; event: object }[]> {
@@ -903,6 +932,9 @@ class SqliteStore implements Store {
   }
 
   async close(): Promise<void> {
+    // The events that wait are stored first, or told that they weren't.
+    this.flush();
+    this.insertEvent = undefined;
     this.db.close();
   }
 }

@@ -6,12 +6,14 @@
 // Needs docker. From the repository's root:
 //   node deploy/smoke-docker.ts            build the image, make the network, run the checks, clean up
 //   BUILD=0 node deploy/smoke-docker.ts    use the image as it is (IMAGE names it, jig-worker:smoke by default)
-// It exits 0 only if every check passed.
+// It exits 0 only if every check passed. Where a build can't reach npm or apt directly (behind a proxy with a
+// CA of its own), tag a node:22-slim that trusts the CA, and build with --network host and the proxy's
+// build args; then BUILD=0.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { startService } from "../server/api.ts";
@@ -94,6 +96,8 @@ async function main(): Promise<void> {
         model: "claude-opus-5-5",
         gatewayBaseUrl: `http://${host}:${new URL(gateway.url).port}/anthropic`,
         graceSeconds: 5,
+        // The repository the clone check makes is a folder here.
+        gitProtocols: ["file"],
         runner: "docker",
         docker: { image: IMAGE, network: NETWORK, pool: { size: 1, maxIdleSeconds: 120 } },
         // Small, so a command can pass it in seconds; the image's own files aren't in the task's folder.
@@ -172,6 +176,20 @@ async function main(): Promise<void> {
       const types = all.map((event) => event.type);
       assert.deepEqual(types.filter((type) => type !== "notice"), ["start", "step", "tool_call", "tool_result", "step", "text", "outputs", "end"], JSON.stringify(all.filter((event) => event.type === "notice")));
       assert.ok(task.usage && task.cost !== null, "the gateway's count of what it spent is on the task");
+    });
+
+    await check("a workspace cloned from a git repository is in the container, where git reads its history", async () => {
+      const repo = join(base, "repo");
+      const git = (...args: string[]) => execFileSync("git", ["-C", repo, "-c", "user.name=smoke", "-c", "user.email=smoke@example.invalid", ...args], { stdio: "ignore" });
+      execFileSync("git", ["init", "-q", "-b", "main", repo]);
+      writeFileSync(join(repo, "readme.txt"), "from the repository\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "the first commit");
+      const { status, body } = await call("POST", "/v1/tasks", { prompt: "run: cat readme.txt && git log --format=%s", workspace: { git: `file://${repo}`, ref: "main" }, maxSteps: 5 });
+      assert.equal(status, 201, JSON.stringify(body));
+      const task = await ended(body.id);
+      assert.equal(task.status, "succeeded", JSON.stringify(task));
+      assert.match(task.result, /from the repository.*the first commit/s, task.result);
     });
 
     await check("the same Idempotency-Key makes no second task", async () => {
