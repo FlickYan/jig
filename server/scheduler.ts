@@ -1,12 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { hostname } from "node:os";
+import { eventBytes, OUTPUT_BYTES, OUTPUTS_BYTES } from "../src/outputs.ts";
 import { approvalAnswer, approvalRequest } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
 import { PgError } from "./pg.ts";
 import { checkedGit, DiskLimit, type JigEvent, type RunExit, type RunHandle, type Runner, statusFor, stopFor } from "./runner.ts";
 import { type ServiceMetrics, serviceMetrics } from "./service-metrics.ts";
-import { type Approval, diskFull, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskStatus, type Tenant, type Usage } from "./store.ts";
+import { type Approval, diskFull, FINISHED, type Outcome, spentOf, type Store, type Task, type TaskOutput, type TaskStatus, type Tenant, type Usage } from "./store.ts";
 
 // Starts queued tasks as slots free up: never more than `concurrency` at once, nor more of a tenant's than
 // its own limit, and round-robin across the tenants with work queued, so one that queues a thousand tasks
@@ -465,6 +466,8 @@ export class Scheduler {
     let end: JigEvent | undefined;
     /** The run's last text so far, cut to size: the task's result. */
     let said: Said | undefined;
+    /** The files of the run's last outputs event, as the task keeps them. */
+    let handed: TaskOutput[] | undefined;
     let stored = 0;
     /** The bytes of the events stored, as JSON. */
     let bytes = 0;
@@ -486,6 +489,8 @@ export class Scheduler {
         if (event.type === "end") end = event;
         // Taken before the caps below, so a run whose events are dropped still leaves what it said last.
         if (event.type === "text" && typeof event.text === "string") said = resultOf(event.text, this.maxResultBytes);
+        // The files the run hands back, likewise: jig writes them once, just before its end.
+        if (event.type === "outputs" && Array.isArray(event.files)) handed = outputsOf(event.files, task.spec.outputs);
         let kept = event;
         // Past either cap, a run's events are dropped, but for its last event if that is an end (jig writes
         // its own last), and one notice in place of the first dropped says so: a task's commands can't fill
@@ -549,7 +554,7 @@ export class Scheduler {
     }
     run.ended = true;
     // Each failure to store it is counted as it is tried again.
-    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping, said)).catch((err: unknown) => {
+    const recorded = this.record(task, run, outcomeOf(exit, end, failure, run.stopping, said, handed)).catch((err: unknown) => {
       this.log.error("couldn't store how the task ended", { tenant: task.tenant, task: task.id, err });
     });
     this.recording.add(recorded);
@@ -676,11 +681,52 @@ export function resultOf(text: string, maxBytes: number): Said {
   return { text: buf.subarray(0, end).toString(), truncated: true };
 }
 
+/** The problems jig gives for a file it doesn't hand back (src/outputs.ts's OutputProblem). */
+const OUTPUT_PROBLEMS = ["missing", "not_a_file", "too_large", "not_text", "hidden"];
+
 /**
- * A run's outcome: from its exit, its end event (the stop, usage and cost), why it was stopped, and the
- * last text it wrote (the result), however it ended.
+ * An outputs event's files as a task keeps them: those of the paths the task `asked` for, each once (the
+ * first), with its text or its problem. The event is the run's word: jig writes it, but on Docker and
+ * Kubernetes a task's commands can write events too, so nothing in it is taken as given. An entry for a path
+ * that wasn't asked for is dropped, as is one that is neither a text nor a problem jig knows. A text is held
+ * to jig's own bounds again, OUTPUT_BYTES each and OUTPUTS_BYTES together as JSON writes them, past which
+ * its entry says too_large, and has its NULs replaced as a result's are (jig hands back none) and any half of
+ * a surrogate pair, which no file's text has. Undefined if nothing is left, or the task asked for none.
  */
-export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"], said?: Said): Outcome {
+export function outputsOf(files: unknown[], asked: string[] | undefined): TaskOutput[] | undefined {
+  if (!asked?.length) return undefined;
+  const kept: TaskOutput[] = [];
+  const seen = new Set<string>();
+  let total = 0;
+  for (const file of files) {
+    // Every asked path has its entry: nothing after it would be kept.
+    if (seen.size === asked.length) break;
+    if (typeof file !== "object" || file === null) continue;
+    const { path, text, problem } = file as Record<string, unknown>;
+    if (typeof path !== "string" || !asked.includes(path) || seen.has(path)) continue;
+    if (typeof text === "string" && problem === undefined) {
+      seen.add(path);
+      const clean = withoutNul(text).toWellFormed();
+      const bytes = eventBytes(clean);
+      if (Buffer.byteLength(clean) > OUTPUT_BYTES || total + bytes > OUTPUTS_BYTES) {
+        kept.push({ path, problem: "too_large" });
+        continue;
+      }
+      total += bytes;
+      kept.push({ path, text: clean });
+    } else if (typeof problem === "string" && text === undefined && OUTPUT_PROBLEMS.includes(problem)) {
+      seen.add(path);
+      kept.push({ path, problem });
+    }
+  }
+  return kept.length ? kept : undefined;
+}
+
+/**
+ * A run's outcome: from its exit, its end event (the stop, usage and cost), why it was stopped, the last
+ * text it wrote (the result) and the files it handed back (the outputs), however it ended.
+ */
+export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, failure: string | undefined, stopping: Run["stopping"], said?: Said, handed?: TaskOutput[]): Outcome {
   const status = stopping === "shutdown" || stopping === "lost" ? "error" : stopping === "cancelled" ? "cancelled" : failure ? "error" : statusFor(exit!);
   const exitCode = exit?.exitCode ?? null;
   // The runner stopped it at the disk cap, and nothing else was stopping it.
@@ -709,6 +755,7 @@ export function outcomeOf(exit: RunExit | undefined, end: JigEvent | undefined, 
     cost: typeof end?.cost === "number" ? end.cost : null,
     result: said?.text ?? null,
     resultTruncated: said?.truncated ?? false,
+    outputs: handed ?? null,
   };
 }
 

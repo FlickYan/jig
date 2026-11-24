@@ -70,8 +70,9 @@ its content is deleted, as `DELETE /v1/tasks/:id` deletes it (Deleting a task, a
 number over 0, up to 36,500, fractions allowed; one setting for every tenant; queued and running tasks are
 never touched, and a row per task and the usage ledger stay. Take a backup before first setting it, as
 the first sweep deletes the content of every task older than that. A misspelt field in the config is
-silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB) is the most of a run's last text that is kept as the
-task's `result` (below); setting it over 1 MiB does nothing more, as a longer line of events is never read.
+silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB)
+is the most of a run's last text that is kept as the task's `result` (below); setting it over 1 MiB does
+nothing more, as a longer line of events is never read.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed.
 `maxTaskDiskBytes` (4294967296, 4 GiB; 0 for none) is the most a task's folder may take on `dataDir`'s
 disk before its run is stopped (the disk cap, below). It is the local and docker runners': with `runner`
@@ -112,9 +113,14 @@ curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type
 # With a key of the client's own, a retry of the same request makes no second task (below).
 curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
   -H 'Idempotency-Key: order-4711' -d '{"prompt": "..."}'
+# With outputs, up to 20 files of its workspace come back on the task when it ends (below):
+# "outputs": [{"path": "report.md", "text": "..."}, {"path": "dist/summary.json", "problem": "missing"}]
+curl -s localhost:8080/v1/tasks -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"prompt": "write what you find to report.md", "workspace": {"git": "https://github.com/owner/repo"}, "outputs": ["report.md", "dist/summary.json"]}'
 
-curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats and result
-# The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1; with "next"
+curl -s localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"             # the task, with its usage, cost, stats, result and outputs
+# The tenant's latest 100 (or ?limit=), newest first, without their prompts and results unless ?full=1, and
+# never with their outputs; with "next"
 # when the page is full, the id that ?before= takes for the page after it.
 # ?status= takes one status or several, separated by commas.
 curl -s 'localhost:8080/v1/tasks?status=running' -H "Authorization: Bearer $KEY"
@@ -123,7 +129,7 @@ curl -s "localhost:8080/v1/tasks?limit=20&before=$NEXT" -H "Authorization: Beare
 # The tenant's limits, and what it has used of them (Quotas and usage, below).
 curl -s localhost:8080/v1/limits -H "Authorization: Bearer $KEY"
 curl -s -X POST localhost:8080/v1/tasks/$ID/cancel -H "Authorization: Bearer $KEY"
-# Deletes an ended task's prompt, files, result, events and approvals; its row and its usage stay (below).
+# Deletes an ended task's prompt, files, result, outputs, events and approvals; its row and its usage stay (below).
 curl -s -X DELETE localhost:8080/v1/tasks/$ID -H "Authorization: Bearer $KEY"
 
 # Its events (jig's --events lines) as server-sent events, each one's id its seq: those so far, the rest
@@ -135,7 +141,8 @@ curl -sN localhost:8080/v1/tasks/$ID/events -H "Authorization: Bearer $KEY" -H '
 
 A request is refused with 400 and the reason when a field is unknown or out of bounds, the model isn't a
 Claude or DeepSeek one (the gateway serves the Anthropic API), a workspace file's path is absolute, goes
-through `..` or names a folder, the workspace has both files and a repository, or the prompt or a
+through `..` or names a folder, the workspace has both files and a repository, `outputs` isn't a list of 1
+to 20 such paths (each a string of 512 characters at most, none twice, none with a NUL), or the prompt or a
 workspace file's path or contents holds a NUL character (`\u0000`, which Postgres text can't hold and its
 JSON operators can't read, so no store takes it); with 413 when the body is
 over `maxBodyBytes`; with 429 when the tenant already has `maxQueued` tasks queued, or is at one of its
@@ -176,6 +183,9 @@ tenant's, and it holds for 24 hours from the create that made its task:
   against `maxQueued` or the quotas, so it is answered even while a new task would be refused;
 - another body answers 422, `{"error", "id"}` with the id of the task the key made. Bodies are compared as
   the bytes they came in, not as JSON: a retry must resend the same bytes, and a new task takes a new key.
+
+A cancel doesn't free the key: the same create answers 200 with the cancelled task, as `cancelled`, for
+the rest of the 24 hours, so a client that cancels a task and wants it made again must send a new key.
 
 A create that was refused (400, 413, 429) records nothing: its key is free for the next try. The 429 for a
 full queue is `{"error", "quota": "maxQueued", "limit", "used"}` with `retry-after: 5`. The queue has no
@@ -223,16 +233,55 @@ character, and `resultTruncated` is true; a NUL in it is shown as U+FFFD. On Doc
 task's commands can write its events, so the result is the task's word, not the service's. It isn't in
 the stream's `done`, the webhooks or the usage ledger.
 
-The task's files aren't retrievable: there is no diff of the workspace and no `GET /v1/tasks/:id/diff`.
-Making one would run git on the host over a repository the task's commands wrote, a files workspace has
-no commit to compare with, and on Kubernetes the only way out of the pod is its log. A task whose changes
-you need must push them, or print them.
+`outputs` is how a task hands files back: in the request, a list of 1 to 20 paths in its workspace, each
+once, relative and without `..` as `workspace.files`' paths are, 512 characters at most and not a name the
+events would blank out as a secret, with any workspace
+or none (the run may write the files itself). jig is given each (`--outputs`), and when its run ends by its
+own doing, whichever way (the model finished, `max_steps`, the time limit jig keeps, an error, a cancel or a
+stop it had the time to act on), it reads them and writes one `outputs` event just before its `end`. The
+task then has `outputs` on `GET /v1/tasks/:id`: an entry for each path, in the order asked, `{"path",
+"text"}` for a file that was read, or `{"path", "problem"}`:
+
+| problem | the path |
+|---------|----------|
+| `missing` | has no file |
+| `not_a_file` | is a folder, a symlink (to a file in the workspace too), a named pipe, a socket or a device, leads through a folder that is a link out of the workspace (whether or not a file is there), or can't be opened |
+| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the texts together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes); the files before it are kept |
+| `not_text` | isn't valid UTF-8, or holds a NUL |
+| `hidden` | lies in a path jig's file tools refuse (`local.hiddenPaths`, jig's own directory) |
+
+The limits keep the event's line under the mebibyte a runner reads of one; a file past them must be pushed,
+or split. As in every event, what looks like a secret in a text (an API key, a private key, a password's
+value) is blanked out as `[REDACTED]`, so a file isn't always byte for byte what the run wrote. `outputs`
+is `null` while the task is queued or running, for a task that asked for none, and for one whose run wrote
+no such event: one that never ran, whose jig was killed before it could write its end (a stop it didn't
+act on within the grace, a lost replica) or failed before it had read its settings. It is kept even when the event itself was past `maxEvents` or `maxEventBytes`; within them, the
+event is stored and streamed like any other, and counts toward both. It is never in the list (with
+`?full=1` neither), the stream's `done`, the webhooks or the usage ledger.
+
+With the local runner, jig reads the files on the service's machine as the service's user, of a folder the
+task's commands wrote, so the read follows no link: the path must be a regular file whose real path lies in
+the workspace, it is opened without following a link and without waiting (a named pipe isn't waited on),
+and what was opened is checked again, by where its descriptor leads, before any of it is read. One thing it
+can't tell: a hard link to a file outside the workspace is a file like any other. jig's sandbox keeps the
+task's commands from linking to a file they can't read (the service's database, another task's folder), and
+what they can read they could have copied; with `local.allowUnsandboxed` nothing keeps them from either.
+On Docker and Kubernetes the read is inside the task's own container. There, a task's commands can write
+events too, so, like the result, the outputs are the task's word: the service keeps only entries for the
+paths the task asked for, the first for each, holds the texts to the same limits again, and replaces a NUL
+with U+FFFD.
+
+There is still no diff of the workspace and no `GET /v1/tasks/:id/diff`. Making one would run git on the
+host over a repository the task's commands wrote, a files workspace has no commit to compare with, and on
+Kubernetes the only way out of the pod is its log. So a task's files aren't retrievable as a whole: name
+the ones you need in `outputs` (have the prompt ask for a patch in a file, say), or have the task push its
+changes, or print them.
 
 ### Deleting a task, and retention
 
 `DELETE /v1/tasks/:id` deletes what an ended task holds of the tenant's and the run's words: its events and
 approvals, its prompt (an empty string from then on), its workspace (the files, or the repository's URL),
-its `error`, `stats` and `result`. It keeps a slim row: `id`, `status`, `exitCode`, `stop`, `created`,
+its `error`, `stats`, `result` and `outputs` (and the paths of the outputs it asked for). It keeps a slim row: `id`, `status`, `exitCode`, `stop`, `created`,
 `started`, `ended`, `usage`, `cost`, the model, `maxSteps`, `timeLimit`, `approvals` and `mode`, and the
 time it was deleted, `purged`, which every view of a task has (`null` until then). `stop` and `usage` stay
 as the run reported them. The task's row of the usage ledger and its `Idempotency-Key` stay too: a deleted
@@ -256,11 +305,20 @@ for a task with 64 MiB of events, so about 2 s a batch. A sweep that purged anyt
 many; one that failed logs an error, counts in `jig_service_store_errors_total{retried="false"}`, and the
 next tries again. On Postgres one replica sweeps at a time (an advisory lock; the others skip that sweep),
 and the database's clock says what is old enough. During a rolling upgrade, a replica of the version before
-neither refuses a purged task's late events nor answers 410.
+neither refuses a purged task's late events nor answers 410; one from before `outputs` purges a task without
+its `outputs` column, which the API then shows as `null` though the row still holds it until the task is
+deleted again through an upgraded replica (`DELETE` on a purged task blanks it again).
 
 What a delete doesn't reach, so don't call it complete erasure: a task's folder kept with `keepTaskDirs`,
-the service's and the gateway's logs, approval webhooks already posted or still being tried again (for up to a minute after the request), what the model's provider keeps,
-and backups. On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
+the service's and the gateway's logs, approval webhooks already posted, what the model's provider keeps,
+and backups. An approval's POST still being tried (for up to a minute after the task asked) is stopped by
+the `DELETE`, with no further try, on the replica that takes the delete; one being tried by another
+replica goes on to its last try. A POST stopped so is counted neither `delivered` nor `failed` in
+`jig_service_webhook_deliveries_total`, as the endpoint didn't fail it. The retention sweep stops none:
+it deletes tasks that ended `retentionDays` ago, by when no try is left (unless that is set to under a
+minute).
+
+On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
 stay in its `-wal` file until that is next reset (a checkpoint with no reader, or the service's stop). On
 Postgres the rows stay dead in the table until vacuum, and in WAL archives and on standbys as long as those
 keep them. There is no delete of a task's row or its ledger row, no retention per tenant or of the events
@@ -337,7 +395,10 @@ tried again, as it would fail each time.
 
 A SQLite database whose disk is full (SQLite's `SQLITE_FULL`) is tried again like any other failure:
 stopping a run can't make room, and the task that filled the disk is stopped by its disk cap and its folder
-removed, which the other runs' tries ride out. A run whose events still can't be written after half a lease
+removed, which makes room for the other runs' tries. That saves their writes to the database, not the
+runs themselves where `dataDir` is on the same file system: their own files are on the full disk too, so
+jig or its commands fail writing them and those tasks end as errors, as the warning at the start says
+(The disk cap, below). A run whose events still can't be written after half a lease
 ends as an `error` that says the service's database couldn't be written because its disk is full. Before
 a run's outcome is tried again after that failure, its folder is removed (unless `keepTaskDirs`), as it may
 be what filled the disk. The API's own writes (a new task, an approval's answer) are answered 503 with
@@ -357,7 +418,9 @@ in `sslrootcert`), and several replicas of the service share it: each runs the s
 `replicaId` of its own (the host's name, the process's id and a random part, by default). The schema is
 moved on by the `jig_schema` table, under a lock, so replicas starting together do it once. A replica of
 the version before goes on running against the schema once a newer one has moved it, but refuses to start
-again; a task it finishes meanwhile has a `null` result (the columns came with schema 7, SQLite's 8).
+again; a task it finishes meanwhile has a `null` result (the columns came with schema 7, SQLite's 8), and
+`null` outputs, whatever its run handed back (the column came with schema 10, SQLite's 11; it gives its jig
+no `--outputs` either).
 
 A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
 counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`
@@ -432,8 +495,8 @@ it. A redirect is not followed but counted as a failed try, as it could send the
 service can reach. Each approval is counted once in
 `jig_service_webhook_deliveries_total{tenant,kind,result}` (`kind="approval"`), `delivered` or `failed`
 (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's fail. One whose tries are
-cut off by the service stopping is counted neither way. Each tenant with a webhook starts at 0 for both, so
-the first failures show.
+cut off by the service stopping, or by its task's `DELETE`, is counted neither way. Each tenant with a
+webhook starts at 0 for both, so the first failures show.
 
 A tenant with `taskWebhook` (a URL, with the same `webhookSecretEnv`) is told as each of its tasks ends: a
 POST of `{"task": <id>, "status": <the status it ended with>}` and no more, from the replica that ended it,
@@ -496,6 +559,14 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&fo
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 ```
 
+Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
+that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
+the config, the environment variable that holds the admin key (which must be set, and may hold no
+whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
+`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
+month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
+them down by model or to check them against.
+
 ```bash
 # What the tenant may do, and where it stands:
 # {"tenant", "region", "limits": {"concurrency", "maxSteps", "timeLimit", "budgetUsd", "maxQueued", "approvalTimeout", "maxStreams", "quotas"},
@@ -509,14 +580,6 @@ counts; `resets` is when the next UTC day and month start. The counts are read w
 task is admitted by, but outside its lock, so they can be a task behind. `usdToday` and `usdThisMonth`
 count ended tasks only, as the quotas do. `maxStreams` is per replica, and the streams open now aren't
 reported. Each region answers for itself. It takes no parameter (400).
-
-Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
-that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
-the config, the environment variable that holds the admin key (which must be set, and may hold no
-whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
-`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
-month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
-them down by model or to check them against.
 
 ### Metrics and logs
 
@@ -791,7 +854,9 @@ once it takes more than `maxTaskDiskBytes`: SIGTERM, to jig's process group or t
 SIGKILL 5 seconds later. The task ends as an `error` with stop `disk_limit` and the error `the task's folder
 grew past maxTaskDiskBytes (<n> bytes), so the service stopped the run`; what it spent until then is
 stored as for any run. A workspace that is past the cap by itself, or a clone stopped at it, ends the
-task the same way before any run. The folder is then removed with the task, as any is.
+task the same way before any run. The folder is then removed with the task, as any is, but for one in
+which the task made a path longer than the system's longest (`PATH_MAX`): its removal fails with
+`ENAMETOOLONG`, logged as a warning, and the folder stays until an operator removes it.
 
 What is counted is the blocks each file and folder takes on the disk, so a sparse file counts for what it
 holds, not its length. No link is followed and no other file system entered, and a file with several
@@ -816,7 +881,9 @@ It is a check, not a quota, and these are its limits:
   runner.
 - A folder that can't be measured (a folder in it the service's user can't read, a path too long to name,
   over 1,000,000 files) on two checks in a row ends the task as an `error` that says so, as it can't be held
-  to the cap. One such check may only have met a folder as it was made.
+  to the cap. One such check may only have met a folder as it was made. A check before the start that
+  fails for any other reason (an I/O error) ends the task as an `error` that says only that the folder
+  couldn't be measured; the failure itself, which names paths in `dataDir`, is in the service's log.
 - On a file system that compresses, the blocks are what is stored, so the cap undercounts what was written.
 
 At its start the service warns when `dataDir`'s file system has less free than `concurrency` ×
@@ -971,6 +1038,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it, 0 before the first), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
+| `outputs` | `files`: with `--outputs`, once, just before the `end`: for each path `{path, text}`, or `{path, problem}` with `missing`, `not_a_file`, `too_large`, `not_text` or `hidden` (see `outputs` under The API, above) |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that
@@ -994,6 +1062,10 @@ these for a call told in a `notice`. With no answer in `--approval-timeout` seco
 denied. It needs `--events`, and an address without credentials, a query or a fragment. Both event types
 are additions to version 1: `v` stays 1. A task stopped while it waits (by `--time-limit`, a signal or a
 cancel) writes no `approval`.
+
+`jig --outputs <path>`, repeatable up to 20 times and only with `--events`, has jig write the `outputs`
+event at every end it writes, a signal's included; the README's section on `--events` has its rules, which
+are those above. It is an addition to version 1 too.
 
 A program can also run a task in its own process with `runTask` (`src/lib.ts`, the README's "As a
 library"), which hands it these events as objects, in the same order and with the same fields, and resolves
@@ -1231,7 +1303,10 @@ A request that ends while Redis can't be reached can't give its slot back, and n
 The replica remembers such slots (up to 10,000, each for `leaseMs` at most) and gives them back, a thousand
 in a round, about a second after Redis answers again, rather than leave the tenant short of them on every
 replica until their leases end. A slot Redis may have taken for a request whose answer was lost is given
-back the same way, when Redis ran the request before the connection was lost. What this leaves:
+back the same way, when Redis ran the request before the connection was lost. A Redis that accepts
+connections but doesn't answer makes almost every refused admit count as owed, as each may have been run:
+the list can then fill to its 10,000, and the real give-backs that come after are dropped, with one warning,
+to expire with their leases. What this leaves:
 
 - What a gateway owes when it stops, and what is over 10,000, expires with its lease; the list is each
   replica's own, in memory.
@@ -1371,6 +1446,12 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz;
 CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL;
 SELECT indisvalid FROM pg_index WHERE indexrelid = 'tasks_unpurged'::regclass;
 ```
+
+Adding `outputs` to `tasks` (schema 10, SQLite's 11) changes the catalog alone: a nullable column with no
+default, no row rewritten and no index. It takes the table's lock for a moment, as any `ALTER TABLE` does,
+so it waits behind a long transaction on `tasks`. Replicas of the version before go on inserting and ending
+tasks beside it (they name their columns); what they miss is said under Several replicas and Deleting a
+task. A task's outputs add up to 768 KiB to its row (more as JSON), until it is purged.
 
 A concurrent build that failed leaves an index that isn't valid (`indisvalid` false), which `IF NOT EXISTS`
 takes as there: drop it (`DROP INDEX CONCURRENTLY tasks_unpurged`) and build it again before the upgrade.

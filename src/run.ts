@@ -24,6 +24,7 @@ import { Inputs } from "./inputs.ts";
 import { connectMcpServers, type McpServers } from "./mcp.ts";
 import OpenAI from "openai";
 import { type Api, apiKeyFor, APIS, type CallModel, contextWindow, createModel, defaultApi, EFFORTS, type Effort, effortFor } from "./model.ts";
+import { MAX_OUTPUTS, outputProblem, readOutputs } from "./outputs.ts";
 import { MODE_HELP, MODES, Permissions, type Mode } from "./permissions.ts";
 import { overview, type Part } from "./overview.ts";
 import { type Instructions, loadInstructions, REVIEW, subagentPrompt, systemPrompt } from "./prompt.ts";
@@ -41,6 +42,7 @@ import { type Mechanism, type Share, Stats } from "./stats.ts";
 import { VERSION } from "./version.ts";
 import { bashTool, killCommands, OutputFiles, whyStopped } from "./tools/bash.ts";
 import { parseToolList, selectTools, type Tool, type ToolInput } from "./tools/index.ts";
+import { hiddenTest } from "./tools/util.ts";
 import { subagentTool, type SubagentSetup } from "./tools/subagent.ts";
 import * as ui from "./ui.ts";
 
@@ -151,6 +153,7 @@ const OPTIONS = {
   tools: { type: "string" },
   stats: { type: "string" },
   events: { type: "string" },
+  outputs: { type: "string", multiple: true, default: [] },
   "system-prompt": { type: "string" },
   "hide-skill": { type: "string", multiple: true, default: [] },
   memory: { type: "boolean", default: true },
@@ -289,6 +292,16 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
     if (!taskText || skillsVerb || memoryVerb) throw new Error('--approve-via is for a task given on the command line or stdin: jig --approve-via <url> "task".');
     if (mode === "auto") throw new Error("--approve-via asks before the tool calls the mode doesn't allow, and --yes (--mode auto) allows them all: use one.");
   }
+  // --outputs: the files handed back are an event, so there must be events to hold it. Refused here, before
+  // anything runs, rather than answered with a problem at the end: a path that isn't one in the project.
+  if (values.outputs.length) {
+    if (sink === undefined) throw new Error("--outputs hands a task's files back in its outputs event: give --events too.");
+    if (new Set(values.outputs).size > MAX_OUTPUTS) throw new Error(`--outputs takes at most ${MAX_OUTPUTS} files`);
+    for (const path of values.outputs) {
+      const problem = outputProblem(path);
+      if (problem) throw new Error(`--outputs: ${JSON.stringify(path)} ${problem}`);
+    }
+  }
   const viaService = approveVia(values, model, api, library?.apiKey);
   // The service follows the contract: an approval exists once its event is stored, so without the events
   // every call would wait out the timeout.
@@ -356,6 +369,13 @@ async function start(values: Values, { given, skillsVerb, memoryVerb }: Request,
   // commands no longer see; the session's own places there stay (see tools/util.ts's keptIn). The snapshots
   // keep the settings' own list: what they leave out is the user's choice.
   const hiddenForTools = [...settings.hiddenPaths, ...(isolated ? sharedPlaces() : [])];
+  // --outputs: from here on every end, jig's exit handler's too, is preceded by the files' event. Not before:
+  // until the settings are read, nothing says what is hidden. Hidden to the read as to read_file (its test,
+  // worked out now), and only in the project: a folder added with --add-dir isn't the task's to hand back.
+  if (events && values.outputs.length) {
+    const hides = hiddenTest(hiddenForTools, [cwd, ...dirs]);
+    events.outputs = () => readOutputs(cwd, values.outputs, hides);
+  }
   // Said up front, since without the sandbox commands ask first (or, with no one to ask, don't run).
   const noSandbox = wantSandbox && !sandbox ? `No sandbox: ${sandboxProblem()}.` : undefined;
   // Only the sandbox can hide paths: without it, commands can read everything the user can.

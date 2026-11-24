@@ -15,7 +15,7 @@ agent harness does for a model.)
 
 - **Built from scratch.** No agent framework: one streaming tool-use loop, six tools and subagents, on the
   Anthropic Messages API (Claude, and DeepSeek through its compatible endpoint) and any OpenAI-compatible
-  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 1089 tests, and CI on Linux and macOS.
+  API (OpenAI, DeepSeek's, a local model through Ollama or vLLM). 1125 tests, and CI on Linux and macOS.
 - **Safe by construction.** Commands run in the operating system's sandbox (Seatbelt on macOS, bubblewrap
   on Linux); permission modes, deny rules, project trust, and snapshots with `/undo`. The API key never
   reaches the commands the model runs, and on Terminal-Bench it stays on the host for DeepSeek and Claude.
@@ -107,6 +107,8 @@ Usage: jig [options] [task]          (a task of - is read from stdin)
       --system-prompt <text>  use this system prompt instead of jig's own
       --stats <file>    keep a JSON file of the model calls, tokens, tool calls and mechanisms fired so far
       --events <file>   write a task's events as JSON lines as they happen (- for stdout; see below)
+      --outputs <path>  with --events, hand a file of the project back in an outputs event when the task ends
+                        (repeatable, up to 20; see below)
       --check           in a one-shot run, ask the model to check its work before it finishes
       --reviewer <model>  before the task ends, this model checks the work against the task (read-only)
       --check-writes    after write_file and edit_file, tell the model of a syntax error the change made, or of
@@ -179,6 +181,25 @@ within those limits, loses no line, the `end` included, on Linux or macOS. If th
 or a write jig tries again fails otherwise, jig says so on stderr, writes no more events, and goes on with
 the task. `--events /dev/stdout` isn't `-`: jig opens it as a file, whose writes can wait for the reader,
 signals with them, and the terminal's output goes there too.
+
+`--outputs <path>`, given with `--events` and up to 20 times, hands files of the project back to whatever
+runs jig, which may have no other way to reach them (a pod, a task's folder that is removed): just before
+the `end`, whichever end it is (out of steps, the time limit, an error, a signal), jig writes one `outputs`
+event, `{"files": [...]}`, with an entry for each path in the order given: `{"path", "text"}` for a file it
+read, or `{"path", "problem"}` with `missing`, `not_a_file`, `too_large`, `not_text` or `hidden`. A file is
+handed back only if it is UTF-8 text with no NUL, 256 KiB at most, and all the texts together 768 KiB as the
+line holds them (JSON's escapes counted: a newline or a quote is two bytes), the files past that being
+`too_large`, so the line stays under a mebibyte. The read is jig's own, outside the sandbox, of a folder the
+task's commands control, so it never follows a link: `not_a_file` for a link (to a file in the project
+too), for a path with a folder on the way that is a link leading out of the project, and for a folder, a
+named pipe, a socket or a device (none is opened to wait on); `hidden` for a file in a path the settings
+hide or in jig's own directory, as `read_file` refuses it. What it opened is checked again by where the
+descriptor leads before a byte is read. A hard link to a file outside the project can't be told from a
+file, as it is one: the sandbox keeps commands from making a link to a file they can't read. A path must be
+relative, with no `..`: anything else is refused before the task starts, as is `--outputs` without
+`--events`. As in every event, what looks like a secret in a text is blanked out (`[REDACTED]`). A run that
+fails before its settings are read (a `--add-dir` that doesn't exist, say) writes its `end` without the
+event.
 
 `--approve-via <url>` is for a task no one runs at a terminal but a person should still approve, as the
 task service runs it with approvals on ([docs/server.md](docs/server.md)). Where the mode would ask at the
@@ -738,6 +759,7 @@ Terminal-Bench 15 points), and milestone 18 a cheaper check that would have let 
 | [`src/stats.ts`](src/stats.ts), [`src/prices.ts`](src/prices.ts) | The `--stats` file: model calls, tokens, tool calls and the mechanisms that fired, kept up to date as a task runs; the price table |
 | [`src/approvals.ts`](src/approvals.ts) | `--approve-via`: the tool calls jig would ask about at a terminal, asked of a service over HTTP |
 | [`src/events.ts`](src/events.ts) | `--events`: a task's start, steps, tool calls, text, notices and end as JSON lines, for a service that runs jig |
+| [`src/outputs.ts`](src/outputs.ts) | `--outputs`: the files a task hands back in its events, read without following a link out of the project |
 | [`server/`](server) | jig as a service ([docs/server.md](docs/server.md)): the task service's HTTP API for many tenants, its store (SQLite, or Postgres for several replicas, through a client of its own in `pg.ts`), a fair scheduler, approvals asked over the API (`approvals.ts`), and the runners that start jig for each task: on this machine, in a Docker container or as a Kubernetes Job, with warm pools of workers started ahead of tasks |
 | [`server/gateway.ts`](server/gateway.ts), [`token.ts`](server/token.ts), [`limits.ts`](server/limits.ts), [`state.ts`](server/state.ts), [`redis.ts`](server/redis.ts) | The model gateway for jig behind a backend ([docs/server.md](docs/server.md)): tasks' tokens for the provider's keys, per-tenant limits and quotas, usage and budgets, in memory or in Redis for several replicas, and failover between providers |
 | [`server/router.ts`](server/router.ts) | The router in front of several regions ([docs/server.md](docs/server.md)): each tenant's requests to its home region, a task's to the region in its id, new tasks to another region while the home is down |

@@ -167,7 +167,8 @@ const MAX_WAITING = 100;
  * secret (x-jig-signature: sha256=<hex HMAC-SHA256 of the body>). Sent in the background, so the run never
  * waits on it, and tried again three times, 1, 2 and 4 seconds apart. A redirect is a failed try, never
  * followed: it could send the signed POST anywhere the service reaches. Each POST is counted once in
- * jig_service_webhook_deliveries_total, delivered or failed (one cut off by close, neither).
+ * jig_service_webhook_deliveries_total, delivered or failed (one cut off by close or by its task's purge,
+ * neither: no endpoint failed it, the service chose to stop).
  *
  * Approvals wait on an answer, so a tenant's are bounded by the tasks it runs. Ends are bounded only by how
  * fast its tasks end, and an endpoint that hangs holds each for a minute: with MAX_WAITING of a tenant's
@@ -177,7 +178,8 @@ const MAX_WAITING = 100;
 export class Webhooks {
   private hooks: Map<string, Webhook>;
   private retryMs: number;
-  private pending = new Set<AbortController>();
+  /** The POSTs being tried, each with the task it is for and, for an approval's, that it carries one. */
+  private pending = new Map<AbortController, { task: string; kind: "approval" | "task" }>();
   /** The POSTs of task ends being tried, by tenant, and the tenants warned that theirs are at the cap. */
   private waiting = new Map<string, number>();
   private full = new Set<string>();
@@ -229,7 +231,7 @@ export class Webhooks {
     if (!hook || this.closed) return;
     const headers = { "content-type": "application/json", "x-jig-signature": `sha256=${createHmac("sha256", hook.secret).update(body).digest("hex")}` };
     const stop = new AbortController();
-    this.pending.add(stop);
+    this.pending.set(stop, { task, kind });
     try {
       let last = "";
       for (let attempt = 0; attempt <= RETRIES; attempt++) {
@@ -251,9 +253,23 @@ export class Webhooks {
     }
   }
 
+  /**
+   * A task's content was deleted through the API (DELETE /v1/tasks/:id): its approvals' POSTs still being
+   * tried stop here, since each carries the approval's description, which is content. A POST cut off so is
+   * counted neither delivered nor failed, as one cut off by close. Only this replica's: one being tried by
+   * another replica goes on (docs/server.md). The end's POST holds an id and a status, and goes on too.
+   *
+   * The retention sweep makes no such call: it purges tasks that ended retentionDays ago, days as a rule,
+   * and an approval's POST is tried for under a minute after the task asked, so none is still pending
+   * (only a retentionDays set to under a minute, 0.0005 say, could purge under one).
+   */
+  purged(task: string): void {
+    for (const [stop, post] of this.pending) if (post.task === task && post.kind === "approval") stop.abort();
+  }
+
   /** Stops the POSTs still being tried, and sends no more. */
   close(): void {
     this.closed = true;
-    for (const stop of this.pending) stop.abort();
+    for (const stop of this.pending.keys()) stop.abort();
   }
 }

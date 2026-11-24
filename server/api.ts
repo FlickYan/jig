@@ -9,6 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { isolationProblem, sandboxProblem, sharedPlaces } from "../src/sandbox.ts";
+import { MAX_OUTPUT_PATH, MAX_OUTPUTS, outputProblem } from "../src/outputs.ts";
 import { isInside } from "../src/tools/util.ts";
 import { Answers, APPROVAL_MODES, handleInternal, type Webhook, Webhooks } from "./approvals.ts";
 import { createLog, type Log } from "./log.ts";
@@ -373,6 +374,7 @@ export async function startService(
     store,
     scheduler,
     answers,
+    webhooks,
     region: config.region ?? null,
     model: config.model ?? "deepseek-flash",
     gitHosts: config.gitHosts,
@@ -833,6 +835,7 @@ interface Context {
   store: Store;
   scheduler: Scheduler;
   answers: Answers;
+  webhooks: Webhooks;
   region: string | null;
   model: string;
   gitHosts?: string[];
@@ -873,8 +876,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (statuses?.some((status) => !STATUSES.includes(status))) return reply(res, 400, { error: `status must be one or more of: ${STATUSES.join(", ")}, separated by commas` });
     const before = url.searchParams.get("before") ?? undefined;
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
-    const limit = Number(url.searchParams.get("limit") ?? 100);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
+    // Digits alone: Number() would also take 0x10, 1e1 and " 10".
+    const most = url.searchParams.get("limit") ?? "100";
+    const limit = /^[0-9]{1,3}$/.test(most) ? Number(most) : 0;
+    if (limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
     // The prompts and the results can be long: a list leaves them out unless asked.
     const asked = url.searchParams.get("full") ?? "0";
     if (!["1", "true", "0", "false"].includes(asked)) return reply(res, 400, { error: "full must be 1 or 0" });
@@ -898,7 +903,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
   const [, , action, approval] = match;
   if (!action) {
     if (req.method === "DELETE") return purge(res, task, context);
-    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
+    return req.method === "GET" ? reply(res, 200, view(task, { prompt: true, stats: true, result: true, outputs: true }, await context.store.pendingApprovals([task.id]), context.region)) : reply(res, 405, { error: "Use GET or DELETE" });
   }
   // A purged task has neither events nor approvals left: said once, here, for every way of asking for them,
   // rather than an empty stream or list that would read as a run that wrote nothing. A cancel says it has ended.
@@ -945,8 +950,14 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   // A spec may name the region it is for, as the router reads it; the task is made only in that region.
   if (isObject(input) && input.region !== undefined) {
     const { region, ...rest } = input;
-    if (typeof region !== "string" || !/^[a-z0-9]{1,16}$/.test(region)) return reply(res, 400, { error: "region must be a region's name" });
-    if (region !== context.region) return reply(res, 400, { error: `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router` });
+    const wrong =
+      typeof region !== "string" || !/^[a-z0-9]{1,16}$/.test(region) ? "region must be a region's name"
+      : region !== context.region ? `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router`
+      : undefined;
+    if (wrong) {
+      refused("invalid");
+      return reply(res, 400, { error: wrong });
+    }
     input = rest;
   }
   const spec = taskSpec(input, tenant, context.model, context.gitHosts);
@@ -990,14 +1001,17 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
  * DELETE /v1/tasks/:id: deletes an ended task's content (Store.purge) and answers with what is left of it,
  * 200, however often it is asked; 409 for a task that hasn't ended, which is cancelled first.
  */
-async function purge(res: ServerResponse, task: Task, { store, metrics, region }: Context): Promise<void> {
+async function purge(res: ServerResponse, task: Task, { store, webhooks, metrics, region }: Context): Promise<void> {
   const purged = await store.purge(task.id);
   if (!purged) return reply(res, 404, { error: "No such task" });
   const { id, status } = purged.task;
   if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
   // Once a task, however many deletes it gets, at once or one after another.
   if (purged.first) metrics.purged.inc({ reason: "api" });
-  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
+  // An approval's POST still being tried carries its description: no more tries of this task's, on every
+  // delete, since a repeat may reach a replica other than the first did.
+  webhooks.purged(id);
+  reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true, outputs: true }, new Map(), region));
 }
 
 /** The /admin routes: 404 without an admin key in the config, and only GET /admin/usage, to that key. */
@@ -1147,9 +1161,9 @@ async function readBody(req: IncomingMessage, max: number): Promise<string | und
  */
 export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, gitHosts?: string[]): TaskSpec | string {
   if (!isObject(input)) return "The body must be a JSON object";
-  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode"].includes(key));
+  const unknown = Object.keys(input).find((key) => !["prompt", "workspace", "maxSteps", "timeLimit", "model", "approvals", "mode", "outputs"].includes(key));
   if (unknown) return `Unknown field: ${unknown}`;
-  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel, approvals = false, mode } = input;
+  const { prompt, workspace, maxSteps = tenant.limits.maxSteps, timeLimit = tenant.limits.timeLimit, model = defaultModel, approvals = false, mode, outputs } = input;
   if (typeof prompt !== "string" || !prompt.trim()) return "prompt must be a string that isn't empty";
   if (prompt.length > MAX_PROMPT) return `prompt must be at most ${MAX_PROMPT} characters`;
   // Postgres text can't hold one, and jig has no use for it: refused on every store alike.
@@ -1162,7 +1176,16 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
   // Without approvals the run asks nothing (--yes), so a mode would mean nothing.
   if (mode !== undefined && !approvals) return "mode goes with approvals: true";
   if (mode !== undefined && !APPROVAL_MODES.includes(mode as never)) return `mode must be one of: ${APPROVAL_MODES.join(", ")}`;
-  const asks = approvals ? { approvals, mode: (mode ?? "edits") as TaskSpec["mode"] } : {};
+  // The files the run hands back: paths in its workspace, as workspace.files' are, whatever the workspace is
+  // made from (the run may write them itself). Few and short, as jig is given each on its command line.
+  if (outputs !== undefined) {
+    if (!Array.isArray(outputs) || !outputs.length || outputs.length > MAX_OUTPUTS || outputs.some((path) => typeof path !== "string")) return `outputs must be a list of 1 to ${MAX_OUTPUTS} paths in the workspace`;
+    for (const [i, path] of (outputs as string[]).entries()) {
+      const problem = workspaceProblem(path) ?? outputProblem(path) ?? (path.length > MAX_OUTPUT_PATH ? `is longer than ${MAX_OUTPUT_PATH} characters` : outputs.indexOf(path) !== i ? "is there twice" : undefined);
+      if (problem) return `outputs: ${JSON.stringify(path)} ${problem}`;
+    }
+  }
+  const asks = { ...(approvals && { approvals, mode: (mode ?? "edits") as TaskSpec["mode"] }), ...(outputs !== undefined && { outputs: outputs as string[] }) };
   if (workspace === undefined) return { prompt, maxSteps: maxSteps as number, timeLimit: timeLimit as number, model, ...asks };
   if (!isObject(workspace)) return "workspace must be an object";
   const extra = Object.keys(workspace).find((key) => !["files", "git", "ref"].includes(key));
@@ -1182,6 +1205,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
+  // As for the prompt: \S takes one, and without gitHosts the URL is kept as it came.
+  if (typeof git === "string" && git.includes("\0")) return "workspace.git must not hold a NUL character (\\u0000)";
   // The local and Docker runners clone on the service's own network, which a tenant would otherwise reach
   // any host on. The scheduler checks it again as the task starts, should gitHosts have changed.
   const checked = typeof git === "string" ? checkedGit(git, gitHosts) : undefined;
@@ -1196,12 +1221,13 @@ function isObject(value: unknown): value is Record<string, unknown> {
 
 /**
  * A task as the API shows it, with the region it is in and how many of its approvals wait for an answer
- * (none, once it has ended); the list leaves out the stats, and the prompt and the result unless asked.
+ * (none, once it has ended); the list leaves out the stats and the outputs, and the prompt and the result
+ * unless asked.
  */
-function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean }, pending: Map<string, number>, region: string | null) {
-  const { spec, tenant, stats, result, resultTruncated, ...rest } = task;
+function view(task: Task, show: { prompt?: boolean; stats?: boolean; result?: boolean; outputs?: boolean }, pending: Map<string, number>, region: string | null) {
+  const { spec, tenant, stats, result, resultTruncated, outputs, ...rest } = task;
   const asks = { approvals: spec.approvals ?? false, ...(spec.approvals && { mode: spec.mode }), pendingApprovals: FINISHED.has(task.status) ? 0 : (pending.get(task.id) ?? 0) };
-  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }) };
+  return { ...rest, region, ...(show.prompt && { prompt: spec.prompt }), model: spec.model, maxSteps: spec.maxSteps, timeLimit: spec.timeLimit, ...asks, ...(show.stats && { stats }), ...(show.result && { result, resultTruncated }), ...(show.outputs && { outputs }) };
 }
 
 function reply(res: ServerResponse, status: number, body: object, headers: Record<string, string> = {}): void {

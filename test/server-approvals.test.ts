@@ -343,6 +343,46 @@ const approvalTests = () => {
     assert.ok(posts[2].at - posts[1].at >= 90, "the second retry waits twice as long as the first");
   });
 
+  it("stops trying an approval's POST once its task is deleted, and counts it neither delivered nor failed", async () => {
+    // The endpoint answers 500 each time: the POST, which carries the approval's description, would be tried
+    // for well over the test's length (0.6 s, then 1.2, then 2.4) but for the delete.
+    const posts: string[] = [];
+    const receiver = createServer((req, res: ServerResponse) => {
+      let body = "";
+      req.on("data", (chunk) => (body += chunk));
+      req.on("end", () => (posts.push(body), res.writeHead(500).end()));
+    });
+    await new Promise<void>((done) => receiver.listen(0, "127.0.0.1", done));
+    closers.push(() => new Promise((done) => (receiver.closeAllConnections(), receiver.close(done))));
+    const saved = process.env.ACME_WEBHOOK_SECRET;
+    process.env.ACME_WEBHOOK_SECRET = "acme's webhook secret";
+    closers.push(async () => (saved === undefined ? delete process.env.ACME_WEBHOOK_SECRET : (process.env.ACME_WEBHOOK_SECRET = saved)));
+    const url = `http://127.0.0.1:${(receiver.address() as AddressInfo).port}/hooks/approvals`;
+    const tenants = [{ ...ACME, approvalTimeout: 120, approvalWebhook: url, webhookSecretEnv: "ACME_WEBHOOK_SECRET" }, GLOBEX];
+    const api = await service({ metrics: { port: 0 }, tenants }, { webhookRetryMs: 600 });
+
+    // Two tasks ask; one is deleted between its POST's first try and the second, the other is left be.
+    const [id, other] = [(await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id, (await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "ask 1", approvals: true })).body.id];
+    for (const task of [id, other]) {
+      await asked(api, task, 1);
+      assert.equal((await call(api, KEYS.acme, "POST", `/v1/tasks/${task}/approvals/ap_1`, { decision: "allow" })).status, 200);
+      await statusOf(api, task, "succeeded");
+    }
+    const of = (task: string) => posts.filter((body) => JSON.parse(body).task === task).length;
+    await until(() => of(id) >= 1 && of(other) >= 1, "each approval's first POST");
+    assert.equal((await call(api, KEYS.acme, "DELETE", `/v1/tasks/${id}`)).status, 200);
+    // A try the delete cut off may have reached the endpoint whole already.
+    await new Promise((done) => setTimeout(done, 100));
+    const tried = of(id);
+    assert.ok(tried < 4, "deleted before the last try");
+    await until(() => of(other) === 4, "the other task's four tries");
+    assert.equal(of(id), tried, "no try after the delete");
+    const counted = async () => (await (await fetch(`${api.metricsUrl}/metrics`)).text()).split("\n").filter((line) => line.startsWith("jig_service_webhook_deliveries_total")).sort();
+    const failed = 'jig_service_webhook_deliveries_total{tenant="acme",kind="approval",result="failed"}';
+    await until(async () => (await counted()).includes(`${failed} 1`), "the other's POST counted as failed");
+    assert.deepEqual(await counted(), [`${failed.replace("failed", "delivered")} 0`, `${failed} 1`]);
+  });
+
   it("posts each task's end to the tenant's task webhook, signed and tried again, and none to a tenant without one", async () => {
     // The first POST is answered 500; the rest are taken.
     const posts: { headers: IncomingHttpHeaders; url: string; body: string }[] = [];
