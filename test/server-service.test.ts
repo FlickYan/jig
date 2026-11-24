@@ -2284,6 +2284,52 @@ describe("the SQLite store's reads", () => {
     assert.ok("id" in again && again.id !== made.id);
   });
 
+  it("commits the events of one turn of the event loop together, each stored only once the commit is made", async () => {
+    const path = join(await tempDir("jig-service-"), "jig.db");
+    const store = await openStore(path);
+    let open = true;
+    opened.push(async () => void (open && (await store.close())));
+    await store.putTenant({ id: "a", limits }, []);
+    const one = await store.createTask("a", spec);
+    const two = await store.createTask("a", spec);
+    const { DatabaseSync } = process.getBuiltinModule("node:sqlite") as typeof import("node:sqlite");
+    const exec = DatabaseSync.prototype.exec;
+    let commits = 0;
+    DatabaseSync.prototype.exec = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+      if (sql === "COMMIT") commits++;
+      return exec.call(this, sql);
+    };
+    try {
+      const writes = [];
+      for (let seq = 1; seq <= 50; seq++) for (const task of [one, two]) writes.push(store.addEvent(task.id, seq, { seq }));
+      // Nothing is there until the turn is over, and then all of it is, by one commit.
+      assert.equal((await store.events(one.id)).length, 0);
+      await Promise.all(writes);
+      assert.equal(commits, 1);
+      assert.deepEqual((await store.events(two.id)).map(({ seq }) => seq), Array.from({ length: 50 }, (_, i) => i + 1));
+      // A commit that fails is each event's failure, and the next ones are stored.
+      DatabaseSync.prototype.exec = function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+        if (sql === "COMMIT") throw Object.assign(new Error("database or disk is full"), { code: "ERR_SQLITE_ERROR", errcode: 13 });
+        return exec.call(this, sql);
+      };
+      const lost = await Promise.allSettled([store.addEvent(one.id, 51, {}), store.addEvent(one.id, 52, {})]);
+      assert.deepEqual(lost.map((write) => write.status), ["rejected", "rejected"]);
+      DatabaseSync.prototype.exec = exec;
+      await store.addEvent(one.id, 51, {});
+      assert.equal((await store.events(one.id)).length, 51);
+      // What waits when the store is closed is stored first.
+      const last = store.addEvent(one.id, 52, {});
+      await store.close();
+      open = false;
+      await last;
+    } finally {
+      DatabaseSync.prototype.exec = exec;
+    }
+    const again = await openStore(path);
+    opened.push(() => again.close());
+    assert.equal((await again.events(one.id)).length, 52);
+  });
+
   it("reads a task's events a page at a time, and all of them without a limit", async () => {
     const store = await openStore(":memory:");
     opened.push(() => store.close());

@@ -171,11 +171,17 @@ const shifted = (sql: string, by: number) => sql.replace(/\$([2-9])/g, (_, n: st
 const STANDING = `SELECT (${USED.maxQueued}) AS queued, (SELECT count(*) FROM tasks WHERE tenant = $1 AND status = 'running') AS running,
   (${USED.tasksPerDay}) AS tasks_today, (${shifted(USED.usdPerDay, 2)}) AS usd_today, (${shifted(USED.usdPerMonth, 3)}) AS usd_this_month`;
 
+/** The most events one statement writes: three parameters each, of the 65,535 a statement may have. */
+const EVENT_BATCH = 1000;
+
 export class PostgresStore implements Store {
   readonly changes: Changes = new EventEmitter().setMaxListeners(0);
   private pool: Pool;
   private listener: Listener;
   private region?: string;
+  /** The events to write together (addEvent), and whether a batch of them is being written. */
+  private pending: { task: string; seq: number; json: string; stored: () => void; failed: (err: unknown) => void }[] = [];
+  private flushing = false;
 
   private constructor(pool: Pool, listener: Listener, region?: string) {
     this.pool = pool;
@@ -384,11 +390,56 @@ export class PostgresStore implements Store {
     return rows.length === 1;
   }
 
-  async addEvent(task: string, seq: number, event: object): Promise<void> {
+  //
+  // Each event was a statement and a commit of its own, on one of the pool's few connections: with many runs
+  // writing at once, the events waited for a connection more than for the disk. So the events that wait are
+  // written by one statement, one batch at a time, and those that come while it runs make the next: one run
+  // alone still has each of its events committed by itself, and many share a commit. Each is stored, for its
+  // caller, only once its batch is committed.
+  addEvent(task: string, seq: number, event: object): Promise<void> {
+    return new Promise((stored, failed) => {
+      this.pending.push({ task, seq, json: JSON.stringify(event), stored, failed });
+      if (this.pending.length === 1 && !this.flushing) setImmediate(() => void this.flush());
+    });
+  }
+
+  /** Writes the events that wait, EVENT_BATCH at most, then those that came meanwhile. A failure is each one's: each is tried again by its caller. */
+  private async flush(): Promise<void> {
+    if (this.flushing) return;
+    this.flushing = true;
+    try {
+      while (this.pending.length) {
+        const batch = this.pending.splice(0, EVENT_BATCH);
+        try {
+          await this.write(batch);
+          for (const { stored } of batch) stored();
+        } catch (err) {
+          if (batch.length === 1) {
+            batch[0].failed(err);
+            continue;
+          }
+          // One event the database refuses (a seq no integer holds, say, from a run that writes its own
+          // events) must not fail the other runs' with it: each is written alone, and fails alone.
+          await Promise.all(batch.map((one) => this.write([one]).then(one.stored, one.failed)));
+        }
+      }
+    } finally {
+      this.flushing = false;
+    }
+  }
+
+  /**
+   * One statement for a batch of events. The tasks' rows are locked in the order of their ids, so two batches
+   * (two replicas') never wait on each other; nothing is stored for a purged task, or for one the store
+   * doesn't have.
+   */
+  private async write(batch: { task: string; seq: number; json: string }[]): Promise<void> {
     await this.pool.query(
-      `WITH ${LIVE}, added AS (INSERT INTO events (task, seq, json) SELECT id, $2::integer, $3::text FROM live ON CONFLICT DO NOTHING RETURNING task, seq)
+      `WITH input (task, seq, json) AS (VALUES ${batch.map((_, i) => `($${3 * i + 1}::text, $${3 * i + 2}::integer, $${3 * i + 3}::text)`).join(", ")}),
+         live AS (SELECT id FROM tasks WHERE id IN (SELECT task FROM input) AND purged IS NULL ORDER BY id FOR KEY SHARE),
+         added AS (INSERT INTO events (task, seq, json) SELECT input.task, input.seq, input.json FROM input JOIN live ON live.id = input.task ON CONFLICT DO NOTHING RETURNING task, seq)
        SELECT pg_notify('${EVENTS}', json_build_object('task', task, 'seq', seq)::text) FROM added`,
-      [task, seq, JSON.stringify(event)],
+      batch.flatMap(({ task, seq, json }) => [task, seq, json]),
     );
   }
 
@@ -535,6 +586,8 @@ export class PostgresStore implements Store {
   }
 
   async close(): Promise<void> {
+    // The events that wait are written first, or told that they weren't.
+    while (this.pending.length || this.flushing) await (this.flushing ? new Promise((done) => setTimeout(done, 5)) : this.flush());
     await this.pool.close();
   }
 }

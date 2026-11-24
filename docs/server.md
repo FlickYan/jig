@@ -1439,6 +1439,39 @@ a folder past `maxTaskDiskBytes` stops its container as `disk_limit`, that an ap
 container is answered through the API, that a cancel kills the container, that a `DELETE` purges, and that
 no container or folder of a task is left. It exits 0 only if all of them passed.
 
+### What the service itself takes
+
+`node bench/service-load.ts` measures the service with nothing run: its API, its store and its scheduler under
+many tasks at once, the runs a stand-in that writes 20 events over 200 ms and ends (no jig, no container, no
+model), with a follower on one task's stream in ten. It is the ceiling adding workers can't pass. With
+`JIG_TEST_POSTGRES_URL` it measures Postgres too, with one replica and with two. On 4 cores with a local
+SSD (Node 22, Postgres 16 on the same machine, its `fsync` on), the service, the two replicas and the 32
+clients all in one process, 2,000 tasks, 64 running at a time on each replica:
+
+| | SQLite | Postgres | Postgres, two replicas |
+|---|---|---|---|
+| tasks made a second, none running (p99) | 600 (280 ms) | 470 (97 ms) | 455 (95 ms) |
+| tasks made a second while the others run (p99) | 530 (350 ms) | 490 (91 ms) | 450 (97 ms) |
+| tasks run to their end a second | 176 | 175 | 187 |
+| events stored a second | 3,500 | 3,500 | 3,700 |
+| `GET /v1/tasks/:id` a second (p99) | 2,100 (33 ms) | 2,600 (21 ms) | 3,100 (19 ms) |
+| a list of 100 a second (p99) | 740 (72 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
+
+Every task succeeded and every followed stream had each of its events once, in order, then `done`. The two
+replicas don't run more than one does here because they share the one process, and so one core, with the
+clients: the measure says what a core of the service does, some 180 tasks of 20 events a second, not what
+two machines would. A real task's jig makes a few model calls of seconds each, so the service is far from
+what holds a deployment back: the model, then the runner's containers, are.
+
+The events were most of that work. Each was a commit of its own: on SQLite a write the event loop waits
+for (0.2 ms on that SSD), and on Postgres a statement on one of the pool's ten connections, where with its
+`fsync` on the events waited for a connection more than for the disk. Now the events that come in one turn
+of the event loop (SQLite), or while the statement before is being written (Postgres), are committed
+together, and each is stored for its run only once that commit is made, so nothing is told of an event the
+disk doesn't have; one run alone commits each event by itself, as before. On Postgres an event the database
+refuses is written again alone with the rest of its batch, so it fails alone. That took the same load from
+107 to 176 tasks a second on SQLite, and from 88 to 175 on Postgres.
+
 ### Database size and upgrades
 
 Deleting tasks' content (`DELETE /v1/tasks/:id`, `retentionDays`) frees space inside the database, not on
