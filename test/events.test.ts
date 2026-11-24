@@ -632,6 +632,105 @@ describe("--events", () => {
   });
 });
 
+describe("--outputs", () => {
+  it("writes one outputs event just before the end, with each file's text or why there is none", async () => {
+    // The model's command writes one of the files; another is there already, one never is, one is a link out.
+    const api = await fakeMessagesApi((request) =>
+      (request.messages as unknown[]).length === 1 ? [{ tool: "bash", input: { command: "mkdir -p dist && printf 'built\\n' > dist/report.txt" } }] : [{ text: "Done." }],
+    );
+    await writeFile(join(outside, "secret.txt"), "not the task's\n");
+    await symlink(join(outside, "secret.txt"), join(project, "leak.txt"));
+    try {
+      const asked = ["dist/report.txt", "parser.py", "missing.txt", "leak.txt"].flatMap((path) => ["--outputs", path]);
+      const { code, output } = await runJig([...args, "--events", file, ...asked, "Build it."], { api, cwd: project });
+      assert.equal(code, 0, output);
+      const events = await read();
+      assert.deepEqual(types(events).slice(-3), ["text", "outputs", "end"]);
+      assert.equal(ofType(events, "outputs").length, 1);
+      assert.deepEqual(events.at(-2)!.files, [
+        { path: "dist/report.txt", text: "built\n" },
+        { path: "parser.py", text: "def parse(text):\n    return text\n" },
+        { path: "missing.txt", problem: "missing" },
+        { path: "leak.txt", problem: "not_a_file" },
+      ]);
+      assert.equal(events.at(-2)!.seq, (events.at(-1)!.seq as number) - 1);
+      assert.doesNotMatch(await readFile(file, "utf8"), /not the task's/);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("writes it at every end: out of steps, a failed task, and a kill in the task", async () => {
+    let hang: (() => void) | undefined;
+    let fail = false;
+    const fake = await fakeMessagesApi((request) => (request.tool_choice ? [{ text: "The fix is left." }] : [{ tool: "glob", input: { pattern: "*" } }]));
+    // In front of the fake: refuses with 401 when `fail` is set, and once `hang` is set takes the request and never answers.
+    const server = createServer((req, res) => {
+      if (hang) return void (req.resume(), hang());
+      if (fail) {
+        req.resume();
+        res.writeHead(401, { "content-type": "application/json" });
+        return void res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "invalid x-api-key" } }));
+      }
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk)).on("end", async () => {
+        const upstream = await fetch(`${fake.url}${req.url}`, { method: "POST", headers: { "content-type": "application/json" }, body: Buffer.concat(chunks) });
+        res.writeHead(upstream.status, { "content-type": upstream.headers.get("content-type") ?? "application/json" });
+        res.end(Buffer.from(await upstream.arrayBuffer()));
+      });
+    });
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const api = { url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`, requests: [], close: () => (server.closeAllConnections(), server.close(), fake.close()) };
+    const outputs = ["--outputs", "parser.py"];
+    const files = [{ path: "parser.py", text: "def parse(text):\n    return text\n" }];
+    const last = async () => {
+      const events = await read();
+      assert.equal(ofType(events, "outputs").length, 1);
+      const [outputs, end] = events.slice(-2);
+      assert.deepEqual([outputs.type, outputs.files], ["outputs", files]);
+      return [end.type, end.stop, end.exitCode];
+    };
+    try {
+      const steps = await runJig([...args, "--max-steps", "1", "--events", file, ...outputs, "Fix the parser."], { api, cwd: project });
+      assert.equal(steps.code, 2, steps.output);
+      assert.deepEqual(await last(), ["end", "max_steps", 2]);
+
+      fail = true;
+      const failed = await runJig([...args, "--events", file, ...outputs, "Fix the parser."], { api, cwd: project });
+      assert.equal(failed.code, 1, failed.output);
+      assert.deepEqual(await last(), ["end", "error", 1]);
+
+      const child = spawnJig(api, [...args, "--events", file, ...outputs, "Fix the parser."]);
+      hang = () => child.kill("SIGTERM");
+      assert.equal(await new Promise((done) => child.on("close", done)), 143);
+      assert.deepEqual(await last(), ["end", "interrupted", 143]);
+    } finally {
+      api.close();
+    }
+  });
+
+  it("is refused without --events, for a path that isn't one in the project, and past 20 files", async () => {
+    const api = await fakeMessagesApi(() => [{ text: "Done." }]);
+    try {
+      const alone = await runJig([...args, "--outputs", "parser.py", "Fix the parser."], { api, cwd: project });
+      assert.equal(alone.code, 1);
+      assert.match(alone.output, /--outputs hands a task's files back in its outputs event: give --events too\./);
+      for (const [path, why] of [["../out/secret.txt", /leads out of the project/], ["/etc/hostname", /is absolute/], ["dist/", /names a folder/]] as const) {
+        const refused = await runJig([...args, "--events", file, "--outputs", path, "Fix the parser."], { api, cwd: project });
+        assert.equal(refused.code, 1);
+        assert.match(refused.output, why);
+      }
+      const many = Array.from({ length: 21 }, (_, i) => ["--outputs", `f${i}`]).flat();
+      const over = await runJig([...args, "--events", file, ...many, "Fix the parser."], { api, cwd: project });
+      assert.match(over.output, /--outputs takes at most 20 files/);
+      assert.equal(api.requests.length, 0);
+      assert.equal(existsSync(file), false, "refused before the events file is made");
+    } finally {
+      api.close();
+    }
+  });
+});
+
 describe("Events", () => {
   const listen = () => {
     const got: Written[] = [];

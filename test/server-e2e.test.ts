@@ -193,6 +193,34 @@ describe("Phase 1 end to end: API, scheduler, local runner, jig --events, gatewa
     assert.equal(gw.budgetUsd, 1);
   });
 
+  it("hands back the files a task asked for as its outputs: what its command wrote, never what a link leads to outside", async () => {
+    // The command makes a file, and two ways out of its folder: a link to a file, and a folder that is a link.
+    const command = "mkdir -p out && printf 'built: %s\\n' \"$(cat note.txt)\" > out/report.txt && ln -s /etc/hostname leak.txt && ln -s /etc door";
+    const { service } = await stack([[{ tool: "bash", input: { command } }], [{ text: "Built the report." }]]);
+    const outputs = ["out/report.txt", "note.txt", "leak.txt", "door/hostname", "never.txt"];
+    const posted = await call(service, "POST", "/v1/tasks", { prompt: "build the report", workspace: { files: { "note.txt": "hello\n" } }, maxSteps: 5, outputs });
+    assert.equal(posted.status, 201, JSON.stringify(posted.body));
+    assert.equal((await call(service, "GET", `/v1/tasks/${posted.body.id}`)).body.outputs, null);
+    const task = await ended(service, posted.body.id);
+    assert.equal(task.status, "succeeded", JSON.stringify(task));
+    assert.deepEqual(task.outputs, [
+      { path: "out/report.txt", text: "built: hello\n" },
+      { path: "note.txt", text: "hello\n" },
+      { path: "leak.txt", problem: "not_a_file" },
+      { path: "door/hostname", problem: "not_a_file" },
+      { path: "never.txt", problem: "missing" },
+    ]);
+    assert.equal(task.result, "Built the report.");
+    // jig's own event, just before its end, is the same; the list has none.
+    const stream = (await events(service, task.id)).filter((frame) => !frame.event).map((frame) => frame.data);
+    assert.deepEqual(stream.slice(-2).map((event) => event.type), ["outputs", "end"]);
+    assert.deepEqual(stream.at(-2).files, task.outputs);
+    assert.ok(!("outputs" in (await call(service, "GET", "/v1/tasks?full=1")).body.tasks[0]));
+    // A DELETE takes them with the rest.
+    assert.equal((await call(service, "DELETE", `/v1/tasks/${task.id}`)).body.outputs, null);
+    assert.equal((await call(service, "GET", `/v1/tasks/${task.id}`)).body.outputs, null);
+  });
+
   it("cancels a running task: the real jig and its command are stopped, and the task ends cancelled", async () => {
     const { service } = await stack([[{ tool: "bash", input: { command: "sleep 60" } }], [{ text: "done" }]]);
     const { body } = await call(service, "POST", "/v1/tasks", { prompt: "wait a minute", maxSteps: 5 });

@@ -517,6 +517,68 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     assert.deepEqual([listed.spec.prompt, listed.result, listed.resultTruncated], ["", null, false]);
   });
 
+  it("keeps a finished task's outputs, never lists them, and deletes them with a purge, by its id or by its age", async () => {
+    const url = await postgresDatabase();
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    const db = pool(url);
+    await store.putTenant({ id: "a", limits: LIMITS }, []);
+    const asked = { ...PLAIN, outputs: ["a.txt", "b.txt"] };
+    // A text with what JSON escapes, and half a surrogate pair, which the column holds as it came (json).
+    const outputs = [{ path: "a.txt", text: "quotes \" and \\ and é and \ud83d\ude00 and \ud800\n" }, { path: "b.txt", problem: "missing" }];
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const run = await store.createTask("a", asked);
+      assert.deepEqual([run.spec.outputs, run.outputs], [asked.outputs, null]);
+      await store.claim("a", TERMS);
+      // The last as a caller written before the outputs were: no field.
+      assert.equal(await store.finish(run.id, "r1", i < 2 ? { ...OUTCOME, outputs } : OUTCOME), true);
+      ids.push(run.id);
+    }
+    assert.deepEqual(await Promise.all(ids.map(async (id) => (await store.task(id))!.outputs)), [outputs, outputs, null]);
+    for (const prompts of [true, false]) assert.deepEqual((await store.tasks("a", { prompts })).map((task) => task.outputs), [null, null, null]);
+    const stored = () => db.query("SELECT outputs IS NOT NULL AS kept, spec::text AS spec FROM tasks ORDER BY n");
+    assert.deepEqual((await stored()).rows.map((row) => row.kept), [true, true, false]);
+
+    const purged = (await store.purge(ids[0]))!;
+    assert.deepEqual([purged.first, purged.task.outputs, purged.task.spec.outputs], [true, null, undefined]);
+    await new Promise((done) => setTimeout(done, 20));
+    // Retried while another test file's purge holds the database's lock.
+    assert.equal(await until(() => store.purgeEnded(1, 10), "the rest to be purged"), 2);
+    // The column itself, and the paths in the spec: a task's row reads as having none once it is purged.
+    for (const row of (await stored()).rows) assert.deepEqual([row.kept, /outputs|a\.txt/.test(String(row.spec))], [false, false]);
+  });
+
+  it("moves a database from before the outputs on without touching its tasks, which a replica of that version still ends", async () => {
+    const url = await postgresDatabase();
+    await (await openStore(url)).close();
+    const db = pool(url);
+    // As schema 9 left it.
+    await db.query("ALTER TABLE tasks DROP COLUMN outputs");
+    await db.query("UPDATE jig_schema SET version = 9");
+    await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
+    const { prompt: _, ...plain } = PLAIN;
+    // The statements of the version before, which name their columns: an insert, and the update that ends a task.
+    const insert = (id: string) => db.query("INSERT INTO tasks (id, tenant, prompt, spec, model, status, created, started, owner) VALUES ($1, 'a', 'x', $2, 'deepseek-flash', 'running', now(), now(), 'r0')", [id, JSON.stringify(plain)]);
+    const finish = (id: string) => db.query("UPDATE tasks SET status = 'succeeded', exit_code = 0, result = 'said', result_truncated = false, ended = now() WHERE id = $1 AND status = 'running' AND owner = 'r0'", [id]);
+    await insert("task_1");
+    await finish("task_1");
+    const store = await openStore(url);
+    closers.push(() => store.close());
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 10);
+    assert.deepEqual((await db.query("SELECT is_nullable, column_default, data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'tasks' AND column_name = 'outputs'")).rows, [
+      { is_nullable: "YES", column_default: null, data_type: "json" },
+    ]);
+    // A replica still on the version before goes on beside this one.
+    await insert("task_2");
+    await finish("task_2");
+    assert.deepEqual(await Promise.all(["task_1", "task_2"].map(async (id) => [(await store.task(id))!.status, (await store.task(id))!.result, (await store.task(id))!.outputs])), [["succeeded", "said", null], ["succeeded", "said", null]]);
+    const next = await store.createTask("a", { ...PLAIN, outputs: ["a.txt"] });
+    await store.claim("a", TERMS);
+    assert.equal(await store.finish(next.id, "r1", { ...OUTCOME, outputs: [{ path: "a.txt", text: "a\n" }] }), true);
+    assert.deepEqual((await store.task(next.id))!.outputs, [{ path: "a.txt", text: "a\n" }]);
+  });
+
   it("answers a create whose key the tenant used with the task it made, and whether its body was the same", async () => {
     const store = await openStore(await postgresDatabase());
     closers.push(() => store.close());
@@ -598,7 +660,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     const db = pool(url);
     // As schema 5 left it: no model column, the model in the spec alone (nor the result's and the table of
     // Idempotency-Keys, which came after).
-    await db.query("ALTER TABLE tasks DROP COLUMN model, DROP COLUMN result, DROP COLUMN result_truncated");
+    await db.query("ALTER TABLE tasks DROP COLUMN model, DROP COLUMN result, DROP COLUMN result_truncated, DROP COLUMN outputs");
     await db.query("DROP TABLE idempotency");
     await db.query("UPDATE jig_schema SET version = 5");
     await db.query("INSERT INTO tenants (id, limits) VALUES ('a', $1)", [JSON.stringify(LIMITS)]);
@@ -617,7 +679,7 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     await insert("task_7", { ...plain, workspace: { files: { "a.txt": "x\u0001y" } } }, "queued");
     const store = await openStore(url);
     closers.push(() => store.close());
-    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 10);
     // The model of a spec that holds one can't be read in SQL: it is left out, and its ledger row has none.
     assert.deepEqual((await db.query("SELECT id, model FROM tasks ORDER BY id")).rows, [
       { id: "task_1", model: "deepseek-flash" },
@@ -642,13 +704,13 @@ describe("the Postgres store, on a real Postgres", { skip: NO_POSTGRES }, () => 
     const db = pool(url);
     // As schema 8 left it, then the two statements docs/server.md gives for a large table.
     await db.query("DROP INDEX tasks_unpurged");
-    await db.query("ALTER TABLE tasks DROP COLUMN purged");
+    await db.query("ALTER TABLE tasks DROP COLUMN purged, DROP COLUMN outputs");
     await db.query("UPDATE jig_schema SET version = 8");
     await db.query("ALTER TABLE tasks ADD COLUMN IF NOT EXISTS purged timestamptz");
     await db.query("CREATE INDEX CONCURRENTLY IF NOT EXISTS tasks_unpurged ON tasks (ended) WHERE purged IS NULL AND ended IS NOT NULL");
     const store = await openStore(url);
     closers.push(() => store.close());
-    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 9);
+    assert.equal((await db.query("SELECT version FROM jig_schema")).rows[0].version, 10);
     assert.deepEqual((await db.query("SELECT indisvalid FROM pg_index WHERE indexrelid = 'tasks_unpurged'::regclass")).rows, [{ indisvalid: true }]);
     await store.putTenant({ id: "a", limits: LIMITS }, []);
     const task = await store.createTask("a", PLAIN);

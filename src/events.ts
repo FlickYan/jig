@@ -4,6 +4,7 @@
 // Where an approver answers in the terminal's place (--approve-via's service, or a library's), the calls put
 // to it and its answers too. Each model call that isn't a step's (the wrap-up, a compaction, a subagent's, the
 // reviewer's) is a call event, so the steps' and the calls' costs add up to the end's.
+// With --outputs, one outputs event just before the end holds the files the task was asked to hand back.
 // The fields are a contract (version 1): a reader ignores a type it doesn't know, and a field may be added.
 // A library's task (lib.ts) gets the same objects, handed to its listener instead of written.
 
@@ -12,6 +13,7 @@ import { randomBytes } from "node:crypto";
 import { addUsage, type AgentUI, type Usage, WRAP_UP } from "./agent.ts";
 import { redact } from "./export.ts";
 import type { CallModel } from "./model.ts";
+import type { Output } from "./outputs.ts";
 import { costOf } from "./prices.ts";
 import { truncate } from "./tools/index.ts";
 import { notice } from "./ui.ts";
@@ -75,6 +77,11 @@ export class Events {
   private failed: { error: unknown } | undefined;
   /** The end's exit code, once it is written: a signal after it doesn't change how jig exits. */
   endedWith: number | undefined;
+  /**
+   * --outputs: reads the files the task hands back (outputs.ts), once the run knows what is hidden. Called
+   * as the end is written, whichever end it is, so it can't wait for anything: jig's exit handler may call it.
+   */
+  outputs: (() => Output[]) | undefined;
 
   constructor(path: string | ((event: Event) => void), model: string, io?: Io) {
     this.model = model;
@@ -223,6 +230,13 @@ export class Events {
     // The events dropped while the reader was too far behind, said before the end where there is room by now.
     const dropped = this.lines?.dropped ?? 0;
     if (dropped) this.notice(`${count(dropped)} written: the --events reader was too far behind.`);
+    // --outputs' files, as they are now, in one event just before the end. A failure there (a library's
+    // listener that throws, say) leaves the event out: the end is written all the same.
+    try {
+      if (this.outputs) this.write("outputs", { files: this.outputs() });
+    } catch {
+      // Left out.
+    }
     this.ended = true;
     this.endedWith = exitCode;
     const seconds = Math.round((Date.now() - this.started) / 100) / 10;

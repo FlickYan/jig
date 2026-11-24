@@ -77,6 +77,10 @@ ${MODES.map((mode) => `                            ${mode.padEnd(6)} ${MODE_HELP
       --events <file>     write a task's events as JSON lines, as they happen: its start, each step with its
                           tokens, the tool calls and results, the text, the notices and its end (- for stdout,
                           the terminal's output then going to stderr; see the README)
+      --outputs <path>    with --events, hand a file of the project back when the task ends, however it ends: one
+                          outputs event just before the end holds each file's text, or why not (missing,
+                          not_a_file, too_large, not_text, hidden). Text files only, 256 KiB each and 768 KiB
+                          in all; never a link, or a file outside the project (repeatable, up to 20)
       --hide-skill <name> leave a skill out, as if it weren't installed (repeatable)
       --no-memory         leave out what jig remembers from earlier sessions, and don't offer to remember
       --system-prompt <text>
