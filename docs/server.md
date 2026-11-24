@@ -427,13 +427,16 @@ no `--outputs` either).
 A task posted to any replica is in the one queue, and whichever replica has a slot first runs it. A claim
 counts the running tasks in the database under a lock it holds to its transaction's end, so `concurrency`
 and each tenant's own hold across the replicas, and two can't both take the last slot; the turn among
-tenants is each replica's own. A run's events are stored and announced (`NOTIFY jig_events`), so a stream
+tenants is each replica's own. The lock and the claim are sent to the database together, and it commits
+without waiting for the replica again, so the lock, which every replica's claims wait for, is held only
+while the database works: a replica that is busy, or frozen, in the middle of a claim holds up no other. A run's events are stored and announced (`NOTIFY jig_events`), so a stream
 through any replica gets them as they come; a cancel through a replica that doesn't run the task marks it
 and announces it (`jig_cancel`), and the one that runs it stops it, or finds the mark when it renews its
 leases. While a replica's connection that hears these is lost, its streams read the database every second,
 and it connects again. Each connection asks the server to end a transaction left idle for over a minute
-(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds the claims'
-lock holds up the others' claims for that long at most, not until the server's TCP keepalive notices. A
+(`idle_in_transaction_session_timeout`), so a replica that freezes or is cut off while it holds a tenant's
+lock on its new tasks (a create is several statements under it) holds up that tenant's creates through the
+others for that long at most, not until the server's TCP keepalive notices. A
 replica that crashes leaves its runs going until another ends its tasks as `error`, once their leases run
 out, and stops their Jobs or containers (above); the others go on. A database that all of them lose for
 longer than a lease ends none of their tasks: once it is back, each waits a round of renewals before it
@@ -1446,7 +1449,7 @@ many tasks at once, the runs a stand-in that writes 20 events over 200 ms and en
 model), with a follower on one task's stream in ten. It is the ceiling adding workers can't pass. With
 `JIG_TEST_POSTGRES_URL` it measures Postgres too, with one replica and with two. On 4 cores with a local
 SSD (Node 22, Postgres 16 on the same machine, its `fsync` on), the service, the two replicas and the 32
-clients all in one process, 2,000 tasks, 64 running at a time on each replica:
+clients all in one process, 2,000 tasks, 64 running at a time (`concurrency` is the replicas' together):
 
 | | SQLite | Postgres | Postgres, two replicas |
 |---|---|---|---|
@@ -1458,10 +1461,9 @@ clients all in one process, 2,000 tasks, 64 running at a time on each replica:
 | a list of 100 a second (p99) | 740 (72 ms) | 1,030 (54 ms) | 1,160 (33 ms) |
 
 Every task succeeded and every followed stream had each of its events once, in order, then `done`. The two
-replicas don't run more than one does here because they share the one process, and so one core, with the
-clients: the measure says what a core of the service does, some 180 tasks of 20 events a second, not what
-two machines would. A real task's jig makes a few model calls of seconds each, so the service is far from
-what holds a deployment back: the model, then the runner's containers, are.
+replicas share the one process here, and so one core, with the clients: the measure says what a core of the
+service does, some 180 tasks of 20 events a second. A real task's jig makes a few model calls of seconds
+each, so the service is far from what holds a deployment back: the model, then the runner's containers, are.
 
 The events were most of that work. Each was a commit of its own: on SQLite a write the event loop waits
 for (0.2 ms on that SSD), and on Postgres a statement on one of the pool's ten connections, where with its
@@ -1471,6 +1473,67 @@ together, and each is stored for its run only once that commit is made, so nothi
 disk doesn't have; one run alone commits each event by itself, as before. On Postgres an event the database
 refuses is written again alone with the rest of its batch, so it fails alone. That took the same load from
 107 to 176 tasks a second on SQLite, and from 88 to 175 on Postgres.
+
+What replicas add is `node bench/service-replicas.ts`'s to say (it needs `JIG_TEST_POSTGRES_URL`): each
+replica is a process of its own there, with the same stand-in runs, on the one Postgres, and the 32 clients
+are a process too, posting to the replicas in turn and following one task in ten through another replica
+than the one it was posted to. `concurrency` is 192 whatever the number of replicas, as it is the cap of
+all of them together, so every column is the same load; the tasks are one tenant's, or 8 tenants' that may
+each run 36 at once. On the same 4 cores, which Postgres, the replicas and the clients share, and which
+were busy with other work besides (so read the columns against each other, not as the most a machine
+does), the medians of three runs:
+
+| | 1 replica | 2 replicas | 3 replicas |
+|---|---|---|---|
+| one tenant: tasks made a second (p99) | 336 (145 ms) | 297 (168 ms) | 222 (219 ms) |
+| one tenant: tasks run to their end a second | 182 | 188 | 215 |
+| 8 tenants: tasks made a second (p99) | 799 (109 ms) | 683 (106 ms) | 547 (141 ms) |
+| 8 tenants: tasks run to their end a second | 283 | 276 | 277 |
+| 8 tenants: events stored a second | 5,700 | 5,500 | 5,500 |
+| 8 tenants: each replica's CPU, of one core | 50% | 32% | 25% |
+
+In every run each task succeeded, was started once, by one replica, and has its 20 events and one row in
+the usage ledger; the followed streams had each event once, in order, then `done`; and by the runners' own
+clocks never more than 192 ran at once over the replicas, nor more than 36 of a tenant's (with three
+replicas it reached 185 to 190, and 36). The script prints those checks, each replica's CPU, and the most queries that waited for a
+connection of its pool at once; `STORE_TIMES=1` adds what each of the store's calls took, and
+`PROFILE=<dir>` has each replica write a CPU profile.
+
+So replicas don't add to what the service itself does: two or three run what one does, each with less of
+its core. A replica isn't what is short. Its CPU profile is half idle, waiting for the database, and what
+the rate hangs on is in the database they share, where `pg_stat_activity`, read every 20 ms through a run
+of 3 replicas and 8 tenants, shows what waits:
+
+- A tenant's creates are made one at a time, under its lock, so that its caps are counted with the insert
+  (Quotas and usage): 5 connections on average wait for a tenant's lock, and 5 more are in a create's
+  transaction, between two statements, waiting for their replica to send the next. One tenant's creates
+  get slower as replicas are added (336 a second to 222) because the lock is then passed between
+  processes; 8 tenants' go on side by side, 550 to 800 a second.
+- Postgres commits the transactions that announce something (`NOTIFY`: every batch of events, every task's
+  end) one at a time, behind a lock on its queue of notices (`Lock:object` in `pg_stat_activity`): 2
+  connections wait for it on average, and 2 more for the log to reach the disk (`WALWrite`, `WALSync`),
+  which each of those commits waits for in its turn. A run's events are written one after another, so
+  what a commit takes is what a run takes, and with a fixed number running, what the service does.
+- A claim is one task and one commit under the claims' lock, which all replicas share, and a replica makes
+  one at a time. With `concurrency` at 600 (and 4,000 tasks) no more than 230 ever ran at once, with tasks
+  queued all the while, and 250 to 380 a second ended, by one replica or by three: the rate the claims
+  went at.
+- The pool's 10 connections are all in use during the creates (some 35 queries waited for one at once, on
+  one replica), but a pool of 40 (`POOL=40`) ran no more: what a query waits for is behind the connection.
+
+Replicas are for surviving the loss of one, and for the room their machines give the runs (the local
+runner's jigs, a Docker daemon's containers); a deployment whose tasks make model calls of seconds each is
+far under these rates.
+
+Claims held the replicas back more before. A claim was a transaction made a statement at a time (the lock,
+the count, the update, the commit), so the claims' lock was held through three of its replica's turns to
+read a reply, and a replica that is storing its runs' events is slow to take its turn: with 3 replicas, of
+the three connections claiming, 1.5 on average were waiting for the lock while the one holding it sat idle
+two thirds of the time, waiting for its replica, and about 100 tasks ran at once of the 192 allowed. Now
+the lock and the claim are sent together and the database commits without waiting for the replica (Several
+replicas, above): 185 run at once, and the same load, run before and after three times each, went from 224
+tasks a second to 283 with one replica and 8 tenants, 224 to 276 with two and 201 to 277 with three (with
+one tenant, whose creates take most of the pool: 172 to 182, 153 to 188 and 194 to 215).
 
 ### Database size and upgrades
 
