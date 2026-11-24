@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { chmod, link, mkdir, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -10,7 +10,7 @@ import { promisify } from "node:util";
 import { checkConfig, type Config, diskRisks, type Service, startService } from "../server/api.ts";
 import { createLog } from "../server/log.ts";
 import { PgError } from "../server/pg.ts";
-import { DISK_UNMEASURABLE, diskError, folderBytes, Gone, type Runner, statusFor, Unmeasurable, watchDisk } from "../server/runner.ts";
+import { checkDisk, DISK_UNCHECKED, DISK_UNMEASURABLE, DiskLimit, diskError, folderBytes, Gone, type Runner, statusFor, Unmeasurable, watchDisk } from "../server/runner.ts";
 import { DockerRunner } from "../server/runners/docker.ts";
 import { LocalRunner } from "../server/runners/local.ts";
 import { DB_FULL, outcomeOf, Scheduler } from "../server/scheduler.ts";
@@ -216,6 +216,55 @@ describe("the watch of a task's folder", () => {
     assert.deepEqual([calls, walks], [[], 1]);
   });
 
+  it("aborts a walk under way when it is stopped, so the next watch's walk isn't held up behind it", async () => {
+    // The first watch's walk goes on until its signal says to stop, as one of a tree of a million entries would.
+    let walking: AbortSignal | undefined;
+    const measure = (_dir: string, _limit: number, _max?: number, signal?: AbortSignal) =>
+      new Promise<number>((_done, fail) => {
+        walking = signal;
+        signal?.addEventListener("abort", () => fail(signal.reason));
+      });
+    const calls: string[] = [];
+    const stop = watchDisk("/the/task", 1000, (why) => calls.push(why), 10, { measure });
+    opened.push(async () => stop());
+    await until(() => walking, "a walk to start");
+    const next = watching([5000]);
+    await pause(100);
+    assert.equal(next.walks(), 0, "one walk at a time");
+    stop();
+    assert.ok(walking!.aborted);
+    await until(() => next.calls.length, "the next watch's walk");
+    assert.deepEqual(calls, []);
+  });
+
+  it("stops a walk of the folder at its next entry once its signal is aborted", async () => {
+    const dir = await tempDir("jig-disk-");
+    for (let n = 0; n < 50; n++) await writeFile(join(dir, `file-${n}`), "x");
+    assert.ok((await folderBytes(dir, 1e12, undefined, new AbortController().signal)) > 0);
+    const stopped = new AbortController();
+    // Aborted once the walk has begun: it awaits the folder's own lstat first.
+    const walk = folderBytes(dir, 1e12, undefined, stopped.signal);
+    stopped.abort();
+    await assert.rejects(walk, { name: "AbortError" });
+  });
+
+  it("tells the task nothing of a check before its start that failed, but that it failed, and logs why", async () => {
+    const base = await tempDir("jig-disk-");
+    const lines: any[] = [];
+    // A folder that is gone, as any failure but Unmeasurable: its error names the path, under dataDir.
+    const failed = await checkDisk(join(base, "tasks", "task_1"), 1000, logTo(lines)).then(() => undefined, (err: Error) => err);
+    assert.ok(failed && !(failed instanceof DiskLimit));
+    assert.equal(failed.message, DISK_UNCHECKED);
+    assert.equal(DISK_UNCHECKED, "the service couldn't measure the task's folder against maxTaskDiskBytes, so the run wasn't started");
+    assert.deepEqual(lines.map(({ level, msg, dir }) => ({ level, msg, dir })), [{ level: "error", msg: "couldn't measure a task's folder before its start; the task isn't started", dir: join(base, "tasks", "task_1") }]);
+    assert.match(JSON.stringify(lines[0].err), /is gone/);
+    // What the task is told when the folder can't be measured, or is past the cap, is as it was; and no cap, no check.
+    await mkdir(join(base, "big"));
+    await writeFile(join(base, "big", "data"), Buffer.alloc(300_000, 1));
+    await assert.rejects(checkDisk(join(base, "big"), 100_000), (err: Error) => err instanceof DiskLimit && err.message === diskError(100_000));
+    await checkDisk(join(base, "tasks", "task_1"), 0);
+  });
+
   it("ends a task whose folder can't be measured twice in a row, not once", async () => {
     const unreadable = new Unmeasurable("EACCES");
     const once = watching([unreadable, 10, unreadable, 10, 10]);
@@ -342,7 +391,7 @@ describe("the local runner's disk cap", () => {
     assert.equal(task.cost, 0.001);
     await until(() => pids.length === 1 && !groupAlive(pids[0]), "the run's process group to be gone");
     await until(() => !existsSync(runner.dir(id)), "the task's folder to be removed");
-    const warned = lines.filter((line) => line.msg === "stopping a task whose folder went past the disk cap");
+    const warned = lines.filter((line) => line.msg === "stopping a task at the disk cap: its folder went past it, or can't be measured");
     assert.deepEqual(warned.map(({ tenant, task, why }) => ({ tenant, task, why })), [{ tenant: "acme", task: id, why: diskError(MIB) }]);
   });
 
@@ -373,6 +422,33 @@ describe("the local runner's disk cap", () => {
     }, "the task to end as an error");
     assert.deepEqual([task.status, task.stop, task.exitCode, task.error], ["error", "disk_limit", null, diskError(100_000)]);
     assert.ok(!existsSync(join(runner.dir(id), "work", ".fake-jig.json")) && !existsSync(join(runner.dir(id), "events.jsonl")), "jig never started");
+  });
+
+  it("stops a clone whose folder goes past the cap while git still writes, and tells the task of the cap", async () => {
+    // A repository of bytes that don't compress, far bigger than the cap: the clone takes many checks' time.
+    const base = await tempDir("jig-disk-");
+    const origin = join(base, "origin");
+    const git = (...args: string[]) => execFileSync("git", ["-C", origin, "-c", "user.name=jig", "-c", "user.email=jig@example.com", ...args], { stdio: "pipe" });
+    await mkdir(origin);
+    git("init", "-q");
+    await writeFile(join(origin, "data.bin"), randomBytes(48 * MIB));
+    git("add", "data.bin");
+    git("commit", "-q", "-m", "data");
+    const lines: any[] = [];
+    const runner = new LocalRunner(options(base, { maxDiskBytes: MIB, diskPollMs: 5, gitProtocols: ["file"], log: logTo(lines) }));
+    const now = new Date().toISOString();
+    const task: Task = { id: "task_clone", tenant: "acme", spec: { prompt: "exit 0", workspace: { git: pathToFileURL(origin).href }, maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, result: null, resultTruncated: false, purged: null, usage: null, cost: null };
+    await assert.rejects(runner.start(task, TENANT), (err: Error) => err instanceof DiskLimit && err.message === diskError(MIB));
+    // The watch stopped it, not the check after a clone that ended: git was cut off, and failed for it.
+    const said = lines.map((line) => line.msg);
+    assert.deepEqual(said.filter((msg) => /disk cap|git clone/.test(msg)), ["stopping a task at the disk cap: its folder went past it, or can't be measured", "git clone failed"]);
+    assert.match(lines.find((line) => line.msg === "git clone failed").stderr, /abort/i);
+    assert.ok(!existsSync(join(runner.dir(task.id), "work", "data.bin")), "the clone never checked its files out");
+    assert.ok(!existsSync(join(runner.dir(task.id), "events.jsonl")), "jig never started");
+    // And the watch is over: nothing more is said of the folder.
+    const count = lines.length;
+    await pause(200);
+    assert.equal(lines.length, count);
   });
 
   it("stops measuring the folder of a task that couldn't start", async () => {
@@ -447,6 +523,59 @@ describe("the Docker runner's disk cap", () => {
       }
     };
     await until(() => !groupAlive(), "the worker's processes to be gone");
+  });
+});
+
+describe("the Docker runner's disk cap, at a start that doesn't go through", () => {
+  const STOPPING = "stopping a task at the disk cap: its folder went past it, or can't be measured";
+  async function docker(lines: any[], config: Partial<ConstructorParameters<typeof DockerRunner>[0]> = {}) {
+    const base = await tempDir("jig-disk-");
+    const state = join(base, "state");
+    await mkdir(state);
+    return new DockerRunner({ dataDir: join(base, "data"), docker: [process.execPath, FAKE_DOCKER, state], image: "jig-worker:test", network: "jig-tasks", gatewayBaseUrl: "http://gateway:8081/anthropic", gatewaySecret: SECRET, graceSeconds: 5, pollMs: 20, diskPollMs: 20, maxDiskBytes: MIB, log: logTo(lines), ...config });
+  }
+
+  it("stops measuring a warm worker's folder when the worker went away and the task starts cold", async () => {
+    const lines: any[] = [];
+    const runner = await docker(lines, { pool: { size: 1 } });
+    const api = await service(runner, { keepTaskDirs: true });
+    await until(() => runner.pool!.stats().idle === 1, "a warm worker waiting for a task");
+    // The worker taken for the task is gone by the time it is answered, as far as the runner is told; its
+    // folder is kept here, to see whether it is still measured.
+    const take = runner.pool!.take.bind(runner.pool!);
+    const taken: NonNullable<ReturnType<typeof take>>[] = [];
+    runner.pool!.take = (task) => {
+      const warm = take(task);
+      if (!warm || taken.length) return warm;
+      taken.push(warm);
+      return { ...warm, answer: () => false };
+    };
+    opened.push(async () => taken[0]?.stop());
+    const id = (await call(api, "POST", "/v1/tasks", { prompt: "wait" })).body.id;
+    const work = join(runner.dir(id), "work");
+    await until(() => existsSync(join(work, ".fake-jig.json")), "the task's jig to wait");
+    assert.equal(taken.length, 1);
+    assert.ok(runner.dir(id).endsWith(id), "in a folder of its own, started cold");
+    // The worker's folder past the cap is no task's: nothing is stopped for it, through many checks.
+    await writeFile(join(taken[0].slot.dir, "work", "big"), Buffer.alloc(3 * MIB, 1));
+    await pause(300);
+    assert.deepEqual(lines.filter((line) => line.msg === STOPPING), []);
+    await writeFile(join(work, "go"), "");
+    const task = await ended(api, id);
+    assert.deepEqual([task.status, task.stop, task.error], ["succeeded", "end_turn", null]);
+  });
+
+  it("stops measuring the folder of a task whose start threw", async () => {
+    const lines: any[] = [];
+    const runner = await docker(lines);
+    opened.push(() => runner.close());
+    const now = new Date().toISOString();
+    // A task with approvals and nowhere to ask for them: its start throws once its folder is made and measured.
+    const task: Task = { id: "task_unasked", tenant: "acme", spec: { prompt: "hang", approvals: true, maxSteps: 50, timeLimit: 600, model: "claude-haiku-4-5" }, status: "running", exitCode: null, stop: null, error: null, created: now, started: now, ended: null, stats: null, result: null, resultTruncated: false, purged: null, usage: null, cost: null };
+    await assert.rejects(runner.start(task, TENANT), /needs the service's internalBaseUrl/);
+    await writeFile(join(runner.dir(task.id), "big"), Buffer.alloc(3 * MIB, 1));
+    await pause(300);
+    assert.deepEqual(lines.filter((line) => line.level === "warn"), []);
   });
 });
 

@@ -70,8 +70,9 @@ its content is deleted, as `DELETE /v1/tasks/:id` deletes it (Deleting a task, a
 number over 0, up to 36,500, fractions allowed; one setting for every tenant; queued and running tasks are
 never touched, and a row per task and the usage ledger stay. Take a backup before first setting it, as
 the first sweep deletes the content of every task older than that. A misspelt field in the config is
-silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB) is the most of a run's last text that is kept as the
-task's `result` (below); setting it over 1 MiB does nothing more, as a longer line of events is never read.
+silently ignored, so check the log for the sweep's `purged` line, or the metric. `maxResultBytes` (64 KiB)
+is the most of a run's last text that is kept as the task's `result` (below); setting it over 1 MiB does
+nothing more, as a longer line of events is never read.
 `keepTaskDirs` (false) keeps each task's folder after it ends, which is otherwise removed.
 `maxTaskDiskBytes` (4294967296, 4 GiB; 0 for none) is the most a task's folder may take on `dataDir`'s
 disk before its run is stopped (the disk cap, below). It is the local and docker runners': with `runner`
@@ -177,6 +178,9 @@ tenant's, and it holds for 24 hours from the create that made its task:
 - another body answers 422, `{"error", "id"}` with the id of the task the key made. Bodies are compared as
   the bytes they came in, not as JSON: a retry must resend the same bytes, and a new task takes a new key.
 
+A cancel doesn't free the key: the same create answers 200 with the cancelled task, as `cancelled`, for
+the rest of the 24 hours, so a client that cancels a task and wants it made again must send a new key.
+
 A create that was refused (400, 413, 429) records nothing: its key is free for the next try. The 429 for a
 full queue is `{"error", "quota": "maxQueued", "limit", "used"}` with `retry-after: 5`. The queue has no
 time it empties at, so the 5 is a fixed guess; it means nothing for a tenant whose `concurrency` or
@@ -259,8 +263,15 @@ and the database's clock says what is old enough. During a rolling upgrade, a re
 neither refuses a purged task's late events nor answers 410.
 
 What a delete doesn't reach, so don't call it complete erasure: a task's folder kept with `keepTaskDirs`,
-the service's and the gateway's logs, approval webhooks already posted or still being tried again (for up to a minute after the request), what the model's provider keeps,
-and backups. On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
+the service's and the gateway's logs, approval webhooks already posted, what the model's provider keeps,
+and backups. An approval's POST still being tried (for up to a minute after the task asked) is stopped by
+the `DELETE`, with no further try, on the replica that takes the delete; one being tried by another
+replica goes on to its last try. A POST stopped so is counted neither `delivered` nor `failed` in
+`jig_service_webhook_deliveries_total`, as the endpoint didn't fail it. The retention sweep stops none:
+it deletes tasks that ended `retentionDays` ago, by when no try is left (unless that is set to under a
+minute).
+
+On SQLite the freed bytes are overwritten with zeros in the database's file, but copies can
 stay in its `-wal` file until that is next reset (a checkpoint with no reader, or the service's stop). On
 Postgres the rows stay dead in the table until vacuum, and in WAL archives and on standbys as long as those
 keep them. There is no delete of a task's row or its ledger row, no retention per tenant or of the events
@@ -337,7 +348,10 @@ tried again, as it would fail each time.
 
 A SQLite database whose disk is full (SQLite's `SQLITE_FULL`) is tried again like any other failure:
 stopping a run can't make room, and the task that filled the disk is stopped by its disk cap and its folder
-removed, which the other runs' tries ride out. A run whose events still can't be written after half a lease
+removed, which makes room for the other runs' tries. That saves their writes to the database, not the
+runs themselves where `dataDir` is on the same file system: their own files are on the full disk too, so
+jig or its commands fail writing them and those tasks end as errors, as the warning at the start says
+(The disk cap, below). A run whose events still can't be written after half a lease
 ends as an `error` that says the service's database couldn't be written because its disk is full. Before
 a run's outcome is tried again after that failure, its folder is removed (unless `keepTaskDirs`), as it may
 be what filled the disk. The API's own writes (a new task, an approval's answer) are answered 503 with
@@ -432,8 +446,8 @@ it. A redirect is not followed but counted as a failed try, as it could send the
 service can reach. Each approval is counted once in
 `jig_service_webhook_deliveries_total{tenant,kind,result}` (`kind="approval"`), `delivered` or `failed`
 (after the last try), and `JigWebhookFailures` alerts when over half of a tenant's fail. One whose tries are
-cut off by the service stopping is counted neither way. Each tenant with a webhook starts at 0 for both, so
-the first failures show.
+cut off by the service stopping, or by its task's `DELETE`, is counted neither way. Each tenant with a
+webhook starts at 0 for both, so the first failures show.
 
 A tenant with `taskWebhook` (a URL, with the same `webhookSecretEnv`) is told as each of its tasks ends: a
 POST of `{"task": <id>, "status": <the status it ended with>}` and no more, from the replica that ended it,
@@ -496,6 +510,14 @@ curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&group=model&fo
 curl -s 'localhost:8080/admin/usage?from=2026-10-01&to=2026-10-31&tenant=acme' -H "Authorization: Bearer $JIG_ADMIN_KEY"
 ```
 
+Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
+that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
+the config, the environment variable that holds the admin key (which must be set, and may hold no
+whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
+`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
+month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
+them down by model or to check them against.
+
 ```bash
 # What the tenant may do, and where it stands:
 # {"tenant", "region", "limits": {"concurrency", "maxSteps", "timeLimit", "budgetUsd", "maxQueued", "approvalTimeout", "maxStreams", "quotas"},
@@ -509,14 +531,6 @@ counts; `resets` is when the next UTC day and month start. The counts are read w
 task is admitted by, but outside its lock, so they can be a task behind. `usdToday` and `usdThisMonth`
 count ended tasks only, as the quotas do. `maxStreams` is per replica, and the streams open now aren't
 reported. Each region answers for itself. It takes no parameter (400).
-
-Rows are sorted by what they are grouped by, and a day or model with no task is left out; a range or group
-that isn't one, or a parameter given twice, is a 400. `/admin/usage` is there only with `adminKeyEnv` in
-the config, the environment variable that holds the admin key (which must be set, and may hold no
-whitespace, such as a Secret's trailing newline: the service won't start with one); without it every
-`/admin` route is a 404. The ledger is jig's own report of what its runs said they spent. To bill a
-month, use the gateway's counts (`GET /usage?tenant=<id>&from=&to=`, below), and the admin's CSV to break
-them down by model or to check them against.
 
 ### Metrics and logs
 
@@ -791,7 +805,9 @@ once it takes more than `maxTaskDiskBytes`: SIGTERM, to jig's process group or t
 SIGKILL 5 seconds later. The task ends as an `error` with stop `disk_limit` and the error `the task's folder
 grew past maxTaskDiskBytes (<n> bytes), so the service stopped the run`; what it spent until then is
 stored as for any run. A workspace that is past the cap by itself, or a clone stopped at it, ends the
-task the same way before any run. The folder is then removed with the task, as any is.
+task the same way before any run. The folder is then removed with the task, as any is, but for one in
+which the task made a path longer than the system's longest (`PATH_MAX`): its removal fails with
+`ENAMETOOLONG`, logged as a warning, and the folder stays until an operator removes it.
 
 What is counted is the blocks each file and folder takes on the disk, so a sparse file counts for what it
 holds, not its length. No link is followed and no other file system entered, and a file with several
@@ -816,7 +832,9 @@ It is a check, not a quota, and these are its limits:
   runner.
 - A folder that can't be measured (a folder in it the service's user can't read, a path too long to name,
   over 1,000,000 files) on two checks in a row ends the task as an `error` that says so, as it can't be held
-  to the cap. One such check may only have met a folder as it was made.
+  to the cap. One such check may only have met a folder as it was made. A check before the start that
+  fails for any other reason (an I/O error) ends the task as an `error` that says only that the folder
+  couldn't be measured; the failure itself, which names paths in `dataDir`, is in the service's log.
 - On a file system that compresses, the blocks are what is stored, so the cap undercounts what was written.
 
 At its start the service warns when `dataDir`'s file system has less free than `concurrency` ×
@@ -1231,7 +1249,10 @@ A request that ends while Redis can't be reached can't give its slot back, and n
 The replica remembers such slots (up to 10,000, each for `leaseMs` at most) and gives them back, a thousand
 in a round, about a second after Redis answers again, rather than leave the tenant short of them on every
 replica until their leases end. A slot Redis may have taken for a request whose answer was lost is given
-back the same way, when Redis ran the request before the connection was lost. What this leaves:
+back the same way, when Redis ran the request before the connection was lost. A Redis that accepts
+connections but doesn't answer makes almost every refused admit count as owed, as each may have been run:
+the list can then fill to its 10,000, and the real give-backs that come after are dropped, with one warning,
+to expire with their leases. What this leaves:
 
 - What a gateway owes when it stops, and what is over 10,000, expires with its lease; the list is each
   replica's own, in memory.

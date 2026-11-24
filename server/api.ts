@@ -373,6 +373,7 @@ export async function startService(
     store,
     scheduler,
     answers,
+    webhooks,
     region: config.region ?? null,
     model: config.model ?? "deepseek-flash",
     gitHosts: config.gitHosts,
@@ -833,6 +834,7 @@ interface Context {
   store: Store;
   scheduler: Scheduler;
   answers: Answers;
+  webhooks: Webhooks;
   region: string | null;
   model: string;
   gitHosts?: string[];
@@ -873,8 +875,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, context: Contex
     if (statuses?.some((status) => !STATUSES.includes(status))) return reply(res, 400, { error: `status must be one or more of: ${STATUSES.join(", ")}, separated by commas` });
     const before = url.searchParams.get("before") ?? undefined;
     if (before !== undefined && !/^[\w-]{1,100}$/.test(before)) return reply(res, 400, { error: "before must be a task's id" });
-    const limit = Number(url.searchParams.get("limit") ?? 100);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
+    // Digits alone: Number() would also take 0x10, 1e1 and " 10".
+    const most = url.searchParams.get("limit") ?? "100";
+    const limit = /^[0-9]{1,3}$/.test(most) ? Number(most) : 0;
+    if (limit < 1 || limit > 100) return reply(res, 400, { error: "limit must be a whole number from 1 to 100" });
     // The prompts and the results can be long: a list leaves them out unless asked.
     const asked = url.searchParams.get("full") ?? "0";
     if (!["1", "true", "0", "false"].includes(asked)) return reply(res, 400, { error: "full must be 1 or 0" });
@@ -945,8 +949,14 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
   // A spec may name the region it is for, as the router reads it; the task is made only in that region.
   if (isObject(input) && input.region !== undefined) {
     const { region, ...rest } = input;
-    if (typeof region !== "string" || !/^[a-z0-9]{1,16}$/.test(region)) return reply(res, 400, { error: "region must be a region's name" });
-    if (region !== context.region) return reply(res, 400, { error: `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router` });
+    const wrong =
+      typeof region !== "string" || !/^[a-z0-9]{1,16}$/.test(region) ? "region must be a region's name"
+      : region !== context.region ? `this is ${context.region ? `region ${context.region}` : "a service with no region"}; post to region ${region}'s service or through the router`
+      : undefined;
+    if (wrong) {
+      refused("invalid");
+      return reply(res, 400, { error: wrong });
+    }
     input = rest;
   }
   const spec = taskSpec(input, tenant, context.model, context.gitHosts);
@@ -990,13 +1000,16 @@ async function createTask(req: IncomingMessage, res: ServerResponse, tenant: Ten
  * DELETE /v1/tasks/:id: deletes an ended task's content (Store.purge) and answers with what is left of it,
  * 200, however often it is asked; 409 for a task that hasn't ended, which is cancelled first.
  */
-async function purge(res: ServerResponse, task: Task, { store, metrics, region }: Context): Promise<void> {
+async function purge(res: ServerResponse, task: Task, { store, webhooks, metrics, region }: Context): Promise<void> {
   const purged = await store.purge(task.id);
   if (!purged) return reply(res, 404, { error: "No such task" });
   const { id, status } = purged.task;
   if (purged.task.purged === null) return reply(res, 409, { error: `The task hasn't ended: cancel it first (POST /v1/tasks/${id}/cancel)`, id, status });
   // Once a task, however many deletes it gets, at once or one after another.
   if (purged.first) metrics.purged.inc({ reason: "api" });
+  // An approval's POST still being tried carries its description: no more tries of this task's, on every
+  // delete, since a repeat may reach a replica other than the first did.
+  webhooks.purged(id);
   reply(res, 200, view(purged.task, { prompt: true, stats: true, result: true }, new Map(), region));
 }
 
@@ -1182,6 +1195,8 @@ export function taskSpec(input: unknown, tenant: Tenant, defaultModel: string, g
     }
   }
   if (git !== undefined && (typeof git !== "string" || !/^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(git) || git.length > 2000)) return "workspace.git must be a repository's URL";
+  // As for the prompt: \S takes one, and without gitHosts the URL is kept as it came.
+  if (typeof git === "string" && git.includes("\0")) return "workspace.git must not hold a NUL character (\\u0000)";
   // The local and Docker runners clone on the service's own network, which a tenant would otherwise reach
   // any host on. The scheduler checks it again as the task starts, should gitHosts have changed.
   const checked = typeof git === "string" ? checkedGit(git, gitHosts) : undefined;

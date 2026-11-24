@@ -124,9 +124,10 @@ export const DISK_UNMEASURABLE = `the task's folder can't be measured (a folder 
  * followed, and no folder on another file system entered (the walk only lstats, and descends by what lstat
  * says): a task's commands could otherwise send it round the machine. A file with several names is
  * counted once. What goes away during the walk is left out; the folder itself gone throws Gone, and one
- * that can't be read through, or holds over `maxEntries` entries, Unmeasurable.
+ * that can't be read through, or holds over `maxEntries` entries, Unmeasurable. A walk whose `signal` is
+ * aborted throws its reason at the next entry: nobody wants its sum, and it holds watchDisk's one queue.
  */
-export async function folderBytes(dir: string, limit: number, maxEntries = MAX_ENTRIES): Promise<number> {
+export async function folderBytes(dir: string, limit: number, maxEntries = MAX_ENTRIES, signal?: AbortSignal): Promise<number> {
   const gone = (err: NodeJS.ErrnoException) => err.code === "ENOENT" || err.code === "ENOTDIR";
   const unreadable = (err: NodeJS.ErrnoException): never => {
     throw UNREADABLE.has(err.code ?? "") ? new Unmeasurable(err.code!) : err;
@@ -151,6 +152,7 @@ export async function folderBytes(dir: string, limit: number, maxEntries = MAX_E
     }
     // The loop closes the folder however it is left.
     for await (const entry of handle) {
+      signal?.throwIfAborted();
       if (++entries > maxEntries) throw new Unmeasurable("too many");
       const path = join(folder, entry.name);
       let stats;
@@ -174,18 +176,24 @@ export async function folderBytes(dir: string, limit: number, maxEntries = MAX_E
   return sum;
 }
 
-/**
- * One check of the folder against the cap, before the task's jig starts: throws what the task is told if
- * its workspace alone is past it, or can't be measured. No limit (0), no check.
- */
 /** A start the disk cap stopped, before any run: its message is what the task is told, and its stop is disk_limit. */
 export class DiskLimit extends Error {}
 
-export async function checkDisk(dir: string, limit: number): Promise<void> {
+/** What the task is told when the check before its start failed for a reason that isn't its doing. */
+export const DISK_UNCHECKED = "the service couldn't measure the task's folder against maxTaskDiskBytes, so the run wasn't started";
+
+/**
+ * One check of the folder against the cap, before the task's jig starts: throws what the task is told if
+ * its workspace alone is past it, or can't be measured. Any other failure of the walk (an I/O error, the
+ * folder gone) names paths under dataDir, and what is thrown becomes the task's `error`: the failure is
+ * logged, and the task told only that the check failed. No limit (0), no check.
+ */
+export async function checkDisk(dir: string, limit: number, log: Log = createLog("service")): Promise<void> {
   if (!limit) return;
   const bytes = await folderBytes(dir, limit).catch((err: unknown) => {
     if (err instanceof Unmeasurable) throw new DiskLimit(DISK_UNMEASURABLE);
-    throw err;
+    log.error("couldn't measure a task's folder before its start; the task isn't started", { dir, err });
+    throw new Error(DISK_UNCHECKED);
   });
   if (bytes > limit) throw new DiskLimit(diskError(limit));
 }
@@ -200,16 +208,18 @@ let walks: Promise<void> = Promise.resolve();
  * time at most however big the tree. A folder that can't be measured on two walks in a row is over too, as
  * it can't be held to the cap; one walk may only have met a folder as the task made it. A folder that is
  * gone ends the watch. Any other failure is logged once, and the watch goes on. Returns what stops it; a
- * walk then in flight comes to nothing. Its timers don't keep the process going.
+ * walk then in flight is aborted at its next entry, so it doesn't hold the queue to the end of a big tree,
+ * and comes to nothing. Its timers don't keep the process going.
  */
 export function watchDisk(
   dir: string,
   limit: number,
   over: (why: string) => void,
   everyMs = 5000,
-  { log = createLog("service"), measure = folderBytes }: { log?: Log; measure?: (dir: string, limit: number) => Promise<number> } = {},
+  { log = createLog("service"), measure = folderBytes }: { log?: Log; measure?: (dir: string, limit: number, maxEntries?: number, signal?: AbortSignal) => Promise<number> } = {},
 ): () => void {
   let stopped = false;
+  const walking = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   let unmeasured = false;
   let warned = false;
@@ -221,7 +231,7 @@ export function watchDisk(
     if (stopped) return;
     const began = Date.now();
     try {
-      const bytes = await measure(dir, limit);
+      const bytes = await measure(dir, limit, undefined, walking.signal);
       if (stopped) return;
       unmeasured = false;
       if (bytes > limit) return end(diskError(limit));
@@ -247,6 +257,7 @@ export function watchDisk(
   return () => {
     stopped = true;
     clearTimeout(timer);
+    walking.abort();
   };
 }
 

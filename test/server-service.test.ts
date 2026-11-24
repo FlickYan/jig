@@ -439,6 +439,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     // Nor in a file: a spec that holds one broke Postgres's JSON operators, and git has no path with one.
     assert.equal(await refused({ prompt: "hi", workspace: { files: { "a.bin": "x\u0000y" } } }), 'workspace.files: "a.bin" must not hold a NUL character (\\u0000) in its contents');
     assert.match(await refused({ prompt: "hi", workspace: { files: { "a\u0000b": "x" } } }), /^workspace\.files: "a\\u0000b" .*NUL/);
+    // Nor in a repository's URL, which is kept as it came when the config lists no gitHosts.
+    assert.equal(await refused({ prompt: "hi", workspace: { git: "https://example.com/a\u0000b.git" } }), "workspace.git must not hold a NUL character (\\u0000)");
     assert.equal((await call(api, KEYS.acme, "POST", "/v1/tasks", { prompt: "x".repeat(20_000) })).status, 413);
     assert.deepEqual((await call(api, KEYS.acme, "GET", "/v1/tasks")).body, { tasks: [] });
 
@@ -576,7 +578,8 @@ const apiTests = (name: (typeof BACKENDS)[number]["name"]) => {
     assert.deepEqual(last, { tasks: [{ ...last.tasks[0], id: ids[4], prompt: "task 0" }] });
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?before=${ids[0]}`)).body.tasks.length, 4);
     // A page is 1 to 100 tasks.
-    for (const query of ["limit=0", "limit=101", "limit=x", "before=../x"]) assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).status, 400, query);
+    // Digits alone, not all that Number() reads: hex, an exponent, a space before, a fraction.
+    for (const query of ["limit=0", "limit=101", "limit=x", "limit=0x10", "limit=1e1", "limit=%2010", "limit=10.0", "limit=", "before=../x"]) assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks?${query}`)).status, 400, query);
     assert.equal((await call(api, KEYS.acme, "GET", `/v1/tasks/${ids[0]}`)).body.prompt, "task 4");
   });
 
