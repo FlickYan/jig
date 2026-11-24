@@ -186,9 +186,10 @@ signals with them, and the terminal's output goes there too.
 runs jig, which may have no other way to reach them (a pod, a task's folder that is removed): just before
 the `end`, whichever end it is (out of steps, the time limit, an error, a signal), jig writes one `outputs`
 event, `{"files": [...]}`, with an entry for each path in the order given: `{"path", "text"}` for a file it
-read, or `{"path", "problem"}` with `missing`, `not_a_file`, `too_large`, `not_text` or `hidden`. A file is
-handed back only if it is UTF-8 text with no NUL, 256 KiB at most, and all the texts together 768 KiB as the
-line holds them (JSON's escapes counted: a newline or a quote is two bytes), the files past that being
+read, `{"path", "base64"}` with the bytes of one that isn't UTF-8 text or holds a NUL, or `{"path",
+"problem"}` with `missing`, `not_a_file`, `too_large` or `hidden`. A file is handed back only if it is
+256 KiB at most, and all of them together 768 KiB as the line holds them (JSON's escapes counted: a newline
+or a quote is two bytes, and base64 is four bytes for three), the files past that being
 `too_large`, so the line stays under a mebibyte. The read is jig's own, outside the sandbox, of a folder the
 task's commands control, so it never follows a link: `not_a_file` for a link (to a file in the project
 too), for a path with a folder on the way that is a link leading out of the project, and for a folder, a

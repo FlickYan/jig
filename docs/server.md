@@ -240,19 +240,21 @@ or none (the run may write the files itself). jig is given each (`--outputs`), a
 own doing, whichever way (the model finished, `max_steps`, the time limit jig keeps, an error, a cancel or a
 stop it had the time to act on), it reads them and writes one `outputs` event just before its `end`. The
 task then has `outputs` on `GET /v1/tasks/:id`: an entry for each path, in the order asked, `{"path",
-"text"}` for a file that was read, or `{"path", "problem"}`:
+"text"}` for a file that was read, `{"path", "base64"}` with its bytes for one that isn't valid UTF-8 or
+holds a NUL (an image, an archive), or `{"path", "problem"}`:
 
 | problem | the path |
 |---------|----------|
 | `missing` | has no file |
 | `not_a_file` | is a folder, a symlink (to a file in the workspace too), a named pipe, a socket or a device, leads through a folder that is a link out of the workspace (whether or not a file is there), or can't be opened |
-| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the texts together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes); the files before it are kept |
-| `not_text` | isn't valid UTF-8, or holds a NUL |
+| `too_large` | is over 256 KiB (measured after secrets are blanked out, below, which can make a text longer), or would take all the files together past 768 KiB as the event's line holds them (JSON's escapes counted: a newline or a quote is two bytes; base64 is four bytes for three, so two files of 256 KiB that aren't text fit, and not a third); the files before it are kept |
+| `not_text` | isn't valid UTF-8, or holds a NUL: only from a worker image whose jig is older than `base64` entries |
 | `hidden` | lies in a path jig's file tools refuse (`local.hiddenPaths`, jig's own directory) |
 
 The limits keep the event's line under the mebibyte a runner reads of one; a file past them must be pushed,
 or split. As in every event, what looks like a secret in a text (an API key, a private key, a password's
-value) is blanked out as `[REDACTED]`, so a file isn't always byte for byte what the run wrote. `outputs`
+value) is blanked out as `[REDACTED]`, so a file isn't always byte for byte what the run wrote; nothing is
+blanked out in `base64`, which is the bytes as they are. `outputs`
 is `null` while the task is queued or running, for a task that asked for none, and for one whose run wrote
 no such event: one that never ran, whose jig was killed before it could write its end (a stop it didn't
 act on within the grace, a lost replica) or failed before it had read its settings. It is kept even when the event itself was past `maxEvents` or `maxEventBytes`; within them, the
@@ -1038,7 +1040,7 @@ whatever runs it (here, the runners). Each line is `{"v": 1, "seq": n, "ts": "<I
 | `call` | `for` (`wrap-up`, `compaction`, `subagent` or `review`), `step` (the main loop's step it came in, or the last before it, 0 before the first), `usage`, `cost`: a model call that isn't a step's, priced as a step's, so the steps' and the calls' add up to the end's |
 | `approval_request` | `step`, `id` (`ap_1`, `ap_2`, ...), `tool`, `description` (at most 64,000 characters, cut from the middle), `truncated`: a tool call put to the approver (`--approve-via`'s service, or a library's `approve`) |
 | `approval` | `id`, `decision` (`allow` or `deny`), `always` (true only where jig remembered it), `by`: `api` when answered, `timeout` when `--approval-timeout` passed first; none after a library's `approve` that rejects |
-| `outputs` | `files`: with `--outputs`, once, just before the `end`: for each path `{path, text}`, or `{path, problem}` with `missing`, `not_a_file`, `too_large`, `not_text` or `hidden` (see `outputs` under The API, above) |
+| `outputs` | `files`: with `--outputs`, once, just before the `end`: for each path `{path, text}`, `{path, base64}` for a file that isn't UTF-8 text, or `{path, problem}` with `missing`, `not_a_file`, `too_large` or `hidden` (see `outputs` under The API, above) |
 | `end` | `stop`, `exitCode` (as the process exits), `steps`, `usage` and `cost` of every model call (each priced by the model its reply names, if that has a price, else by the one jig asked for; null if neither has), `seconds` |
 
 Secrets are blanked out of every string, as `jig sessions export` does. With `-` the events are all that

@@ -1848,6 +1848,21 @@ const schedulerTests = () => {
     assert.deepEqual(outputsOf(full, ["1", "2", "3", "4"])!.map((file) => "problem" in file && file.problem), [false, false, false, "too_large"]);
     const lines = ["1", "2", "3"].map((path) => ({ path, text: "\n".repeat(200 * 1024) }));
     assert.deepEqual(outputsOf(lines, ["1", "2", "3"])!.map((file) => "problem" in file && file.problem), [false, "too_large", "too_large"]);
+    // Bytes in base64 are kept as they are, if they are base64 and no longer than a file may be; with a
+    // text or a problem beside them they are nobody's.
+    const b64 = Buffer.from([0x89, 0x50, 0x00, 0x01]).toString("base64");
+    const binary = [
+      { path: "1", base64: b64 },
+      { path: "2", base64: "not base64!" },
+      { path: "2", base64: "abc" },
+      { path: "2", base64: b64, text: "both" },
+      { path: "3", base64: Buffer.alloc(256 * 1024 + 1).toString("base64") },
+      { path: "4", base64: Buffer.alloc(256 * 1024).toString("base64") },
+    ];
+    assert.deepEqual(
+      outputsOf(binary, ["1", "2", "3", "4"])!.map((file) => ("base64" in file ? file.base64.length : file)),
+      [b64.length, { path: "3", problem: "too_large" }, Math.ceil((256 * 1024) / 3) * 4],
+    );
     // What is kept always fits a line a runner reads, and the store.
     const kept = outputsOf([...full, ...forged], ["1", "2", "3", "4", ...asked])!;
     assert.ok(Buffer.byteLength(JSON.stringify(kept)) < 1024 * 1024);

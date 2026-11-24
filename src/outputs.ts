@@ -28,12 +28,16 @@ export const OUTPUTS_BYTES = 768 * 1024;
 /**
  * Why a file isn't handed back: no such file; not a regular file that lies in the project (a folder, a link,
  * a pipe, a device, a path that leads out, one jig can't open); over OUTPUT_BYTES, or over OUTPUTS_BYTES with
- * the files before it; not UTF-8 text, or text with a NUL; or hidden from jig's file tools.
+ * the files before it; or hidden from jig's file tools. (not_text was a file that isn't UTF-8 text, from a
+ * jig before such files were handed back in base64.)
  */
 export type OutputProblem = "missing" | "not_a_file" | "too_large" | "not_text" | "hidden";
 
-/** One file of the outputs event: its text, or why there is none. */
-export type Output = { path: string; text: string } | { path: string; problem: OutputProblem };
+/**
+ * One file of the outputs event: its text; its bytes in base64, for a file that isn't UTF-8 text or holds a
+ * NUL (an image, an archive); or why there is neither.
+ */
+export type Output = { path: string; text: string } | { path: string; base64: string } | { path: string; problem: OutputProblem };
 
 /** Why --outputs can't take a path, or undefined if it names a file in the project. */
 export function outputProblem(path: string): string | undefined {
@@ -69,6 +73,12 @@ export function readOutputs(root: string, paths: string[], hides: (real: string)
   return [...new Set(paths)].slice(0, MAX_OUTPUTS).map((path): Output => {
     const read = realRoot === undefined ? "missing" : readOutput(root, realRoot, path, hides);
     if (typeof read === "string") return { path, problem: read };
+    if ("base64" in read) {
+      // Bytes as they are: nothing in them is redacted, as nothing in what a task encodes itself is.
+      if (total + read.base64.length > OUTPUTS_BYTES) return { path, problem: "too_large" };
+      total += read.base64.length;
+      return { path, base64: read.base64 };
+    }
     // As the event will hold it: the events' redaction can make a text longer (a URL's password becomes
     // [REDACTED]), so it is done here, before the bounds, and finds nothing more when the event is written.
     const text = redactSecrets(read.text).text;
@@ -93,7 +103,7 @@ export function readOutputs(root: string, paths: string[], hides: (real: string)
  * A hard link to a file outside the project can't be told from a file: it is one. The sandbox keeps
  * commands from making a link to a file they can't read, and what they can read they could have copied in.
  */
-function readOutput(root: string, realRoot: string, path: string, hides: (real: string) => unknown): { text: string } | OutputProblem {
+function readOutput(root: string, realRoot: string, path: string, hides: (real: string) => unknown): { text: string } | { base64: string } | OutputProblem {
   if (outputProblem(path)) return "not_a_file";
   const abs = resolve(root, path);
   if (!isInside(root, abs)) return "not_a_file";
@@ -138,7 +148,7 @@ function readOutput(root: string, realRoot: string, path: string, hides: (real: 
     if (length > OUTPUT_BYTES) return "too_large";
     const read = bytes.subarray(0, length);
     const text = read.includes(0) ? undefined : decodeUTF8(read);
-    return text === undefined ? "not_text" : { text };
+    return text === undefined ? { base64: read.toString("base64") } : { text };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     // ENOTDIR: a file is where a folder on the way would be. Anything else (ELOOP for a link put there since

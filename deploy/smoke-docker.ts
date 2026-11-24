@@ -153,9 +153,9 @@ async function main(): Promise<void> {
     let first = "";
     await check("a task runs in a container, its workspace's files there, and hands back a file it made", async () => {
       const posted = await call("POST", "/v1/tasks", {
-        prompt: "run: cat note.txt && hostname > host.txt && printf 'made in the container\\n' > dist.txt && id -u",
+        prompt: "run: cat note.txt && hostname > host.txt && printf 'made in the container\\n' > dist.txt && printf '\\211PNG\\0' > img.bin && id -u",
         workspace: { files: { "note.txt": "hello from the workspace\n" } },
-        outputs: ["dist.txt", "host.txt", "nope.txt"],
+        outputs: ["dist.txt", "host.txt", "nope.txt", "img.bin"],
         maxSteps: 5,
       });
       assert.equal(posted.status, 201, JSON.stringify(posted.body));
@@ -163,10 +163,11 @@ async function main(): Promise<void> {
       const task = await ended(first);
       assert.deepEqual([task.status, task.stop], ["succeeded", "end_turn"], JSON.stringify(task));
       assert.match(task.result, /hello from the workspace.*10001/s, "the command saw the file and ran as the image's user");
-      const [dist, hostname, nope] = task.outputs;
+      const [dist, hostname, nope, image] = task.outputs;
       assert.deepEqual(dist, { path: "dist.txt", text: "made in the container\n" });
       assert.match(hostname.text, /^[0-9a-f]{12}\n$/, "a container's hostname, not this machine's");
       assert.deepEqual(nope, { path: "nope.txt", problem: "missing" });
+      assert.deepEqual(image, { path: "img.bin", base64: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00]).toString("base64") }, "a file that isn't text comes back as its bytes");
       const all = await events(first);
       const types = all.map((event) => event.type);
       assert.deepEqual(types.filter((type) => type !== "notice"), ["start", "step", "tool_call", "tool_result", "step", "text", "outputs", "end"], JSON.stringify(all.filter((event) => event.type === "notice")));
